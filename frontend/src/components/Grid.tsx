@@ -8,7 +8,17 @@ export interface GridProps {
   children: ReactNode;
 }
 
-/** Grade responsiva para cartões e indicadores: 1 coluna no celular, até 4 em telas largas. */
+/**
+ * Grade responsiva para cartões e indicadores: 1 coluna no celular, até 4 em telas largas.
+ *
+ * @category Layout
+ * @example
+ * <Grid cols={3}>
+ *   <Stat label="Faturas" value={12} />
+ *   <Stat label="Total" value={<Money value={1439.9} />} />
+ *   <Stat label="Em aberto" value={3} />
+ * </Grid>
+ */
 export function Grid({ cols = 3, children }: GridProps) {
   return <div className={`grid grid-cols-1 gap-4 ${COLS[cols]}`}>{children}</div>;
 }

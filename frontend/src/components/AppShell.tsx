@@ -27,7 +27,15 @@ export interface AppShellProps {
   children: ReactNode;
 }
 
-/** Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. */
+/**
+ * Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado.
+ *
+ * @category Aplicação
+ * @example
+ * <AppShell brand="CV-Frame" nav={[{ to: "/faturas", label: "Faturas" }]} aside={<SessionStatus user={usuario} onSignOut={sair} />}>
+ *   <Text>Conteúdo</Text>
+ * </AppShell>
+ */
 export function AppShell({ brand, nav, aside, children }: AppShellProps) {
   const { pathname } = useLocation();
   const current = nav.find((item) => pathname.startsWith(item.to));

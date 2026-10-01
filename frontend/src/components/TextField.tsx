@@ -20,7 +20,13 @@ export interface TextFieldProps {
   autoComplete?: string;
 }
 
-/** Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidade. */
+/**
+ * Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidade.
+ *
+ * @category Formulários
+ * @example
+ * <TextField label="E-mail" type="email" value={nome} onChange={setNome} required hint="Usado no login." />
+ */
 export function TextField({ label, value, onChange, type = "text", hint, error, required, placeholder, autoComplete }: TextFieldProps) {
   const id = useId();
   const help = error ? `${id}-erro` : hint ? `${id}-ajuda` : undefined;

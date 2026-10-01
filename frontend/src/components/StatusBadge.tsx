@@ -18,7 +18,13 @@ export interface StatusBadgeProps {
   labels?: Record<string, string>;
 }
 
-/** Status como etiqueta colorida, com cor automática para valores comuns (pago, pendente, erro...). */
+/**
+ * Status como etiqueta colorida, com cor automática para valores comuns (pago, pendente, erro...).
+ *
+ * @category Formatação
+ * @example
+ * <StatusBadge value="aberta" labels={{ aberta: "Em aberto" }} />
+ */
 export function StatusBadge({ value, tones, labels }: StatusBadgeProps) {
   const tone = tones?.[value] ?? DEFAULT_TONES[value.toLowerCase()] ?? "neutral";
   return <Badge tone={tone}>{labels?.[value] ?? value}</Badge>;

@@ -5,7 +5,13 @@ export interface SpinnerProps {
   label?: string;
 }
 
-/** Indicador de carregamento acessível, com texto. */
+/**
+ * Indicador de carregamento acessível, com texto.
+ *
+ * @category Feedback
+ * @example
+ * <Spinner label="Carregando faturas" />
+ */
 export function Spinner({ label = "Carregando" }: SpinnerProps) {
   return (
     <span role="status" className="inline-flex items-center gap-2 text-sm text-muted-foreground">

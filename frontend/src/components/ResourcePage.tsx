@@ -33,7 +33,23 @@ export interface ResourcePageProps<T, B> {
   };
 }
 
-/** Receita de tela de cadastro: título, indicadores, lista com todos os estados e criação em painel lateral. */
+/**
+ * Receita de tela de cadastro: título, indicadores, lista com todos os estados e criação em painel lateral.
+ *
+ * @category Receitas
+ * @example
+ * <ResourcePage
+ *   title="Faturas"
+ *   query={faturas}
+ *   rowKey={(f) => f.id}
+ *   stats={(rows) => [{ label: "Faturas", value: rows.length }]}
+ *   columns={[
+ *     { key: "cliente", header: "Cliente" },
+ *     { key: "valor", header: "Valor", render: (f) => <Money value={f.valor} /> },
+ *   ]}
+ *   create={{ label: "Nova fatura", action: criar, fields: [{ name: "cliente", label: "Cliente", required: true }] }}
+ * />
+ */
 export function ResourcePage<T, B>({ title, description, query, columns, rowKey, empty, stats, create }: ResourcePageProps<T, B>) {
   const [open, setOpen] = useState(false);
   const cards = stats && query.data ? stats(query.data) : [];

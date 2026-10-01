@@ -15,7 +15,13 @@ export interface BadgeProps {
   children: ReactNode;
 }
 
-/** Etiqueta curta para status, papéis ou categorias. */
+/**
+ * Etiqueta curta para status, papéis ou categorias.
+ *
+ * @category Formatação
+ * @example
+ * <Badge tone="accent">financeiro</Badge>
+ */
 export function Badge({ tone = "neutral", children }: BadgeProps) {
   const { variant, className } = TONE[tone];
   return (

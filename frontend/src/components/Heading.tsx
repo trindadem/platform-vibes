@@ -6,7 +6,13 @@ export interface HeadingProps {
   children: ReactNode;
 }
 
-/** Título de seção dentro de uma tela (h2 ou h3). */
+/**
+ * Título de seção dentro de uma tela (h2 ou h3).
+ *
+ * @category Texto
+ * @example
+ * <Heading level={3}>Itens da fatura</Heading>
+ */
 export function Heading({ level = 2, children }: HeadingProps) {
   return level === 2 ? (
     <h2 className="font-heading text-xl font-semibold tracking-tight">{children}</h2>

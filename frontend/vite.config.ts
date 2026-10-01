@@ -10,7 +10,8 @@
  * - .css só src/core/theme.css, importado por main.tsx.
  * - Módulo não importa outro módulo. Arquivo fora da topologia é erro.
  *
- * Também gera src/components/CATALOG.md a partir do próprio código: é o que existe para compor.
+ * Também gera src/components/CATALOG.md a partir do próprio código (índice por categoria + detalhe com exemplo)
+ * e .cv/catalog-examples.tsx, onde o TypeScript confere cada @example no `npm run check`.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -21,6 +22,7 @@ import { defineConfig, parseSync, type Plugin } from "vite";
 
 const SRC = fileURLToPath(new URL("./src", import.meta.url));
 const CATALOG = path.join(SRC, "components", "CATALOG.md");
+const EXAMPLES = fileURLToPath(new URL("./.cv/catalog-examples.tsx", import.meta.url));
 const GATEWAY = process.env.GATEWAY_URL ?? "http://localhost:8088";
 
 export default defineConfig({
@@ -46,6 +48,17 @@ const CORE_FILES = new Set(["api.ts", "auth.ts", "contracts.ts", "theme.css"]);
 const ROOT_FILES = new Set(["App.tsx", "main.tsx"]);
 const NETWORK = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]);
 const HEADER = "Trilhos do frontend violados (README §6):";
+// Categorias do catálogo, na ordem do índice. Componente novo escolhe uma delas em @category.
+const CATEGORIES: Record<string, string> = {
+  Receitas: "telas e dados prontos: comece por aqui",
+  Layout: "estrutura da tela",
+  Dados: "registros e números",
+  Formatação: "dinheiro, datas, status e códigos",
+  Formulários: "campos e ações",
+  Feedback: "avisos, carregamento e vazio",
+  Texto: "títulos e parágrafos",
+  Aplicação: "moldura e sessão (usados pelo App.tsx, não pelas páginas)",
+};
 
 function rails(): Plugin {
   return {
@@ -164,11 +177,37 @@ function checkComponent(r: string, body: Node[], comments: Comment[], code: stri
   const exported = body.filter((n) => n.type === "ExportNamedDeclaration" && n.declaration);
   const fn = exported.find((n) => n.declaration.type === "FunctionDeclaration" && n.declaration.id?.name === name);
   if (!fn) fail(`exporte "export function ${name}(...)", com o mesmo nome do arquivo`);
-  else if (!jsdocBefore(fn, comments, code)) fail(`documente ${name} com /** ... */ logo acima: é o texto do CATALOG.md`);
+  const raw = fn ? jsdocBefore(fn, comments, code) : null;
+  if (fn && !raw) fail(`documente ${name} com /** ... */ logo acima: é o texto do CATALOG.md`);
+  if (raw) {
+    const doc = parseDoc(raw);
+    if (!doc.summary) fail(`o JSDoc de ${name} começa com uma frase dizendo o que ele é`);
+    if (!doc.category || !(doc.category in CATEGORIES)) {
+      fail(`JSDoc de ${name} precisa de @category com uma destas: ${Object.keys(CATEGORIES).join(", ")}`);
+    }
+    if (!doc.example) fail(`JSDoc de ${name} precisa de @example: uma expressão JSX que usa <${name}`);
+    else checkExample(name, doc.example, fail);
+  }
   if (!exported.some((n) => isTypeDecl(n.declaration) && n.declaration.id?.name === `${name}Props`)) {
     fail(`exporte "${name}Props" (interface ou type) com as props documentadas`);
   }
   if (body.some((n) => n.type === "ExportDefaultDeclaration")) fail("componente usa export nomeado, nunca default");
+}
+
+// O exemplo é código de página: JSX válido, usa o próprio componente, sem tag HTML nem className/style.
+function checkExample(name: string, example: string, fail: (m: string) => void) {
+  const { program, errors } = parseSync("example.tsx", `const exemplo = (\n${example}\n);`);
+  if (errors.length) return fail(`@example de ${name} não é uma expressão JSX válida`);
+  let usesItself = false;
+  walk(program, (node) => {
+    if (node.type !== "JSXOpeningElement") return;
+    if (node.name?.name === name) usesItself = true;
+    if (isIntrinsic(node.name)) fail(`@example de ${name} usa <${node.name.name}>: exemplo segue as regras de página`);
+    for (const attr of node.attributes ?? []) {
+      if (["className", "style"].includes(attr.name?.name)) fail(`@example de ${name} usa ${attr.name.name}: exemplo segue as regras de página`);
+    }
+  });
+  if (!usesItself) fail(`@example de ${name} precisa usar <${name}`);
 }
 
 function checkPage(body: Node[], fail: (m: string) => void) {
@@ -181,41 +220,123 @@ function checkPage(body: Node[], fail: (m: string) => void) {
 
 // ── Catálogo ─────────────────────────────────────────────────────────────────
 
+interface Entry {
+  name: string;
+  summary: string;
+  category: string;
+  example: string | null;
+  props: { name: string; optional: boolean; type: string; doc: string }[];
+}
+
 function writeCatalog() {
   const dir = path.join(SRC, "components");
   if (!fs.existsSync(dir)) return;
-  const names = fs.readdirSync(dir).filter((f) => COMPONENT_FILE.test(f)).sort();
-  const sections = names.map((file) => describe(path.join(dir, file)));
+  const order = Object.keys(CATEGORIES);
+  const entries = fs
+    .readdirSync(dir)
+    .filter((f) => COMPONENT_FILE.test(f))
+    .map((f) => describe(path.join(dir, f)))
+    .sort((a, b) => rank(order, a.category) - rank(order, b.category) || a.name.localeCompare(b.name));
+
+  const index = order.flatMap((category) => {
+    const group = entries.filter((e) => e.category === category);
+    if (!group.length) return [];
+    return [`**${category}**: ${CATEGORIES[category]}`, "", ...group.map(indexLine), ""];
+  });
+  const loose = entries.filter((e) => !(e.category in CATEGORIES));
   const content = [
     "# Catálogo de componentes",
     "",
     "> Gerado por `vite.config.ts` a partir de `src/components/*.tsx` em todo `npm run dev` e `npm run build`. Não edite.",
-    "> Antes de compor uma tela, procure aqui. Faltou peça? Crie `src/components/<Nome>.tsx` com JSDoc e `<Nome>Props`.",
+    "> Como usar: leia o índice, escolha as peças (receitas primeiro) e copie o exemplo da seção de cada uma.",
+    "> Dados vêm de `useQuery`/`useAction` com as funções de `src/core/contracts.ts`. Faltou peça? Crie",
+    "> `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.",
+    "> Os exemplos usam dados fictícios (`faturas`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.",
     "",
-    `${names.length} componentes: ${names.map((f) => `[${f.slice(0, -4)}](#${f.slice(0, -4).toLowerCase()})`).join(" · ")}`,
+    `## Índice (${entries.length})`,
     "",
-    ...sections,
+    ...index,
+    ...(loose.length ? ["**Sem categoria**", "", ...loose.map(indexLine), ""] : []),
+    ...entries.flatMap(detail),
   ].join("\n");
   if (!fs.existsSync(CATALOG) || fs.readFileSync(CATALOG, "utf8") !== content) fs.writeFileSync(CATALOG, content);
+  writeExamples(entries);
 }
 
-function describe(file: string): string {
+function indexLine(e: Entry): string {
+  const props = [...e.props.filter((p) => !p.optional), ...e.props.filter((p) => p.optional)];
+  const signature = props.map((p) => p.name + (p.optional ? "?" : "")).join(", ");
+  return `- [${e.name}](#${e.name.toLowerCase()}): ${e.summary.split(/(?<=\.)\s/)[0]} \`${signature}\``;
+}
+
+function detail(e: Entry): string[] {
+  return [
+    "---",
+    "",
+    `## ${e.name}`,
+    "",
+    `${e.summary} _(${e.category || "sem categoria"})_`,
+    "",
+    ...(e.example ? ["```tsx", e.example, "```", ""] : []),
+    ...e.props.map((p) => `- \`${p.name}${p.optional ? "?" : ""}\`: \`${p.type}\`${p.doc ? `: ${p.doc}` : ""}`),
+    "",
+  ];
+}
+
+function describe(file: string): Entry {
   const name = path.basename(file, ".tsx");
   const code = fs.readFileSync(file, "utf8");
   const { program, comments } = parseSync(file, code);
   const body = (program as Node).body as Node[];
   const fn = body.find((n) => n.type === "ExportNamedDeclaration" && n.declaration?.id?.name === name);
-  const props = body.find((n) => n.type === "ExportNamedDeclaration" && n.declaration?.id?.name === `${name}Props`);
-  const summary = fn ? jsdocBefore(fn, comments as Comment[], code) : null;
-  const members: Node[] = props ? (props.declaration.body?.body ?? props.declaration.typeAnnotation?.members ?? []) : [];
-  const lines = members
+  const propsNode = body.find((n) => n.type === "ExportNamedDeclaration" && n.declaration?.id?.name === `${name}Props`);
+  const raw = fn ? jsdocBefore(fn, comments as Comment[], code) : null;
+  const doc = raw ? parseDoc(raw) : { summary: "", category: "", example: null };
+  const members: Node[] = propsNode ? (propsNode.declaration.body?.body ?? propsNode.declaration.typeAnnotation?.members ?? []) : [];
+  const props = members
     .filter((m) => m.type === "TSPropertySignature")
     .map((m) => {
       const type = m.typeAnnotation ? code.slice(m.typeAnnotation.typeAnnotation.start, m.typeAnnotation.typeAnnotation.end) : "unknown";
-      const doc = jsdocBefore(m, comments as Comment[], code);
-      return `- \`${m.key.name}${m.optional ? "?" : ""}\`: \`${type.replace(/\s+/g, " ")}\`${doc ? ` — ${doc}` : ""}`;
+      const propDoc = jsdocBefore(m, comments as Comment[], code);
+      return { name: m.key.name, optional: Boolean(m.optional), type: type.replace(/\s+/g, " "), doc: propDoc ? parseDoc(propDoc).summary : "" };
     });
-  return [`## ${name}`, "", summary ?? "_sem descrição_", "", ...lines, ""].join("\n");
+  return { name, summary: doc.summary || "_sem descrição_", category: doc.category ?? "", example: doc.example, props };
+}
+
+// Cada @example vira uma expressão num .tsx que o tsc confere: exemplo que mente sobre as props quebra o check.
+function writeExamples(entries: Entry[]) {
+  const uses = (example: string, name: string) => new RegExp(`<${name}[\\s/>]`).test(example);
+  const used = new Set(entries.flatMap((e) => entries.filter((o) => e.example && uses(e.example, o.name)).map((o) => o.name)));
+  const content = [
+    "// Gerado por vite.config.ts a partir dos @example dos componentes. Não edite; conferido por `npm run check`.",
+    'import type { ActionState, QueryState } from "@/core/api";',
+    ...[...used].sort().map((n) => `import { ${n} } from "@/components/${n}";`),
+    "",
+    "// Dados fictícios que os exemplos usam.",
+    'export type Fatura = { id: string; cliente: string; valor: number; status: "aberta" | "paga"; criada_em: string };',
+    'export type FaturaIn = { cliente: string; valor: number; status?: "aberta" | "paga" };',
+    "export declare const faturas: QueryState<Fatura[]>;",
+    "export declare const fatura: QueryState<Fatura>;",
+    "export declare const criar: ActionState<[body: FaturaIn], Fatura>;",
+    "export declare const nome: string;",
+    "export declare function setNome(value: string): void;",
+    "export declare const usuario: string | null;",
+    "export declare function salvar(): void;",
+    "export declare function sair(): void;",
+    "",
+    "export const exemplos = {",
+    // Erro aqui = @example desatualizado no componente indicado no comentário acima dele.
+    ...entries.filter((e) => e.example).map((e) => `  // @example de src/components/${e.name}.tsx\n  ${e.name}: (\n${e.example!.replace(/^/gm, "    ")}\n  ),`),
+    "};",
+    "",
+  ].join("\n");
+  fs.mkdirSync(path.dirname(EXAMPLES), { recursive: true });
+  if (!fs.existsSync(EXAMPLES) || fs.readFileSync(EXAMPLES, "utf8") !== content) fs.writeFileSync(EXAMPLES, content);
+}
+
+function rank(order: string[], category: string): number {
+  const i = order.indexOf(category);
+  return i === -1 ? order.length : i;
 }
 
 // ── Utilidades ───────────────────────────────────────────────────────────────
@@ -223,7 +344,27 @@ function describe(file: string): string {
 function jsdocBefore(node: Node, comments: Comment[], code: string): string | null {
   const doc = comments.findLast((c) => c.end <= node.start && c.type === "Block" && c.value.startsWith("*"));
   if (!doc || code.slice(doc.end, node.start).trim() !== "") return null;
-  return doc.value.replace(/^\*/, "").split("\n").map((line) => line.replace(/^\s*\*\s?/, "").trim()).filter(Boolean).join(" ");
+  return doc.value.replace(/^\*/, "");
+}
+
+function parseDoc(raw: string): { summary: string; category: string | null; example: string | null } {
+  const summary: string[] = [];
+  const example: string[] = [];
+  let category: string | null = null;
+  let section = "summary";
+  for (const line of raw.split("\n").map((l) => l.replace(/^\s*\*\s?/, ""))) {
+    const tag = line.match(/^@(\w+)\s*(.*)$/);
+    if (tag) {
+      section = tag[1]!;
+      if (section === "category") category = tag[2]!.trim();
+      if (section === "example" && tag[2]) example.push(tag[2]);
+      continue;
+    }
+    if (section === "summary") summary.push(line.trim());
+    if (section === "example") example.push(line);
+  }
+  const text = example.join("\n").replace(/\s+$/, "").replace(/^\n+/, "");
+  return { summary: summary.filter(Boolean).join(" "), category, example: text || null };
 }
 
 function walk(node: unknown, visit: (n: Node) => void): void {

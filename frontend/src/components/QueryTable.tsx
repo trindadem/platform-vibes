@@ -14,7 +14,20 @@ export interface QueryTableProps<T> {
   caption?: string;
 }
 
-/** Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito. */
+/**
+ * Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito.
+ *
+ * @category Receitas
+ * @example
+ * <QueryTable
+ *   query={faturas}
+ *   rowKey={(f) => f.id}
+ *   columns={[
+ *     { key: "cliente", header: "Cliente" },
+ *     { key: "status", header: "Status", render: (f) => <StatusBadge value={f.status} /> },
+ *   ]}
+ * />
+ */
 export function QueryTable<T>({ query, columns, rowKey, empty, caption }: QueryTableProps<T>) {
   return (
     <QueryView query={query} empty={empty}>

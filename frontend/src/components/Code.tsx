@@ -5,7 +5,13 @@ export interface CodeProps {
   block?: boolean;
 }
 
-/** Trecho de código, comando ou identificador em fonte monoespaçada. */
+/**
+ * Trecho de código, comando ou identificador em fonte monoespaçada.
+ *
+ * @category Formatação
+ * @example
+ * <Code>{"python gateway/contracts.py"}</Code>
+ */
 export function Code({ children, block = false }: CodeProps) {
   if (block) {
     return <pre className="overflow-x-auto rounded-lg border bg-muted/50 px-4 py-3 font-mono text-xs break-all whitespace-pre-wrap">{children}</pre>;

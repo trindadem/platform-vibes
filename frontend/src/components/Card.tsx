@@ -11,7 +11,15 @@ export interface CardProps {
   children?: ReactNode;
 }
 
-/** Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais. */
+/**
+ * Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais.
+ *
+ * @category Layout
+ * @example
+ * <Card title="Resumo" description="Últimos 30 dias" footer={<Button variant="secondary" onClick={salvar}>Ver tudo</Button>}>
+ *   <Text>12 faturas emitidas.</Text>
+ * </Card>
+ */
 export function Card({ title, description, footer, children }: CardProps) {
   return (
     <UiCard>

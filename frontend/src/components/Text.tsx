@@ -11,7 +11,13 @@ export interface TextProps {
   children: ReactNode;
 }
 
-/** Parágrafo de texto com tom e tamanho padronizados. */
+/**
+ * Parágrafo de texto com tom e tamanho padronizados.
+ *
+ * @category Texto
+ * @example
+ * <Text tone="muted" size="sm">Atualizado há 5 minutos.</Text>
+ */
 export function Text({ tone = "default", size = "md", children }: TextProps) {
   return <p className={`${TONE[tone]} ${SIZE[size]}`}>{children}</p>;
 }

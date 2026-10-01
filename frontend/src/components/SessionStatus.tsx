@@ -17,7 +17,13 @@ export interface SessionStatusProps {
   onSignOut: () => void;
 }
 
-/** Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão. */
+/**
+ * Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão.
+ *
+ * @category Aplicação
+ * @example
+ * <SessionStatus user={usuario} onSignOut={sair} />
+ */
 export function SessionStatus({ user, onSignOut }: SessionStatusProps) {
   if (!user) {
     return <p className="px-2 py-1.5 text-sm text-muted-foreground">Sem sessão</p>;

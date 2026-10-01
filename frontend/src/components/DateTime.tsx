@@ -21,7 +21,13 @@ export interface DateTimeProps {
   format?: "date" | "datetime" | "time" | "relative";
 }
 
-/** Data e hora em pt-BR; a data completa aparece ao passar o mouse. */
+/**
+ * Data e hora em pt-BR; a data completa aparece ao passar o mouse.
+ *
+ * @category Formatação
+ * @example
+ * <DateTime value="2026-10-01T14:30:00Z" format="relative" />
+ */
 export function DateTime({ value, format = "datetime" }: DateTimeProps) {
   const date = value instanceof Date ? value : value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return <span className="text-muted-foreground">—</span>;

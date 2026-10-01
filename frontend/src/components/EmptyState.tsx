@@ -10,7 +10,17 @@ export interface EmptyStateProps {
   action?: ReactNode;
 }
 
-/** Espaço reservado para lista vazia, página inexistente ou recurso indisponível. */
+/**
+ * Espaço reservado para lista vazia, página inexistente ou recurso indisponível.
+ *
+ * @category Feedback
+ * @example
+ * <EmptyState
+ *   title="Nenhuma fatura"
+ *   description="Emita a primeira pelo botão Nova fatura."
+ *   action={<Button onClick={salvar}>Nova fatura</Button>}
+ * />
+ */
 export function EmptyState({ title, description, action }: EmptyStateProps) {
   return (
     <Empty className="border border-dashed">

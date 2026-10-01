@@ -19,7 +19,13 @@ export interface ButtonProps {
   children: ReactNode;
 }
 
-/** Botão de ação com variantes, tamanhos e estado de carregamento. */
+/**
+ * Botão de ação com variantes, tamanhos e estado de carregamento.
+ *
+ * @category Formulários
+ * @example
+ * <Button variant="secondary" onClick={salvar}>Cancelar</Button>
+ */
 export function Button({ variant = "primary", size = "md", type = "button", loading = false, disabled = false, onClick, children }: ButtonProps) {
   return (
     <UiButton type={type} variant={VARIANT[variant]} size={SIZE[size]} onClick={onClick} disabled={disabled || loading} aria-busy={loading}>

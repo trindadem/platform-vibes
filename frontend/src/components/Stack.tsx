@@ -8,7 +8,16 @@ export interface StackProps {
   children: ReactNode;
 }
 
-/** Empilha itens na vertical com espaçamento uniforme. */
+/**
+ * Empilha itens na vertical com espaçamento uniforme.
+ *
+ * @category Layout
+ * @example
+ * <Stack gap="sm">
+ *   <Heading>Resumo</Heading>
+ *   <Text tone="muted">Últimos 30 dias.</Text>
+ * </Stack>
+ */
 export function Stack({ gap = "md", children }: StackProps) {
   return <div className={`flex flex-col ${GAP[gap]}`}>{children}</div>;
 }

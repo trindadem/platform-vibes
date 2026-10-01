@@ -291,9 +291,9 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 
 - **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente.
 - **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order }`. Vira a rota `/<module_name>` e um item do menu, sem registro manual. Um módulo tem só `page.tsx` e não importa outro módulo.
-- **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default), documentada com `/** ... */`, e `<Nome>Props` com cada prop documentada. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
+- **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default) e `<Nome>Props` com cada prop documentada. O JSDoc da função começa com uma frase dizendo o que ele é e traz `@category` (uma das categorias do `vite.config.ts`: Receitas, Layout, Dados, Formatação, Formulários, Feedback, Texto, Aplicação) e `@example`: uma expressão JSX que usa o próprio componente e segue as regras de página. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
-- **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código (nome, descrição, props, tipos). Ler o catálogo antes de criar uma tela; nunca editá-lo à mão.
+- **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão.
 - **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). `Money`, `DateTime` e `StatusBadge` formatam em pt-BR. Peça avulsa só quando a receita não serve.
 
@@ -328,7 +328,7 @@ export default function Faturas() {
 cd frontend
 npm install
 npm run dev      # http://localhost:5173, com /api e /health encaminhados ao gateway (GATEWAY_URL, padrão :8088)
-npm run check    # tipos (TypeScript) + build com os trilhos; regenera o CATALOG.md
+npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + TypeScript, inclusive nos exemplos
 ```
 
 ## 7. Fluxo de Trabalho

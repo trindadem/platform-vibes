@@ -16,7 +16,16 @@ export interface RowProps {
   children: ReactNode;
 }
 
-/** Coloca itens lado a lado, com alinhamento e quebra de linha controlados. */
+/**
+ * Coloca itens lado a lado, com alinhamento e quebra de linha controlados.
+ *
+ * @category Layout
+ * @example
+ * <Row justify="between">
+ *   <Heading>Itens</Heading>
+ *   <Button variant="secondary" onClick={salvar}>Exportar</Button>
+ * </Row>
+ */
 export function Row({ gap = "md", align = "center", justify = "start", wrap = true, children }: RowProps) {
   return <div className={`flex ${wrap ? "flex-wrap" : ""} ${GAP[gap]} ${ALIGN[align]} ${JUSTIFY[justify]}`}>{children}</div>;
 }

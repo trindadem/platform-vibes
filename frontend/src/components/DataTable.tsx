@@ -13,7 +13,20 @@ export interface DataTableProps<T> {
   caption?: string;
 }
 
-/** Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rótulo e valor. */
+/**
+ * Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rótulo e valor.
+ *
+ * @category Dados
+ * @example
+ * <DataTable
+ *   rows={[{ id: "f1", cliente: "Padaria Aurora", valor: 150 }]}
+ *   rowKey={(r) => r.id}
+ *   columns={[
+ *     { key: "cliente", header: "Cliente" },
+ *     { key: "valor", header: "Valor", render: (r) => <Money value={r.valor} /> },
+ *   ]}
+ * />
+ */
 export function DataTable<T>({ columns, rows, rowKey, empty = "Nada por aqui ainda.", caption }: DataTableProps<T>) {
   if (rows.length === 0) {
     return <p className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">{empty}</p>;

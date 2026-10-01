@@ -9,7 +9,16 @@ export interface FormProps {
   children: ReactNode;
 }
 
-/** Formulário com campos espaçados de forma uniforme e envio sem recarregar a página. */
+/**
+ * Formulário com campos espaçados de forma uniforme e envio sem recarregar a página.
+ *
+ * @category Formulários
+ * @example
+ * <Form onSubmit={salvar}>
+ *   <TextField label="Nome" value={nome} onChange={setNome} required />
+ *   <Button type="submit">Salvar</Button>
+ * </Form>
+ */
 export function Form({ onSubmit, busy = false, children }: FormProps) {
   return (
     <form

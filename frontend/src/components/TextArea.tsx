@@ -20,7 +20,13 @@ export interface TextAreaProps {
   monospace?: boolean;
 }
 
-/** Campo de texto de várias linhas com rótulo, ajuda e erro ligados para acessibilidade. */
+/**
+ * Campo de texto de várias linhas com rótulo, ajuda e erro ligados para acessibilidade.
+ *
+ * @category Formulários
+ * @example
+ * <TextArea label="Observações" value={nome} onChange={setNome} rows={3} />
+ */
 export function TextArea({ label, value, onChange, rows = 4, hint, error, required, placeholder, monospace = false }: TextAreaProps) {
   const id = useId();
   const help = error ? `${id}-erro` : hint ? `${id}-ajuda` : undefined;

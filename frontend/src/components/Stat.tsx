@@ -14,7 +14,13 @@ export interface StatProps {
   tone?: "default" | "success" | "danger";
 }
 
-/** Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid. */
+/**
+ * Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid.
+ *
+ * @category Dados
+ * @example
+ * <Stat label="Total" value={<Money value={1439.9} />} hint="nesta semana" tone="success" />
+ */
 export function Stat({ label, value, hint, tone = "default" }: StatProps) {
   return (
     <Card className="@container/card">

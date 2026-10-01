@@ -13,7 +13,13 @@ export interface AlertProps {
   children?: ReactNode;
 }
 
-/** Mensagem de destaque para resultado, aviso ou erro, com ícone conforme a gravidade. */
+/**
+ * Mensagem de destaque para resultado, aviso ou erro, com ícone conforme a gravidade.
+ *
+ * @category Feedback
+ * @example
+ * <Alert tone="warning" title="Fatura vencida">Regularize até sexta-feira.</Alert>
+ */
 export function Alert({ tone = "info", title, children }: AlertProps) {
   const Icon = ICON[tone];
   return (

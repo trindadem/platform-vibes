@@ -36,7 +36,22 @@ export interface ActionFormProps<B> {
   onDone?: () => void;
 }
 
-/** Receita de formulário: campos a partir de uma lista, envio pela ação, erro do servidor no campo certo. */
+/**
+ * Receita de formulário: campos a partir de uma lista, envio pela ação, erro do servidor no campo certo.
+ *
+ * @category Receitas
+ * @example
+ * <ActionForm
+ *   action={criar}
+ *   submitLabel="Emitir"
+ *   successMessage="Fatura emitida."
+ *   fields={[
+ *     { name: "cliente", label: "Cliente", required: true },
+ *     { name: "valor", label: "Valor (R$)", kind: "number", required: true },
+ *     { name: "status", label: "Status", kind: "select", options: [{ value: "aberta", label: "Aberta" }, { value: "paga", label: "Paga" }] },
+ *   ]}
+ * />
+ */
 export function ActionForm<B>({ action, fields, submitLabel = "Salvar", successMessage, initial, onDone }: ActionFormProps<B>) {
   const start = (): Values => Object.fromEntries(fields.map((f) => [f.name, initial?.[f.name] ?? ""]));
   const [values, setValues] = useState<Values>(start);

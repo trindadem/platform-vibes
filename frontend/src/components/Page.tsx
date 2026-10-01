@@ -10,7 +10,15 @@ export interface PageProps {
   children: ReactNode;
 }
 
-/** Estrutura de uma tela: título, descrição, ações e conteúdo com o espaçamento padrão. */
+/**
+ * Estrutura de uma tela: título, descrição, ações e conteúdo com o espaçamento padrão.
+ *
+ * @category Layout
+ * @example
+ * <Page title="Faturas" description="Emitidas este mês." actions={<Button onClick={salvar}>Nova fatura</Button>}>
+ *   <Text>Conteúdo da tela.</Text>
+ * </Page>
+ */
 export function Page({ title, description, actions, children }: PageProps) {
   useEffect(() => {
     document.title = title;

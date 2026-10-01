@@ -19,7 +19,18 @@ export interface SelectFieldProps {
   required?: boolean;
 }
 
-/** Lista de opções com rótulo, ajuda e erro ligados para acessibilidade. */
+/**
+ * Lista de opções com rótulo, ajuda e erro ligados para acessibilidade.
+ *
+ * @category Formulários
+ * @example
+ * <SelectField
+ *   label="Status"
+ *   value={nome}
+ *   onChange={setNome}
+ *   options={[{ value: "aberta", label: "Aberta" }, { value: "paga", label: "Paga" }]}
+ * />
+ */
 export function SelectField({ label, value, onChange, options, placeholder = "Selecione", hint, error, required }: SelectFieldProps) {
   const id = useId();
   const help = error ? `${id}-erro` : hint ? `${id}-ajuda` : undefined;

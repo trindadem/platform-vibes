@@ -13,7 +13,15 @@ export interface QueryViewProps<T> {
   empty?: string;
 }
 
-/** Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados. */
+/**
+ * Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados.
+ *
+ * @category Receitas
+ * @example
+ * <QueryView query={fatura}>
+ *   {(f) => <KeyValue items={[{ label: "Cliente", value: f.cliente }, { label: "Valor", value: <Money value={f.valor} /> }]} />}
+ * </QueryView>
+ */
 export function QueryView<T>({ query, children, empty = "Nada por aqui ainda." }: QueryViewProps<T>) {
   if (query.loading && query.data === null) {
     return (
