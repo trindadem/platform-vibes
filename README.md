@@ -25,15 +25,17 @@ cogniventure/
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
 │   └── <service_name>.md
 │
-├── tests/                       # Testes (estritamente 1 arquivo .py por serviço)
+├── tests/                       # Testes (estritamente 1 arquivo .py por serviço, mais core.py)
+│   ├── core.py
 │   └── <service_name>.py
 │
 ├── core/                        # Recursos compartilhados (estritamente 1 arquivo .py por recurso)
 │   ├── envelope.py              # Envelope canônico de I/O + handlers de erro
-│   ├── surreal.py               # Pooling e queries SurrealDB
-│   ├── nats_bus.py              # Pub/Sub, RPC e mensageria JetStream
+│   ├── security.py              # Autenticação, autorização, senhas, cabeçalhos, SSRF (seção 5.7)
+│   ├── surreal.py               # Conexão multiplexada e queries parametrizadas SurrealDB
+│   ├── nats_bus.py              # Eventos duráveis (JetStream) e RPC
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
-│   └── http_client.py           # Client HTTPX padronizado
+│   └── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -77,7 +79,8 @@ Exemplo para `user-auth`:
 | Spec, rota, teste | `specs/user-auth.md`, `gateway/endpoints/user-auth.yaml`, `tests/user-auth.py` | kebab |
 | Pasta, container e host | `services/svc-user-auth/`, `svc-user-auth` | kebab |
 | Rota pública | `/api/v1/user-auth` | kebab |
-| Subjects NATS | `events.user-auth.trigger`, `events.user-auth.processed` | kebab |
+| Eventos NATS (duráveis) | `events.user-auth.trigger`, `events.user-auth.processed` | kebab |
+| RPC NATS (request/reply) | `rpc.user-auth.<método>` | kebab |
 | Task queue e activities | `user-auth-queue`, `user-auth.<método>` | kebab |
 | Tabela SurrealDB | `user_auth_records` | snake |
 | Classes Python | `UserAuthService`, `UserAuthWorkflow` | Pascal |
@@ -153,8 +156,12 @@ Novo passo de negócio = novo método público em `service.py` + uma chamada em 
 
 | Entrada | Caminho | Natureza |
 |---|---|---|
-| HTTP `POST /execute` | Chama o service diretamente | Síncrona |
-| NATS `events.<service_name>.trigger` | Inicia `<Pascal>Workflow` no Temporal | Assíncrona e durável |
+| HTTP `POST /execute` | Chama o service diretamente; exige token (seção 5.7) | Síncrona |
+| NATS `events.<service_name>.trigger` | Inicia `<Pascal>Workflow` no Temporal | Assíncrona, durável e idempotente |
+
+- **Durável:** eventos `events.*` vivem no stream JetStream `EVENTS` (7 dias). Mensagem publicada com o serviço fora do ar é entregue quando ele voltar. Réplicas do mesmo serviço dividem o trabalho; serviços diferentes recebem cada um a sua cópia.
+- **Idempotente:** a entrega é at-least-once. O workflow nasce com `id=bus.message_id()`, o mesmo em toda reentrega, então uma mensagem nunca inicia duas execuções. Quem publica passa `msg_id=` para o JetStream descartar duplicatas.
+- **Falhas:** mensagem inválida é descartada sem reentrega; handler que falha é re-tentado até 5 vezes, com espera crescente.
 
 ### 5.4 Execução isolada
 
@@ -174,21 +181,61 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz. Serviço não declara dependência própria.
 - **Imagem:** todo serviço usa `services/Dockerfile` com `SERVICE=<service_name>`; a imagem instala o `pyproject.toml` e copia apenas `core/` e a pasta do serviço.
-- **Testes:** em `tests/<service_name>.py`, um serviço por processo:
+- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura (SurrealDB e NATS viram dublês):
 
   ```bash
   PYTHONPATH=services/svc-<service_name> python -m pytest tests/<service_name>.py
+  python -m pytest tests/core.py
   ```
 
 ### 5.6 Contrato do core
 
+Importar o core nunca conecta em nada nem exige variáveis: a configuração é lida e validada no boot (lifespan).
+
 | Arquivo | Expõe |
 |---|---|
-| `envelope.py` | `ResponseEnvelope.success(data, service)`, `install_envelope(app, service)` |
-| `nats_bus.py` | `bus.connected()`, `bus.subscribe(subject, handler, model)`, `bus.publish(subject, model)` |
-| `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue)` |
-| `surreal.py` | `db.create(tabela, dados)` e as demais operações SurrealQL |
-| `http_client.py` | Client HTTPX padronizado para chamadas externas |
+| `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)` |
+| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
+| `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)` |
+| `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
+| `surreal.py` | `db.connected()`, `db.query(sql, **params)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
+| `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas |
+
+Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
+
+### 5.7 Segurança (`core/security.py`)
+
+Segurança não se implementa por serviço: importa-se do core. Proibido reimplementar autenticação, hash de senha, verificação de token ou proteção de URL.
+
+- **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. Papéis: `Depends(require("admin"))`.
+- **Identidade vem do token:** quem chama é o `Principal` (`Depends(principal)`), nunca um campo do payload.
+- **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
+- **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
+- **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
+- **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
+- **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). NATS em produção com `NATS_CREDS` e permissões por subject.
+- **Respostas:** cabeçalhos de segurança em toda resposta (HSTS e CSP em produção), `cache-control: no-store`, erro 500 sem detalhe interno, CORS só com origens listadas (`*` é recusado).
+- **Segredos e logs:** segredos só no `.env` (fora do Git). Antes de logar dados, `redact(...)`.
+- **Configuração insegura não sobe:** falta de chave, CORS `*`, JWKS sem https ou par de chaves trocado impedem o boot.
+
+Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
+
+| Variável | Uso |
+|---|---|
+| `ENVIRONMENT` | `production` (padrão) ou `development` (libera `/docs`, sem HSTS/CSP) |
+| `AUTH_ISSUER`, `AUTH_AUDIENCE` | Obrigatórias: quem emite e para quem são os tokens |
+| `AUTH_PUBLIC_KEY` / `AUTH_PRIVATE_KEY` | Chaves próprias. A privada só no serviço que emite tokens |
+| `AUTH_JWKS_URL` | Alternativa às chaves próprias: provedor externo (https) |
+| `AUTH_TOKEN_TTL_SECONDS`, `AUTH_ROLES_CLAIM`, `AUTH_CLIENT_CLAIM`, `CORS_ORIGINS` | Opcionais (900, `roles`, `client_id`, nenhuma) |
+| `SURREAL_URL`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USER`, `SURREAL_PASSWORD` | Banco; só a URL tem padrão |
+| `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
+| `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
+
+Chaves próprias, uma vez por ambiente:
+
+```bash
+python -m core.security keygen
+```
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -210,6 +257,8 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 
 - criar arquivo ou pasta fora da topologia da seção 1 — inclusive um 5º arquivo ou uma subpasta em `services/svc-<service_name>/`;
 - importar código de outro serviço;
+- implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
+- abrir uma rota (`public=`) que o spec não declara pública;
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;
 

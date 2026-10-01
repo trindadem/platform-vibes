@@ -80,7 +80,7 @@ render "$STAGE/svc/schemas.py" <<'EOF'
 """svc-__NAME__ · contratos (DTOs, enums, constantes). Fonte da verdade: specs/__NAME__.md §2"""
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-__NAME__"
@@ -91,6 +91,8 @@ TABLE = "__SNAKE___records"
 
 
 class ExecutionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
     client_id: str = Field(..., description="ID do cliente ou da célula")
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -120,7 +122,7 @@ class __PASCAL__Service:
     async def process_task(self, data: ExecutionInput) -> ExecutionResult:
         record = await db.create(TABLE, data.model_dump())
         result = ExecutionResult(task_id=str(record["id"]), status="SUCCESS", data=record)
-        await bus.publish(PROCESSED_SUBJECT, result)
+        await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
         return result
 EOF
 
@@ -155,8 +157,8 @@ EOF
 render "$STAGE/svc/main.py" <<'EOF'
 """svc-__NAME__ · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/__NAME__.md
 
-HTTP POST /execute  → chamada direta ao service (síncrona).
-NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona e durável).
+HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
+NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona, durável e idempotente).
 
 Rodar (da raiz): python -m uvicorn --app-dir services/svc-__NAME__ main:app
 """
@@ -166,6 +168,8 @@ from fastapi import FastAPI
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
+from core.security import install_security
+from core.surreal import db
 from core.temporal_runner import runner
 
 from schemas import SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput
@@ -176,18 +180,24 @@ svc = __PASCAL__Service()
 
 
 async def on_trigger(data: ExecutionInput) -> None:
-    await runner.start_workflow(__PASCAL__Workflow.run, data, task_queue=TASK_QUEUE)
+    # id = id estável da mensagem: reentrega do NATS nunca inicia um segundo workflow.
+    await runner.start_workflow(__PASCAL__Workflow.run, data, task_queue=TASK_QUEUE, id=bus.message_id())
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with bus.connected(), runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc):
+    async with (
+        bus.connected(SERVICE),
+        db.connected(),
+        runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc),
+    ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
         yield
 
 
 app = FastAPI(title=SERVICE, lifespan=lifespan)
 install_envelope(app, service=SERVICE)
+install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
 
 
 @app.post("/execute", response_model=ResponseEnvelope)
@@ -237,7 +247,7 @@ def published(monkeypatch):
     async def create(table, data):
         return {"id": f"{table}:1", **data}
 
-    async def publish(subject, message):
+    async def publish(subject, message, msg_id=None):
         events.append((subject, message))
 
     monkeypatch.setattr(service.db, "create", create)
@@ -254,6 +264,11 @@ def test_process_task(published):
 def test_payload_sem_client_id_e_rejeitado():
     with pytest.raises(ValidationError):
         ExecutionInput.model_validate({"payload": {}})
+
+
+def test_campo_nao_declarado_e_rejeitado():
+    with pytest.raises(ValidationError):
+        ExecutionInput.model_validate({"client_id": "c1", "is_admin": True})
 EOF
 
 # 3. Autoverificação: nenhum placeholder sobrando e Python sintaticamente válido.
