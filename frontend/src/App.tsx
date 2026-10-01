@@ -10,8 +10,9 @@
  * - "guest": só sem sessão (ex.: /entrar, /cadastro). Com sessão, segue para ?next= ou para o início.
  *
  * meta.module diz de que módulo (serviço) é a tela (README §5.17): o menu a agrupa pela categoria do módulo e a
- * esconde quando o plano da organização não inclui o módulo; aberta pelo endereço, mostra o aviso de fora do plano.
- * As subtelas herdam o módulo da tela do módulo. Sem resposta do svc-plans, tudo aparece (o serviço confere de novo).
+ * esconde quando o plano da organização não inclui o módulo ou quando ele não está instalado (fora do catálogo, como
+ * numa instalação dedicada, README §9); aberta pelo endereço, mostra o aviso de fora do plano. As subtelas herdam o
+ * módulo da tela do módulo. Sem resposta do svc-plans, tudo aparece (o serviço confere de novo).
  *
  * A moldura usa o nome, o logo e a cor da organização ativa (svc-identity).
  */
@@ -150,7 +151,7 @@ function TenantShell({ session }: { session: Session }) {
   const included: Included = (module) => {
     if (always(module) || modules.error) return true; // sem resposta do svc-plans, tudo aparece
     if (!modules.data) return null;
-    return modules.data.items.find((m) => m.name === module)?.enabled ?? true;
+    return modules.data.items.find((m) => m.name === module)?.enabled ?? false; // fora do catálogo: não instalado
   };
   return (
     <ModulesContext.Provider value={included}>

@@ -14,6 +14,9 @@ Trilhos (manifesto fora deles impede o boot do gateway):
   o cliente tipado do frontend. name é o nome da função gerada (padrão: último trecho fixo do path).
 - query (só em GET) nomeia o modelo dos parâmetros da URL, em geral um ListQuery (lista paginada, README §5.12):
   vira o argumento tipado query? da função gerada. O gateway repassa a query string como veio; o serviço valida.
+- resources: [nome] publica as 5 rotas de cada cadastro declarado no schemas.py (core/resources.py, README §5.19):
+  GET /<nome>, GET /<nome>/item, POST /<nome>, POST /<nome>/update e POST /<nome>/remove, todas com token. O aviso
+  ao vivo <service>.<nome> vem junto (não declare em live:).
 """
 import re
 import string
@@ -78,13 +81,37 @@ class LiveTopic(BaseModel):
     model: str = Field(..., description="Modelo do schemas.py que o evento carrega")
 
 
+RESOURCE_ROUTES = (  # (método, sufixo do caminho, nome da operação): as rotas de core/resources.py
+    ("GET", "", "list"),
+    ("GET", "/item", "get"),
+    ("POST", "", "create"),
+    ("POST", "/update", "update"),
+    ("POST", "/remove", "remove"),
+)
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     service: str
     base_path: str
-    endpoints: tuple[Endpoint, ...] = Field(min_length=1)
+    endpoints: tuple[Endpoint, ...] = ()
+    resources: tuple[str, ...] = Field((), description="Cadastros do schemas.py (core/resources.py) publicados")
     live: tuple[LiveTopic, ...] = ()
+
+    def resource_endpoints(self, name: str) -> list[Endpoint]:
+        """As 5 rotas de um cadastro, como endpoints HTTP do próprio serviço."""
+        return [
+            Endpoint(
+                path=f"/{name}{suffix}", name=f"{name}-{operation}", method=method, auth="client_jwt", target_type="http",
+                target_url=f"http://svc-{self.service}:{SERVICE_PORT}/{name}{suffix}",
+            )
+            for method, suffix, operation in RESOURCE_ROUTES
+        ]
+
+    def all_endpoints(self) -> list[Endpoint]:
+        """As rotas declaradas e as dos cadastros: o que o gateway monta."""
+        return [*self.endpoints, *(ep for name in self.resources for ep in self.resource_endpoints(name))]
 
     @model_validator(mode="after")
     def _rails(self) -> "Manifest":
@@ -102,7 +129,19 @@ class Manifest(BaseModel):
             raise ValueError("live: topic repetido")
         if self.base_path != f"/api/v1/{self.service}":
             raise ValueError(f"base_path deve ser /api/v1/{self.service}")
+        if not self.endpoints and not self.resources:
+            raise ValueError("declare endpoints ou resources (o manifesto publica ao menos uma rota)")
+        for name in self.resources:
+            if not _NAME.match(name):
+                raise ValueError(f"resources: {name!r} inválido (kebab-case, o nome do Resource no schemas.py)")
+        if len(self.resources) != len(set(self.resources)):
+            raise ValueError("resources: cadastro repetido")
+        if clash := sorted(set(self.resources) & set(events)):
+            raise ValueError(f"live: {', '.join(clash)} é o aviso de um cadastro (resources) e já vem junto")
         seen, operations = set(), set()
+        for name in self.resources:
+            for ep in self.resource_endpoints(name):
+                seen.add((ep.method, ep.path))
         for ep in self.endpoints:
             where = f"{ep.method} {ep.path}"
             if (ep.method, ep.path) in seen:

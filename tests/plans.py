@@ -275,6 +275,18 @@ def test_modulos_vem_do_plano_e_do_ajuste_da_organizacao():
     assert (pro.slug, pro.modules) == ("pro", {"juridico": True})
 
 
+def test_instalacao_dedicada_so_lista_os_modulos_instalados(monkeypatch):
+    monkeypatch.setenv("MODULES", "crm")
+    service.settings.cache_clear()
+
+    async def cenario(svc):
+        return await como(ACME, lambda: svc.resolve(LimitsRequest())), await como(ACME, lambda: svc.catalog(Empty()))
+
+    resolved, catalogo = run(cenario)
+    assert sorted(m.name for m in catalogo.modules) == ["ai", "crm", "webhooks"]  # vendas, jurídico e relatórios: fora
+    assert _ligados(resolved) == ["ai", "crm", "webhooks"]
+
+
 def test_trilhos_dos_modulos():
     async def cenario(svc):
         await planos(svc)

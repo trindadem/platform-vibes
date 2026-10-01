@@ -1,0 +1,273 @@
+# Nível 2: consulta agregada em SurrealQL, sempre na organização ($tenant).
+id: despesas-resumo
+level: 2
+service: despesas
+title: Despesas com resumo do mês
+spec: |
+  # Spec: despesas
+
+  ## 1. Objetivo Operacional
+  Despesas da organização e o resumo do mês por categoria.
+  Módulo (schemas.MODULE): título "Despesas", descrição "Gastos e resumo mensal", categoria "Financeiro".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `despesas` (Resource, título "Despesas"), modelo `Despesa`:
+    - `descricao`: texto obrigatório, 2 a 160 caracteres, título "Descrição";
+    - `categoria`: "aluguel" | "pessoal" | "insumos" | "outros", título "Categoria" (obrigatória);
+    - `valor`: Money com gt=0, título "Valor";
+    - `data`: data (date) obrigatória, título "Data".
+  - Busca em descricao; filtro por categoria; ordem por data e valor.
+  - GET /resumo?mes=AAAA-MM (`ResumoQuery { mes }`, mes com o padrão ^\d{4}-\d{2}$) → `Resumo { mes, total,
+    por_categoria: dict[str, float] }`: soma das despesas cuja data está no mês (categorias sem despesa ficam fora).
+    Rota no manifesto (GET, query: ResumoQuery, response: Resumo) e no main.py; a consulta em service.py, com
+    db.query e WHERE tenant = $tenant (a data é guardada como texto AAAA-MM-DD: string::starts_with(data, $mes)).
+  - Mantenha o restante do esqueleto (registros, /execute, gatilho e workflow).
+  - Tela do módulo: as despesas com ResourceList.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — despesas_despesas, por organização.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - 422: mes fora do padrão AAAA-MM.
+acceptance: |
+  from core.testing import service_app
+
+
+  def test_resumo_do_mes():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "owner")
+          for descricao, categoria, valor, data in (("Aluguel loja", "aluguel", 3000, "2026-10-05"),
+                                                    ("Farinha", "insumos", 450.5, "2026-10-08"),
+                                                    ("Açúcar", "insumos", 120, "2026-10-20"),
+                                                    ("Aluguel setembro", "aluguel", 3000, "2026-09-05")):
+              r = await ana.post("/despesas", json={"descricao": descricao, "categoria": categoria, "valor": valor, "data": data})
+              assert r.status_code == 200, r.text
+          await app.user("bia", "beta", "owner").post("/despesas", json={"descricao": "Da Beta", "categoria": "outros", "valor": 999, "data": "2026-10-01"})
+          resumo = await ana.get("/resumo", params={"mes": "2026-10"})
+          assert resumo.status_code == 200, resumo.text
+          dados = resumo.json()["data"]
+          assert dados["mes"] == "2026-10" and abs(dados["total"] - 3570.5) < 0.001
+          assert {k: round(v, 2) for k, v in dados["por_categoria"].items()} == {"aluguel": 3000, "insumos": 570.5}
+          vazio = (await ana.get("/resumo", params={"mes": "2025-01"})).json()["data"]
+          assert (vazio["total"], vazio["por_categoria"]) == (0, {})
+          assert (await ana.get("/resumo", params={"mes": "outubro"})).status_code == 422
+          assert (await ana.post("/despesas", json={"descricao": "Sem categoria", "valor": 1, "data": "2026-10-01"})).status_code == 422
+
+      service_app(cenario)
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-despesas/schemas.py: |
+    """svc-despesas · contratos (DTOs, enums, constantes). Fonte da verdade: specs/despesas.md §2"""
+    from datetime import date
+    from typing import Any, Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Money, Resource, Text
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-despesas"
+    TASK_QUEUE = "despesas-queue"
+    TRIGGER_SUBJECT = "events.despesas.trigger"
+    PROCESSED_SUBJECT = "events.despesas.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Despesas", "Gastos e resumo mensal", category="Financeiro")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Registro(Fields):
+        title: str = Field(..., min_length=1, max_length=200, title="Título", description="Aparece na lista e entra na busca")
+        notes: Text | None = Field(None, title="Observações")
+
+
+    REGISTROS = Resource(SERVICE, "registros", Registro, "Registros", search=("title",), sort=("title",))
+
+
+    class Despesa(Fields):
+        descricao: str = Field(..., min_length=2, max_length=160, title="Descrição")
+        categoria: Literal["aluguel", "pessoal", "insumos", "outros"] = Field(..., title="Categoria")
+        valor: Money = Field(..., gt=0, title="Valor")
+        data: date = Field(..., title="Data")
+
+
+    DESPESAS = Resource(SERVICE, "despesas", Despesa, "Despesas", search=("descricao",), sort=("data", "valor"), filters=("categoria",))
+    RESOURCES = [REGISTROS, DESPESAS]
+
+
+    class ResumoQuery(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        mes: str = Field(..., pattern=r"^\d{4}-\d{2}$", description="AAAA-MM")
+
+
+    class Resumo(BaseModel):
+        mes: str
+        total: float
+        por_categoria: dict[str, float]
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-despesas/service.py: |
+    """svc-despesas · lógica de negócio pura. Fonte da verdade: specs/despesas.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "despesas.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.nats_bus import bus
+    from core.resources import resources
+    from core.surreal import Migration, db
+    from core.temporal_runner import activities
+
+    from schemas import PROCESSED_SUBJECT, REGISTROS, ExecutionInput, ExecutionResult, Registro, Resumo, ResumoQuery
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    #   Migration(1, "observação padrão nos registros antigos", sql="UPDATE despesas_registros SET notes = '' WHERE notes = NONE")
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("despesas")
+    class DespesasService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(REGISTROS, Registro(title=data.title))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+
+        async def resumo(self, data: ResumoQuery) -> Resumo:
+            """Soma das despesas do mês, no total e por categoria."""
+            linhas = await db.query(
+                "SELECT categoria, math::sum(valor) AS total FROM despesas_despesas "
+                "WHERE tenant = $tenant AND string::starts_with(data, $mes) GROUP BY categoria",
+                mes=data.mes,
+            )
+            por_categoria = {linha["categoria"]: float(linha["total"]) for linha in linhas or []}
+            return Resumo(mes=data.mes, total=sum(por_categoria.values()), por_categoria=por_categoria)
+  services/svc-despesas/main.py: |
+    """svc-despesas · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/despesas.md
+
+    HTTP /registros...  → cadastro declarado em schemas.RESOURCES (core/resources.py): lista, item, cria, edita, remove.
+    HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
+    NATS TRIGGER_SUBJECT → inicia DespesasWorkflow (assíncrona, durável e idempotente).
+
+    Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-despesas main:app --port 8100 --env-file .env
+    """
+    from contextlib import asynccontextmanager
+    from typing import Annotated
+
+    from fastapi import FastAPI, Query
+
+    from core.envelope import ResponseEnvelope, install_envelope
+    from core.nats_bus import bus
+    from core.plans import plans
+    from core.resources import resources
+    from core.security import install_security
+    from core.surreal import db
+    from core.telemetry import install_telemetry
+    from core.temporal_runner import runner
+
+    from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, ResumoQuery
+    from service import MIGRATIONS, DespesasService
+    from workflows import SCHEDULES, DespesasWorkflow
+
+    svc = DespesasService()
+
+
+    async def on_trigger(data: ExecutionInput) -> None:
+        # id = id estável da mensagem: reentrega do NATS nunca inicia um segundo workflow.
+        await runner.start_workflow(DespesasWorkflow.run, data, task_queue=TASK_QUEUE, id=bus.message_id())
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with (
+            bus.connected(SERVICE),
+            db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
+            runner.worker(TASK_QUEUE, workflows=[DespesasWorkflow], service=svc, schedules=SCHEDULES),
+        ):
+            await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
+            await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
+            yield
+
+
+    app = FastAPI(title=SERVICE, lifespan=lifespan)
+    install_envelope(app, service=SERVICE)
+    install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
+    install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
+    resources.mount(app, RESOURCES)  # as rotas dos cadastros (README §5.19)
+
+
+    @app.post("/execute", response_model=ResponseEnvelope)
+    async def execute(data: ExecutionInput) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.process_task(data), service=SERVICE)
+
+
+    @app.get("/resumo", response_model=ResponseEnvelope)
+    async def resumo(data: Annotated[ResumoQuery, Query()]) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.resumo(data), service=SERVICE)
+  gateway/endpoints/despesas.yaml: |
+    # svc-despesas · rotas públicas no Gateway. Fonte da verdade: specs/despesas.md §2
+    service: despesas
+    base_path: /api/v1/despesas
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # despesas.<cadastro>, e vira despesas.<cadastro> no frontend.
+    resources: [registros, despesas]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-despesas:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.despesas.trigger
+
+      - path: /resumo
+        method: GET
+        auth: client_jwt
+        query: ResumoQuery
+        response: Resumo
+        target_type: http
+        target_url: http://svc-despesas:8000/resumo
+  frontend/src/modules/despesas/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { despesas } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Despesas", module: "despesas" };
+
+    export default function Despesas() {
+      const lista = useResource(despesas.despesas);
+      return (
+        <Page title="Despesas" description="Gastos da organização.">
+          <ResourceList resource={lista} noun="despesa" />
+        </Page>
+      );
+    }

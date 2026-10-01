@@ -1,0 +1,166 @@
+# Nível 1: só declaração. Um cadastro novo no módulo, sem regra de negócio.
+id: crm-contatos
+level: 1
+service: crm
+title: Cadastro de contatos (só declaração)
+spec: |
+  # Spec: crm
+
+  ## 1. Objetivo Operacional
+  Guardar os contatos comerciais da organização (clientes, fornecedores e parceiros) com busca e filtro por tipo.
+  Módulo (schemas.MODULE): título "CRM", descrição "Contatos e relacionamento", categoria "Comercial".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `contatos` (Resource em schemas.RESOURCES, título "Contatos"), campos do modelo `Contato`:
+    - `nome`: texto obrigatório, de 2 a 120 caracteres, título "Nome";
+    - `email`: Email opcional, título "E-mail";
+    - `telefone`: Phone opcional, título "Telefone";
+    - `empresa`: texto opcional, até 120 caracteres, título "Empresa";
+    - `tipo`: "cliente" | "fornecedor" | "parceiro", padrão "cliente", título "Tipo".
+  - Busca por palavras em nome, email e empresa; filtro por tipo; ordem por nome.
+  - O cadastro `registros` do esqueleto continua como está.
+  - Tela do módulo (frontend/src/modules/crm/page.tsx): a lista de contatos com ResourceList (useResource(crm.contatos)).
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — cadastro por organização: crm_contatos (o core grava, filtra e carimba).
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - 422: nome curto, e-mail inválido ou tipo fora da lista.
+  - ERRO_RECORD_NOT_FOUND (404): contato de outra organização.
+acceptance: |
+  from pathlib import Path
+
+  import schemas
+  from core.testing import service_app
+
+
+  def test_modulo_declarado():
+      assert (schemas.MODULE.title, schemas.MODULE.category) == ("CRM", "Comercial")
+      nomes = [r.name for r in schemas.RESOURCES]
+      assert "contatos" in nomes and "registros" in nomes
+
+
+  def test_contatos_pelas_rotas():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "owner")
+          maria = await ana.post("/contatos", json={"nome": "Maria Souza", "email": "Maria@Exemplo.com", "empresa": "Padaria Aurora", "tipo": "fornecedor"})
+          assert maria.status_code == 200, maria.text
+          assert maria.json()["data"]["email"] == "maria@exemplo.com"
+          joao = await ana.post("/contatos", json={"nome": "João Lima", "telefone": "+55 11 99999-0000"})
+          assert joao.status_code == 200, joao.text
+          assert joao.json()["data"]["tipo"] == "cliente"
+          for ruim in ({"nome": "X"}, {"nome": "Ana Paula", "tipo": "outro"}, {"nome": "Ana Paula", "email": "sem-arroba"}):
+              assert (await ana.post("/contatos", json=ruim)).status_code == 422, ruim
+          busca = await ana.get("/contatos", params={"q": "aurora"})
+          assert [c["nome"] for c in busca.json()["data"]["items"]] == ["Maria Souza"]
+          clientes = await ana.get("/contatos", params={"tipo": "cliente"})
+          assert [c["nome"] for c in clientes.json()["data"]["items"]] == ["João Lima"]
+          ordem = await ana.get("/contatos", params={"sort": "nome"})
+          assert [c["nome"] for c in ordem.json()["data"]["items"]] == ["João Lima", "Maria Souza"]
+          beta = app.user("bia", "beta", "owner")
+          assert (await beta.get("/contatos")).json()["data"]["total"] == 0
+          assert (await beta.get("/contatos/item", params={"id": maria.json()["data"]["id"]})).status_code == 404
+
+      service_app(cenario)
+
+
+  def test_tela_usa_o_cadastro():
+      tela = Path("frontend/src/modules/crm/page.tsx").read_text()
+      assert "useResource(crm.contatos)" in tela and "<ResourceList" in tela
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-crm/schemas.py: |
+    """svc-crm · contratos (DTOs, enums, constantes). Fonte da verdade: specs/crm.md §2"""
+    from typing import Any, Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Email, Fields, Phone, Resource, Text
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-crm"
+    TASK_QUEUE = "crm-queue"
+    TRIGGER_SUBJECT = "events.crm.trigger"
+    PROCESSED_SUBJECT = "events.crm.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("CRM", "Contatos e relacionamento", category="Comercial")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Registro(Fields):
+        title: str = Field(..., min_length=1, max_length=200, title="Título", description="Aparece na lista e entra na busca")
+        notes: Text | None = Field(None, title="Observações")
+
+
+    REGISTROS = Resource(SERVICE, "registros", Registro, "Registros", search=("title",), sort=("title",))
+
+
+    class Contato(Fields):
+        nome: str = Field(..., min_length=2, max_length=120, title="Nome")
+        email: Email | None = Field(None, title="E-mail")
+        telefone: Phone | None = Field(None, title="Telefone")
+        empresa: str | None = Field(None, max_length=120, title="Empresa")
+        tipo: Literal["cliente", "fornecedor", "parceiro"] = Field("cliente", title="Tipo")
+
+
+    CONTATOS = Resource(SERVICE, "contatos", Contato, "Contatos", search=("nome", "email", "empresa"), sort=("nome",), filters=("tipo",))
+    RESOURCES = [REGISTROS, CONTATOS]
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  gateway/endpoints/crm.yaml: |
+    # svc-crm · rotas públicas no Gateway. Fonte da verdade: specs/crm.md §2
+    service: crm
+    base_path: /api/v1/crm
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # crm.<cadastro>, e vira crm.<cadastro> no frontend.
+    resources: [registros, contatos]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-crm:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.crm.trigger
+  frontend/src/modules/crm/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { crm } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "CRM", module: "crm" };
+
+    export default function Crm() {
+      const contatos = useResource(crm.contatos);
+      return (
+        <Page title="Contatos" description="Clientes, fornecedores e parceiros da organização.">
+          <ResourceList resource={contatos} noun="contato" />
+        </Page>
+      );
+    }

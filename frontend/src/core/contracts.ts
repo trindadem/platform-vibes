@@ -7,6 +7,22 @@ export interface Dispatched {
   message_id: string;
 }
 
+/** Um registro de cadastro pelo id (core/resources.py). */
+export interface ResourceRef {
+  id: string;
+}
+
+/** Resposta da remoção de um registro de cadastro. */
+export interface ResourceRemoved {
+  id: string;
+}
+
+/** Aviso ao vivo de um cadastro (<serviço>.<cadastro>): a lista aberta busca de novo. */
+export interface ResourceChanged {
+  id: string;
+  action: "created" | "updated" | "removed";
+}
+
 /** GET /health do gateway (README §5.18). */
 export interface GatewayHealth {
   /** "ok" quando tudo responde (senão, a resposta é um erro 503). */

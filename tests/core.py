@@ -4,6 +4,7 @@ Rodar (da raiz): uv run python -m pytest tests/core.py
 """
 import asyncio
 import json
+from pathlib import Path
 import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -2097,3 +2098,299 @@ def test_keygen_de_producao(tmp_path, capsys):
         security._keygen(env, "app.exemplo.com")
     with pytest.raises(SystemExit, match="domínio inválido"):
         security._keygen(tmp_path / "outro.env", "nao é domínio")
+    assert (values["MODULES"], values["COMPOSE_PROFILES"]) == ("", "modules")  # sem lista: todos os módulos
+
+
+def test_keygen_de_instalacao_dedicada(tmp_path):
+    env = tmp_path / ".env"
+    security._keygen(env, "cliente.exemplo.com", "crm, vendas")
+    values = dict(line.split("=", 1) for line in env.read_text().splitlines() if line and not line.startswith("#"))
+    assert (values["MODULES"], values["COMPOSE_PROFILES"]) == ("crm,vendas", "crm,vendas")  # só os do cliente sobem
+    with pytest.raises(SystemExit, match="módulo inválido"):
+        security._keygen(tmp_path / "outro.env", "cliente.exemplo.com", "svc-crm")
+
+
+# ── Recursos: core/resources.py (README §5.19) ───────────────────────────────
+
+from datetime import date as _date  # noqa: E402
+
+from pydantic import Field as _Field  # noqa: E402
+
+from core import resources as resources_module  # noqa: E402
+from core.resources import Email, Fields, Money, Resource, ResourceRef, Text, resources  # noqa: E402
+
+
+class ClienteCampos(Fields):
+    nome: str = _Field(..., min_length=2, max_length=120, title="Nome ou razão social")
+    email: Email | None = None
+    status: Literal["ativo", "inativo"] = "ativo"
+    limite: Money = 0
+    desde: _date | None = None
+    obs: Text | None = None
+
+
+CLIENTES = Resource(
+    "svc-vendas", "clientes", ClienteCampos, "Clientes", search=("nome", "email"), sort=("nome", "limite"),
+    filters=("status",), unique=("nome",), limit="clientes",
+)
+ANA_VENDAS = Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))
+CAIO_VENDAS = Principal(sub="caio", tenant="acme", roles=frozenset({"member"}))
+BIA_VENDAS = Principal(sub="bia", tenant="beta", roles=frozenset({"owner"}))
+
+
+@pytest.fixture
+def vendas(monkeypatch):
+    """Serviço svc-vendas com o cadastro de clientes no SurrealDB embutido e um svc-plans de mentira (limite 3)."""
+    box = SimpleNamespace(live=[], counts=[], limit=3)
+
+    async def live(topic, message, user=None):
+        box.live.append((topic, message.id, message.action))
+
+    async def publish(subject, message, msg_id=None):
+        if subject == plans_module.COUNT_SUBJECT:
+            box.counts.append((message.name, message.total))
+
+    async def request(subject, message, response_model, timeout=5.0):
+        state = LimitState(name="vendas.clientes", service="svc-vendas", description="Clientes cadastrados", default=None,
+                           monthly=False, limit=box.limit, used=0)
+        return PlanLimits(plan="pro", plan_name="Pro", month="2026-10", limits=[state])
+
+    monkeypatch.setattr(nats_bus.bus, "live", live)
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "request", request)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-vendas")
+    monkeypatch.setattr(plans, "_module", None)
+    monkeypatch.setattr(plans, "_declared", {})
+    plans.clear()
+    asyncio.run(plans.declare(Module("Vendas", "Clientes e propostas", limits=[Limit("clientes", "Clientes cadastrados")])))
+    yield box
+    plans.clear()
+
+
+def _no_banco(cenario, items=(CLIENTES,)):
+    async def run():
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        surreal.db._conn = conn
+        async with surreal.db.connected(resources=items):
+            return await cenario()
+
+    return asyncio.run(run())
+
+
+async def _como_async(who, call):
+    with security.acting_as(who):
+        return await call()
+
+
+def test_recurso_deriva_tabela_modelos_e_a_descricao_da_tela():
+    assert (CLIENTES.table, CLIENTES.live, CLIENTES.sort) == ("vendas_clientes", "vendas.clientes", ("nome", "limite", "created_at"))
+    meta = CLIENTES.meta()
+    assert [(f["name"], f["kind"], f["required"]) for f in meta["fields"]] == [
+        ("nome", "text", True), ("email", "email", False), ("status", "select", False), ("limite", "money", False),
+        ("desde", "date", False), ("obs", "textarea", False)]
+    assert meta["fields"][0]["label"] == "Nome ou razão social"
+    assert [c["key"] for c in meta["columns"]] == ["nome", "email", "status", "limite", "desde"]  # texto longo fica fora
+    assert meta["filters"] == [{"name": "status", "label": "Status", "options": [
+        {"value": "ativo", "label": "Ativo"}, {"value": "inativo", "label": "Inativo"}]}]
+    assert meta["search"] == "nome ou razão social, email"
+    assert CLIENTES.item.model_validate({"id": "vendas_clientes:⟨abc⟩", "nome": "Ana", "tenant": "acme"}).id == "abc"
+    assert CLIENTES.update(id="abc", status="inativo").model_dump(exclude_unset=True) == {"id": "abc", "status": "inativo"}
+    with pytest.raises(ValidationError):
+        CLIENTES.update(id="abc", nome="A")  # as regras do campo valem também na edição
+    with pytest.raises(ValidationError):
+        ClienteCampos(nome="Ana", tenant="outra")  # campo não declarado
+    with pytest.raises(ValidationError):
+        CLIENTES.query(sort="email")  # só ordena pelo que declarou
+
+
+def test_recurso_com_declaracao_errada_nao_nasce():
+    class Ruim(Fields):
+        nome: str
+        created_at: str | None = None
+
+    class Livre(BaseModel):
+        nome: str
+
+    for call, erro in (
+        (lambda: Resource("vendas", "clientes", ClienteCampos, "Clientes"), "SERVICE"),
+        (lambda: Resource("svc-vendas", "Clientes", ClienteCampos, "Clientes"), "kebab-case"),
+        (lambda: Resource("svc-vendas", "clientes", Livre, "Clientes"), "Fields"),
+        (lambda: Resource("svc-vendas", "clientes", Ruim, "Clientes"), "do banco"),
+        (lambda: Resource("svc-vendas", "clientes", ClienteCampos, "Clientes", search=("cpf",)), "não tem"),
+        (lambda: Resource("svc-vendas", "clientes", ClienteCampos, "Clientes", filters=("nome",)), "Literal"),
+        (lambda: Resource("svc-vendas", "clientes", ClienteCampos, "Clientes", unique=("email",)), "obrigatório"),
+    ):
+        with pytest.raises((ValueError, TypeError), match=erro):
+            call()
+
+
+def test_crud_na_organizacao_de_quem_age_com_limite_e_aviso_ao_vivo(vendas):
+    async def cenario():
+        criar = lambda who, **campos: _como_async(who, lambda: resources.create(CLIENTES, ClienteCampos(**campos)))  # noqa: E731
+        padaria = await criar(ANA_VENDAS, nome="Padaria Aurora", email="Contato@Aurora.com", limite=500, desde=_date(2024, 5, 2))
+        await criar(ANA_VENDAS, nome="Mercado Bom Preço", status="inativo")
+        await criar(BIA_VENDAS, nome="Cliente da Beta")
+        lista = await _como_async(ANA_VENDAS, lambda: resources.list(CLIENTES, CLIENTES.query(q="aurora")))
+        inativos = await _como_async(ANA_VENDAS, lambda: resources.list(CLIENTES, CLIENTES.query(status="inativo", sort="nome")))
+        mudou = await _como_async(ANA_VENDAS, lambda: resources.update(CLIENTES, CLIENTES.update(id=padaria.id, limite=900)))
+        da_beta = await _como_async(BIA_VENDAS, lambda: resources.list(CLIENTES, CLIENTES.query()))
+        erros = []
+        for who, call in (
+            (BIA_VENDAS, lambda: resources.get(CLIENTES, ResourceRef(id=padaria.id))),  # de outra organização: não existe
+            (BIA_VENDAS, lambda: resources.update(CLIENTES, CLIENTES.update(id=padaria.id, nome="Invadido"))),
+            (BIA_VENDAS, lambda: resources.remove(CLIENTES, ResourceRef(id=padaria.id))),
+            (ANA_VENDAS, lambda: resources.create(CLIENTES, ClienteCampos(nome="Padaria Aurora"))),  # nome repetido
+            (ANA_VENDAS, lambda: resources.create(CLIENTES, ClienteCampos(nome="Terceiro"))),
+            (ANA_VENDAS, lambda: resources.create(CLIENTES, ClienteCampos(nome="Quarto"))),  # limite 3: o quarto para
+        ):
+            try:
+                await _como_async(who, call)
+            except ServiceError as exc:
+                erros.append((exc.code, exc.status))
+        removido = await _como_async(ANA_VENDAS, lambda: resources.remove(CLIENTES, ResourceRef(id=padaria.id)))
+        sobra = await _como_async(ANA_VENDAS, lambda: resources.list(CLIENTES, CLIENTES.query(sort="nome")))
+        return padaria, lista, inativos, mudou, da_beta, erros, removido, sobra
+
+    padaria, lista, inativos, mudou, da_beta, erros, removido, sobra = _no_banco(cenario)
+    assert (padaria.email, padaria.limite, padaria.desde, padaria.created_by) == ("contato@aurora.com", 500, _date(2024, 5, 2), "ana")
+    assert ":" not in padaria.id and padaria.created_at is not None
+    assert [c.nome for c in lista.items] == ["Padaria Aurora"]
+    assert [c.nome for c in inativos.items] == ["Mercado Bom Preço"]
+    assert (mudou.limite, mudou.nome, mudou.updated_by) == (900, "Padaria Aurora", "ana")  # só o que veio mudou
+    assert [c.nome for c in da_beta.items] == ["Cliente da Beta"]
+    assert erros == [
+        ("ERRO_RECORD_NOT_FOUND", 404), ("ERRO_RECORD_NOT_FOUND", 404), ("ERRO_RECORD_NOT_FOUND", 404),
+        ("ERRO_RECORD_DUPLICATE", 409), ("ERRO_PLAN_LIMIT", 402)]
+    assert removido.id == padaria.id and [c.nome for c in sobra.items] == ["Mercado Bom Preço", "Terceiro"]
+    assert vendas.counts[-1] == ("vendas.clientes", 2)  # a tela Plano mostra o total
+    assert ("vendas.clientes", padaria.id, "updated") in vendas.live and ("vendas.clientes", padaria.id, "removed") in vendas.live
+
+
+def test_escrita_so_com_o_papel_declarado(vendas):
+    restrito = Resource("svc-vendas", "contratos", ClienteCampos, "Contratos", write=("owner", "admin"))
+
+    async def cenario():
+        dono = await _como_async(ANA_VENDAS, lambda: resources.create(restrito, ClienteCampos(nome="Contrato A")))
+        with pytest.raises(ServiceError) as negado:
+            await _como_async(CAIO_VENDAS, lambda: resources.create(restrito, ClienteCampos(nome="Contrato B")))
+        visto = await _como_async(CAIO_VENDAS, lambda: resources.get(restrito, ResourceRef(id=dono.id)))  # ler, pode
+        return negado.value, visto
+
+    negado, visto = _no_banco(cenario, items=(restrito,))
+    assert (negado.code, negado.status) == ("ERRO_VENDAS_FORBIDDEN", 403) and visto.nome == "Contrato A"
+
+
+def test_rotas_do_recurso_pelo_http(vendas, auth_env):
+    app = FastAPI()
+    envelope.install_envelope(app, service="svc-vendas")
+    security.install_security(app, service="svc-vendas")
+    resources.mount(app, [CLIENTES])
+    token = {"Authorization": f"Bearer {security.issue_token('ana', tenant='acme', roles=['owner'])}"}
+
+    async def cenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://svc") as client:
+            criado = await client.post("/clientes", json={"nome": "Padaria Aurora", "limite": 10}, headers=token)
+            item_id = criado.json()["data"]["id"]
+            lista = await client.get("/clientes", params={"q": "padaria", "sort": "-limite"}, headers=token)
+            um = await client.get("/clientes/item", params={"id": item_id}, headers=token)
+            mudou = await client.post("/clientes/update", json={"id": item_id, "status": "inativo"}, headers=token)
+            invalido = await client.post("/clientes", json={"nome": "X", "tenant": "beta"}, headers=token)
+            removido = await client.post("/clientes/remove", json={"id": item_id}, headers=token)
+            sem_token = await client.get("/clientes")
+            return criado, lista, um, mudou, invalido, removido, sem_token
+
+    criado, lista, um, mudou, invalido, removido, sem_token = _no_banco(cenario)
+    assert criado.status_code == 200 and criado.json()["data"]["status"] == "ativo"
+    assert lista.json()["data"]["total"] == 1 and um.json()["data"]["nome"] == "Padaria Aurora"
+    assert mudou.json()["data"]["status"] == "inativo"
+    assert invalido.status_code == 422  # nome curto e campo tenant não declarado
+    assert removido.json()["data"] == {"id": criado.json()["data"]["id"]}
+    assert sem_token.status_code == 401
+
+
+# ── Kit de testes de serviço: core/testing.py (README §5.5) ──────────────────
+
+from core.testing import service_app  # noqa: E402
+
+_KIT_MAIN = """
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from pydantic import Field
+from core.envelope import install_envelope
+from core.nats_bus import bus
+from core.plans import Module, plans
+from core.resources import Fields, Resource, resources
+from core.security import install_security
+from core.surreal import db
+
+class Nota(Fields):
+    texto: str = Field(..., min_length=1)
+
+NOTAS = Resource("svc-kit", "notas", Nota, "Notas", search=("texto",))
+MODULE = Module("Kit", "Serviço de teste do kit", default=False)
+
+async def on_evento(data: Nota) -> None:
+    await resources.create(NOTAS, data)
+
+@asynccontextmanager
+async def lifespan(app):
+    async with bus.connected("svc-kit"), db.connected(resources=[NOTAS]):
+        await bus.subscribe("events.kit.trigger", on_evento, model=Nota)
+        await plans.declare(MODULE)
+        yield
+
+app = FastAPI(lifespan=lifespan)
+install_envelope(app, service="svc-kit")
+install_security(app, service="svc-kit")
+resources.mount(app, [NOTAS])
+"""
+
+
+def test_kit_sobe_o_main_do_servico_em_memoria(tmp_path, monkeypatch):
+    (tmp_path / "kit_main.py").write_text(_KIT_MAIN)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("AUTH_ISSUER", "AUTH_AUDIENCE", "AUTH_PRIVATE_KEY", "AUTH_PUBLIC_KEY"):
+        monkeypatch.delenv(name, raising=False)  # o kit põe as suas
+
+    async def cenario(app):
+        sem_plano = await app.user("ana", "acme", "owner").post("/notas", json={"texto": "oi"})  # svc-plans fora: liga
+        app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan="basico", plan_name="Básico", month="2026-10", limits=[], modules=[
+            ModuleState(name="kit", service="svc-kit", title="Kit", description="Teste", category="Geral", core=False,
+                        default=False, requires=[], enabled=security.current_tenant() == "acme")]))  # só a Acme tem
+        plans.clear()
+        fora = await app.user("bia", "beta", "owner").post("/notas", json={"texto": "oi"})
+        from core.security import Principal as P
+        await app.deliver("events.kit.trigger", app.main.Nota(texto="do evento"), who=P(sub="ana", tenant="acme"))
+        lista = await app.user("ana", "acme").get("/notas")
+        return sem_plano, fora, lista, list(app.published), list(app.live)
+
+    sem_plano, fora, lista, published, live = service_app(cenario, main="kit_main")
+    assert sem_plano.status_code == 200
+    assert fora.status_code == 402 and fora.json()["error"]["code"] == "ERRO_PLAN_MODULE"  # o portão do core vale no kit
+    assert lista.json()["data"]["total"] == 2  # a da rota e a do evento
+    assert [s for s, _ in published] == ["events.plans.catalog"] and [t for t, _, _ in live] == ["kit.notas", "kit.notas"]
+    assert plans._module is None  # nada vaza para o próximo teste
+
+
+def test_kit_recusa_rota_do_manifesto_que_o_main_nao_tem(tmp_path):
+    from core import testing as testing_module
+
+    (tmp_path / "gateway" / "endpoints").mkdir(parents=True)
+    (tmp_path / "gateway" / "schemas.py").write_text((Path(testing_module.__file__).parent.parent / "gateway" / "schemas.py").read_text())
+    (tmp_path / "gateway" / "endpoints" / "kit.yaml").write_text(json.dumps({
+        "service": "kit", "base_path": "/api/v1/kit", "resources": ["notas"],
+        "endpoints": [{"path": "/abrir", "method": "POST", "auth": "client_jwt", "target_type": "http",
+                       "target_url": "http://svc-kit:8000/abrir"}],
+    }))
+    app = FastAPI()
+    resources.mount(app, [Resource("svc-kit", "notas", ClienteCampos, "Notas")])
+    with pytest.raises(AssertionError, match="POST /abrir"):
+        testing_module._routes_match_manifest(app, "svc-kit", root=tmp_path)
+
+    @app.post("/abrir")
+    async def abrir():
+        return {}
+
+    testing_module._routes_match_manifest(app, "svc-kit", root=tmp_path)  # com a rota, passa

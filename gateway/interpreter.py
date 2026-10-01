@@ -14,6 +14,7 @@ O trace começa aqui (core/telemetry.py, edge): o traceparent de fora é ignorad
 """
 import asyncio
 import hashlib
+import os
 import re
 import time
 import uuid
@@ -58,13 +59,24 @@ def load_manifests(directory: Path = ENDPOINTS_DIR) -> list[Manifest]:
     return manifests
 
 
+# Serviços da plataforma: sempre instalados. Os demais são módulos de negócio, publicados se estiverem em MODULES.
+PLATFORM_SERVICES = frozenset({"identity", "notify", "plans", "ai", "webhooks"})
+
+
+def installed(manifests: list[Manifest], modules: str | None = None) -> list[Manifest]:
+    """Os manifestos que o gateway publica: os da plataforma e os dos módulos em MODULES (vazio: todos). Instalação
+    dedicada de um cliente (README §9): só as rotas dos módulos dele existem."""
+    chosen = {m.strip() for m in (modules if modules is not None else os.environ.get("MODULES", "")).split(",") if m.strip()}
+    return [m for m in manifests if not chosen or m.service in chosen or m.service in PLATFORM_SERVICES]
+
+
 def public_paths(manifests: list[Manifest]) -> set[str]:
-    return {m.base_path + ep.path for m in manifests for ep in m.endpoints if ep.auth == "public"}
+    return {m.base_path + ep.path for m in manifests for ep in m.all_endpoints() if ep.auth == "public"}
 
 
 def mount(app: FastAPI, manifests: list[Manifest], upstream: httpx.AsyncClient) -> None:
     for manifest in manifests:
-        for ep in manifest.endpoints:
+        for ep in manifest.all_endpoints():
             if ep.target_type == "nats":
                 handler = _publish(ep)
             else:

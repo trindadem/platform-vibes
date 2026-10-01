@@ -8,6 +8,9 @@ Rota stream: true vira função com options.onDelta (pedaços tipados) que resol
 live: viram a interface LiveTopics, que dá o tipo de cada evento em useLive/useLiveQuery (README §5.10).
 O MODULE de cada schemas.py (core/plans.py) vira a constante appModules e o tipo ModuleName: o meta.module de uma tela
 só aceita módulo que existe, e o menu agrupa pela categoria (README §5.17 e §6). Serviço com manifesto sem MODULE é erro.
+Cada cadastro de resources: (core/resources.py, README §5.19) vira <serviço>.<cadastro> = { list, get, create, update,
+remove, meta }: os tipos saem do Resource do schemas.py e meta descreve campos, colunas e filtros para useResource e
+ResourceList. Cadastro citado no manifesto e ausente em RESOURCES é erro, e o contrário também (o erro diz a linha certa).
 
 Rodar (da raiz):  uv run python gateway/contracts.py           gera o arquivo
                   uv run python gateway/contracts.py --check   falha se o arquivo estiver desatualizado
@@ -26,6 +29,7 @@ sys.path.insert(1, str(ROOT))  # o interpreter importa core/; rodando da raiz, a
 from pydantic import BaseModel  # noqa: E402
 
 from core.plans import Module  # noqa: E402
+from core.resources import Resource  # noqa: E402
 
 from interpreter import ENDPOINTS_DIR, load_manifests  # noqa: E402
 from schemas import Endpoint, Manifest  # noqa: E402
@@ -42,6 +46,22 @@ import { __IMPORTS__ } from "./api";
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */
 export interface Dispatched {
   message_id: string;
+}
+
+/** Um registro de cadastro pelo id (core/resources.py). */
+export interface ResourceRef {
+  id: string;
+}
+
+/** Resposta da remoção de um registro de cadastro. */
+export interface ResourceRemoved {
+  id: string;
+}
+
+/** Aviso ao vivo de um cadastro (<serviço>.<cadastro>): a lista aberta busca de novo. */
+export interface ResourceChanged {
+  id: string;
+  action: "created" | "updated" | "removed";
 }
 
 /** GET /health do gateway (README §5.18). */
@@ -69,13 +89,17 @@ def generate(endpoints_dir: Path = ENDPOINTS_DIR, services_dir: Path = SERVICES_
         sections.append(section)
         topics += service_topics
         modules.append((manifest.service, module))
-    endpoints = [ep for manifest in load_manifests(endpoints_dir) for ep in manifest.endpoints]
+    manifests = load_manifests(endpoints_dir)
+    endpoints = [ep for manifest in manifests for ep in manifest.endpoints]
+    has_resources = any(manifest.resources for manifest in manifests)
     imports = ["request"]
     if any(ep.stream for ep in endpoints):
         imports.append("stream")
-    if any(ep.query for ep in endpoints):
+    if any(ep.query for ep in endpoints) or has_resources:
         imports.append("withQuery")
     imports.append("type RequestOptions")
+    if has_resources:
+        imports.append("type ResourceMeta")
     if any(ep.stream for ep in endpoints):
         imports.append("type StreamOptions")
     sections[0] = HEADER.replace("__IMPORTS__", ", ".join(imports))
@@ -127,8 +151,61 @@ def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[
          f"svc-{manifest.service} · bus.live(\"{manifest.service}.{t.topic}\", ...)")
         for t in manifest.live
     ]
+    declared_resources = {r.name: r for r in getattr(module, "RESOURCES", []) if isinstance(r, Resource)}
+    if missing := [name for name in declared_resources if name not in manifest.resources]:
+        listed = ", ".join([*manifest.resources, *missing])
+        raise RuntimeError(
+            f"contracts: services/svc-{manifest.service}/schemas.py declara em RESOURCES {', '.join(missing)}, que o "
+            f"manifesto não publica: em gateway/endpoints/{manifest.service}.yaml, use resources: [{listed}] (README §5.19)"
+        )
+    operations = {ep.operation() for ep in manifest.endpoints}
+    for name in manifest.resources:
+        r = declared_resources.get(name)
+        if r is None:
+            raise RuntimeError(
+                f"contracts: {manifest.service}: resources cita {name!r}, que não está em RESOURCES do schemas.py (README §5.19)"
+            )
+        if r.service != f"svc-{manifest.service}":
+            raise RuntimeError(f"contracts: {manifest.service}: o Resource {name!r} declara {r.service}")
+        if _camel(name) in operations:
+            raise RuntimeError(f"contracts: {manifest.service}: o cadastro {name!r} e uma rota geram o mesmo nome {_camel(name)!r}")
+        functions.append(_resource_functions(manifest, r, prefix, types))
+        topics.append((r.live, "ResourceChanged", f"svc-{manifest.service} · cadastro {name} (core/resources.py)"))
     client = f"/** svc-{manifest.service} · {manifest.base_path} */\nexport const {_camel(manifest.service)} = {{\n" + "\n".join(functions) + "\n};\n"
     return "\n".join([*types.values(), client]), topics, declared
+
+
+def _resource_functions(manifest: Manifest, r: Resource, prefix: str, types: dict[str, str]) -> str:
+    """<cadastro>: { list, get, create, update, remove, meta } com os tipos derivados do Resource."""
+    created = _declare_model(r.model, prefix, types, response=False)
+    update = _declare_model(r.update, prefix, types, response=False)
+    query = _declare_model(r.query, prefix, types, response=False)
+    item = _declare_model(r.item, prefix, types, response=True)
+    page = _declare_model(r.page, prefix, types, response=True)
+    url = f"{manifest.base_path}/{r.name}"
+    meta = json.dumps(r.meta(), ensure_ascii=False)
+    return (
+        f"  /** Cadastro {r.title} (core/resources.py) · {url} · exige token */\n"
+        f"  {_key(_camel(r.name))}: {{\n"
+        f"    /** GET {url} · página, busca, filtros e ordem */\n"
+        f"    list: (query?: {query}, options?: RequestOptions) =>\n"
+        f'      request<{page}>("GET", withQuery("{url}", query), undefined, options),\n'
+        f"    /** GET {url}/item?id= */\n"
+        f"    get: (query: ResourceRef, options?: RequestOptions) =>\n"
+        f'      request<{item}>("GET", withQuery("{url}/item", query), undefined, options),\n'
+        f"    /** POST {url} */\n"
+        f"    create: (body: {created}, options?: RequestOptions) =>\n"
+        f'      request<{item}>("POST", "{url}", body, options),\n'
+        f"    /** POST {url}/update · só os campos que vierem mudam */\n"
+        f"    update: (body: {update}, options?: RequestOptions) =>\n"
+        f'      request<{item}>("POST", "{url}/update", body, options),\n'
+        f"    /** POST {url}/remove */\n"
+        f"    remove: (body: ResourceRef, options?: RequestOptions) =>\n"
+        f'      request<ResourceRemoved>("POST", "{url}/remove", body, options),\n'
+        f"    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */\n"
+        f"    meta: {meta} satisfies ResourceMeta,\n"
+        f"  }},"
+    )
 
 
 def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: str | None = None, query: str | None = None) -> str:
@@ -175,11 +252,16 @@ def _declare(module: ModuleType, model_name: str, prefix: str, types: dict[str, 
     model = getattr(module, model_name, None)
     if not (isinstance(model, type) and issubclass(model, BaseModel)):
         raise RuntimeError(f"contracts: {where} cita {model_name}, que não é um modelo Pydantic do schemas.py")
+    return _declare_model(model, prefix, types, response, name=model_name)
+
+
+def _declare_model(model: type[BaseModel], prefix: str, types: dict[str, str], response: bool, name: str | None = None) -> str:
+    name = name or model.__name__
     schema = model.model_json_schema(mode="serialization" if response else "validation", ref_template="#/$defs/{model}")
-    for name, definition in schema.get("$defs", {}).items():
-        types.setdefault(prefix + name, _declaration(prefix + name, definition, prefix, response))
-    types.setdefault(prefix + model_name, _declaration(prefix + model_name, schema, prefix, response))
-    return prefix + model_name
+    for ref, definition in schema.get("$defs", {}).items():
+        types.setdefault(prefix + ref, _declaration(prefix + ref, definition, prefix, response))
+    types.setdefault(prefix + name, _declaration(prefix + name, schema, prefix, response))
+    return prefix + name
 
 
 def _declaration(name: str, schema: dict[str, Any], prefix: str, response: bool) -> str:

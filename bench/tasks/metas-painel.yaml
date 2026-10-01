@@ -1,0 +1,201 @@
+# Nível 1 com tela: a página compõe indicadores e a lista, só com o catálogo.
+id: metas-painel
+level: 1
+service: metas
+title: Metas com painel de indicadores
+spec: |
+  # Spec: metas
+
+  ## 1. Objetivo Operacional
+  Metas da equipe com um painel: quantas metas existem e quantas estão concluídas.
+  Módulo (schemas.MODULE): título "Metas", descrição "Metas e resultados", categoria "Gestão".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `metas` (Resource, título "Metas"), modelo `Meta`:
+    - `nome`: texto obrigatório, 2 a 120 caracteres, título "Meta";
+    - `alvo`: número >= 0, título "Alvo";
+    - `atual`: número >= 0, padrão 0, título "Atual";
+    - `concluida`: bool, padrão false, título "Concluída".
+  - Busca em nome; filtro por concluida; ordem por nome.
+  - Substitua o cadastro `registros` do esqueleto por `metas` (a ação /execute cria uma meta com nome = title e alvo 0).
+  - Tela do módulo (frontend/src/modules/metas/page.tsx): acima da lista, um Grid com dois Stat: "Metas" (o total de
+    useQuery(metas.metas.list)) e "Concluídas" (o total de useQuery(metas.metas.list, { concluida: true })), depois a
+    lista com ResourceList e useResource(metas.metas). Só componentes do catálogo (README §6).
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — metas_metas, por organização.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - 422: alvo negativo.
+acceptance: |
+  from pathlib import Path
+
+  from core.testing import service_app
+
+
+  def test_metas_pelas_rotas():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "owner")
+          assert (await ana.post("/metas", json={"nome": "Vender 100 bolos", "alvo": 100})).status_code == 200
+          assert (await ana.post("/metas", json={"nome": "Abrir 2 lojas", "alvo": 2, "atual": 2, "concluida": True})).status_code == 200
+          assert (await ana.post("/metas", json={"nome": "Ruim", "alvo": -1})).status_code == 422
+          feitas = await ana.get("/metas", params={"concluida": "true"})
+          assert [m["nome"] for m in feitas.json()["data"]["items"]] == ["Abrir 2 lojas"]
+          criada = await ana.post("/execute", json={"title": "Pela ação"})
+          assert criada.status_code == 200, criada.text
+          assert (await ana.get("/metas")).json()["data"]["total"] == 3
+
+      service_app(cenario)
+
+
+  def test_painel_na_tela():
+      tela = Path("frontend/src/modules/metas/page.tsx").read_text()
+      assert tela.count("<Stat") == 2 and "<Grid" in tela and "<ResourceList" in tela and "useResource(metas.metas)" in tela
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-metas/schemas.py: |
+    """svc-metas · contratos (DTOs, enums, constantes). Fonte da verdade: specs/metas.md §2"""
+    from typing import Any
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Resource
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-metas"
+    TASK_QUEUE = "metas-queue"
+    TRIGGER_SUBJECT = "events.metas.trigger"
+    PROCESSED_SUBJECT = "events.metas.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Metas", "Metas e resultados", category="Gestão")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Meta(Fields):
+        nome: str = Field(..., min_length=2, max_length=120, title="Meta")
+        alvo: float = Field(..., ge=0, title="Alvo")
+        atual: float = Field(0, ge=0, title="Atual")
+        concluida: bool = Field(False, title="Concluída")
+
+
+    METAS = Resource(SERVICE, "metas", Meta, "Metas", search=("nome",), sort=("nome",), filters=("concluida",))
+    RESOURCES = [METAS]
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-metas/service.py: |
+    """svc-metas · lógica de negócio pura. Fonte da verdade: specs/metas.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "metas.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.nats_bus import bus
+    from core.resources import resources
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import METAS, PROCESSED_SUBJECT, ExecutionInput, ExecutionResult, Meta
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    #   Migration(1, "observação padrão nos registros antigos", sql="UPDATE metas_registros SET notes = '' WHERE notes = NONE")
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("metas")
+    class MetasService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(METAS, Meta(nome=data.title, alvo=0))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+  gateway/endpoints/metas.yaml: |
+    # svc-metas · rotas públicas no Gateway. Fonte da verdade: specs/metas.md §2
+    service: metas
+    base_path: /api/v1/metas
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # metas.<cadastro>, e vira metas.<cadastro> no frontend.
+    resources: [metas]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-metas:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.metas.trigger
+  tests/metas.py: |
+    """svc-metas · testes. Fonte da verdade: specs/metas.md §2 e §4"""
+    import pytest
+    from pydantic import ValidationError
+
+    from core.testing import service_app
+
+    from schemas import METAS, ExecutionInput
+
+
+    def test_cadastro_pelas_rotas_so_da_organizacao():
+        async def cenario(app):
+            ana = app.user("ana", "acme", "owner")
+            criado = await ana.post("/metas", json={"nome": "Vender", "alvo": 10})
+            assert criado.status_code == 200, criado.text
+            assert (await ana.get("/metas")).json()["data"]["total"] == 1
+            assert (await app.user("bia", "beta", "owner").get("/metas")).json()["data"]["total"] == 0
+
+        service_app(cenario)
+
+
+    def test_campo_nao_declarado_e_rejeitado():
+        with pytest.raises(ValidationError):
+            ExecutionInput.model_validate({"title": "x", "is_admin": True})
+  frontend/src/modules/metas/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Grid } from "@/components/Grid";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { Stat } from "@/components/Stat";
+    import { useQuery, useResource } from "@/core/api";
+    import { metas } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Metas", module: "metas" };
+
+    export default function Metas() {
+      const lista = useResource(metas.metas);
+      const todas = useQuery(metas.metas.list);
+      const concluidas = useQuery(metas.metas.list, { concluida: true });
+      return (
+        <Page title="Metas" description="Metas da equipe e quantas já foram concluídas.">
+          <Grid cols={2}>
+            <Stat label="Metas" value={todas.data?.total ?? "—"} />
+            <Stat label="Concluídas" value={concluidas.data?.total ?? "—"} tone="success" />
+          </Grid>
+          <ResourceList resource={lista} noun="meta" />
+        </Page>
+      );
+    }

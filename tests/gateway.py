@@ -433,6 +433,15 @@ from core.surreal import ListQuery, Page
 
 MODULE = Module("Loja", "Faturas e pedidos da loja", category="Comercial", limits=[Limit("faturas", "Faturas no mês", monthly=True)])
 
+from core.resources import Fields, Money, Resource
+
+class Produto(Fields):
+    nome: str = Field(..., min_length=2, title="Nome do produto")
+    preco: Money = 0
+    ativo: bool = True
+
+RESOURCES = [Resource("svc-loja", "produtos", Produto, "Produtos", search=("nome",), filters=("ativo",))]
+
 class Status(str, Enum):
     ABERTA = "aberta"
     PAGA = "paga"
@@ -464,6 +473,7 @@ class FaturaPage(Page[Fatura]):
 LOJA = {
     "service": "loja",
     "base_path": "/api/v1/loja",
+    "resources": ["produtos"],
     "endpoints": [
         {"path": "/faturas", "name": "criar", "method": "POST", "auth": "client_jwt", "request": "FaturaIn",
          "response": "Fatura", "target_type": "http", "target_url": "http://svc-loja:8000/faturas"},
@@ -522,7 +532,7 @@ def test_contrato_de_lista_tipa_os_parametros_da_url_e_a_pagina(loja_dirs):
     import contracts
 
     ts = contracts.generate(*loja_dirs)
-    assert "import { request, withQuery, type RequestOptions } from \"./api\";" in ts
+    assert "import { request, withQuery, type RequestOptions, type ResourceMeta } from \"./api\";" in ts
     assert "  listar: (query?: LojaFaturaQuery, options?: RequestOptions) =>" in ts
     assert '    request<LojaFaturaPage>("GET", withQuery("/api/v1/loja/faturas", query), undefined, options),' in ts
     assert '  sort?: "cliente" | "-cliente" | "valor" | "-valor" | null;' in ts  # só as ordens permitidas
@@ -550,6 +560,64 @@ def test_contrato_lista_os_modulos_para_o_menu_e_tipa_o_nome(loja_dirs):
     (services / "svc-loja" / "schemas.py").write_text(LOJA_SCHEMAS.replace("MODULE = ", "OUTRO = "))
     with pytest.raises(RuntimeError, match="não declara MODULE"):  # todo serviço com rota é um módulo
         contracts.generate(endpoints, services)
+
+
+def test_cadastro_do_manifesto_vira_cinco_rotas_e_um_cliente_tipado(loja_dirs):
+    import contracts
+    from schemas import Manifest
+
+    endpoints, services = loja_dirs
+    manifest = Manifest.model_validate({**LOJA, "resources": ["produtos"]})
+    assert [(ep.method, ep.path, ep.target_url) for ep in manifest.all_endpoints()[-5:]] == [
+        ("GET", "/produtos", "http://svc-loja:8000/produtos"),
+        ("GET", "/produtos/item", "http://svc-loja:8000/produtos/item"),
+        ("POST", "/produtos", "http://svc-loja:8000/produtos"),
+        ("POST", "/produtos/update", "http://svc-loja:8000/produtos/update"),
+        ("POST", "/produtos/remove", "http://svc-loja:8000/produtos/remove"),
+    ]
+    assert all(ep.auth == "client_jwt" for ep in manifest.all_endpoints())
+    (endpoints / "loja.yaml").write_text(json.dumps({**LOJA, "resources": ["produtos"]}))
+    ts = contracts.generate(endpoints, services)
+    assert "  produtos: {\n" in ts
+    assert '    list: (query?: LojaProdutoQuery, options?: RequestOptions) =>\n      request<LojaProdutoPage>("GET", withQuery("/api/v1/loja/produtos", query), undefined, options),' in ts
+    assert '    create: (body: LojaProduto, options?: RequestOptions) =>\n      request<LojaProdutoItem>("POST", "/api/v1/loja/produtos", body, options),' in ts
+    assert "export interface LojaProdutoUpdate {\n  /** Id do registro */\n  id: string;" in ts
+    assert '"loja.produtos": ResourceChanged;' in ts and "satisfies ResourceMeta" in ts
+    assert '"kind": "money"' in ts and '"filters": [{"name": "ativo"' in ts
+    (endpoints / "loja.yaml").write_text(json.dumps({**LOJA, "resources": ["produtos", "servicos"]}))
+    with pytest.raises(RuntimeError, match="não está em RESOURCES"):
+        contracts.generate(endpoints, services)
+    sem_cadastro = {k: v for k, v in LOJA.items() if k != "resources"}
+    (endpoints / "loja.yaml").write_text(json.dumps(sem_cadastro))  # declarado e não publicado: o erro diz o que pôr
+    with pytest.raises(RuntimeError, match=r"use resources: \[produtos\]"):
+        contracts.generate(endpoints, services)
+
+
+def test_cadastro_com_rota_ou_aviso_no_mesmo_nome_e_recusado():
+    from schemas import Manifest
+
+    criar = {"path": "/produtos", "method": "POST", "auth": "client_jwt", "target_type": "http",
+             "target_url": "http://svc-loja:8000/produtos"}
+    with pytest.raises(ValidationError, match="duplicada"):
+        Manifest.model_validate({**LOJA, "endpoints": [criar], "resources": ["produtos"]})
+    with pytest.raises(ValidationError, match="já vem junto"):
+        Manifest.model_validate({**LOJA, "resources": ["produtos"], "live": [{"topic": "produtos", "model": "Fatura"}]})
+    with pytest.raises(ValidationError, match="kebab-case"):
+        Manifest.model_validate({**LOJA, "resources": ["Produtos"]})
+    so_cadastro = Manifest.model_validate({"service": "loja", "base_path": "/api/v1/loja", "resources": ["produtos"]})
+    assert len(so_cadastro.all_endpoints()) == 5  # manifesto só com cadastros vale
+
+
+def test_instalacao_dedicada_publica_so_a_plataforma_e_os_modulos_escolhidos():
+    from interpreter import installed
+    from schemas import Manifest
+
+    def manifesto(service):
+        return Manifest.model_validate({"service": service, "base_path": f"/api/v1/{service}", "resources": ["itens"]})
+
+    todos = [manifesto(s) for s in ("identity", "plans", "crm", "vendas", "juridico")]
+    assert [m.service for m in installed(todos, "")] == ["identity", "plans", "crm", "vendas", "juridico"]
+    assert [m.service for m in installed(todos, "crm, vendas")] == ["identity", "plans", "crm", "vendas"]
 
 
 def test_contrato_sem_schemas_do_servico_e_erro(loja_dirs):

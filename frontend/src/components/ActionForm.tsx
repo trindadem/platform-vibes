@@ -9,6 +9,11 @@ import { TextField } from "./TextField";
 
 type Values = Record<string, string>;
 
+const YES_NO = [
+  { value: "true", label: "Sim" },
+  { value: "false", label: "Não" },
+];
+
 export interface ActionFormProps<B> {
   /** Estado de useAction(...) (src/core/api.ts): o formulário chama action.run(valores). */
   action: {
@@ -16,11 +21,11 @@ export interface ActionFormProps<B> {
     running: boolean;
     error: { message: string; details?: { loc?: (string | number)[]; msg?: string; type?: string }[] } | null;
   };
-  /** Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; color dá #rrggbb. */
+  /** Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; boolean vira true/false (Sim/Não); color dá #rrggbb; date e datetime dão a data no formato ISO. */
   fields: {
     name: keyof B & string;
     label: string;
-    kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "color";
+    kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "boolean" | "color" | "tel" | "date" | "datetime";
     required?: boolean;
     placeholder?: string;
     hint?: string;
@@ -77,11 +82,11 @@ export function ActionForm<B>({ action, fields, submitLabel = "Salvar", successM
   const submit = async () => {
     setDone(false);
     setEdited(new Set());
-    const body: Record<string, string | number> = {};
+    const body: Record<string, string | number | boolean> = {};
     for (const field of fields) {
       const raw = values[field.name] ?? "";
       if (raw === "" && !field.required) continue;
-      body[field.name] = field.kind === "number" ? Number(raw.replace(",", ".")) : raw;
+      body[field.name] = field.kind === "number" ? Number(raw.replace(",", ".")) : field.kind === "boolean" ? raw === "true" : raw;
     }
     const result = await action.run(body as B);
     if (result !== undefined) {
@@ -107,7 +112,9 @@ export function ActionForm<B>({ action, fields, submitLabel = "Salvar", successM
         };
         if (field.kind === "textarea") return <TextArea key={field.name} {...common} />;
         if (field.kind === "select") return <SelectField key={field.name} {...common} options={field.options ?? []} />;
-        return <TextField key={field.name} {...common} type={field.kind ?? "text"} autoComplete={field.autoComplete} />;
+        if (field.kind === "boolean") return <SelectField key={field.name} {...common} options={field.options ?? YES_NO} />;
+        const type = field.kind === "datetime" ? "datetime-local" : (field.kind ?? "text");
+        return <TextField key={field.name} {...common} type={type} autoComplete={field.autoComplete} />;
       })}
       <Row>
         <Button type="submit" loading={action.running}>

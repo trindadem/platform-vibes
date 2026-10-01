@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (44)
+## Índice (45)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -14,6 +14,7 @@
 - [ListView](#listview): Receita de lista paginada no servidor: busca por texto, filtros, ordenação no cabeçalho, páginas e todos os estados. `list, columns, rowKey, search?, filters?, empty?, noun?, caption?, actions?`
 - [QueryTable](#querytable): Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito. `query, columns, rowKey, empty?, caption?`
 - [QueryView](#queryview): Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados. `query, children, empty?`
+- [ResourceList](#resourcelist): Receita de cadastro inteiro: lista com busca, filtros, ordem e páginas, criação e edição em painel lateral e remoção com confirmação, tudo a partir dos campos declarados no backend (core/resources.py). `resource, columns?, rowActions?, noun?, readOnly?`
 - [ResourcePage](#resourcepage): Receita de tela de cadastro: título, indicadores, lista com todos os estados e criação em painel lateral. `title, query, columns, rowKey, description?, empty?, stats?, create?`
 
 **Layout**: estrutura da tela
@@ -96,7 +97,7 @@ Receita de formulário: campos a partir de uma lista, envio pela ação, erro do
 ```
 
 - `action`: `{ run: (body: B) => Promise<unknown>; running: boolean; error: { message: string; details?: { loc?: (string | number)[]; msg?: string; type?: string }[] } | null; }`: Estado de useAction(...) (src/core/api.ts): o formulário chama action.run(valores).
-- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "color"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; color dá #rrggbb.
+- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "boolean" | "color" | "tel" | "date" | "datetime"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; boolean vira true/false (Sim/Não); color dá #rrggbb; date e datetime dão a data no formato ISO.
 - `submitLabel?`: `string`: Texto do botão de envio. Padrão: "Salvar".
 - `successMessage?`: `string`: Mensagem exibida após sucesso (o formulário é limpo).
 - `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo.
@@ -170,6 +171,22 @@ Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", va
 - `query`: `{ data: T | null; loading: boolean; error: { message: string } | null; reload: () => void }`: Estado devolvido por useQuery(...) (src/core/api.ts).
 - `children`: `(data: T) => ReactNode`: Desenha os dados quando chegam: (dados) => <KeyValue ... />.
 - `empty?`: `string`: Título quando o resultado é vazio (lista sem itens). Padrão: "Nada por aqui ainda."
+
+---
+
+## ResourceList
+
+Receita de cadastro inteiro: lista com busca, filtros, ordem e páginas, criação e edição em painel lateral e remoção com confirmação, tudo a partir dos campos declarados no backend (core/resources.py). _(Receitas)_
+
+```tsx
+<ResourceList resource={cadastro} noun="fatura" />
+```
+
+- `resource`: `{ list: ListViewProps<T>["list"]; create: Action<never>; update: Action<never>; remove: Action<{ id: string }>; meta: { title: string; fields: Field[]; columns: { key: string; header: string; kind: Kind; sort?: string }[]; filters: { name: string; label: string; options: { value: string; label: string }[] }[]; search: string | null; }; }`: Estado de useResource(modulo.cadastro) (src/core/api.ts): lista, ações e os campos que o backend declarou.
+- `columns?`: `DataTableProps<T>["columns"]`: Colunas no lugar das declaradas (ex.: com uma coluna calculada).
+- `rowActions?`: `(row: T) => ReactNode`: Ações a mais em cada linha (ex.: um Button que abre a tela do registro).
+- `noun?`: `string`: Nome de um item, para os botões e painéis (ex.: "cliente"). Padrão: "registro".
+- `readOnly?`: `boolean`: Só a lista: sem criar, editar e remover (ex.: para quem não tem o papel de escrita).
 
 ---
 
@@ -644,7 +661,7 @@ Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidad
 - `label`: `string`: Rótulo visível (também é o nome acessível).
 - `value`: `string`
 - `onChange`: `(value: string) => void`: Recebe o novo texto, não o evento.
-- `type?`: `"text" | "email" | "password" | "number" | "search" | "url" | "color"`: Padrão: text. color: seletor de cor, o valor é #rrggbb.
+- `type?`: `"text" | "email" | "password" | "number" | "search" | "url" | "color" | "tel" | "date" | "datetime-local"`: Padrão: text. color: seletor de cor (#rrggbb); date: AAAA-MM-DD; datetime-local: AAAA-MM-DDTHH:MM.
 - `hint?`: `string`: Ajuda abaixo do campo.
 - `error?`: `string`: Mensagem de erro: marca o campo como inválido.
 - `required?`: `boolean`

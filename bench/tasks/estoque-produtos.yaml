@@ -1,0 +1,216 @@
+# Nível 1: declaração com índice único, limite do plano e filtros.
+id: estoque-produtos
+level: 1
+service: estoque
+title: Produtos com SKU único e limite do plano
+spec: |
+  # Spec: estoque
+
+  ## 1. Objetivo Operacional
+  Cadastro de produtos da organização com código (SKU) único, preço e quantidade em estoque, limitado pelo plano.
+  Módulo (schemas.MODULE): título "Estoque", descrição "Produtos e quantidades", categoria "Operações", com o limite
+  total `produtos` ("Produtos cadastrados", default 500, unidade "produtos").
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `produtos` (Resource, título "Produtos"), modelo `Produto`:
+    - `nome`: texto obrigatório, 2 a 120 caracteres, título "Nome";
+    - `sku`: texto obrigatório, padrão ^[A-Z0-9-]{3,20}$, título "SKU", único na organização;
+    - `preco`: Money, padrão 0, título "Preço";
+    - `quantidade`: inteiro >= 0, padrão 0, título "Quantidade";
+    - `ativo`: bool, padrão true, título "Ativo".
+  - Busca em nome e sku; filtro por ativo; ordem por nome, preco e quantidade; limite do plano `produtos` no cadastro.
+  - Substitua o cadastro `registros` do esqueleto por `produtos`. A ação /execute e o gatilho continuam, mas passam a
+    criar um produto com nome = title e sku "AUTO-001". A tela do módulo mostra os produtos com ResourceList.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — estoque_produtos, por organização, com índice único em sku.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - ERRO_RECORD_DUPLICATE (409): SKU repetido na organização (em outra organização pode repetir).
+  - ERRO_PLAN_LIMIT (402): a organização chegou ao limite de produtos do plano.
+  - 422: SKU fora do padrão ou quantidade negativa.
+acceptance: |
+  import schemas
+  from core.plans import LIMITS_SUBJECT, LimitState, PlanLimits
+  from core.security import current_tenant
+  from core.testing import service_app
+
+
+  def test_modulo_e_limite():
+      assert (schemas.MODULE.title, schemas.MODULE.category) == ("Estoque", "Operações")
+      limite = {l.name: l for l in schemas.MODULE.limits}["produtos"]
+      assert (limite.default, limite.monthly) == (500, False)
+      assert [r.name for r in schemas.RESOURCES] == ["produtos"]
+
+
+  def test_produtos_pelas_rotas():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "owner")
+          ok = await ana.post("/produtos", json={"nome": "Pão francês", "sku": "PAO-01", "preco": 0.8, "quantidade": 100})
+          assert ok.status_code == 200, ok.text
+          assert ok.json()["data"]["ativo"] is True
+          assert (await ana.post("/produtos", json={"nome": "Outro pão", "sku": "PAO-01"})).status_code == 409
+          assert (await app.user("bia", "beta", "owner").post("/produtos", json={"nome": "Pão", "sku": "PAO-01"})).status_code == 200
+          for ruim in ({"nome": "Bolo", "sku": "bolo"}, {"nome": "Bolo", "sku": "BOLO-1", "quantidade": -1}):
+              assert (await ana.post("/produtos", json=ruim)).status_code == 422, ruim
+          await ana.post("/produtos", json={"nome": "Bolo de milho", "sku": "BOLO-1", "preco": 25, "ativo": False})
+          inativos = await ana.get("/produtos", params={"ativo": "false"})
+          assert [p["nome"] for p in inativos.json()["data"]["items"]] == ["Bolo de milho"]
+          caros = await ana.get("/produtos", params={"sort": "-preco"})
+          assert [p["sku"] for p in caros.json()["data"]["items"]] == ["BOLO-1", "PAO-01"]
+          busca = await ana.get("/produtos", params={"q": "bolo"})
+          assert busca.json()["data"]["total"] == 1
+          app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan="basico", plan_name="Básico", month="2026-10", limits=[
+              LimitState(name="estoque.produtos", service="svc-estoque", description="Produtos cadastrados", default=500,
+                         monthly=False, unit="produtos", limit=2 if current_tenant() == "acme" else None, used=0)]))
+          from core.plans import plans
+          plans.clear()
+          cheio = await ana.post("/produtos", json={"nome": "Café", "sku": "CAFE-1"})
+          assert cheio.status_code == 402 and cheio.json()["error"]["code"] == "ERRO_PLAN_LIMIT"
+
+      service_app(cenario)
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-estoque/schemas.py: |
+    """svc-estoque · contratos (DTOs, enums, constantes). Fonte da verdade: specs/estoque.md §2"""
+    from typing import Any
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Limit, Module
+    from core.resources import Fields, Money, Resource
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-estoque"
+    TASK_QUEUE = "estoque-queue"
+    TRIGGER_SUBJECT = "events.estoque.trigger"
+    PROCESSED_SUBJECT = "events.estoque.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Estoque", "Produtos e quantidades", category="Operações", limits=[
+        Limit("produtos", "Produtos cadastrados", default=500, unit="produtos"),
+    ])
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Produto(Fields):
+        nome: str = Field(..., min_length=2, max_length=120, title="Nome")
+        sku: str = Field(..., pattern=r"^[A-Z0-9-]{3,20}$", title="SKU")
+        preco: Money = Field(0, title="Preço")
+        quantidade: int = Field(0, ge=0, title="Quantidade")
+        ativo: bool = Field(True, title="Ativo")
+
+
+    PRODUTOS = Resource(
+        SERVICE, "produtos", Produto, "Produtos", search=("nome", "sku"), sort=("nome", "preco", "quantidade"),
+        filters=("ativo",), unique=("sku",), limit="produtos",
+    )
+    RESOURCES = [PRODUTOS]
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-estoque/service.py: |
+    """svc-estoque · lógica de negócio pura. Fonte da verdade: specs/estoque.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "estoque.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.nats_bus import bus
+    from core.resources import resources
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import PROCESSED_SUBJECT, PRODUTOS, ExecutionInput, ExecutionResult, Produto
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("estoque")
+    class EstoqueService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(PRODUTOS, Produto(nome=data.title, sku="AUTO-001"))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+  gateway/endpoints/estoque.yaml: |
+    # svc-estoque · rotas públicas no Gateway. Fonte da verdade: specs/estoque.md §2
+    service: estoque
+    base_path: /api/v1/estoque
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # estoque.<cadastro>, e vira estoque.<cadastro> no frontend.
+    resources: [produtos]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-estoque:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.estoque.trigger
+  tests/estoque.py: |
+    """svc-estoque · testes. Fonte da verdade: specs/estoque.md §2 e §4"""
+    import pytest
+    from pydantic import ValidationError
+
+    from core.testing import service_app
+
+    from schemas import PRODUTOS, ExecutionInput
+
+
+    def test_cadastro_pelas_rotas_so_da_organizacao():
+        async def cenario(app):
+            ana = app.user("ana", "acme", "owner")
+            criado = await ana.post("/produtos", json={"nome": "Pão", "sku": "PAO-01"})
+            assert criado.status_code == 200, criado.text
+            assert (await ana.get("/produtos")).json()["data"]["total"] == 1
+            assert (await app.user("bia", "beta", "owner").get("/produtos")).json()["data"]["total"] == 0
+
+        service_app(cenario)
+
+
+    def test_campo_nao_declarado_e_rejeitado():
+        with pytest.raises(ValidationError):
+            ExecutionInput.model_validate({"title": "x", "is_admin": True})
+  frontend/src/modules/estoque/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { estoque } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Estoque", module: "estoque" };
+
+    export default function Estoque() {
+      const produtos = useResource(estoque.produtos);
+      return (
+        <Page title="Produtos" description="Produtos e quantidades em estoque.">
+          <ResourceList resource={produtos} noun="produto" />
+        </Page>
+      );
+    }

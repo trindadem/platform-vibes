@@ -1,0 +1,260 @@
+# Nível 2: ação que cria pelo cadastro e avisa pessoas (core/notify.py).
+id: atendimento-chamados
+level: 2
+service: atendimento
+title: Chamados com aviso de urgência
+spec: |
+  # Spec: atendimento
+
+  ## 1. Objetivo Operacional
+  Chamados de atendimento; chamado de prioridade alta avisa donos e administradores na hora.
+  Módulo (schemas.MODULE): título "Atendimento", descrição "Chamados e solicitações", categoria "Serviços".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `chamados` (Resource, título "Chamados"), modelo `Chamado`:
+    - `assunto`: texto obrigatório, 3 a 120 caracteres, título "Assunto";
+    - `descricao`: Text opcional, título "Descrição";
+    - `prioridade`: "baixa" | "media" | "alta", padrão "media", título "Prioridade";
+    - `status`: "aberto" | "fechado", padrão "aberto", título "Status".
+  - Busca em assunto; filtros por prioridade e status.
+  - POST /abrir (`Chamado`) → `ChamadoItem`: cria pelo cadastro (resources.create) e, se a prioridade for "alta",
+    avisa com notify.roles("owner", "admin", title="Chamado urgente: <assunto>", body=<descricao ou "">,
+    link="/atendimento", key="chamado-<id>"). A rota POST /chamados do cadastro também existe e não avisa.
+  - Mantenha o restante do esqueleto (registros, /execute, gatilho e workflow).
+  - Tela do módulo: os chamados com ResourceList.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — atendimento_chamados, por organização.
+  2. Aviso pelo core/notify.py (events.notify.send), só para prioridade alta.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - 422: assunto curto ou prioridade fora da lista.
+acceptance: |
+  from core.notify import SEND_SUBJECT
+  from core.testing import service_app
+
+
+  def test_abrir_avisa_so_o_urgente():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "member")
+          normal = await ana.post("/abrir", json={"assunto": "Dúvida sobre nota"})
+          assert normal.status_code == 200, normal.text
+          urgente = await ana.post("/abrir", json={"assunto": "Sistema parado", "descricao": "Caixa não abre", "prioridade": "alta"})
+          assert urgente.status_code == 200, urgente.text
+          avisos = [m for s, m in app.published if s == SEND_SUBJECT]
+          assert len(avisos) == 1
+          aviso = avisos[0]
+          assert (aviso.title, aviso.body, aviso.link, sorted(aviso.roles)) == ("Chamado urgente: Sistema parado", "Caixa não abre", "/atendimento", ["admin", "owner"])
+          pelo_cadastro = await ana.post("/chamados", json={"assunto": "Outro urgente", "prioridade": "alta"})
+          assert pelo_cadastro.status_code == 200
+          assert len([1 for s, _ in app.published if s == SEND_SUBJECT]) == 1  # o cadastro não avisa
+          altas = await ana.get("/chamados", params={"prioridade": "alta"})
+          assert altas.json()["data"]["total"] == 2
+          assert (await ana.post("/abrir", json={"assunto": "Oi"})).status_code == 422
+
+      service_app(cenario)
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-atendimento/schemas.py: |
+    """svc-atendimento · contratos (DTOs, enums, constantes). Fonte da verdade: specs/atendimento.md §2"""
+    from typing import Any, Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Resource, Text
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-atendimento"
+    TASK_QUEUE = "atendimento-queue"
+    TRIGGER_SUBJECT = "events.atendimento.trigger"
+    PROCESSED_SUBJECT = "events.atendimento.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Atendimento", "Chamados e solicitações", category="Serviços")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Registro(Fields):
+        title: str = Field(..., min_length=1, max_length=200, title="Título", description="Aparece na lista e entra na busca")
+        notes: Text | None = Field(None, title="Observações")
+
+
+    REGISTROS = Resource(SERVICE, "registros", Registro, "Registros", search=("title",), sort=("title",))
+
+
+    class Chamado(Fields):
+        assunto: str = Field(..., min_length=3, max_length=120, title="Assunto")
+        descricao: Text | None = Field(None, title="Descrição")
+        prioridade: Literal["baixa", "media", "alta"] = Field("media", title="Prioridade")
+        status: Literal["aberto", "fechado"] = Field("aberto", title="Status")
+
+
+    CHAMADOS = Resource(SERVICE, "chamados", Chamado, "Chamados", search=("assunto",), filters=("prioridade", "status"))
+    RESOURCES = [REGISTROS, CHAMADOS]
+    ChamadoItem = CHAMADOS.item
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-atendimento/service.py: |
+    """svc-atendimento · lógica de negócio pura. Fonte da verdade: specs/atendimento.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "atendimento.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.nats_bus import bus
+    from core.notify import notify
+    from core.resources import resources
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import CHAMADOS, PROCESSED_SUBJECT, REGISTROS, Chamado, ChamadoItem, ExecutionInput, ExecutionResult, Registro
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    #   Migration(1, "observação padrão nos registros antigos", sql="UPDATE atendimento_registros SET notes = '' WHERE notes = NONE")
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("atendimento")
+    class AtendimentoService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(REGISTROS, Registro(title=data.title))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+
+        async def abrir(self, data: Chamado) -> ChamadoItem:
+            """Abre um chamado; prioridade alta avisa donos e administradores."""
+            item = await resources.create(CHAMADOS, data)
+            if item.prioridade == "alta":
+                await notify.roles(
+                    "owner", "admin", title=f"Chamado urgente: {item.assunto}", body=item.descricao or "", link="/atendimento",
+                    key=f"chamado-{item.id}",
+                )
+            return item
+  services/svc-atendimento/main.py: |
+    """svc-atendimento · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/atendimento.md
+
+    HTTP /registros...  → cadastro declarado em schemas.RESOURCES (core/resources.py): lista, item, cria, edita, remove.
+    HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
+    NATS TRIGGER_SUBJECT → inicia AtendimentoWorkflow (assíncrona, durável e idempotente).
+
+    Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-atendimento main:app --port 8100 --env-file .env
+    """
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    from core.envelope import ResponseEnvelope, install_envelope
+    from core.nats_bus import bus
+    from core.plans import plans
+    from core.resources import resources
+    from core.security import install_security
+    from core.surreal import db
+    from core.telemetry import install_telemetry
+    from core.temporal_runner import runner
+
+    from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, Chamado, ExecutionInput
+    from service import MIGRATIONS, AtendimentoService
+    from workflows import SCHEDULES, AtendimentoWorkflow
+
+    svc = AtendimentoService()
+
+
+    async def on_trigger(data: ExecutionInput) -> None:
+        # id = id estável da mensagem: reentrega do NATS nunca inicia um segundo workflow.
+        await runner.start_workflow(AtendimentoWorkflow.run, data, task_queue=TASK_QUEUE, id=bus.message_id())
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with (
+            bus.connected(SERVICE),
+            db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
+            runner.worker(TASK_QUEUE, workflows=[AtendimentoWorkflow], service=svc, schedules=SCHEDULES),
+        ):
+            await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
+            await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
+            yield
+
+
+    app = FastAPI(title=SERVICE, lifespan=lifespan)
+    install_envelope(app, service=SERVICE)
+    install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
+    install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
+    resources.mount(app, RESOURCES)  # as rotas dos cadastros (README §5.19)
+
+
+    @app.post("/execute", response_model=ResponseEnvelope)
+    async def execute(data: ExecutionInput) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.process_task(data), service=SERVICE)
+
+
+    @app.post("/abrir", response_model=ResponseEnvelope)
+    async def abrir(data: Chamado) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.abrir(data), service=SERVICE)
+  gateway/endpoints/atendimento.yaml: |
+    # svc-atendimento · rotas públicas no Gateway. Fonte da verdade: specs/atendimento.md §2
+    service: atendimento
+    base_path: /api/v1/atendimento
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # atendimento.<cadastro>, e vira atendimento.<cadastro> no frontend.
+    resources: [registros, chamados]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-atendimento:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.atendimento.trigger
+
+      - path: /abrir
+        method: POST
+        auth: client_jwt
+        request: Chamado
+        response: ChamadoItem
+        target_type: http
+        target_url: http://svc-atendimento:8000/abrir
+  frontend/src/modules/atendimento/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { atendimento } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Atendimento", module: "atendimento" };
+
+    export default function Atendimento() {
+      const chamados = useResource(atendimento.chamados);
+      return (
+        <Page title="Chamados" description="Chamados e solicitações; prioridade alta avisa os responsáveis.">
+          <ResourceList resource={chamados} noun="chamado" />
+        </Page>
+      );
+    }

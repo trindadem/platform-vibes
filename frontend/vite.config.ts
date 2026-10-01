@@ -324,7 +324,7 @@ function writeExamples(entries: Entry[]) {
   const used = new Set(entries.flatMap((e) => entries.filter((o) => e.example && uses(e.example, o.name)).map((o) => o.name)));
   const content = [
     "// Gerado por vite.config.ts a partir dos @example dos componentes. Não edite; conferido por `npm run check`.",
-    'import type { ActionState, ListState, QueryState } from "@/core/api";',
+    'import type { ActionState, ListState, QueryState, ResourceState } from "@/core/api";',
     ...[...used].sort().map((n) => `import { ${n} } from "@/components/${n}";`),
     "",
     "// Dados fictícios que os exemplos usam.",
@@ -335,6 +335,7 @@ function writeExamples(entries: Entry[]) {
     "export declare const fatura: QueryState<Fatura>;",
     "export declare const criar: ActionState<[body: FaturaIn], Fatura>;",
     "export declare const logo: ActionState<[file: File], unknown>;",
+    "export declare const cadastro: ResourceState<Fatura, FaturaIn, Partial<FaturaIn> & { id: string }>;",
     "export declare const nome: string;",
     "export declare function setNome(value: string): void;",
     "export declare const usuario: string | null;",

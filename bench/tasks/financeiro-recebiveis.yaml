@@ -1,0 +1,260 @@
+# Nível 2: cadastro + uma ação de negócio com regra de estado.
+id: financeiro-recebiveis
+level: 2
+service: financeiro
+title: Contas a receber com a ação pagar
+spec: |
+  # Spec: financeiro
+
+  ## 1. Objetivo Operacional
+  Contas a receber da organização: cadastrar, acompanhar e dar baixa no pagamento.
+  Módulo (schemas.MODULE): título "Financeiro", descrição "Contas a receber", categoria "Financeiro".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `recebiveis` (Resource, título "Contas a receber"), modelo `Recebivel`:
+    - `descricao`: texto obrigatório, 2 a 160 caracteres, título "Descrição";
+    - `cliente`: texto obrigatório, 2 a 120 caracteres, título "Cliente";
+    - `valor`: número > 0 (Money com gt=0), título "Valor";
+    - `vencimento`: data (date) obrigatória, título "Vencimento";
+    - `status`: "aberto" | "pago" | "cancelado", padrão "aberto", título "Status";
+    - `pago_em`: data (date) opcional, título "Pago em".
+  - Busca em descricao e cliente; filtro por status; ordem por vencimento e valor.
+  - POST /pagar (`Pagamento { id, pago_em?: date }`) → o `RecebivelItem` atualizado: status "pago" e pago_em (a data
+    informada ou a de hoje, em UTC). Rota no manifesto (name: pagar) e no main.py; a regra fica em service.py.
+  - Substitua o cadastro `registros` do esqueleto por `recebiveis` e remova a ação /execute, o gatilho /trigger e o
+    workflow do esqueleto (o workflows.py fica com SCHEDULES vazio e sem workflow; o main.py sem worker de workflow
+    nenhum: runner.worker(TASK_QUEUE, workflows=[], service=svc, schedules=SCHEDULES)).
+  - Tela do módulo: os recebíveis com ResourceList e, em cada linha aberta, o botão "Receber" que chama pagar.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — financeiro_recebiveis, por organização.
+  2. pagar: lê o recebível (resources.get), confere o status e atualiza (resources.update).
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - ERRO_RECORD_NOT_FOUND (404): recebível inexistente ou de outra organização.
+  - ERRO_FINANCEIRO_JA_PAGO (409): o recebível já está pago.
+  - ERRO_FINANCEIRO_CANCELADO (409): recebível cancelado não recebe pagamento.
+  - 422: valor zero ou negativo.
+acceptance: |
+  from datetime import UTC, datetime
+
+  from core.testing import service_app
+
+
+  def test_pagar():
+      async def cenario(app):
+          ana = app.user("ana", "acme", "owner")
+          criado = await ana.post("/recebiveis", json={"descricao": "Mensalidade outubro", "cliente": "Padaria Aurora", "valor": 750, "vencimento": "2026-10-10"})
+          assert criado.status_code == 200, criado.text
+          rid = criado.json()["data"]["id"]
+          assert criado.json()["data"]["status"] == "aberto"
+          assert (await ana.post("/recebiveis", json={"descricao": "Zero", "cliente": "Ninguém", "valor": 0, "vencimento": "2026-10-10"})).status_code == 422
+          pago = await ana.post("/pagar", json={"id": rid, "pago_em": "2026-10-09"})
+          assert pago.status_code == 200, pago.text
+          assert (pago.json()["data"]["status"], pago.json()["data"]["pago_em"]) == ("pago", "2026-10-09")
+          de_novo = await ana.post("/pagar", json={"id": rid})
+          assert de_novo.status_code == 409 and de_novo.json()["error"]["code"] == "ERRO_FINANCEIRO_JA_PAGO"
+          outro = await ana.post("/recebiveis", json={"descricao": "Avulso", "cliente": "Mercado", "valor": 50, "vencimento": "2026-11-01"})
+          oid = outro.json()["data"]["id"]
+          hoje = await ana.post("/pagar", json={"id": oid})
+          assert hoje.json()["data"]["pago_em"] == datetime.now(UTC).date().isoformat()
+          cancelado = await ana.post("/recebiveis", json={"descricao": "Cancelado", "cliente": "X Ltda", "valor": 10, "vencimento": "2026-11-01", "status": "cancelado"})
+          negado = await ana.post("/pagar", json={"id": cancelado.json()["data"]["id"]})
+          assert negado.status_code == 409 and negado.json()["error"]["code"] == "ERRO_FINANCEIRO_CANCELADO"
+          assert (await app.user("bia", "beta", "owner").post("/pagar", json={"id": rid})).status_code == 404
+          assert (await ana.post("/pagar", json={"id": rid, "extra": 1})).status_code == 422
+          pagos = await ana.get("/recebiveis", params={"status": "pago", "sort": "valor"})
+          assert [r["valor"] for r in pagos.json()["data"]["items"]] == [50, 750]
+
+      service_app(cenario)
+
+
+  def test_sem_workflow_do_esqueleto():
+      import workflows
+
+      assert workflows.SCHEDULES == []
+      assert not [name for name in dir(workflows) if name.endswith("Workflow")]
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-financeiro/schemas.py: |
+    """svc-financeiro · contratos (DTOs, enums, constantes). Fonte da verdade: specs/financeiro.md §2"""
+    from datetime import date
+    from typing import Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Money, Resource
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-financeiro"
+    TASK_QUEUE = "financeiro-queue"
+
+    MODULE = Module("Financeiro", "Contas a receber", category="Financeiro")
+
+
+    class Recebivel(Fields):
+        descricao: str = Field(..., min_length=2, max_length=160, title="Descrição")
+        cliente: str = Field(..., min_length=2, max_length=120, title="Cliente")
+        valor: Money = Field(..., gt=0, title="Valor")
+        vencimento: date = Field(..., title="Vencimento")
+        status: Literal["aberto", "pago", "cancelado"] = Field("aberto", title="Status")
+        pago_em: date | None = Field(None, title="Pago em")
+
+
+    RECEBIVEIS = Resource(
+        SERVICE, "recebiveis", Recebivel, "Contas a receber", search=("descricao", "cliente"), sort=("vencimento", "valor"),
+        filters=("status",),
+    )
+    RESOURCES = [RECEBIVEIS]
+    RecebivelItem = RECEBIVEIS.item
+
+
+    class Pagamento(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+        pago_em: date | None = None
+  services/svc-financeiro/service.py: |
+    """svc-financeiro · lógica de negócio pura. Fonte da verdade: specs/financeiro.md §3"""
+    from datetime import UTC, datetime
+
+    from core.envelope import ServiceError
+    from core.resources import ResourceRef, resources
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import RECEBIVEIS, Pagamento, RecebivelItem
+
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("financeiro")
+    class FinanceiroService:
+        async def pagar(self, data: Pagamento) -> RecebivelItem:
+            """Dá baixa: status pago e a data do pagamento (a informada ou hoje, em UTC)."""
+            atual = await resources.get(RECEBIVEIS, ResourceRef(id=data.id))
+            if atual.status == "pago":
+                raise ServiceError("ERRO_FINANCEIRO_JA_PAGO", "Este recebível já está pago.", status=409)
+            if atual.status == "cancelado":
+                raise ServiceError("ERRO_FINANCEIRO_CANCELADO", "Recebível cancelado não recebe pagamento.", status=409)
+            pago_em = data.pago_em or datetime.now(UTC).date()
+            return await resources.update(RECEBIVEIS, RECEBIVEIS.update(id=data.id, status="pago", pago_em=pago_em))
+  services/svc-financeiro/workflows.py: |
+    """svc-financeiro · orquestração durável. Fonte da verdade: specs/financeiro.md §3
+
+    Nenhum workflow nem agendamento por enquanto.
+    """
+    from temporalio import workflow
+
+    with workflow.unsafe.imports_passed_through():
+        from core.temporal_runner import Schedule
+
+    SCHEDULES: list[Schedule] = []
+  services/svc-financeiro/main.py: |
+    """svc-financeiro · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/financeiro.md
+
+    HTTP /recebiveis... → cadastro declarado em schemas.RESOURCES (core/resources.py).
+    HTTP POST /pagar    → dá baixa num recebível.
+
+    Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-financeiro main:app --port 8100 --env-file .env
+    """
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    from core.envelope import ResponseEnvelope, install_envelope
+    from core.nats_bus import bus
+    from core.plans import plans
+    from core.resources import resources
+    from core.security import install_security
+    from core.surreal import db
+    from core.telemetry import install_telemetry
+    from core.temporal_runner import runner
+
+    from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE, Pagamento
+    from service import MIGRATIONS, FinanceiroService
+    from workflows import SCHEDULES
+
+    svc = FinanceiroService()
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with (
+            bus.connected(SERVICE),
+            db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
+            runner.worker(TASK_QUEUE, workflows=[], service=svc, schedules=SCHEDULES),
+        ):
+            await plans.declare(MODULE)
+            yield
+
+
+    app = FastAPI(title=SERVICE, lifespan=lifespan)
+    install_envelope(app, service=SERVICE)
+    install_security(app, service=SERVICE)
+    install_telemetry(app, service=SERVICE)
+    resources.mount(app, RESOURCES)
+
+
+    @app.post("/pagar", response_model=ResponseEnvelope)
+    async def pagar(data: Pagamento) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.pagar(data), service=SERVICE)
+  gateway/endpoints/financeiro.yaml: |
+    # svc-financeiro · rotas públicas no Gateway. Fonte da verdade: specs/financeiro.md §2
+    service: financeiro
+    base_path: /api/v1/financeiro
+
+    resources: [recebiveis]
+
+    endpoints:
+      - path: /pagar
+        method: POST
+        auth: client_jwt
+        request: Pagamento
+        response: RecebivelItem
+        target_type: http
+        target_url: http://svc-financeiro:8000/pagar
+  tests/financeiro.py: |
+    """svc-financeiro · testes. Fonte da verdade: specs/financeiro.md §2 e §4"""
+    from core.testing import service_app
+
+
+    def test_pagar_uma_vez():
+        async def cenario(app):
+            ana = app.user("ana", "acme", "owner")
+            criado = await ana.post("/recebiveis", json={"descricao": "Mensalidade", "cliente": "Padaria", "valor": 10, "vencimento": "2026-10-10"})
+            rid = criado.json()["data"]["id"]
+            assert (await ana.post("/pagar", json={"id": rid})).json()["data"]["status"] == "pago"
+            assert (await ana.post("/pagar", json={"id": rid})).status_code == 409
+
+        service_app(cenario)
+  frontend/src/modules/financeiro/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Button } from "@/components/Button";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useAction, useResource } from "@/core/api";
+    import { financeiro } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Financeiro", module: "financeiro" };
+
+    export default function Financeiro() {
+      const recebiveis = useResource(financeiro.recebiveis);
+      const receber = useAction(financeiro.pagar, { onSuccess: recebiveis.list.reload });
+      return (
+        <Page title="Contas a receber" description="Cadastre, acompanhe e dê baixa nos pagamentos.">
+          <ResourceList
+            resource={recebiveis}
+            noun="recebível"
+            rowActions={(r) =>
+              r.status === "aberto" && (
+                <Button size="sm" variant="secondary" loading={receber.running} onClick={() => void receber.run({ id: r.id })}>
+                  Receber
+                </Button>
+              )
+            }
+          />
+        </Page>
+      );
+    }

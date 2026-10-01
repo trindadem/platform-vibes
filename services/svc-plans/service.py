@@ -435,8 +435,10 @@ def _module_states(catalog: dict[str, CatalogModule], tier: dict | None, account
 
 
 async def _module_catalog() -> dict[str, CatalogModule]:
+    """Os módulos que os serviços declararam; numa instalação dedicada (MODULES), só os da plataforma e os instalados."""
     rows = await db.query_shared("SELECT * FROM plan_modules ORDER BY category, title")
-    return {row["name"]: _module(row) for row in rows}
+    chosen = settings().installed()
+    return {row["name"]: _module(row) for row in rows if chosen is None or row.get("is_core") or row["name"] in chosen}
 
 
 async def _limit_catalog() -> list[CatalogLimit]:

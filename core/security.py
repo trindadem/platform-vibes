@@ -460,6 +460,9 @@ AI_SECRETS_KEY={ai_secrets_key}
 WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
 # Organização dona da plataforma (provedores de IA para todas): o id dela, depois de criada pela tela de cadastro.
 # PLATFORM_TENANT=
+# Módulos de negócio instalados (README §9): vazio = todos os do repositório; COMPOSE_PROFILES sobe os containers.
+MODULES={modules}
+COMPOSE_PROFILES={profiles}
 """
 
 _PRODUCTION_ENV = """\
@@ -500,20 +503,28 @@ OTEL_EXPORTER_OTLP_ENDPOINT=
 # Opcional: Temporal Cloud no lugar do Temporal do compose (TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_API_KEY).
 # Organização que administra a plataforma (IA e planos): o id dela, depois de criada pela tela de cadastro.
 # PLATFORM_TENANT=
+# Módulos de negócio instalados (README §9): vazio = todos; instalação dedicada = só os do cliente (--modules).
+MODULES={modules}
+COMPOSE_PROFILES={profiles}
 """
 _DOMAIN = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 _USAGE = """uso:
   uv run python -m core.security keygen                                   cria o .env local (chaves e senhas aleatórias)
   uv run python -m core.security keygen --production <domínio>            cria o .env de produção (README §9)
+  uv run python -m core.security keygen --production <domínio> --modules crm,vendas
+                                                                          instalação dedicada: só esses módulos de negócio
   uv run python -m core.security token <sub> [--tenant <org>] [papel...]  emite um token de teste com as chaves do .env"""
 
 
-def _keygen(env_file: Path, domain: str | None = None) -> None:
+def _keygen(env_file: Path, domain: str | None = None, modules: str | None = None) -> None:
     if env_file.exists():
         sys.exit(f"{env_file} já existe; nada foi alterado. Apague-o para gerar chaves novas.")
     if domain is not None and not _DOMAIN.match(domain):
         sys.exit(f"domínio inválido: {domain!r} (ex.: app.minhaempresa.com)")
+    chosen = [m.strip() for m in (modules or "").split(",") if m.strip()]
+    if bad := [m for m in chosen if not re.fullmatch(r"[a-z][a-z0-9]*(-[a-z0-9]+)*", m) or m.startswith("svc-")]:
+        sys.exit(f"módulo inválido: {', '.join(bad)} (o nome do serviço, sem svc-: crm,vendas)")
     key = Ed25519PrivateKey.generate()
     template = _LOCAL_ENV if domain is None else _PRODUCTION_ENV
     env_file.write_text(template.format(
@@ -529,6 +540,8 @@ def _keygen(env_file: Path, domain: str | None = None) -> None:
         nats_gateway_password=new_secret(24),
         storage_access_key="cv" + new_secret(9).lower().replace("_", "").replace("-", "")[:10],
         storage_secret_key=new_secret(24),
+        modules=",".join(chosen),
+        profiles=",".join(chosen) or "modules",  # sem lista: todos os serviços de negócio do compose
     ))
     env_file.chmod(0o600)
     print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")
@@ -557,6 +570,8 @@ if __name__ == "__main__":
             _keygen(Path(".env"))
         case ["keygen", "--production", domain]:
             _keygen(Path(".env"), domain.strip().lower())
+        case ["keygen", "--production", domain, "--modules", modules]:
+            _keygen(Path(".env"), domain.strip().lower(), modules)
         case ["token", sub, *args]:
             _token(Path(".env"), sub, args)
         case _:

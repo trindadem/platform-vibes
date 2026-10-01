@@ -46,6 +46,8 @@ x-service: &service
     STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?rode uv run python -m core.security keygen}
     STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:?rode uv run python -m core.security keygen}
     STORAGE_CORS_ORIGINS: ${STORAGE_CORS_ORIGINS:-${CORS_ORIGINS:-}}
+    # Módulos de negócio instalados (README §9): vazio = todos. O svc-plans só lista estes.
+    MODULES: ${MODULES:-}
   depends_on:
     nats: { condition: service_healthy }
     surreal-init: { condition: service_completed_successfully }
@@ -88,6 +90,8 @@ services:
       # O gateway tem usuário próprio no NATS, restrito (compose.prod.yaml): publica gatilhos e lê os avisos ao vivo.
       NATS_USER: ${NATS_GATEWAY_PASSWORD:+gateway}
       NATS_PASSWORD: ${NATS_GATEWAY_PASSWORD:-}
+      # Só as rotas da plataforma e dos módulos instalados (README §9); vazio = todos os manifestos.
+      MODULES: ${MODULES:-}
     depends_on:
       nats: { condition: service_healthy }
     healthcheck: *service-health

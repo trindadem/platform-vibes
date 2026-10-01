@@ -63,6 +63,12 @@ MODULE = Module("Plano", "Plano, módulos e consumo da organização", category=
 
 class PlansSettings(BaseSettings):
     platform_tenant: str | None = Field(None, description="Organização que administra a plataforma (gerencia os planos)")
+    modules: str = Field("", description="Módulos de negócio instalados, separados por vírgula (vazio: todos do catálogo)")
+
+    def installed(self) -> frozenset[str] | None:
+        """None: todos os módulos do catálogo valem (instalação compartilhada)."""
+        chosen = frozenset(m.strip() for m in self.modules.split(",") if m.strip())
+        return chosen or None
 
 
 class _Input(BaseModel):

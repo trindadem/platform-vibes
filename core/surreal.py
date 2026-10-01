@@ -192,6 +192,7 @@ class Database:
         search: Mapping[str, Iterable[str]] | None = None,
         migrations: Sequence[Migration] = (),
         service: str | None = None,
+        resources: Iterable[Any] = (),
     ) -> AsyncIterator["Database"]:
         """Conecta no boot (falha cedo se faltar credencial) e garante tabelas, campo tenant e índices.
 
@@ -199,10 +200,17 @@ class Database:
         unique: {"tabela": ["campo", ...]}; em tabela por organização o tenant entra no índice sozinho
         (o mesmo e-mail pode existir em duas organizações). search: {"tabela": ["campo", ...]} cria o índice de busca
         por palavras de cada campo (db.page com q). migrations (com service=SERVICE) roda as mudanças de dados pendentes,
-        em ordem. Idempotente. O SurrealDB 3 recusa SELECT em
+        em ordem. resources (core/resources.py) acrescenta a tabela por organização, a busca e o índice único de cada
+        cadastro declarado. Idempotente. O SurrealDB 3 recusa SELECT em
         tabela que nunca recebeu registro; declarar no boot faz a primeira listagem devolver [] em vez de erro.
         """
+        resources = list(resources)
+        tables = [*tables, *(r.table for r in resources)]
+        unique = {**(unique or {}), **{r.table: r.unique for r in resources if r.unique}}
+        search = {**(search or {}), **{r.table: r.search for r in resources if r.search}}
         per_tenant, globals_ = [_ident(t) for t in tables], [_ident(t) for t in shared]
+        if len(per_tenant) != len(set(per_tenant)):
+            raise ValueError(f"tabela declarada duas vezes: {sorted(t for t in per_tenant if per_tenant.count(t) > 1)}")
         if both := set(per_tenant) & set(globals_):
             raise ValueError(f"tabela declarada em tables e em shared: {sorted(both)}")
         indexes = {_ident(t): [_ident(f) for f in fields] for t, fields in (unique or {}).items()}

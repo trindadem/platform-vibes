@@ -1,0 +1,287 @@
+# Nível 2: ação com regra de estado e de papel.
+id: vendas-orcamentos
+level: 2
+service: vendas
+title: Orçamentos com aprovação por papel
+spec: |
+  # Spec: vendas
+
+  ## 1. Objetivo Operacional
+  Orçamentos comerciais: a equipe cadastra e aprova; desconto acima de 10% só com dono ou administrador.
+  Módulo (schemas.MODULE): título "Vendas", descrição "Orçamentos e propostas", categoria "Comercial".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `orcamentos` (Resource, título "Orçamentos"), modelo `Orcamento`:
+    - `cliente`: texto obrigatório, 2 a 120 caracteres, título "Cliente";
+    - `valor`: Money com gt=0, título "Valor";
+    - `desconto`: número de 0 a 100 (percentual), padrão 0, título "Desconto (%)";
+    - `status`: "rascunho" | "aprovado" | "recusado", padrão "rascunho", título "Status".
+  - Busca em cliente; filtro por status; ordem por valor.
+  - POST /aprovar (`Aprovacao { id }`) → `OrcamentoItem` com status "aprovado" (name: aprovar no manifesto).
+  - O cadastro `registros`, a ação /execute, o gatilho e o workflow do esqueleto continuam como estão.
+  - Tela: frontend/src/modules/vendas/orcamentos/page.tsx (subtela /vendas/orcamentos, título "Orçamentos") com
+    ResourceList(useResource(vendas.orcamentos)) e o botão "Aprovar" em cada linha em rascunho.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — vendas_orcamentos, por organização.
+  2. aprovar: lê (resources.get), confere status e papel, atualiza (resources.update).
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - ERRO_VENDAS_STATUS (409): só orçamento em rascunho é aprovado.
+  - ERRO_VENDAS_DESCONTO (403): desconto acima de 10% e quem aprova não é owner nem admin.
+  - ERRO_RECORD_NOT_FOUND (404): de outra organização ou inexistente.
+acceptance: |
+  from pathlib import Path
+
+  from core.testing import service_app
+
+
+  def test_aprovar():
+      async def cenario(app):
+          dona = app.user("ana", "acme", "owner")
+          vendedor = app.user("caio", "acme", "member")
+          pequeno = (await vendedor.post("/orcamentos", json={"cliente": "Padaria", "valor": 1000, "desconto": 5})).json()["data"]
+          grande = (await vendedor.post("/orcamentos", json={"cliente": "Mercado", "valor": 5000, "desconto": 15})).json()["data"]
+          ok = await vendedor.post("/aprovar", json={"id": pequeno["id"]})
+          assert ok.status_code == 200, ok.text
+          assert ok.json()["data"]["status"] == "aprovado"
+          negado = await vendedor.post("/aprovar", json={"id": grande["id"]})
+          assert negado.status_code == 403 and negado.json()["error"]["code"] == "ERRO_VENDAS_DESCONTO"
+          assert (await dona.post("/aprovar", json={"id": grande["id"]})).json()["data"]["status"] == "aprovado"
+          de_novo = await dona.post("/aprovar", json={"id": pequeno["id"]})
+          assert de_novo.status_code == 409 and de_novo.json()["error"]["code"] == "ERRO_VENDAS_STATUS"
+          assert (await app.user("bia", "beta", "owner").post("/aprovar", json={"id": pequeno["id"]})).status_code == 404
+          assert (await vendedor.post("/orcamentos", json={"cliente": "Ruim", "valor": 10, "desconto": 120})).status_code == 422
+          registros = await dona.get("/registros")
+          assert registros.status_code == 200  # o esqueleto continua
+
+      service_app(cenario)
+
+
+  def test_subtela():
+      tela = Path("frontend/src/modules/vendas/orcamentos/page.tsx").read_text()
+      assert "useResource(vendas.orcamentos)" in tela and "vendas.aprovar" in tela
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-vendas/schemas.py: |
+    """svc-vendas · contratos (DTOs, enums, constantes). Fonte da verdade: specs/vendas.md §2"""
+    from typing import Any, Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Money, Resource, Text
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-vendas"
+    TASK_QUEUE = "vendas-queue"
+    TRIGGER_SUBJECT = "events.vendas.trigger"
+    PROCESSED_SUBJECT = "events.vendas.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Vendas", "Orçamentos e propostas", category="Comercial")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Registro(Fields):
+        title: str = Field(..., min_length=1, max_length=200, title="Título", description="Aparece na lista e entra na busca")
+        notes: Text | None = Field(None, title="Observações")
+
+
+    REGISTROS = Resource(SERVICE, "registros", Registro, "Registros", search=("title",), sort=("title",))
+
+
+    class Orcamento(Fields):
+        cliente: str = Field(..., min_length=2, max_length=120, title="Cliente")
+        valor: Money = Field(..., gt=0, title="Valor")
+        desconto: float = Field(0, ge=0, le=100, title="Desconto (%)")
+        status: Literal["rascunho", "aprovado", "recusado"] = Field("rascunho", title="Status")
+
+
+    ORCAMENTOS = Resource(SERVICE, "orcamentos", Orcamento, "Orçamentos", search=("cliente",), sort=("valor",), filters=("status",))
+    RESOURCES = [REGISTROS, ORCAMENTOS]
+    OrcamentoItem = ORCAMENTOS.item
+
+
+    class Aprovacao(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-vendas/service.py: |
+    """svc-vendas · lógica de negócio pura. Fonte da verdade: specs/vendas.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "vendas.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.envelope import ServiceError
+    from core.nats_bus import bus
+    from core.resources import ResourceRef, resources
+    from core.security import current
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import ORCAMENTOS, PROCESSED_SUBJECT, REGISTROS, Aprovacao, ExecutionInput, ExecutionResult, OrcamentoItem, Registro
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    #   Migration(1, "observação padrão nos registros antigos", sql="UPDATE vendas_registros SET notes = '' WHERE notes = NONE")
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("vendas")
+    class VendasService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(REGISTROS, Registro(title=data.title))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+
+        async def aprovar(self, data: Aprovacao) -> OrcamentoItem:
+            """Aprova um orçamento em rascunho; desconto acima de 10% só com dono ou administrador."""
+            atual = await resources.get(ORCAMENTOS, ResourceRef(id=data.id))
+            if atual.status != "rascunho":
+                raise ServiceError("ERRO_VENDAS_STATUS", "Só orçamento em rascunho pode ser aprovado.", status=409)
+            who = current()
+            if atual.desconto > 10 and not (who and {"owner", "admin"} & who.roles):
+                raise ServiceError("ERRO_VENDAS_DESCONTO", "Desconto acima de 10% só com dono ou administrador.", status=403)
+            return await resources.update(ORCAMENTOS, ORCAMENTOS.update(id=data.id, status="aprovado"))
+  services/svc-vendas/main.py: |
+    """svc-vendas · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/vendas.md
+
+    HTTP /registros...  → cadastro declarado em schemas.RESOURCES (core/resources.py): lista, item, cria, edita, remove.
+    HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
+    NATS TRIGGER_SUBJECT → inicia VendasWorkflow (assíncrona, durável e idempotente).
+
+    Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-vendas main:app --port 8100 --env-file .env
+    """
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    from core.envelope import ResponseEnvelope, install_envelope
+    from core.nats_bus import bus
+    from core.plans import plans
+    from core.resources import resources
+    from core.security import install_security
+    from core.surreal import db
+    from core.telemetry import install_telemetry
+    from core.temporal_runner import runner
+
+    from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, Aprovacao, ExecutionInput
+    from service import MIGRATIONS, VendasService
+    from workflows import SCHEDULES, VendasWorkflow
+
+    svc = VendasService()
+
+
+    async def on_trigger(data: ExecutionInput) -> None:
+        # id = id estável da mensagem: reentrega do NATS nunca inicia um segundo workflow.
+        await runner.start_workflow(VendasWorkflow.run, data, task_queue=TASK_QUEUE, id=bus.message_id())
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with (
+            bus.connected(SERVICE),
+            db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
+            runner.worker(TASK_QUEUE, workflows=[VendasWorkflow], service=svc, schedules=SCHEDULES),
+        ):
+            await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
+            await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
+            yield
+
+
+    app = FastAPI(title=SERVICE, lifespan=lifespan)
+    install_envelope(app, service=SERVICE)
+    install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
+    install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
+    resources.mount(app, RESOURCES)  # as rotas dos cadastros (README §5.19)
+
+
+    @app.post("/execute", response_model=ResponseEnvelope)
+    async def execute(data: ExecutionInput) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.process_task(data), service=SERVICE)
+
+
+    @app.post("/aprovar", response_model=ResponseEnvelope)
+    async def aprovar(data: Aprovacao) -> ResponseEnvelope:
+        return ResponseEnvelope.success(data=await svc.aprovar(data), service=SERVICE)
+  gateway/endpoints/vendas.yaml: |
+    # svc-vendas · rotas públicas no Gateway. Fonte da verdade: specs/vendas.md §2
+    service: vendas
+    base_path: /api/v1/vendas
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # vendas.<cadastro>, e vira vendas.<cadastro> no frontend.
+    resources: [registros, orcamentos]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-vendas:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.vendas.trigger
+
+      - path: /aprovar
+        method: POST
+        auth: client_jwt
+        request: Aprovacao
+        response: OrcamentoItem
+        target_type: http
+        target_url: http://svc-vendas:8000/aprovar
+  frontend/src/modules/vendas/orcamentos/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Button } from "@/components/Button";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useAction, useResource } from "@/core/api";
+    import { vendas } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Orçamentos" };
+
+    export default function Orcamentos() {
+      const orcamentos = useResource(vendas.orcamentos);
+      const aprovar = useAction(vendas.aprovar, { onSuccess: orcamentos.list.reload });
+      return (
+        <Page title="Orçamentos" description="Orçamentos da equipe; desconto acima de 10% só o dono ou um administrador aprova.">
+          <ResourceList
+            resource={orcamentos}
+            noun="orçamento"
+            rowActions={(o) =>
+              o.status === "rascunho" && (
+                <Button size="sm" variant="secondary" loading={aprovar.running} onClick={() => void aprovar.run({ id: o.id })}>
+                  Aprovar
+                </Button>
+              )
+            }
+          />
+        </Page>
+      );
+    }

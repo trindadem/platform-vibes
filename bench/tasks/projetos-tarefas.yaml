@@ -1,0 +1,202 @@
+# Nível 1: declaração com papéis de escrita, datas e texto longo.
+id: projetos-tarefas
+level: 1
+service: projetos
+title: Tarefas com papéis de escrita
+spec: |
+  # Spec: projetos
+
+  ## 1. Objetivo Operacional
+  Quadro de tarefas da organização: todos veem, só donos e administradores criam, editam e removem.
+  Módulo (schemas.MODULE): título "Projetos", descrição "Tarefas e prazos", categoria "Operações".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `tarefas` (Resource, título "Tarefas"), modelo `Tarefa`:
+    - `titulo`: texto obrigatório, 3 a 160 caracteres, título "Título";
+    - `descricao`: Text opcional, título "Descrição";
+    - `status`: "a_fazer" | "fazendo" | "feito", padrão "a_fazer", título "Status";
+    - `prazo`: data (date) opcional, título "Prazo";
+    - `responsavel`: texto opcional, até 120 caracteres, título "Responsável".
+  - Busca em titulo e responsavel; filtro por status; ordem por prazo e titulo; escrita só para owner e admin.
+  - Substitua o cadastro `registros` do esqueleto por `tarefas`; a ação /execute e o gatilho passam a criar uma tarefa
+    com titulo = title. A tela do módulo mostra as tarefas com ResourceList.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — projetos_tarefas, por organização.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - ERRO_PROJETOS_FORBIDDEN (403): membro comum tentando criar, editar ou remover.
+acceptance: |
+  import schemas
+  from core.testing import service_app
+
+
+  def test_tarefas_pelas_rotas():
+      async def cenario(app):
+          dona = app.user("ana", "acme", "owner")
+          membro = app.user("caio", "acme", "member")
+          criada = await dona.post("/tarefas", json={"titulo": "Fechar o mês", "prazo": "2026-10-31", "responsavel": "Caio"})
+          assert criada.status_code == 200, criada.text
+          tarefa = criada.json()["data"]
+          assert (tarefa["status"], tarefa["prazo"]) == ("a_fazer", "2026-10-31")
+          negado = await membro.post("/tarefas", json={"titulo": "Pelo membro"})
+          assert negado.status_code == 403 and negado.json()["error"]["code"] == "ERRO_PROJETOS_FORBIDDEN"
+          assert (await membro.post("/tarefas/update", json={"id": tarefa["id"], "status": "feito"})).status_code == 403
+          assert (await membro.get("/tarefas")).json()["data"]["total"] == 1  # ler, pode
+          await dona.post("/tarefas", json={"titulo": "Abrir o caixa", "prazo": "2026-10-02", "status": "fazendo"})
+          ordem = await dona.get("/tarefas", params={"sort": "prazo"})
+          assert [t["titulo"] for t in ordem.json()["data"]["items"]] == ["Abrir o caixa", "Fechar o mês"]
+          fazendo = await dona.get("/tarefas", params={"status": "fazendo"})
+          assert [t["titulo"] for t in fazendo.json()["data"]["items"]] == ["Abrir o caixa"]
+          busca = await dona.get("/tarefas", params={"q": "caio"})
+          assert [t["titulo"] for t in busca.json()["data"]["items"]] == ["Fechar o mês"]
+          assert (await dona.post("/tarefas", json={"titulo": "Ok"})).status_code == 422
+          feita = await dona.post("/tarefas/update", json={"id": tarefa["id"], "status": "feito"})
+          assert feita.json()["data"]["status"] == "feito"
+
+      service_app(cenario)
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-projetos/schemas.py: |
+    """svc-projetos · contratos (DTOs, enums, constantes). Fonte da verdade: specs/projetos.md §2"""
+    from datetime import date
+    from typing import Any, Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Resource, Text
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-projetos"
+    TASK_QUEUE = "projetos-queue"
+    TRIGGER_SUBJECT = "events.projetos.trigger"
+    PROCESSED_SUBJECT = "events.projetos.processed"
+
+    # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+    # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+    MODULE = Module("Projetos", "Tarefas e prazos", category="Operações")
+
+
+    # Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+    # Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+    class Tarefa(Fields):
+        titulo: str = Field(..., min_length=3, max_length=160, title="Título")
+        descricao: Text | None = Field(None, title="Descrição")
+        status: Literal["a_fazer", "fazendo", "feito"] = Field("a_fazer", title="Status")
+        prazo: date | None = Field(None, title="Prazo")
+        responsavel: str | None = Field(None, max_length=120, title="Responsável")
+
+
+    TAREFAS = Resource(
+        SERVICE, "tarefas", Tarefa, "Tarefas", search=("titulo", "responsavel"), sort=("prazo", "titulo"),
+        filters=("status",), write=("owner", "admin"),
+    )
+    RESOURCES = [TAREFAS]
+
+
+    class ExecutionInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+        title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
+        payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
+
+
+    class ExecutionResult(BaseModel):
+        task_id: str
+        status: str
+        data: dict[str, Any] = Field(default_factory=dict)
+  services/svc-projetos/service.py: |
+    """svc-projetos · lógica de negócio pura. Fonte da verdade: specs/projetos.md §3
+
+    Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
+    de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "projetos.<método>".
+    Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+    lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
+    """
+    from core.nats_bus import bus
+    from core.resources import resources
+    from core.surreal import Migration
+    from core.temporal_runner import activities
+
+    from schemas import PROCESSED_SUBJECT, TAREFAS, ExecutionInput, ExecutionResult, Tarefa
+
+    # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+    #   Migration(1, "observação padrão nos registros antigos", sql="UPDATE projetos_registros SET notes = '' WHERE notes = NONE")
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("projetos")
+    class ProjetosService:
+        async def process_task(self, data: ExecutionInput) -> ExecutionResult:
+            """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+            item = await resources.create(TAREFAS, Tarefa(titulo=data.title))
+            result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
+            await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+            return result
+  gateway/endpoints/projetos.yaml: |
+    # svc-projetos · rotas públicas no Gateway. Fonte da verdade: specs/projetos.md §2
+    service: projetos
+    base_path: /api/v1/projetos
+
+    # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+    # projetos.<cadastro>, e vira projetos.<cadastro> no frontend.
+    resources: [tarefas]
+
+    endpoints:
+      - path: /execute
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+        response: ExecutionResult
+        target_type: http
+        target_url: http://svc-projetos:8000/execute
+        timeout: 30
+
+      - path: /trigger
+        method: POST
+        auth: client_jwt
+        request: ExecutionInput
+        target_type: nats
+        nats_subject: events.projetos.trigger
+  tests/projetos.py: |
+    """svc-projetos · testes. Fonte da verdade: specs/projetos.md §2 e §4"""
+    import pytest
+    from pydantic import ValidationError
+
+    from core.testing import service_app
+
+    from schemas import TAREFAS, ExecutionInput
+
+
+    def test_cadastro_pelas_rotas_so_da_organizacao():
+        async def cenario(app):
+            ana = app.user("ana", "acme", "owner")
+            criado = await ana.post("/tarefas", json={"titulo": "Fechar o mês"})
+            assert criado.status_code == 200, criado.text
+            assert (await ana.get("/tarefas")).json()["data"]["total"] == 1
+            assert (await app.user("bia", "beta", "owner").get("/tarefas")).json()["data"]["total"] == 0
+
+        service_app(cenario)
+
+
+    def test_campo_nao_declarado_e_rejeitado():
+        with pytest.raises(ValidationError):
+            ExecutionInput.model_validate({"title": "x", "is_admin": True})
+  frontend/src/modules/projetos/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { projetos } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Projetos", module: "projetos" };
+
+    export default function Projetos() {
+      const tarefas = useResource(projetos.tarefas);
+      return (
+        <Page title="Tarefas" description="Tarefas e prazos da organização.">
+          <ResourceList resource={tarefas} noun="tarefa" />
+        </Page>
+      );
+    }

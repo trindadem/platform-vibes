@@ -25,6 +25,11 @@ cogniventure/
 ├── compose.prod.yaml            # Produção num host só, sobre o compose.yaml: HTTPS, frontend, NATS com senha (seção 9)
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
+├── bench/                       # Banco de provas da meta layer: quanto um modelo de código acerta nos trilhos (seção 7)
+│   ├── run.py                   # Roda as tarefas num modelo (ou nas referências) e escreve o relatório
+│   ├── tasks/<id>.yaml          # 1 tarefa = spec de um módulo + prova de aceitação (+ solução de referência)
+│   └── results/                 # Relatórios de cada rodada (.md e .json)
+│
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
 │   └── <service_name>.md
 │
@@ -45,6 +50,8 @@ cogniventure/
 │   ├── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
 │   ├── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
 │   ├── plans.py                 # Módulos, planos e limites: o que cada organização usa, conferido pelo core (seção 5.17)
+│   ├── resources.py             # Cadastros declarados: CRUD, rotas, contrato e tela saem do schemas.py (seção 5.19)
+│   ├── testing.py               # Kit de testes: o main.py do serviço em memória, pelas rotas (seção 5.5)
 │   └── telemetry.py             # Observabilidade: logs estruturados, trace ponta a ponta, métricas e /health (seção 5.18)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
@@ -122,7 +129,7 @@ O código vive somente em `service.sh` (este README não o duplica). O script:
 
 - valida o nome (seção 2) e aborta sem tocar em nada se o serviço ou a rota já existirem;
 - cria `specs/<service_name>.md` com o template de 4 tópicos — **ou preserva o spec, se já existir** (spec-first);
-- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker), uma lista paginada com busca (`GET /records`, seção 5.12) e as listas vazias `SCHEDULES` e `MIGRATIONS` já ligadas (seção 5.13);
+- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker), um cadastro declarado (`registros`, seção 5.19: lista com busca, criação, edição e remoção sem código) e as listas vazias `SCHEDULES` e `MIGRATIONS` já ligadas (seção 5.13);
 - declara o serviço como módulo (`MODULE` no `schemas.py`, `plans.declare` no boot, seção 5.17) e cria a tela `frontend/src/modules/<service_name>/page.tsx` (lista com busca e criação, já com `meta.module`), ou preserva a que já existir;
 - cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py` (no SurrealDB embutido), e registra o serviço no fim do `compose.yaml`;
 - gera tudo numa área temporária, verifica a sintaxe e só então publica (tudo ou nada).
@@ -208,7 +215,7 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
 - **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), já com o bytecode compilado (o container sobe sem recompilar as bibliotecas), copia apenas `core/` e a pasta do app e roda sem root. O frontend tem a sua, `frontend/Dockerfile` (seção 9).
-- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), com as tabelas e os índices do boot, executando a SurrealQL de verdade. O motor embutido é o 2.x e o servidor é o 3.x: o core cuida das diferenças conhecidas (seção 5.12).
+- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), com as tabelas e os índices do boot, executando a SurrealQL de verdade. O motor embutido é o 2.x e o servidor é o 3.x: o core cuida das diferenças conhecidas (seção 5.12). Para testar pelas rotas, `core/testing.py` sobe o `main.py` de verdade em memória: `service_app(cenario)` roda o lifespan inteiro e dá clientes HTTP com token (`app.user("ana", "acme", "owner")`), o que foi publicado (`app.published`, `app.live`), os handlers assinados (`app.handlers`) e respostas falsas de RPC (`app.respond`).
 
   ```bash
   PYTHONPATH=services/svc-<service_name> uv run python -m pytest tests/<service_name>.py
@@ -234,6 +241,8 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `webhooks.py` | `WebhookEvent(nome, descrição, Modelo)`, `webhooks.declare(lista)`, `webhooks.emit(nome, modelo, key)`, `webhooks.verify(segredo, cabeçalhos, corpo)`, `sign`, `new_secret` (seção 5.16) |
 | `plans.py` | `Module(título, descrição, category, limits, requires, core, default)`, `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(MODULE)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.enabled(módulo)`, `plans.limits()`, `plans.assign(plano, modules=)` (seção 5.17) |
 | `telemetry.py` | `install_telemetry(app, service, edge, health)`, `telemetry.counter(nome, descrição)`, `telemetry.histogram(nome, descrição)` (seção 5.18) |
+| `resources.py` | `Resource(SERVICE, nome, Campos, título, search, sort, filters, unique, columns, limit, write)`, `Fields`, `Money`, `Email`, `Phone`, `Text`, `resources.mount(app, RESOURCES)`, `resources.list/get/create/update/remove(recurso, ...)` (seção 5.19) |
+| `testing.py` | `service_app(cenario)`: o `main.py` em memória, com `app.user(...)`, `app.published`, `app.live`, `app.handlers`, `app.respond(subject, função)` (seção 5.5) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -579,6 +588,34 @@ pagas.add(1, {"forma": "pix"})                                     # atributo de
 - **Exportação:** OTLP/HTTP para `OTEL_EXPORTER_OTLP_ENDPOINT` (Grafana Cloud, Tempo, Jaeger, Honeycomb, Datadog...). Sem a variável, nada sai do processo e os ids continuam nos logs. No ambiente local, o Grafana (`grafana/otel-lgtm`) recebe tudo e mostra traces (Tempo), métricas (Prometheus) e logs (Loki) em `http://localhost:3000`.
 - **Saúde:** `GET /health` em cada serviço e no gateway confere NATS, SurrealDB e Temporal do processo (`200` ou `503` dizendo qual caiu, sem detalhe interno). É aberto, não gera trace nem log e serve ao `healthcheck` do compose e ao orquestrador de produção.
 
+### 5.19 Cadastros declarados (`core/resources.py`)
+
+Cadastro não se programa: declara-se no `schemas.py`, e o core faz o resto. É o primeiro nível da meta layer: a decisão que se repete vira campo de declaração, e o agente só escreve regra de negócio.
+
+```python
+class Cliente(Fields):                                             # schemas.py: os campos de quem preenche
+    nome: str = Field(..., min_length=2, max_length=120, title="Nome ou razão social")
+    email: Email | None = Field(None, title="E-mail")
+    status: Literal["ativo", "inativo"] = Field("ativo", title="Status")
+    limite: Money = Field(0, title="Limite de crédito")
+
+CLIENTES = Resource(SERVICE, "clientes", Cliente, "Clientes", search=("nome", "email"), sort=("nome", "limite"),
+                    filters=("status",), unique=("nome",), limit="clientes", write=("owner", "admin"))
+RESOURCES = [CLIENTES]
+
+db.connected(resources=RESOURCES, ...)       # main.py, no lifespan: tabela, busca e índice
+resources.mount(app, RESOURCES)              # main.py, depois de install_telemetry: as 5 rotas
+resources: [clientes]                        # gateway/endpoints/<serviço>.yaml: publica as rotas e o aviso ao vivo
+const clientes = useResource(vendas.clientes);          // a tela: lista ao vivo, criar, editar e remover
+<ResourceList resource={clientes} noun="cliente" />
+```
+
+- **O que sai da declaração:** a tabela `<serviço>_<cadastro>` (por organização, com carimbos), as rotas `GET /clientes` (página, busca, filtros e ordem pela URL), `GET /clientes/item?id=`, `POST /clientes`, `POST /clientes/update` (muda só o que veio) e `POST /clientes/remove`, o cliente tipado `vendas.clientes.{list, get, create, update, remove, meta}` no `contracts.ts` e o aviso ao vivo `vendas.clientes`. O id na API é a chave curta do registro.
+- **Campos:** herdam de `Fields` (campo não declarado é recusado); `title=` é o rótulo e `description=` a ajuda na tela. Tipos com tela pronta: `Money`, `Email`, `Phone`, `Text` (área de texto) e os do Python (`str`, `int`, `float`, `bool`, `date`, `datetime`, `Literal[...]`, que vira escolha). `id`, `tenant` e carimbos são do banco.
+- **Opções:** `search` (busca por palavras), `sort` (`created_at` sempre entra), `filters` (só campos `Literal`, `Enum` ou `bool`), `unique` (campos obrigatórios que não se repetem na organização: 409 `ERRO_RECORD_DUPLICATE`), `columns` (colunas da lista; padrão: os 5 primeiros campos que não são texto longo), `limit` (um `Limit` total do `MODULE`, conferido antes de criar e contado depois, seção 5.17) e `write` (papéis que criam, editam e removem; ler é de todo membro: 403 `ERRO_<SERVIÇO>_FORBIDDEN`).
+- **Regra de negócio:** em `service.py`, com as mesmas operações do core: `await resources.get(CLIENTES, ResourceRef(id=...))`, `resources.update(CLIENTES, CLIENTES.update(id=..., status="inativo"))`, `resources.create(CLIENTES, Cliente(...))`, `resources.list(CLIENTES, CLIENTES.query(status="ativo"))`. Os modelos derivados têm o nome do modelo de campos: `ClienteItem` (o registro), `ClienteUpdate`, `ClienteQuery` e `ClientePage`, acessíveis por `CLIENTES.item`, `.update`, `.query` e `.page`. Ação nova (ex.: `POST /aprovar`) é uma rota comum: modelo de entrada em `schemas.py`, método em `service.py`, rota em `main.py` e no manifesto (`response: ClienteItem`). Para usar um modelo derivado como tipo (retorno do método, `response:` do manifesto), dê nome a ele no `schemas.py`: `ClienteItem = CLIENTES.item`.
+- **Tela:** `useResource` (`core/api.ts`) junta lista e ações; `ResourceList` (catálogo, Receitas) monta a lista com busca, filtros, ordem e páginas, a criação e a edição em painel lateral e a remoção com confirmação, tudo a partir de `meta`. Colunas próprias por `columns=`; ações por linha por `rowActions=`.
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -591,7 +628,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). Uma ação que muda o que outra parte da tela mostra chama `refresh(contrato.funcao)`: toda consulta aberta com essa função busca de novo (ex.: marcar como lido atualiza o sino). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR; `UsageMeter` mostra quanto foi usado de um limite. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. Cadastro declarado no backend (seção 5.19): `useResource(modulo.cadastro)` + `ResourceList`, e a tela está pronta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). Uma ação que muda o que outra parte da tela mostra chama `refresh(contrato.funcao)`: toda consulta aberta com essa função busca de novo (ex.: marcar como lido atualiza o sino). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR; `UsageMeter` mostra quanto foi usado de um limite. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };
@@ -638,7 +675,15 @@ npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + Ty
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
 
-Em todo push, o CI (`.github/workflows/ci.yml`) repete o que roda à mão: testes do core, do gateway e de cada serviço, `contracts.ts` em dia, `npm run check` com o `CATALOG.md` versionado igual ao gerado, um serviço novo nascendo do `service.sh` e passando nos próprios testes, no contrato, no compose e no frontend, e a produção (seção 9): `compose.prod.yaml` válido, só as portas 80 e 443 abertas e a imagem do frontend construída. Vermelho no GitHub = algo quebrou o contrato.
+**Banco de provas (meta layer).** `bench/` mede quanto um modelo de código barato acerta, de primeira, dentro dos trilhos. Cada tarefa (`bench/tasks/<id>.yaml`) é um módulo de negócio: o spec e uma prova de aceitação que o modelo não vê (pelo `core/testing.py`), mais uma solução de referência. Numa cópia do repositório, o `service.sh` gera o esqueleto, o modelo recebe um pacote de contexto (trechos deste README, docstrings do core, índice do catálogo e os arquivos do serviço) e devolve só os arquivos do serviço; os trilhos conferem contrato, testes, aceitação e `npm run check`, e os erros voltam ao modelo por até 3 tentativas. Toda falha que se repete vira trilho, padrão do gerador ou receita, e o banco roda de novo.
+
+```bash
+set -a; . <arquivo fora do repositório com AWS_BEARER_TOKEN_BEDROCK>; set +a
+uv run python bench/run.py --model qwen-30b          # relatório em bench/results/<data>-qwen-30b.md e .json
+uv run python bench/run.py --reference               # as tarefas passam com as referências (o CI roda isto)
+```
+
+Em todo push, o CI (`.github/workflows/ci.yml`) repete o que roda à mão: testes do core, do gateway e de cada serviço, `contracts.ts` em dia, `npm run check` com o `CATALOG.md` versionado igual ao gerado, um serviço novo nascendo do `service.sh` e passando nos próprios testes, no contrato, no compose e no frontend, as tarefas do banco de provas passando com as referências, e a produção (seção 9): `compose.prod.yaml` válido, só as portas 80 e 443 abertas e a imagem do frontend construída. Vermelho no GitHub = algo quebrou o contrato.
 
 ### Ambiente local (`compose.yaml`)
 
@@ -676,7 +721,7 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 - implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
 - abrir uma rota (`public=`) que o spec não declara pública;
 - ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (seção 5.9), ou organização vinda do corpo (a única exceção são as migrações versionadas, seção 5.13);
-- chamar provedor de IA, montar cliente `openai` ou Agno, ou guardar chave de provedor fora de `core/llm.py` e do `svc-ai`;
+- chamar provedor de IA, montar cliente `openai` ou Agno, ou guardar chave de provedor fora de `core/llm.py` e do `svc-ai` (a exceção é o banco de provas, `bench/`: ferramenta de desenvolvimento que roda com a chave de quem a usa e que nenhum serviço importa);
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;
 
@@ -705,3 +750,4 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --build
 - **Fora do host:** e-mail pelo `SMTP_URL` (SES, Postmark, Resend...); observabilidade pelo `OTEL_EXPORTER_OTLP_ENDPOINT` (vazio: só logs em stdout). Mailpit e Grafana local não sobem.
 - **Por conta da operação:** backup dos volumes (`surreal-data`, `storage-data`, `temporal-data`) e dos segredos do `.env`. O Temporal e o armazenamento do compose servem a um host; para alta disponibilidade, Temporal Cloud (`TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`) e um S3 (`STORAGE_URL`, `STORAGE_PUBLIC_URL` e credenciais) entram pelo `.env`, sem mudar código.
 - **Conferido no CI:** a configuração de produção (`docker compose ... config`) e o build da imagem do frontend, em todo push.
+- **Instalação dedicada (um cliente, Enterprise):** o mesmo código e as mesmas imagens, só com os módulos de negócio do cliente. `keygen --production <domínio> --modules crm,vendas` grava `MODULES` e `COMPOSE_PROFILES` no `.env`: o compose sobe a plataforma e só esses serviços (cada serviço de negócio tem `profiles: [modules, <nome>]`, que o `service.sh` gera), o gateway publica só as rotas deles e da plataforma, o `svc-plans` só os lista nos planos e o menu esconde o que não está instalado. Sem `--modules`, `MODULES` fica vazio e `COMPOSE_PROFILES=modules`: todos os módulos (instalação compartilhada, onde o plano de cada organização liga o que ela usa, seção 5.17).

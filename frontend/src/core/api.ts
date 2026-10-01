@@ -17,6 +17,10 @@
  *   const faturas = useListQuery(loja.listar, { live: "loja.criada" });  // e recarrega ao vivo
  * e entregam o estado ao ListView (busca, filtros, ordenação no cabeçalho e páginas).
  *
+ * Cadastros declarados no backend (README §5.19): um hook e uma receita montam lista, criação, edição e remoção.
+ *   const clientes = useResource(vendas.clientes);                // lista ao vivo + ações + campos
+ *   <ResourceList resource={clientes} />
+ *
  * Tempo real (README §5.10):
  *   const resposta = useStream(assistente.responder);             // rota stream: pedaços tipados + resultado
  *   const lista = useLiveQuery("pedidos.criado", pedidos.listar);  // recarrega quando o evento chega
@@ -233,9 +237,12 @@ export interface QueryState<T> {
 
 /**
  * Hook: chama uma função de contracts.ts ao montar a tela e quando os argumentos mudam.
- * Uso: useQuery(gateway.health) ou useQuery(loja.detalhe, { fatura_id }). Tipos inferidos do contrato.
+ * Uso: useQuery(gateway.health), useQuery(loja.detalhe, { fatura_id }) ou useQuery(vendas.clientes.list) (lista sem
+ * filtro; com filtro: useQuery(vendas.clientes.list, { status: "ativo" })). Tipos inferidos do contrato.
  */
-export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOptions?]) => Promise<T>, ...args: A): QueryState<T> {
+export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOptions?]) => Promise<T>, ...args: A): QueryState<T>;
+export function useQuery<T, Q>(fn: (query?: Q, options?: RequestOptions) => Promise<T>): QueryState<T>;
+export function useQuery<T>(fn: (...args: never[]) => Promise<T>, ...args: unknown[]): QueryState<T> {
   const [state, setState] = useState<Omit<QueryState<T>, "reload">>({ data: null, error: null, loading: true });
   const [version, setVersion] = useState(0);
   // A busca depende só dos argumentos: função criada na hora (useQuery(() => ...)) não vira loop de requisições.
@@ -246,8 +253,11 @@ export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOpt
   useEffect(() => {
     const controller = new AbortController();
     setState((previous) => ({ ...previous, loading: true, error: null }));
-    latest.current
-      .fn(...latest.current.args, { signal: controller.signal })
+    // Parâmetros opcionais não passados (ex.: a query de uma lista) ficam undefined: as opções vão sempre no último.
+    const call = latest.current.fn as (...args: unknown[]) => Promise<T>;
+    const given = [...latest.current.args];
+    while (given.length < call.length - 1) given.push(undefined);
+    call(...given, { signal: controller.signal })
       .then((data) => setState({ data, error: null, loading: false }))
       .catch((error: unknown) => {
         if (!controller.signal.aborted) setState({ data: null, error: toApiError(error), loading: false });
@@ -387,6 +397,62 @@ export function useAction<A extends unknown[], T>(fn: (...args: A) => Promise<T>
 
   const reset = useCallback(() => setState({ running: false, error: null, result: null }), []);
   return { ...state, run, reset };
+}
+
+// ── Cadastros (core/resources.py, README §5.19) ──────────────────────────────
+
+/** Um campo do formulário de um cadastro, como o backend o declara. */
+export interface ResourceField {
+  name: string;
+  label: string;
+  kind: "text" | "textarea" | "email" | "phone" | "number" | "money" | "date" | "datetime" | "select" | "boolean";
+  required: boolean;
+  options?: { value: string; label: string }[];
+  hint?: string;
+}
+
+/** Descrição de um cadastro gerada no contracts.ts (meta): o que a ResourceList monta sozinha. */
+export interface ResourceMeta {
+  title: string;
+  /** Tópico ao vivo: toda mudança no cadastro recarrega a lista aberta. */
+  live: keyof LiveTopics;
+  fields: ResourceField[];
+  columns: { key: string; header: string; kind: ResourceField["kind"]; sort?: string }[];
+  filters: { name: string; label: string; options: { value: string; label: string }[] }[];
+  /** Campos da busca por texto, para o exemplo do campo (null: sem busca). */
+  search: string | null;
+}
+
+/** O que o contracts.ts gera para cada cadastro: <serviço>.<cadastro>. */
+export interface ResourceContract<T, C, U, Q extends object> {
+  list: (query?: Q, options?: RequestOptions) => Promise<ListPage<T>>;
+  get: (query: { id: string }, options?: RequestOptions) => Promise<T>;
+  create: (body: C, options?: RequestOptions) => Promise<T>;
+  update: (body: U, options?: RequestOptions) => Promise<T>;
+  remove: (body: { id: string }, options?: RequestOptions) => Promise<{ id: string }>;
+  meta: ResourceMeta;
+}
+
+/** Estado de useResource: o que a ResourceList recebe. */
+export interface ResourceState<T, C, U> {
+  list: ListState<T>;
+  create: ActionState<[C], T>;
+  update: ActionState<[U], T>;
+  remove: ActionState<[{ id: string }], { id: string }>;
+  meta: ResourceMeta;
+}
+
+/**
+ * Receita de cadastro: a lista (busca, filtros, ordem e páginas na URL, recarregada ao vivo) e as ações de criar,
+ * editar e remover, que recarregam a lista ao terminar. Uso: const clientes = useResource(vendas.clientes).
+ */
+export function useResource<T, C, U, Q extends object>(resource: ResourceContract<T, C, U, Q>): ResourceState<T, C, U> {
+  const list = useListQuery(resource.list, { live: resource.meta.live });
+  const onSuccess = list.reload;
+  const create = useAction((body: C) => resource.create(body), { onSuccess });
+  const update = useAction((body: U) => resource.update(body), { onSuccess });
+  const remove = useAction((body: { id: string }) => resource.remove(body), { onSuccess });
+  return { list, create, update, remove, meta: resource.meta };
 }
 
 /** O que uploadFile precisa dos contratos: pedido do link de envio e o link devolvido (ex.: identity.logoUpload). */

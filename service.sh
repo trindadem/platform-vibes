@@ -18,6 +18,8 @@
 #
 # Todo serviço é um módulo (README §5.17): MODULE no schemas.py, declarado no boot, e a tela
 # frontend/src/modules/<nome>/page.tsx, que entra no menu e some quando o plano não inclui o módulo.
+# O serviço nasce com um cadastro declarado (Resource "registros", README §5.19): lista, criação, edição e remoção
+# saem do core, e a tela é useResource + ResourceList.
 #
 # Garantias: valida o nome; nunca sobrescreve; preserva um spec ou uma tela já escritos (spec-first);
 # gera tudo numa área temporária, confere a sintaxe e só então publica (tudo ou nada).
@@ -80,52 +82,60 @@ TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio
 Módulo (schemas.MODULE): "__TITLE__", categoria Geral, ligado por padrão; tela em /__NAME__.
 
 ## 2. Contrato de Entrada e Saída
-- Request (schemas.ExecutionInput): { title: str, payload: {...} }
-- Response (schemas.ExecutionResult, dentro do envelope): { task_id: str, status: str, data: {...} }
-- GET /records?q=&sort=&page=&size= (schemas.RecordQuery) → RecordPage { items: Record[], total, page, size,
-  pages }: lista paginada da organização, com busca por palavras no title (README §5.12).
+- Cadastro registros (schemas.REGISTROS, README §5.19): Registro { title, notes? }. GET /registros (página, busca
+  por palavras no title, ordem), GET /registros/item?id=, POST /registros, POST /registros/update e
+  POST /registros/remove; ao vivo __NAME__.registros.
+- POST /execute (schemas.ExecutionInput { title, payload }) → ExecutionResult { task_id, status, data }: cria um
+  registro; POST /trigger faz o mesmo de forma durável (NATS + Temporal).
 - Quem chama e a organização vêm do token (core.security.current_tenant()), nunca do corpo.
 
 ## 3. Fluxo de Execução
-1. Persistência SurrealDB — tabela por organização: __SNAKE___records (o core grava e filtra o tenant)
-2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult) e, ao vivo para a tela da
-   organização, __NAME__.processado (bus.live)
+1. Persistência SurrealDB — cadastro por organização: __SNAKE___registros (o core grava, filtra o tenant e carimba)
+2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult)
 3. Temporal — __PASCAL__Workflow → activity __NAME__.process_task (timeout 5 min, 3 tentativas)
 4. Ciclo de vida (README §5.13) — agendamentos (workflows.SCHEDULES) e migrações (service.MIGRATIONS): nenhum ainda.
 
 ## 4. Casos de Borda e Erros Mapeados
+- ERRO_RECORD_NOT_FOUND (404): registro inexistente ou de outra organização.
 - ERRO___UPPER___INVALID_PAYLOAD: payload inconsistente (HTTP 422).
 - ERRO___UPPER___EXECUTION_FAILED: falha na orquestração (HTTP 500).
 EOF
 
 render "$STAGE/svc/schemas.py" <<'EOF'
 """svc-__NAME__ · contratos (DTOs, enums, constantes). Fonte da verdade: specs/__NAME__.md §2"""
-from datetime import datetime
-from typing import Any, ClassVar
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.plans import Module
-from core.surreal import ListQuery, Page
+from core.resources import Fields, Resource, Text
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-__NAME__"
 TASK_QUEUE = "__NAME__-queue"
 TRIGGER_SUBJECT = "events.__NAME__.trigger"
 PROCESSED_SUBJECT = "events.__NAME__.processed"
-PROCESSED_LIVE = "__NAME__.processado"  # ao vivo para a organização (README §5.10)
-TABLE = "__SNAKE___records"
-SEARCH = {TABLE: ["title"]}  # campos com busca por palavras (db.page com q, README §5.12)
 
 # O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
 # requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
 MODULE = Module("__TITLE__", "Descreva em uma frase o que o módulo faz (specs/__NAME__.md §1)", category="Geral")
 
 
+# Cadastros (README §5.19): lista, criação, edição, remoção, rotas, contrato e tela saem da declaração.
+# Campo novo = uma linha aqui (title= é o rótulo na tela); outro cadastro = outro Resource em RESOURCES.
+class Registro(Fields):
+    title: str = Field(..., min_length=1, max_length=200, title="Título", description="Aparece na lista e entra na busca")
+    notes: Text | None = Field(None, title="Observações")
+
+
+REGISTROS = Resource(SERVICE, "registros", Registro, "Registros", search=("title",), sort=("title",))
+RESOURCES = [REGISTROS]
+
+
 class ExecutionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
 
-    title: str = Field("", max_length=200, description="Título curto: aparece na lista e entra na busca")
+    title: str = Field(..., min_length=1, max_length=200, description="Título do registro que a tarefa cria")
     payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
 
 
@@ -133,25 +143,6 @@ class ExecutionResult(BaseModel):
     task_id: str
     status: str
     data: dict[str, Any] = Field(default_factory=dict)
-
-
-class Record(BaseModel):
-    id: str
-    title: str = ""
-    payload: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime | None = None  # carimbos do banco (README §5.13)
-    created_by: str | None = None
-
-
-class RecordQuery(ListQuery):
-    """GET /records: página, ordem e busca vêm da URL. Filtros novos entram como campos (README §5.12)."""
-
-    sortable: ClassVar[tuple[str, ...]] = ("title", "created_at")
-    default_sort: ClassVar[str | None] = "-created_at"  # mais novos primeiro
-
-
-class RecordPage(Page[Record]):
-    pass
 EOF
 
 render "$STAGE/svc/service.py" <<'EOF'
@@ -159,29 +150,28 @@ render "$STAGE/svc/service.py" <<'EOF'
 
 Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo
 de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "__NAME__.<método>".
-Helpers começam com _ e nunca viram activities.
+Helpers começam com _ e nunca viram activities. O cadastro (RESOURCES) não precisa de código aqui: o core faz
+lista, leitura, criação, edição e remoção; aqui fica só a regra de negócio (README §5.19).
 """
 from core.nats_bus import bus
-from core.surreal import Migration, db
+from core.resources import resources
+from core.surreal import Migration
 from core.temporal_runner import activities
 
-from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult, RecordPage, RecordQuery
+from schemas import PROCESSED_SUBJECT, REGISTROS, ExecutionInput, ExecutionResult, Registro
 
 # Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
-#   Migration(1, "título padrão nos registros antigos", sql="UPDATE __SNAKE___records SET title = '' WHERE title = NONE")
+#   Migration(1, "observação padrão nos registros antigos", sql="UPDATE __SNAKE___registros SET notes = '' WHERE notes = NONE")
 MIGRATIONS: list[Migration] = []
 
 
 @activities("__NAME__")
 class __PASCAL__Service:
-    async def list_records(self, data: RecordQuery) -> RecordPage:
-        return await db.page(TABLE, data, RecordPage)  # só da organização atual, com busca, ordem e páginas
-
     async def process_task(self, data: ExecutionInput) -> ExecutionResult:
-        record = await db.create(TABLE, data.model_dump())
-        result = ExecutionResult(task_id=str(record["id"]), status="SUCCESS", data=record)
+        """Uma ação de negócio (POST /execute, ou durável pelo gatilho NATS): cria um registro no cadastro."""
+        item = await resources.create(REGISTROS, Registro(title=data.title))
+        result = ExecutionResult(task_id=item.id, status="SUCCESS", data={**item.model_dump(mode="json"), "payload": data.payload})
         await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
-        await bus.live(PROCESSED_LIVE, result)  # telas abertas da organização atualizam sozinhas
         return result
 EOF
 
@@ -222,26 +212,26 @@ EOF
 render "$STAGE/svc/main.py" <<'EOF'
 """svc-__NAME__ · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/__NAME__.md
 
+HTTP /registros...  → cadastro declarado em schemas.RESOURCES (core/resources.py): lista, item, cria, edita, remove.
 HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
-HTTP GET /records   → lista paginada da organização (busca, ordem e páginas pela URL).
 NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona, durável e idempotente).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-__NAME__ main:app --port 8100 --env-file .env
 """
 from contextlib import asynccontextmanager
-from typing import Annotated
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
 from core.plans import plans
+from core.resources import resources
 from core.security import install_security
 from core.surreal import db
 from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
-from schemas import MODULE, SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
+from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput
 from service import MIGRATIONS, __PASCAL__Service
 from workflows import SCHEDULES, __PASCAL__Workflow
 
@@ -257,7 +247,7 @@ async def on_trigger(data: ExecutionInput) -> None:
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=[TABLE], search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
+        db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
         runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
@@ -269,16 +259,12 @@ app = FastAPI(title=SERVICE, lifespan=lifespan)
 install_envelope(app, service=SERVICE)
 install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
 install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
+resources.mount(app, RESOURCES)  # as rotas dos cadastros (README §5.19)
 
 
 @app.post("/execute", response_model=ResponseEnvelope)
 async def execute(data: ExecutionInput) -> ResponseEnvelope:
     return ResponseEnvelope.success(data=await svc.process_task(data), service=SERVICE)
-
-
-@app.get("/records", response_model=ResponseEnvelope)
-async def records(data: Annotated[RecordQuery, Query()]) -> ResponseEnvelope:
-    return ResponseEnvelope.success(data=await svc.list_records(data), service=SERVICE)
 EOF
 
 render "$STAGE/endpoint.yaml" <<'EOF'
@@ -286,10 +272,9 @@ render "$STAGE/endpoint.yaml" <<'EOF'
 service: __NAME__
 base_path: /api/v1/__NAME__
 
-# Eventos ao vivo que o serviço emite (bus.live): viram tipos no frontend (useLive / useLiveQuery).
-live:
-  - topic: processado
-    model: ExecutionResult
+# Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+# __NAME__.<cadastro>, e vira __CAMEL__.<cadastro> no frontend.
+resources: [registros]
 
 endpoints:
   - path: /execute
@@ -307,154 +292,72 @@ endpoints:
     request: ExecutionInput
     target_type: nats
     nats_subject: events.__NAME__.trigger
-
-  - path: /records
-    method: GET
-    auth: client_jwt
-    query: RecordQuery             # parâmetros da URL tipados: página, ordem, busca e filtros (README §5.12)
-    response: RecordPage
-    target_type: http
-    target_url: http://svc-__NAME__:8000/records
 EOF
 
 render "$STAGE/test.py" <<'EOF'
 """svc-__NAME__ · testes sem infraestrutura. Fonte da verdade: specs/__NAME__.md §2 e §4
 
-SurrealDB embutido em memória (mem://), com as tabelas e índices do boot e a SurrealQL de verdade; o NATS vira dublê.
+Pelo kit do core (core/testing.py): o main.py de verdade em memória, com o SurrealDB embutido, NATS, Temporal e
+plano de mentira. O cadastro em si (lista, busca, edição, isolamento) já é testado no core; aqui ficam as regras e as
+rotas deste serviço. Cadastro que muda de nome: troque a rota (/registros) e os campos nos testes abaixo.
 
 Rodar (da raiz): PYTHONPATH=services/svc-__NAME__ uv run python -m pytest tests/__NAME__.py
 """
-import asyncio
-
 import pytest
 from pydantic import ValidationError
-from surrealdb import AsyncSurreal
 
-from core.security import Principal, acting_as
+from core.testing import service_app
 
-import service
-from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, SEARCH, TABLE, ExecutionInput, ExecutionResult, RecordQuery
-
-ACME = Principal(sub="u1", tenant="acme")
-BETA = Principal(sub="u2", tenant="beta")
+from schemas import PROCESSED_SUBJECT, TRIGGER_SUBJECT, ExecutionInput
 
 
-@pytest.fixture
-def published(monkeypatch):
-    """Troca o NATS por um dublê em memória e devolve o que foi publicado."""
-    events = []
+def test_rotas_do_servico_de_ponta_a_ponta():
+    """Token, rotas do cadastro, /execute, o gatilho NATS e o isolamento por organização."""
 
-    async def publish(subject, message, msg_id=None):
-        events.append((subject, message))
+    async def cenario(app):
+        ana = app.user("ana", "acme", "owner")
+        criado = await ana.post("/registros", json={"title": "Pelo cadastro"})
+        executado = await ana.post("/execute", json={"title": "Pela ação", "payload": {"x": 1}})
+        lista = await ana.get("/registros", params={"sort": "title"})
+        busca = await ana.get("/registros", params={"q": "acao"})
+        da_beta = await app.user("bia", "beta", "owner").get("/registros")
+        sem_token = await app.anonymous().get("/registros")
+        await app.handlers[TRIGGER_SUBJECT](ExecutionInput(title="Pelo gatilho"))  # o NATS entrega: vira workflow
+        return criado, executado, lista, busca, da_beta, sem_token, app.workflows, app.published
 
-    async def live(topic, message, user=None):
-        events.append((topic, message))
-
-    monkeypatch.setattr(service.bus, "publish", publish)
-    monkeypatch.setattr(service.bus, "live", live)
-    return events
-
-
-def run(cenario):
-    """Roda o cenário com o SurrealDB embutido, já com as tabelas e índices do boot."""
-
-    async def go():
-        conn = AsyncSurreal("mem://")
-        await conn.connect()
-        await conn.use("cv", "app")
-        service.db._conn = conn
-        async with service.db.connected(tables=[TABLE], search=SEARCH):
-            return await cenario(service.__PASCAL__Service())
-
-    return asyncio.run(go())
-
-
-def como(who, call):
-    """Executa call() em nome de quem (a organização vem do contexto, como numa requisição)."""
-
-    async def go():
-        with acting_as(who):
-            return await call()
-
-    return go()
-
-
-def test_process_task(published):
-    result = run(lambda svc: como(ACME, lambda: svc.process_task(ExecutionInput(title="Primeira", payload={"x": 1}))))
-    assert isinstance(result, ExecutionResult) and result.status == "SUCCESS"
-    assert result.data["tenant"] == "acme" and result.data["payload"] == {"x": 1}
-    assert [subject for subject, _ in published] == [PROCESSED_SUBJECT, PROCESSED_LIVE]
-
-
-def test_lista_paginada_com_busca_e_so_da_organizacao(published):
-    async def cenario(svc):
-        for who, title in ((ACME, "Pedido da Padaria"), (ACME, "Orçamento João"), (ACME, "Pedido urgente"), (BETA, "Pedido da Beta")):
-            await como(who, lambda: svc.process_task(ExecutionInput(title=title)))
-        primeira = await como(ACME, lambda: svc.list_records(RecordQuery(size=2, sort="title")))
-        pedidos = await como(ACME, lambda: svc.list_records(RecordQuery(q="pedido")))
-        joao = await como(ACME, lambda: svc.list_records(RecordQuery(q="joao")))
-        return primeira, pedidos, joao
-
-    primeira, pedidos, joao = run(cenario)
-    assert ([r.title for r in primeira.items], primeira.total, primeira.pages) == (["Orçamento João", "Pedido da Padaria"], 3, 2)
-    assert primeira.items[0].created_by == "u1" and primeira.items[0].created_at is not None  # carimbos do banco
-    assert sorted(r.title for r in pedidos.items) == ["Pedido da Padaria", "Pedido urgente"]  # o da Beta não aparece
-    assert [r.title for r in joao.items] == ["Orçamento João"]  # sem acento, pelo início da palavra
-
-
-def test_organizacao_nao_vem_do_corpo():
-    with pytest.raises(ValidationError):
-        ExecutionInput.model_validate({"tenant": "outra", "payload": {}})
+    criado, executado, lista, busca, da_beta, sem_token, workflows, published = service_app(cenario)
+    assert criado.status_code == 200, criado.text
+    resultado = executado.json()["data"]
+    assert resultado["status"] == "SUCCESS" and resultado["data"]["payload"] == {"x": 1}
+    assert [r["title"] for r in lista.json()["data"]["items"]] == ["Pela ação", "Pelo cadastro"]
+    assert [r["title"] for r in busca.json()["data"]["items"]] == ["Pela ação"]  # sem acento, pelo início da palavra
+    assert da_beta.json()["data"]["total"] == 0 and sem_token.status_code == 401
+    assert [name for name, _ in workflows] == ["__PASCAL__Workflow.run"]
+    assert PROCESSED_SUBJECT in [subject for subject, _ in published]
 
 
 def test_campo_nao_declarado_e_rejeitado():
     with pytest.raises(ValidationError):
-        ExecutionInput.model_validate({"payload": {}, "is_admin": True})
-
-
-def test_lista_so_ordena_pelos_campos_declarados():
-    with pytest.raises(ValidationError):
-        RecordQuery(sort="payload")
+        ExecutionInput.model_validate({"title": "x", "is_admin": True})
 EOF
 
 if [[ $MAKE_PAGE -eq 1 ]]; then
   render "$STAGE/page.tsx" <<'EOF'
 // Tela do módulo __NAME__ (gerada pelo service.sh): só compõe o catálogo (src/components/CATALOG.md, README §6).
 // Fonte da verdade: specs/__NAME__.md. Telas a mais: src/modules/__NAME__/<parte>/page.tsx ou [id]/page.tsx.
-import { useState } from "react";
 import type { PageMeta } from "@/App";
-import { ActionForm } from "@/components/ActionForm";
-import { Button } from "@/components/Button";
-import { DateTime } from "@/components/DateTime";
-import { ListView } from "@/components/ListView";
 import { Page } from "@/components/Page";
-import { SidePanel } from "@/components/SidePanel";
-import { useAction, useListQuery } from "@/core/api";
+import { ResourceList } from "@/components/ResourceList";
+import { useResource } from "@/core/api";
 import { __CAMEL__ } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "__TITLE__", module: "__NAME__" };
 
 export default function __PASCAL__() {
-  const [criando, setCriando] = useState(false);
-  const lista = useListQuery(__CAMEL__.records, { live: "__NAME__.processado" }); // registro novo aparece sozinho
-  const criar = useAction(__CAMEL__.execute, { onSuccess: lista.reload });
+  const registros = useResource(__CAMEL__.registros); // lista ao vivo, criar, editar e remover (README §5.19)
   return (
     <Page title="__TITLE__" description="Registros do módulo, só da sua organização.">
-      <ListView
-        list={lista}
-        rowKey={(r) => r.id}
-        search="título"
-        noun="registros"
-        empty="Nenhum registro ainda."
-        actions={<Button onClick={() => setCriando(true)}>Novo registro</Button>}
-        columns={[
-          { key: "title", header: "Título", sort: "title" },
-          { key: "created_at", header: "Criado", sort: "created_at", render: (r) => <DateTime value={r.created_at} format="relative" /> },
-        ]}
-      />
-      <SidePanel open={criando} onClose={() => setCriando(false)} title="Novo registro">
-        <ActionForm action={criar} submitLabel="Criar" onDone={() => setCriando(false)} fields={[{ name: "title", label: "Título", required: true }]} />
-      </SidePanel>
+      <ResourceList resource={registros} noun="registro" />
     </Page>
   );
 }
@@ -469,6 +372,7 @@ if [[ -f "$COMPOSE_FILE" ]]; then
   svc-__NAME__:
     <<: *service
     build: { <<: *service-build, args: { SERVICE: __NAME__ } }
+    profiles: [modules, __NAME__]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
 EOF
   cat "$COMPOSE_FILE" "$STAGE/compose-block.yaml" > "$STAGE/compose.yaml"
   COMPOSE_STATUS="svc-${NAME} registrado"

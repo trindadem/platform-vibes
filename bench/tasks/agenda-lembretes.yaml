@@ -1,0 +1,234 @@
+# Nível 3: agendamento diário que passa por todas as organizações.
+id: agenda-lembretes
+level: 3
+service: agenda
+title: Lembretes com agendamento diário de atrasados
+spec: |
+  # Spec: agenda
+
+  ## 1. Objetivo Operacional
+  Lembretes com data; todo dia às 9h (America/Sao_Paulo) os pendentes de data passada viram atrasados.
+  Módulo (schemas.MODULE): título "Agenda", descrição "Lembretes e prazos", categoria "Organização".
+
+  ## 2. Contrato de Entrada e Saída
+  - Cadastro `lembretes` (Resource, título "Lembretes"), modelo `Lembrete`:
+    - `titulo`: texto obrigatório, 2 a 120 caracteres, título "Título";
+    - `data`: data (date) obrigatória, título "Data";
+    - `status`: "pendente" | "feito" | "atrasado", padrão "pendente", título "Status".
+  - Filtro por status; ordem por data.
+  - Activity `marcar_atrasados(Empty) -> Atrasados { total: int }` (Empty: modelo sem campos): para cada organização
+    com lembretes (db.tenants), como system(SERVICE, org), muda para "atrasado" os "pendente" com data anterior a hoje
+    (UTC) e soma quantos mudaram. Pode usar db.query com $tenant (UPDATE ... WHERE tenant = $tenant ...).
+  - workflows.py: `AtrasadosWorkflow` que executa marcar_atrasados (timeout 5 min, 3 tentativas) e
+    SCHEDULES = [Schedule("atrasados", "0 9 * * *", AtrasadosWorkflow.run, Empty(), timezone="America/Sao_Paulo")].
+    O main.py registra o workflow novo no worker. Substitua o cadastro `registros` e a ação /execute do esqueleto: o
+    módulo só tem o cadastro lembretes e o agendamento (sem /execute, sem gatilho, sem o workflow antigo).
+  - Tela do módulo: os lembretes com ResourceList.
+
+  ## 3. Fluxo de Execução
+  1. Persistência SurrealDB — agenda_lembretes, por organização.
+  2. Temporal — AtrasadosWorkflow → activity agenda.marcar_atrasados, agendado todo dia às 9h.
+
+  ## 4. Casos de Borda e Erros Mapeados
+  - Lembrete feito nunca vira atrasado; de hoje ou futuro continua pendente.
+acceptance: |
+  from datetime import UTC, datetime, timedelta
+
+  from core.security import acting_as, system
+  from core.testing import service_app
+
+
+  def test_agendamento_declarado():
+      import workflows
+
+      [s] = workflows.SCHEDULES
+      assert (s.id, s.cron, s.timezone) == ("atrasados", "0 9 * * *", "America/Sao_Paulo")
+      assert s.workflow == workflows.AtrasadosWorkflow.run
+
+
+  def test_marcar_atrasados_em_todas_as_organizacoes():
+      ontem = (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+      hoje = datetime.now(UTC).date().isoformat()
+
+      async def cenario(app):
+          ana, bia = app.user("ana", "acme", "owner"), app.user("bia", "beta", "owner")
+          for cliente, titulo, data, status in ((ana, "Pagar aluguel", ontem, "pendente"), (ana, "Ligar", ontem, "feito"),
+                                                (ana, "Hoje", hoje, "pendente"), (bia, "Beta atrasado", ontem, "pendente")):
+              r = await cliente.post("/lembretes", json={"titulo": titulo, "data": data, "status": status})
+              assert r.status_code == 200, r.text
+          import schemas
+          with acting_as(system("svc-agenda")):
+              resultado = await app.main.svc.marcar_atrasados(schemas.Empty())
+          assert resultado.total == 2
+          atrasados = await ana.get("/lembretes", params={"status": "atrasado"})
+          assert [l["titulo"] for l in atrasados.json()["data"]["items"]] == ["Pagar aluguel"]
+          assert (await bia.get("/lembretes", params={"status": "atrasado"})).json()["data"]["total"] == 1
+          assert (await ana.post("/execute", json={"title": "x"})).status_code in (404, 405)
+
+      service_app(cenario)
+# Solução de referência: prova que a tarefa é possível (bench/run.py --reference).
+reference:
+  services/svc-agenda/schemas.py: |
+    """svc-agenda · contratos (DTOs, enums, constantes). Fonte da verdade: specs/agenda.md §2"""
+    from datetime import date
+    from typing import Literal
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from core.plans import Module
+    from core.resources import Fields, Resource
+
+    # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+    SERVICE = "svc-agenda"
+    TASK_QUEUE = "agenda-queue"
+
+    MODULE = Module("Agenda", "Lembretes e prazos", category="Organização")
+
+
+    class Lembrete(Fields):
+        titulo: str = Field(..., min_length=2, max_length=120, title="Título")
+        data: date = Field(..., title="Data")
+        status: Literal["pendente", "feito", "atrasado"] = Field("pendente", title="Status")
+
+
+    LEMBRETES = Resource(SERVICE, "lembretes", Lembrete, "Lembretes", sort=("data",), filters=("status",))
+    RESOURCES = [LEMBRETES]
+
+
+    class Empty(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+
+    class Atrasados(BaseModel):
+        total: int
+  services/svc-agenda/service.py: |
+    """svc-agenda · lógica de negócio pura. Fonte da verdade: specs/agenda.md §3"""
+    from datetime import UTC, datetime
+
+    from core.security import acting_as, system
+    from core.surreal import Migration, db
+    from core.temporal_runner import activities
+
+    from schemas import LEMBRETES, SERVICE, Atrasados, Empty
+
+    MIGRATIONS: list[Migration] = []
+
+
+    @activities("agenda")
+    class AgendaService:
+        async def marcar_atrasados(self, data: Empty) -> Atrasados:
+            """Em cada organização, os pendentes de data passada viram atrasados."""
+            hoje = datetime.now(UTC).date().isoformat()
+            total = 0
+            for org in await db.tenants(LEMBRETES.table):
+                with acting_as(system(SERVICE, org)):
+                    mudados = await db.query(
+                        "UPDATE agenda_lembretes SET status = 'atrasado' WHERE tenant = $tenant AND status = 'pendente' AND data < $hoje RETURN AFTER",
+                        hoje=hoje,
+                    )
+                    total += len(mudados or [])
+            return Atrasados(total=total)
+  services/svc-agenda/workflows.py: |
+    """svc-agenda · orquestração durável. Fonte da verdade: specs/agenda.md §3"""
+    from datetime import timedelta
+
+    from temporalio import workflow
+    from temporalio.common import RetryPolicy
+
+    with workflow.unsafe.imports_passed_through():
+        from core.temporal_runner import Schedule
+        from schemas import Atrasados, Empty
+        from service import AgendaService
+
+
+    @workflow.defn
+    class AtrasadosWorkflow:
+        @workflow.run
+        async def run(self, data: Empty) -> Atrasados:
+            return await workflow.execute_activity_method(
+                AgendaService.marcar_atrasados,
+                data,
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+
+    SCHEDULES = [Schedule("atrasados", "0 9 * * *", AtrasadosWorkflow.run, Empty(), timezone="America/Sao_Paulo")]
+  services/svc-agenda/main.py: |
+    """svc-agenda · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/agenda.md
+
+    HTTP /lembretes... → cadastro declarado em schemas.RESOURCES (core/resources.py).
+    Temporal: AtrasadosWorkflow todo dia às 9h (workflows.SCHEDULES).
+
+    Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-agenda main:app --port 8100 --env-file .env
+    """
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    from core.envelope import install_envelope
+    from core.nats_bus import bus
+    from core.plans import plans
+    from core.resources import resources
+    from core.security import install_security
+    from core.surreal import db
+    from core.telemetry import install_telemetry
+    from core.temporal_runner import runner
+
+    from schemas import MODULE, RESOURCES, SERVICE, TASK_QUEUE
+    from service import MIGRATIONS, AgendaService
+    from workflows import SCHEDULES, AtrasadosWorkflow
+
+    svc = AgendaService()
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with (
+            bus.connected(SERVICE),
+            db.connected(resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
+            runner.worker(TASK_QUEUE, workflows=[AtrasadosWorkflow], service=svc, schedules=SCHEDULES),
+        ):
+            await plans.declare(MODULE)
+            yield
+
+
+    app = FastAPI(title=SERVICE, lifespan=lifespan)
+    install_envelope(app, service=SERVICE)
+    install_security(app, service=SERVICE)
+    install_telemetry(app, service=SERVICE)
+    resources.mount(app, RESOURCES)
+  gateway/endpoints/agenda.yaml: |
+    # svc-agenda · rotas públicas no Gateway. Fonte da verdade: specs/agenda.md §2
+    service: agenda
+    base_path: /api/v1/agenda
+
+    resources: [lembretes]
+  tests/agenda.py: |
+    """svc-agenda · testes. Fonte da verdade: specs/agenda.md §2 e §4"""
+    from core.testing import service_app
+
+
+    def test_cadastro():
+        async def cenario(app):
+            ana = app.user("ana", "acme", "owner")
+            assert (await ana.post("/lembretes", json={"titulo": "Pagar", "data": "2026-10-01"})).status_code == 200
+
+        service_app(cenario)
+  frontend/src/modules/agenda/page.tsx: |
+    import type { PageMeta } from "@/App";
+    import { Page } from "@/components/Page";
+    import { ResourceList } from "@/components/ResourceList";
+    import { useResource } from "@/core/api";
+    import { agenda } from "@/core/contracts";
+
+    export const meta: PageMeta = { title: "Agenda", module: "agenda" };
+
+    export default function Agenda() {
+      const lembretes = useResource(agenda.lembretes);
+      return (
+        <Page title="Lembretes" description="Lembretes e prazos; os vencidos viram atrasados todo dia às 9h.">
+          <ResourceList resource={lembretes} noun="lembrete" />
+        </Page>
+      );
+    }
