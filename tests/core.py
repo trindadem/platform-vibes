@@ -3,7 +3,9 @@
 Rodar (da raiz): uv run python -m pytest tests/core.py
 """
 import asyncio
+import json
 import time
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import httpx
@@ -59,7 +61,9 @@ def _rejected(token):
 
 def test_token_ida_e_volta(auth_env):
     token = security.issue_token("u1", tenant="acme", roles=["admin", "ops"])
-    assert security.verify_token(token) == Principal(sub="u1", tenant="acme", roles=frozenset({"admin", "ops"}))
+    who = security.verify_token(token)
+    assert who.model_copy(update={"expires_at": None}) == Principal(sub="u1", tenant="acme", roles=frozenset({"admin", "ops"}))
+    assert 0 < who.expires_at - time.time() <= 900
 
 
 def test_token_expirado_e_recusado(auth_env):
@@ -720,3 +724,172 @@ def test_activity_roda_em_nome_de_quem_disparou():
     input = SimpleNamespace(headers={temporal_runner._PRINCIPAL_HEADER: temporal_runner._encode(ACME)})
     assert asyncio.run(inbound.execute_activity(input)) == "acme"
     assert security.current() is None
+
+
+# ── Tempo real e streaming (README §5.10) ───────────────────────────────────
+
+class Pedaco(BaseModel):
+    texto: str
+
+
+class Final(BaseModel):
+    texto: str
+
+
+def _sse_events(body: str) -> list[tuple[str, dict]]:
+    events = []
+    for block in body.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines() if not line.startswith(":"))
+        if lines:
+            events.append((lines["event"], json.loads(lines["data"])))
+    return events
+
+
+def _stream_app(gerador):
+    app = FastAPI()
+    envelope.install_envelope(app, service="svc-teste")
+
+    @app.post("/responder")
+    async def responder():
+        return envelope.stream_response(gerador(), "svc-teste", final=Final)
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_stream_entrega_pedacos_e_o_resultado_no_envelope():
+    async def gerador():
+        yield Pedaco(texto="Olá")
+        yield Pedaco(texto=", mundo")
+        yield Final(texto="Olá, mundo")
+
+    r = _stream_app(gerador).post("/responder")
+    assert r.headers["content-type"].startswith("text/event-stream") and r.headers["cache-control"] == "no-store"
+    assert _sse_events(r.text) == [
+        ("delta", {"texto": "Olá"}),
+        ("delta", {"texto": ", mundo"}),
+        ("done", {"ok": True, "service": "svc-teste", "data": {"texto": "Olá, mundo"}, "error": None}),
+    ]
+
+
+def test_stream_com_erro_de_negocio_ou_inesperado_sai_no_envelope_sem_vazar():
+    async def negocio():
+        yield Pedaco(texto="a")
+        raise ServiceError("ERRO_TESTE_LIMITE", "Limite excedido.", status=409)
+
+    async def quebra():
+        yield Pedaco(texto="a")
+        raise RuntimeError("segredo-interno")
+
+    async def sem_final():
+        yield Pedaco(texto="a")
+
+    assert _sse_events(_stream_app(negocio).post("/responder").text)[-1][1]["error"]["code"] == "ERRO_TESTE_LIMITE"
+    for gerador in (quebra, sem_final):
+        body = _stream_app(gerador).post("/responder").text
+        event, data = _sse_events(body)[-1]
+        assert (event, data["error"]["code"], data["error"]["status"]) == ("error", "ERRO_TESTE_EXECUTION_FAILED", 500)
+        assert "segredo" not in body and "Informe o id" in data["error"]["message"]
+
+
+def test_batimento_quando_a_fonte_demora_e_fonte_fechada_quando_o_cliente_sai():
+    closed = []
+
+    async def lenta():
+        try:
+            await asyncio.sleep(0.05)
+            yield b"pedaco"
+            await asyncio.sleep(10)
+            yield b"nunca"
+        finally:
+            closed.append(True)
+
+    async def consumir():
+        stream = envelope.with_heartbeat(lenta(), every=0.01)
+        first = [await anext(stream), await anext(stream)]
+        while (chunk := await anext(stream)) != b"pedaco":
+            first.append(chunk)
+        await stream.aclose()  # a aba fechou no meio
+        return first
+
+    chunks = asyncio.run(consumir())
+    assert chunks[:2] == [b": ping\n\n", b": ping\n\n"]
+    assert closed == [True]
+
+
+class _FakeNats:
+    def __init__(self):
+        self.published, self.subscriptions = [], {}
+
+    async def publish(self, subject, data):
+        self.published.append((subject, data))
+
+    async def subscribe(self, subject, cb):
+        self.subscriptions[subject] = cb
+        return SimpleNamespace(unsubscribe=lambda: self._unsubscribe(subject))
+
+    async def _unsubscribe(self, subject):
+        self.subscriptions.pop(subject)
+
+
+def _live_bus(service="svc-pedidos"):
+    b = nats_bus.Bus()
+    b._nc, b._service = _FakeNats(), service
+    return b
+
+
+def test_aviso_ao_vivo_fica_na_organizacao_de_quem_age():
+    b = _live_bus()
+    with security.acting_as(ACME):
+        asyncio.run(b.live("pedidos.criado", Entrada(valor=1)))
+        asyncio.run(b.live("pedidos.criado", Entrada(valor=2), user="bia"))
+        asyncio.run(b.live("pedidos.criado", Entrada(valor=3), user="auth0|123"))
+    subjects = [subject for subject, _ in b._nc.published]
+    assert subjects[:2] == ["live.acme.org.pedidos.criado", "live.acme.user.bia.pedidos.criado"]
+    assert subjects[2].startswith("live.acme.user.h") and "|" not in subjects[2]  # id de fora vira hash seguro
+
+
+@pytest.mark.parametrize("topic", ["identity.membros", "pedidos", "pedidos.Criado", "pedidos.criado.x", "live.acme.org.x"])
+def test_topico_ao_vivo_fora_do_trilho(topic):
+    with security.acting_as(ACME), pytest.raises(ValueError, match="fora do trilho"):
+        asyncio.run(_live_bus().live(topic, Entrada(valor=1)))
+
+
+def test_aviso_ao_vivo_sem_organizacao_e_recusado():
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(_live_bus().live("pedidos.criado", Entrada(valor=1)))
+    assert exc.value.code == "ERRO_TENANT_REQUIRED"
+
+
+def test_feed_ao_vivo_so_assina_a_organizacao_e_a_pessoa_do_token():
+    b = _live_bus("gateway")
+
+    async def run():
+        async with b.live_feed(ACME) as queue:
+            subjects = sorted(b._nc.subscriptions)
+            org, user = b._nc.subscriptions["live.acme.org.>"], b._nc.subscriptions["live.acme.user.ana.>"]
+            await org(SimpleNamespace(subject="live.acme.org.pedidos.criado", data=b'{"valor": 1}'))
+            await user(SimpleNamespace(subject="live.acme.user.ana.identity.acesso", data=b"{}"))
+            received = [queue.get_nowait(), queue.get_nowait()]
+        return subjects, received, dict(b._nc.subscriptions)
+
+    subjects, received, left = asyncio.run(run())
+    assert subjects == ["live.acme.org.>", "live.acme.user.ana.>"]
+    assert received == [("pedidos.criado", b'{"valor": 1}'), ("identity.acesso", b"{}")]
+    assert left == {}  # conexão fechada: assinaturas desfeitas
+    with pytest.raises(ServiceError):
+        asyncio.run(b.live_feed(Principal(sub="ana")).__aenter__())
+
+
+def test_metodo_de_streaming_nao_vira_activity_e_segue_trilho():
+    @temporal_runner.activities("x")
+    class Svc:
+        async def responder(self, data: Entrada) -> AsyncIterator[Pedaco | Final]:
+            yield Final(texto="ok")
+
+    assert not getattr(Svc.responder, temporal_runner._MARK, False)
+    with pytest.raises(TypeError, match="trilho de streaming"):
+
+        @temporal_runner.activities("x")
+        class Ruim:
+            async def responder(self, pergunta: str, extra: int):
+                yield pergunta

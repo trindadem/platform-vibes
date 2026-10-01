@@ -10,7 +10,7 @@ import { DateTime } from "@/components/DateTime";
 import { Page } from "@/components/Page";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
-import { useAction, useQuery } from "@/core/api";
+import { useAction, useLiveQuery } from "@/core/api";
 import { hasAnyRole, hasRoles, inviteLink, useSession } from "@/core/auth";
 import { identity } from "@/core/contracts";
 
@@ -20,7 +20,7 @@ const PAPEL = { owner: "Dono", admin: "Administrador", member: "Membro" };
 
 export default function Membros() {
   const session = useSession();
-  const membros = useQuery(identity.members);
+  const membros = useLiveQuery("identity.membros", identity.members); // atualiza quando alguém entra ou sai
   const convidar = useAction(identity.createInvite);
   const remover = useAction(identity.removeMember, { onSuccess: membros.reload });
   const gerencia = hasAnyRole(session, "owner", "admin");

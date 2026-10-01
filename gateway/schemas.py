@@ -6,6 +6,9 @@ Trilhos (manifesto fora deles impede o boot do gateway):
 - NATS só aceita POST. Rota pública não tem papéis nem parâmetros no caminho.
 - cookies: true (só HTTP e POST) é a única forma de um cookie passar pelo gateway: a rota recebe o Cookie do
   navegador e devolve o Set-Cookie do serviço. As demais nunca veem cookie (sessão de login, README §5.8).
+- stream: true (só HTTP) repassa a resposta em pedaços (SSE); exige delta: <Modelo> de cada pedaço (README §5.10).
+- live: [{ topic, model }] declara os eventos ao vivo que o serviço emite (<service>.<topic>); viram tipos no
+  frontend. O nome de serviço "live" é reservado: /api/v1/live é a conexão ao vivo do próprio gateway.
 - Campo desconhecido é erro (um typo não vira configuração silenciosa).
 - request/response nomeiam modelos do schemas.py do serviço; gateway/contracts.py confere que existem e gera
   o cliente tipado do frontend. name é o nome da função gerada (padrão: último trecho fixo do path).
@@ -23,6 +26,8 @@ _PATH = re.compile(r"^(/([a-z0-9_-]+|\{[a-z_][a-z0-9_]*\}))+$")
 _SUBJECT = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
 _MODEL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _OPERATION = re.compile(r"^[a-z][A-Za-z0-9]*$")
+_EVENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+RESERVED = {"live"}
 
 
 class Endpoint(BaseModel):
@@ -40,6 +45,8 @@ class Endpoint(BaseModel):
     request: str | None = None
     response: str | None = None
     cookies: bool = False
+    stream: bool = False
+    delta: str | None = None
 
     def params(self) -> list[str]:
         """Parâmetros do caminho, na ordem em que aparecem."""
@@ -54,17 +61,35 @@ class Endpoint(BaseModel):
         return words[0] + "".join(word.capitalize() for word in words[1:])
 
 
+class LiveTopic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    topic: str = Field(..., description="Evento; o tópico completo é <service>.<topic>")
+    model: str = Field(..., description="Modelo do schemas.py que o evento carrega")
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     service: str
     base_path: str
     endpoints: tuple[Endpoint, ...] = Field(min_length=1)
+    live: tuple[LiveTopic, ...] = ()
 
     @model_validator(mode="after")
     def _rails(self) -> "Manifest":
         if not _NAME.match(self.service):
             raise ValueError(f"service inválido: {self.service!r} (kebab-case, README §2)")
+        if self.service in RESERVED:
+            raise ValueError(f"service {self.service!r} é reservado (/api/v1/{self.service} é do gateway)")
+        events = [t.topic for t in self.live]
+        for t in self.live:
+            if not _EVENT.match(t.topic):
+                raise ValueError(f"live: topic {t.topic!r} inválido (kebab-case, ex.: criado, pagamento-aprovado)")
+            if not _MODEL.match(t.model):
+                raise ValueError(f"live: model {t.model!r} deve ser o nome de um modelo do schemas.py (PascalCase)")
+        if len(events) != len(set(events)):
+            raise ValueError("live: topic repetido")
         if self.base_path != f"/api/v1/{self.service}":
             raise ValueError(f"base_path deve ser /api/v1/{self.service}")
         seen, operations = set(), set()
@@ -80,13 +105,17 @@ class Manifest(BaseModel):
             if ep.operation() in operations:
                 raise ValueError(f"{where}: outra rota já gera a função {ep.operation()!r}; defina name: diferente")
             operations.add(ep.operation())
-            for field, model in (("request", ep.request), ("response", ep.response)):
+            for field, model in (("request", ep.request), ("response", ep.response), ("delta", ep.delta)):
                 if model is not None and not _MODEL.match(model):
                     raise ValueError(f"{where}: {field} deve ser o nome de um modelo do schemas.py (PascalCase)")
             if ep.request is not None and ep.method in ("GET", "DELETE"):
                 raise ValueError(f"{where}: {ep.method} não tem corpo; remova request")
             if ep.cookies and (ep.target_type != "http" or ep.method != "POST"):
                 raise ValueError(f"{where}: cookies: true só em rota HTTP POST")
+            if ep.stream and (ep.target_type != "http" or ep.delta is None):
+                raise ValueError(f"{where}: stream: true só em rota HTTP e exige delta: <Modelo> de cada pedaço")
+            if ep.delta is not None and not ep.stream:
+                raise ValueError(f"{where}: delta só existe com stream: true")
             if ep.auth == "public" and (ep.roles or ep.params()):
                 raise ValueError(f"{where}: rota pública não tem roles nem parâmetros no caminho")
             if ep.target_type == "http":

@@ -11,8 +11,15 @@
  *   const fatura  = useQuery(loja.detalhe, { fatura_id });        // com parâmetros
  *   const criar   = useAction(loja.criar, { onSuccess: faturas.reload });
  * e entregam o estado aos componentes de receita (QueryTable, QueryView, ActionForm, ResourcePage).
+ *
+ * Tempo real (README §5.10):
+ *   const resposta = useStream(assistente.responder);             // rota stream: pedaços tipados + resultado
+ *   const lista = useLiveQuery("pedidos.criado", pedidos.listar);  // recarrega quando o evento chega
+ *   useLive("pedidos.criado", (pedido) => ...);                    // reage a cada evento ao vivo
+ * Uma conexão ao vivo por aba (GET /api/v1/live), aberta no primeiro uso e reaberta sozinha.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { LiveTopics } from "./contracts"; // só tipo: não cria ciclo de import em tempo de execução
 
 export interface ApiErrorDetail {
   loc?: (string | number)[];
@@ -66,29 +73,47 @@ interface Envelope<T> {
 }
 
 export async function request<T>(method: Method, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
+  return withSession(path, options, (token) => send<T>(method, path, body, options, token));
+}
+
+/** Opções de uma rota em pedaços: onDelta recebe cada pedaço; a promessa resolve com o resultado final. */
+export interface StreamOptions<D> extends RequestOptions {
+  onDelta?: (delta: D) => void;
+}
+
+/** Rota stream: true (SSE). Usada pelas funções geradas em contracts.ts; páginas usam useStream. */
+export async function stream<D, T>(method: Method, path: string, body?: unknown, options: StreamOptions<D> = {}): Promise<T> {
+  return withSession(path, options, (token) => sendStream<D, T>(method, path, body, options, token));
+}
+
+// Token vencido ou revogado: renova pelo cookie uma vez e repete com o token novo.
+async function withSession<T>(path: string, options: RequestOptions, call: (token: string | null) => Promise<T>): Promise<T> {
   if (!path.startsWith("/api/") && path !== "/health") {
     throw new ApiError("ERRO_FRONT_INVALID_PATH", `Caminho fora do gateway: ${path}`, 0);
   }
   const token = options.anonymous ? null : session.token();
   try {
-    return await send<T>(method, path, body, options, token);
+    return await call(token);
   } catch (error) {
-    // Token vencido ou revogado: renova pelo cookie uma vez e repete com o token novo.
     if (!(error instanceof ApiError) || error.status !== 401 || !token) throw error;
     if (!(await session.renew())) {
       session.expired();
       throw error;
     }
-    return send<T>(method, path, body, options, session.token());
+    return call(session.token());
   }
 }
 
-async function send<T>(method: Method, path: string, body: unknown, options: RequestOptions, token: string | null): Promise<T> {
-  const headers: Record<string, string> = { Accept: "application/json" };
+function headersFor(token: string | null, body: unknown, options: RequestOptions, accept: string): Record<string, string> {
+  const headers: Record<string, string> = { Accept: accept };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+  return headers;
+}
 
+async function send<T>(method: Method, path: string, body: unknown, options: RequestOptions, token: string | null): Promise<T> {
+  const headers = headersFor(token, body, options, "application/json");
   const timeout = AbortSignal.timeout(options.timeoutMs ?? 30_000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
   let response: Response;
@@ -106,16 +131,84 @@ async function send<T>(method: Method, path: string, body: unknown, options: Req
       ? new ApiError("ERRO_FRONT_TIMEOUT", "O servidor não respondeu a tempo.", 0)
       : new ApiError("ERRO_FRONT_NETWORK", "Sem conexão com o servidor.", 0);
   }
+  return unwrap<T>(response.status, response.ok, await response.json().catch(() => null));
+}
 
-  const envelope = (await response.json().catch(() => null)) as Envelope<T> | null;
+function unwrap<T>(status: number, ok: boolean, envelope: Envelope<T> | null): T {
   if (!envelope || typeof envelope.ok !== "boolean") {
-    throw new ApiError("ERRO_FRONT_INVALID_RESPONSE", "Resposta fora do envelope.", response.status);
+    throw new ApiError("ERRO_FRONT_INVALID_RESPONSE", "Resposta fora do envelope.", status);
   }
-  if (!envelope.ok || !response.ok) {
+  if (!envelope.ok || !ok) {
     const error = envelope.error;
-    throw new ApiError(error?.code ?? `ERRO_HTTP_${response.status}`, error?.message ?? "Falha na requisição.", response.status, error?.details ?? []);
+    throw new ApiError(error?.code ?? `ERRO_HTTP_${status}`, error?.message ?? "Falha na requisição.", error?.status ?? status, error?.details ?? []);
   }
   return envelope.data as T;
+}
+
+async function sendStream<D, T>(method: Method, path: string, body: unknown, options: StreamOptions<D>, token: string | null): Promise<T> {
+  // O tempo limite vale até a resposta começar; depois, quem vigia a pausa entre pedaços é o gateway.
+  const opening = new AbortController();
+  const timer = setTimeout(() => opening.abort(), options.timeoutMs ?? 30_000);
+  const signal = options.signal ? AbortSignal.any([options.signal, opening.signal]) : opening.signal;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method,
+      headers: headersFor(token, body, options, "text/event-stream"),
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+      credentials: "same-origin",
+    });
+  } catch (cause) {
+    if (options.signal?.aborted) throw cause;
+    throw opening.signal.aborted
+      ? new ApiError("ERRO_FRONT_TIMEOUT", "O servidor não respondeu a tempo.", 0)
+      : new ApiError("ERRO_FRONT_NETWORK", "Sem conexão com o servidor.", 0);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.body || !response.headers.get("content-type")?.startsWith("text/event-stream")) {
+    return unwrap<T>(response.status, response.ok, await response.json().catch(() => null)); // erro antes de começar
+  }
+  try {
+    for await (const { event, data } of readEvents(response.body)) {
+      if (event === "delta") options.onDelta?.(JSON.parse(data) as D);
+      else if (event === "done" || event === "error") return unwrap<T>(response.status, event === "done", JSON.parse(data));
+    }
+  } catch (cause) {
+    if (cause instanceof ApiError || options.signal?.aborted) throw cause;
+    throw new ApiError("ERRO_FRONT_NETWORK", "A conexão caiu no meio da resposta.", 0);
+  }
+  throw new ApiError("ERRO_FRONT_STREAM_INCOMPLETE", "A resposta terminou antes do fim.", 0);
+}
+
+/** Lê um corpo SSE: um evento por bloco separado por linha em branco; comentários (": ...") são ignorados. */
+async function* readEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<{ event: string; data: string }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let end: number;
+      while ((end = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        let event = "message";
+        const data: string[] = [];
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+        }
+        if (data.length) yield { event, data: data.join("\n") };
+        else if (event !== "message") yield { event, data: "{}" };
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 /** Chave para repetir um gatilho com segurança: a mesma chave nunca dispara dois workflows. */
@@ -204,4 +297,170 @@ export function useAction<A extends unknown[], T>(fn: (...args: A) => Promise<T>
 
 function toApiError(error: unknown): ApiError {
   return error instanceof ApiError ? error : new ApiError("ERRO_FRONT_UNKNOWN", String(error), 0);
+}
+
+/** Estado de uma rota em pedaços: o que a tela mostra enquanto a resposta chega. */
+export interface StreamState<B, D, T> {
+  /** Começa (ignora cliques enquanto a anterior não termina). Devolve o resultado final ou undefined. */
+  start: (body: B) => Promise<T | undefined>;
+  /** Pedaços recebidos até agora, na ordem. */
+  deltas: D[];
+  result: T | null;
+  error: ApiError | null;
+  running: boolean;
+  /** Interrompe a resposta (o serviço para de gerar). */
+  cancel: () => void;
+}
+
+/**
+ * Hook: chama uma rota stream: true de contracts.ts e acumula os pedaços.
+ * Uso: const resposta = useStream(assistente.responder); resposta.start({ pergunta }); resposta.deltas.map(...).
+ */
+export function useStream<B, D, T>(fn: (body: B, options?: StreamOptions<D>) => Promise<T>): StreamState<B, D, T> {
+  const [state, setState] = useState<{ deltas: D[]; result: T | null; error: ApiError | null; running: boolean }>({
+    deltas: [],
+    result: null,
+    error: null,
+    running: false,
+  });
+  const controller = useRef<AbortController | null>(null);
+  const latest = useRef(fn);
+  latest.current = fn;
+  useEffect(() => () => controller.current?.abort(), []);
+
+  const start = useCallback(async (body: B) => {
+    if (controller.current) return undefined;
+    const current = new AbortController();
+    controller.current = current;
+    setState({ deltas: [], result: null, error: null, running: true });
+    try {
+      const result = await latest.current(body, {
+        signal: current.signal,
+        onDelta: (delta) => setState((previous) => ({ ...previous, deltas: [...previous.deltas, delta] })),
+      });
+      setState((previous) => ({ ...previous, result, running: false }));
+      return result;
+    } catch (error) {
+      const stopped = current.signal.aborted;
+      setState((previous) => ({ ...previous, running: false, error: stopped ? null : toApiError(error) }));
+      return undefined;
+    } finally {
+      controller.current = null;
+    }
+  }, []);
+
+  const cancel = useCallback(() => controller.current?.abort(), []);
+  return { ...state, start, cancel };
+}
+
+// ── Ao vivo: uma conexão por aba, compartilhada por todos os hooks ─────────────
+
+const LIVE_PATH = "/api/v1/live";
+const liveHandlers = new Map<string, Set<(event: unknown) => void>>();
+const liveReconnects = new Set<() => void>();
+let liveController: AbortController | null = null;
+let liveRetry: ReturnType<typeof setTimeout> | undefined;
+let liveFailures = 0;
+let liveOpenedBefore = false;
+
+/** Assina um tópico ao vivo fora de componente (core/auth.ts). Devolve a função que cancela. */
+export function onLive<K extends keyof LiveTopics>(topic: K, handler: (event: LiveTopics[K]) => void): () => void {
+  const key = topic as string;
+  const handlers = liveHandlers.get(key) ?? new Set();
+  const wrapped = handler as (event: unknown) => void;
+  handlers.add(wrapped);
+  liveHandlers.set(key, handlers);
+  openLive();
+  return () => {
+    handlers.delete(wrapped);
+    if (!handlers.size) liveHandlers.delete(key);
+    if (!liveHandlers.size) closeLive();
+  };
+}
+
+/** Chamado quando a conexão volta depois de cair: o que se perdeu fora do ar deve ser buscado de novo. */
+export function onLiveReconnect(handler: () => void): () => void {
+  liveReconnects.add(handler);
+  return () => liveReconnects.delete(handler);
+}
+
+/** Reabre a conexão com a sessão atual. core/auth.ts chama ao entrar, trocar de organização ou sair. */
+export function restartLive(): void {
+  closeLive();
+  liveOpenedBefore = false;
+  openLive();
+}
+
+/** Hook: reage a cada evento ao vivo do tópico (tipado pelo LiveTopics de contracts.ts). */
+export function useLive<K extends keyof LiveTopics>(topic: K, handler: (event: LiveTopics[K]) => void): void {
+  const latest = useRef(handler);
+  latest.current = handler;
+  useEffect(() => onLive(topic, (event) => latest.current(event)), [topic]);
+}
+
+/** Receita: useQuery que recarrega sozinho quando o tópico chega e quando a conexão ao vivo volta. */
+export function useLiveQuery<K extends keyof LiveTopics, T, A extends unknown[]>(
+  topic: K,
+  fn: (...args: [...A, RequestOptions?]) => Promise<T>,
+  ...args: A
+): QueryState<T> {
+  const query = useQuery(fn, ...args);
+  const { reload } = query;
+  useEffect(() => {
+    const stopEvents = onLive(topic, () => reload());
+    const stopReconnects = onLiveReconnect(reload);
+    return () => {
+      stopEvents();
+      stopReconnects();
+    };
+  }, [topic, reload]);
+  return query;
+}
+
+function openLive(): void {
+  if (liveController || !liveHandlers.size) return;
+  const token = session.token();
+  if (!token) return; // sem sessão: restartLive() abre quando alguém entrar
+  const controller = new AbortController();
+  liveController = controller;
+  clearTimeout(liveRetry);
+  void runLive(controller, token);
+}
+
+function closeLive(): void {
+  clearTimeout(liveRetry);
+  liveController?.abort();
+  liveController = null;
+}
+
+async function runLive(controller: AbortController, token: string): Promise<void> {
+  let immediately = false;
+  try {
+    const response = await fetch(LIVE_PATH, {
+      headers: { Accept: "text/event-stream", Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+      credentials: "same-origin",
+    });
+    if (response.status === 401) {
+      immediately = await session.renew();
+      if (!immediately) session.expired();
+    } else if (response.ok && response.body) {
+      if (liveOpenedBefore) liveReconnects.forEach((handler) => handler());
+      liveOpenedBefore = true;
+      liveFailures = 0;
+      for await (const { event, data } of readEvents(response.body)) {
+        if (event === "expired") {
+          immediately = true; // o token desta conexão venceu: reabre com o token já renovado
+          break;
+        }
+        liveHandlers.get(event)?.forEach((handler) => handler(JSON.parse(data)));
+      }
+    }
+  } catch {
+    if (controller.signal.aborted) return;
+  }
+  if (liveController !== controller) return; // foi fechada ou substituída
+  liveController = null;
+  const wait = immediately ? 0 : Math.min(30_000, 1000 * 2 ** liveFailures++); // espera crescente até 30 s
+  liveRetry = setTimeout(openLive, wait);
 }

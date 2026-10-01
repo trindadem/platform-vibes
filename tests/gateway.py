@@ -2,6 +2,7 @@
 
 Rodar (da raiz): PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
 """
+import asyncio
 import json
 
 import httpx
@@ -105,12 +106,32 @@ def test_manifesto_valido():
         ({"method": "GET", "request": "ExecutionInput"}, "não tem corpo"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "response": "Fatura"}, "remova response"),
         ({"method": "GET", "cookies": True}, "cookies: true só em rota HTTP POST"),
+        ({"stream": True}, "exige delta"),
+        ({"delta": "Pedaco"}, "delta só existe com stream: true"),
+        ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "stream": True, "delta": "P"}, "stream: true só em rota HTTP"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "cookies": True}, "cookies: true só"),
     ],
 )
 def test_manifesto_fora_do_trilho_e_recusado(override, erro):
     with pytest.raises(ValidationError) as exc:
         _manifest(**override)
+    assert erro in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("override", "erro"),
+    [
+        ({"live": [{"topic": "Criado", "model": "Fatura"}]}, "kebab-case"),
+        ({"live": [{"topic": "criado", "model": "fatura"}]}, "PascalCase"),
+        ({"live": [{"topic": "criado", "model": "Fatura"}, {"topic": "criado", "model": "Outra"}]}, "topic repetido"),
+        ({"service": "live", "base_path": "/api/v1/live"}, "reservado"),
+    ],
+)
+def test_topicos_ao_vivo_e_nome_reservado(override, erro):
+    from schemas import Manifest
+
+    with pytest.raises(ValidationError) as exc:
+        Manifest.model_validate({**BILLING, **override})
     assert erro in str(exc.value)
 
 
@@ -235,7 +256,7 @@ def test_evento_e_publicado_em_nome_de_quem_chamou(gateway, monkeypatch):
 
     monkeypatch.setattr(bus, "publish", publish)
     client.post("/api/v1/billing/trigger", json={}, headers=_bearer("ana", roles=["ops"], tenant="acme"))
-    assert actors == [security.Principal(sub="ana", tenant="acme", roles=frozenset({"ops"}))]
+    assert [(a.sub, a.tenant, a.roles) for a in actors] == [("ana", "acme", frozenset({"ops"}))]
 
 
 def test_cookie_so_passa_nas_rotas_que_declaram(auth_env, tmp_path):
@@ -262,6 +283,64 @@ def test_cookie_so_passa_nas_rotas_que_declaram(auth_env, tmp_path):
     assert received == ["cv_refresh=antigo", None]
     assert with_cookies.headers.get_list("set-cookie") == ["cv_refresh=novo; HttpOnly; Path=/api/v1/billing", "outro=1"]
     assert without.headers.get_list("set-cookie") == []
+
+
+def _stream_gateway(tmp_path, reply):
+    import interpreter
+    import main
+
+    endpoint = {**BILLING["endpoints"][0], "path": "/responder", "target_url": "http://svc-billing:8000/responder",
+                "stream": True, "delta": "Pedaco"}
+    (tmp_path / "billing.yaml").write_text(json.dumps({**BILLING, "endpoints": [endpoint]}))
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(reply), cookies=main.no_cookie_jar())
+    return TestClient(main.create_app(interpreter.load_manifests(tmp_path), upstream), raise_server_exceptions=False)
+
+
+def test_stream_e_repassado_em_pedacos(auth_env, tmp_path):
+    parts = [b'event: delta\ndata: {"texto": "a"}\n\n', b'event: done\ndata: {"ok": true}\n\n']
+
+    async def body():
+        for part in parts:
+            yield part
+
+    def reply(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body())
+
+    r = _stream_gateway(tmp_path, reply).post("/api/v1/billing/responder", json={}, headers=_bearer())
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
+    assert r.content == b"".join(parts)
+
+
+def test_erro_antes_do_stream_sai_no_envelope_de_sempre(auth_env, tmp_path):
+    def reply(request):
+        return httpx.Response(422, json={"ok": False, "service": "svc-billing", "data": None, "error": {"code": "X"}})
+
+    r = _stream_gateway(tmp_path, reply).post("/api/v1/billing/responder", json={}, headers=_bearer())
+    assert (r.status_code, r.json()["error"]["code"]) == (422, "X")
+
+
+def test_conexao_ao_vivo_entrega_so_o_feed_de_quem_chamou_e_fecha_quando_o_token_vence(gateway, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    client, _, _ = gateway
+    feeds = []
+
+    @asynccontextmanager
+    async def live_feed(who):
+        feeds.append((who.sub, who.tenant))
+        queue = asyncio.Queue()
+        queue.put_nowait(("pedidos.criado", b'{"valor": 1}'))
+        yield queue
+
+    monkeypatch.setattr(bus, "live_feed", live_feed)
+    assert client.get("/api/v1/live").status_code == 401
+    sem_org = client.get("/api/v1/live", headers=_bearer("ana"))
+    assert (sem_org.status_code, sem_org.json()["error"]["code"]) == (403, "ERRO_TENANT_REQUIRED")
+    token = security.issue_token("ana", tenant="acme", ttl_seconds=1)  # vence logo: a conexão termina sozinha
+    r = client.get("/api/v1/live", headers={"Authorization": f"Bearer {token}"})
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert feeds == [("ana", "acme")]
+    assert 'event: pedidos.criado\ndata: {"valor": 1}' in r.text and r.text.rstrip().endswith("event: expired\ndata: {}")
 
 
 @pytest.mark.parametrize("body", [b"[1, 2]", b"nao-e-json", b'"texto"'])

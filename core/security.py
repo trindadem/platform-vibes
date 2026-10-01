@@ -119,6 +119,7 @@ class Principal(BaseModel, frozen=True):
     sub: str
     tenant: str | None = None
     roles: frozenset[str] = frozenset()
+    expires_at: int | None = None  # exp do token (epoch); None para quem age sem token (jobs, testes)
 
     def has(self, *roles: str) -> bool:
         return set(roles) <= self.roles
@@ -200,7 +201,7 @@ def verify_token(token: str) -> Principal:
     tenant = claims.get(s.auth_tenant_claim)
     if tenant is not None and not isinstance(tenant, str):
         raise ServiceError("ERRO_AUTH_INVALID_TOKEN", "Token inválido ou expirado.", status=401)
-    return Principal(sub=str(claims["sub"]), tenant=tenant or None, roles=frozenset(roles))
+    return Principal(sub=str(claims["sub"]), tenant=tenant or None, roles=frozenset(roles), expires_at=int(claims["exp"]))
 
 
 # ── Senhas ───────────────────────────────────────────────────────────────────

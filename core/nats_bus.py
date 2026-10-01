@@ -6,6 +6,9 @@ Trilhos de subject:
   serviços diferentes recebem cada um a sua cópia. Entrega at-least-once: use bus.message_id() como
   id idempotente (o mesmo em toda reentrega).
 - rpc.<serviço>.<método>   → request / respond. Síncrono; a resposta trafega no ResponseEnvelope.
+- live.<org>.org.<tópico> e live.<org>.user.<pessoa>.<tópico> → bus.live / bus.live_feed. Ao vivo para a tela
+  (README §5.10): NATS simples, efêmero (a verdade está no banco). A organização vem sempre do contexto, então um
+  serviço não consegue avisar outra organização; o tópico é <serviço>.<evento> e só o próprio serviço o emite.
 
 Quem age viaja junto (README §5.9): publish e request anexam o Principal do contexto no cabeçalho Cv-Principal;
 subscribe e respond o restauram antes do handler, então current_tenant() funciona igual ao HTTP. O cabeçalho é
@@ -15,7 +18,9 @@ Mensagem inválida é descartada sem reentrega; handler que falha é re-tentado 
 O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e NATS_CREDS
 (arquivo .creds com permissões por subject; obrigatório em produção, conforme README §5.7).
 """
+import asyncio
 import contextvars
+import hashlib
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -29,12 +34,15 @@ from pydantic import BaseModel, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.envelope import ResponseEnvelope, ServiceError, error_code
-from core.security import Principal, acting_as, current
+from core.security import Principal, acting_as, current, current_tenant
 
 STREAM = "EVENTS"
 PRINCIPAL_HEADER = "Cv-Principal"
 MAX_DELIVER = 5
 _SUBJECT = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
+_TOPIC = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+LIVE_QUEUE = 256  # eventos guardados por conexão lenta antes de descartar os mais novos
 _message_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("message_id", default=None)
 
 log = logging.getLogger("core.nats_bus")
@@ -160,6 +168,38 @@ class Bus:
 
         await self._connection().subscribe(subject, queue=service, cb=on_request)
 
+    async def live(self, topic: str, message: BaseModel, *, user: str | None = None) -> None:
+        """Avisa a tela ao vivo: a organização inteira ou só uma pessoa (user=sub), sempre na organização atual."""
+        prefix = (self._service or "").removeprefix("svc-")
+        if not _TOPIC.match(topic) or topic.split(".")[0] != prefix:
+            raise ValueError(f"tópico ao vivo fora do trilho: {topic!r} (use {prefix or '<serviço>'}.<evento>, README §5.10)")
+        tenant = _subject_token(current_tenant())
+        audience = f"user.{_subject_token(user)}" if user is not None else "org"
+        await self._connection().publish(f"live.{tenant}.{audience}.{topic}", message.model_dump_json().encode())
+
+    @asynccontextmanager
+    async def live_feed(self, who: Principal) -> AsyncIterator["asyncio.Queue[tuple[str, bytes]]"]:
+        """Fila com os eventos ao vivo de quem age: os da organização do token e os endereçados a essa pessoa."""
+        if not who.tenant:
+            raise ServiceError("ERRO_TENANT_REQUIRED", "Selecione uma organização para continuar.", status=403)
+        queue: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue(maxsize=LIVE_QUEUE)
+        tenant, person = _subject_token(who.tenant), _subject_token(who.sub)
+        prefixes = (f"live.{tenant}.org.", f"live.{tenant}.user.{person}.")
+
+        async def on_event(msg: Any) -> None:
+            topic = next(msg.subject.removeprefix(p) for p in prefixes if msg.subject.startswith(p))
+            try:
+                queue.put_nowait((topic, msg.data))
+            except asyncio.QueueFull:
+                log.warning("conexão ao vivo lenta: evento %s descartado", topic)
+
+        subscriptions = [await self._connection().subscribe(p + ">", cb=on_event) for p in prefixes]
+        try:
+            yield queue
+        finally:
+            for subscription in subscriptions:
+                await subscription.unsubscribe()
+
     async def _ensure_stream(self) -> None:
         try:
             await self._js.stream_info(STREAM)
@@ -187,6 +227,11 @@ def _context_headers(headers: dict[str, str]) -> dict[str, str] | None:
 def _principal_from(headers: dict[str, str] | None) -> Principal | None:
     raw = (headers or {}).get(PRINCIPAL_HEADER)
     return Principal.model_validate_json(raw) if raw else None
+
+
+def _subject_token(value: str) -> str:
+    """Id seguro como pedaço de subject (sem ponto, espaço ou curinga); ids de fora viram um hash estável."""
+    return value if _TOKEN.match(value) else "h" + hashlib.sha256(value.encode()).hexdigest()[:24]
 
 
 def _check(subject: str, kind: str) -> None:

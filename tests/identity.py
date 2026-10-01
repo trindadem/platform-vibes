@@ -51,7 +51,11 @@ def events(monkeypatch):
     async def publish(subject, message, msg_id=None):
         published.append((subject, message, security.current()))
 
+    async def live(topic, message, user=None):
+        published.append((f"live:{topic}" + (f":{user}" if user else ""), message, security.current()))
+
     monkeypatch.setattr(service.bus, "publish", publish)
+    monkeypatch.setattr(service.bus, "live", live)
     yield published
     _clear()
 
@@ -112,6 +116,7 @@ def test_cadastro_cria_conta_organizacao_dono_e_sessao(events):
     assert [(subject, who.tenant) for subject, _, who in events] == [
         (TENANT_CREATED_SUBJECT, auth.tenant.id),
         (MEMBER_JOINED_SUBJECT, auth.tenant.id),
+        ("live:identity.membros", auth.tenant.id),  # a tela de membros da organização atualiza sozinha
     ]
 
 
@@ -300,6 +305,12 @@ def test_remocao_de_membros(events):
         return before, after, forbidden, last_owner, gone, not_member
 
     before, after, forbidden, last_owner, gone, not_member = run(scenario)
+    removed = [(s, m.model_dump(), who.tenant) for s, m, who in events if s.startswith("live:") and "removed" in str(m)]
+    bia_id = next(m.id for m in before.items if m.name == "Bia")
+    assert removed == [
+        ("live:identity.membros", {"user": bia_id, "change": "removed"}, before_tenant := removed[0][2]),
+        (f"live:identity.acesso:{bia_id}", {"tenant": before_tenant, "change": "removed"}, before_tenant),
+    ]
     assert [(m.name, m.roles) for m in before.items] == [("Ana", ["owner"]), ("Bia", ["member"])]
     assert [m.name for m in after.items] == ["Ana"]
     _error(forbidden, "ERRO_IDENTITY_FORBIDDEN", 403)

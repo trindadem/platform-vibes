@@ -5,14 +5,22 @@
 
 Erro de negócio (spec §4): raise ServiceError("ERRO_X_LIMITE_EXCEDIDO", "mensagem", status=409).
 Exceção inesperada nunca vaza detalhe: o cliente recebe um id; o log recebe o traceback.
+
+Resposta em pedaços (README §5.10): stream_response(gerador, service, final=Modelo) vira SSE com
+    event: delta  data: <pedaço>            (cada item do gerador)
+    event: done   data: <envelope de sucesso com o item final>
+    event: error  data: <envelope de erro>   (mesmas regras: erro de negócio com código, inesperado só com id)
+e um comentário de batimento a cada 15 s. Quem fecha a aba cancela o gerador.
 """
+import asyncio
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException
 
@@ -104,6 +112,67 @@ def validation_message(error: dict[str, Any]) -> str:
         return template.format(**ctx) if template else error["msg"]
     except (KeyError, IndexError):
         return error["msg"]
+
+
+HEARTBEAT_SECONDS = 15
+SSE_HEADERS = {"cache-control": "no-store", "x-accel-buffering": "no"}
+
+
+def sse(event: str, data: str) -> bytes:
+    """Um evento SSE. data é JSON numa linha (model_dump_json nunca quebra linha)."""
+    return f"event: {event}\ndata: {data}\n\n".encode()
+
+
+def stream_response(items: AsyncIterator[BaseModel], service: str, *, final: type[BaseModel]) -> StreamingResponse:
+    """Gerador de modelos → resposta SSE: itens do tipo final encerram com done; os outros saem como delta."""
+
+    async def events() -> AsyncIterator[bytes]:
+        try:
+            async for item in items:
+                if isinstance(item, final):
+                    yield sse("done", ResponseEnvelope.success(item, service).model_dump_json())
+                    return
+                yield sse("delta", item.model_dump_json())
+            raise RuntimeError(f"stream de {service} terminou sem {final.__name__}")
+        except ServiceError as exc:
+            yield sse("error", ResponseEnvelope.failure(exc.code, exc.message, service, exc.status).model_dump_json())
+        except Exception as exc:
+            error_id = uuid.uuid4().hex[:12]
+            log.error("erro inesperado no stream de %s (id %s)", service, error_id, exc_info=exc)
+            failure = ResponseEnvelope.failure(
+                error_code(service, "EXECUTION_FAILED"), f"Falha interna. Informe o id {error_id} ao suporte.", service, 500
+            )
+            yield sse("error", failure.model_dump_json())
+
+    return StreamingResponse(with_heartbeat(events()), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+async def with_heartbeat(source: AsyncIterator[bytes], every: float = HEARTBEAT_SECONDS) -> AsyncIterator[bytes]:
+    """Intercala um comentário SSE quando a fonte fica quieta: proxies não derrubam a conexão parada."""
+    iterator = source.__aiter__()
+    pending: asyncio.Future[bytes] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(anext(iterator))
+            done, _ = await asyncio.wait({pending}, timeout=every)
+            if not done:
+                yield b": ping\n\n"
+                continue
+            try:
+                chunk = pending.result()
+            except StopAsyncIteration:
+                return
+            finally:
+                pending = None
+            yield chunk
+    finally:
+        if pending is not None:  # cliente saiu no meio: cancela o passo em andamento antes de fechar a fonte
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 def install_envelope(app: FastAPI, service: str) -> None:

@@ -122,6 +122,18 @@ export interface IdentityMemberRef {
   user: string;
 }
 
+export interface IdentityMembersChanged {
+  /** Id de quem entrou ou saiu */
+  user: string;
+  change: "joined" | "removed";
+}
+
+export interface IdentityAccessChanged {
+  /** Organização que a pessoa deixou de acessar */
+  tenant: string;
+  change: "removed";
+}
+
 /** svc-identity · /api/v1/identity */
 export const identity = {
   /** POST /api/v1/identity/signup · http · pública · sessão em cookie */
@@ -161,3 +173,11 @@ export const identity = {
   removeMember: (body: IdentityMemberRef, options?: RequestOptions) =>
     request<IdentityMemberList>("POST", "/api/v1/identity/members/remove", body, options),
 };
+
+/** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
+export interface LiveTopics {
+  /** svc-identity · bus.live("identity.membros", ...) */
+  "identity.membros": IdentityMembersChanged;
+  /** svc-identity · bus.live("identity.acesso", ...) */
+  "identity.acesso": IdentityAccessChanged;
+}

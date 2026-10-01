@@ -5,11 +5,12 @@
  *   que o JavaScript não lê: ao abrir a página, restoreSession() renova pelo cookie e a sessão volta.
  * - O token é renovado sozinho um minuto antes de expirar; 401 numa chamada também renova (core/api.ts).
  * - Abas do mesmo navegador compartilham a sessão: entrar, trocar de organização ou sair numa aba vale para todas.
+ * - Removida de uma organização, a pessoa recebe identity.acesso ao vivo e a sessão é renovada na hora.
  * - Páginas usam useSession() para exibir e as ações (login, signup, logout, switchTenant, createTenant,
  *   acceptInvite) com useAction. Quem decide o acesso é sempre o backend.
  */
 import { useSyncExternalStore } from "react";
-import { ApiError, configureSession } from "./api";
+import { ApiError, configureSession, onLive, restartLive } from "./api";
 import { identity, type IdentityAuthResult, type IdentityLoginInput, type IdentitySignupInput, type IdentityTenant } from "./contracts";
 
 export type Tenant = IdentityTenant;
@@ -46,6 +47,9 @@ tabs?.addEventListener("message", (event: MessageEvent<"changed" | "signed-out">
   if (event.data === "signed-out") clear(false);
   else void renew(); // outra aba entrou ou trocou de organização: pega a sessão nova pelo cookie
 });
+
+// Perdeu o acesso à organização ativa: a renovação devolve a sessão em outra organização (ou nenhuma).
+onLive("identity.acesso", () => void renew());
 
 /** Chamado uma vez em main.tsx: tenta voltar à sessão pelo cookie. */
 export async function restoreSession(): Promise<void> {
@@ -145,7 +149,9 @@ function apply(auth: IdentityAuthResult): Session {
   };
   clearTimeout(timer);
   timer = setTimeout(() => void renew(), Math.max(5_000, (auth.expires_in - 60) * 1000));
+  const before = state.session;
   update({ ready: true, session });
+  if (before?.user.id !== session.user.id || before?.tenant?.id !== session.tenant?.id) restartLive();
   return session;
 }
 
@@ -153,6 +159,7 @@ function clear(broadcast: boolean): void {
   clearTimeout(timer);
   if (state.session && broadcast) tabs?.postMessage("signed-out");
   update({ session: null });
+  restartLive(); // sem sessão, a conexão ao vivo fica fechada
 }
 
 function update(changes: Partial<AuthState>): void {

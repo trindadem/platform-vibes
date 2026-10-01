@@ -13,7 +13,7 @@ from core.http_client import no_cookie_jar
 from core.nats_bus import bus
 from core.security import install_security
 
-from interpreter import load_manifests, mount, public_paths
+from interpreter import load_manifests, mount, mount_live, public_paths
 from schemas import Manifest
 
 SERVICE = "gateway"
@@ -29,6 +29,7 @@ def create_app(manifests: list[Manifest], upstream: httpx.AsyncClient) -> FastAP
     install_envelope(app, service=SERVICE)
     install_security(app, service=SERVICE, public=public_paths(manifests) | {"/health"})
     mount(app, manifests, upstream)
+    mount_live(app)
 
     @app.get("/health")
     async def health() -> ResponseEnvelope:

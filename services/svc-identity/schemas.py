@@ -12,6 +12,8 @@ TASK_QUEUE = "identity-queue"
 TRIGGER_SUBJECT = "events.identity.trigger"
 TENANT_CREATED_SUBJECT = "events.identity.tenant-created"
 MEMBER_JOINED_SUBJECT = "events.identity.member-joined"
+MEMBERS_LIVE = "identity.membros"  # ao vivo para a organização: alguém entrou ou saiu
+ACCESS_LIVE = "identity.acesso"  # ao vivo só para a pessoa: perdeu o acesso a uma organização
 
 # Tabelas globais (README §5.9): só este serviço declara shared=[...].
 USERS = "identity_users"
@@ -189,6 +191,16 @@ class MemberJoined(BaseModel):
     tenant: str
     user: str
     roles: list[Role]
+
+
+class MembersChanged(BaseModel):
+    user: str = Field(..., description="Id de quem entrou ou saiu")
+    change: Literal["joined", "removed"]
+
+
+class AccessChanged(BaseModel):
+    tenant: str = Field(..., description="Organização que a pessoa deixou de acessar")
+    change: Literal["removed"]
 
 
 class Cleaned(BaseModel):

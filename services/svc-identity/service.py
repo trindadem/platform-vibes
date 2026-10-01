@@ -29,17 +29,20 @@ from core.surreal import db
 from core.temporal_runner import activities
 
 from schemas import (
+    ACCESS_LIVE,
     INVITE_DAYS,
     INVITES,
     LOCK_MINUTES,
     MAX_FAILED_LOGINS,
     MEMBER_JOINED_SUBJECT,
+    MEMBERS_LIVE,
     MEMBERSHIPS,
     REUSE_GRACE_SECONDS,
     SESSIONS,
     TENANT_CREATED_SUBJECT,
     TENANTS,
     USERS,
+    AccessChanged,
     AuthResult,
     Cleaned,
     Empty,
@@ -55,6 +58,7 @@ from schemas import (
     MemberJoined,
     MemberList,
     MemberRef,
+    MembersChanged,
     RefreshInput,
     Session,
     SignupInput,
@@ -267,6 +271,8 @@ class IdentityService:
             "UPDATE identity_sessions SET revoked = true WHERE user = $u AND tenant = $t",
             u=RecordID(USERS, data.user), t=RecordID(TENANTS, tenant),
         )
+        await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
+        await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
         return await self.list_members(Empty())
 
     # ── Manutenção (workflows.py) ───────────────────────────────────────────
@@ -381,6 +387,7 @@ class IdentityService:
                 MemberJoined(tenant=tenant_key, user=user_key, roles=[role]),
                 msg_id=f"member-{tenant_key}-{user_key}",
             )
+            await bus.live(MEMBERS_LIVE, MembersChanged(user=user_key, change="joined"))
 
 
 def _who() -> Principal:

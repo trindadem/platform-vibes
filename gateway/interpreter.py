@@ -6,10 +6,15 @@ Nenhuma rota de negócio é escrita aqui: cada rota nasce de gateway/endpoints/<
 - NATS: publica o corpo (objeto JSON) e responde 202 com o message_id. Quem chamou viaja no cabeçalho da mensagem
   (core.nats_bus). O cabeçalho Idempotency-Key faz a mesma requisição repetida virar a mesma mensagem (e o mesmo
   workflow); a chave é isolada por organização e usuário.
+- stream: true: repassa a resposta em pedaços (SSE), com tempo limite entre pedaços, nunca juntando tudo.
+- GET /api/v1/live: conexão ao vivo (SSE) com os eventos da organização do token e da própria pessoa
+  (core.nats_bus.live_feed). Fecha quando o token expira; o cliente reabre com o token novo.
 Corpo acima de 1 MiB é recusado antes de chegar ao serviço.
 """
+import asyncio
 import hashlib
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -18,18 +23,19 @@ from urllib.parse import quote
 import httpx
 import yaml
 from fastapi import Depends, FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import RootModel, ValidationError
 
-from core.envelope import ResponseEnvelope, ServiceError
+from core.envelope import HEARTBEAT_SECONDS, SSE_HEADERS, ResponseEnvelope, ServiceError, sse
 from core.nats_bus import bus
-from core.security import require
+from core.security import Principal, principal, require
 
 from schemas import Endpoint, Manifest
 
 ENDPOINTS_DIR = Path(__file__).parent / "endpoints"
 MAX_BODY_BYTES = 1_048_576
 FORWARDED_HEADERS = ("authorization", "content-type", "accept", "x-request-id")
+LIVE_PATH = "/api/v1/live"
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -57,7 +63,10 @@ def public_paths(manifests: list[Manifest]) -> set[str]:
 def mount(app: FastAPI, manifests: list[Manifest], upstream: httpx.AsyncClient) -> None:
     for manifest in manifests:
         for ep in manifest.endpoints:
-            handler = _forward(ep, upstream) if ep.target_type == "http" else _publish(ep)
+            if ep.target_type == "nats":
+                handler = _publish(ep)
+            else:
+                handler = _forward_stream(ep, upstream) if ep.stream else _forward(ep, upstream)
             app.add_api_route(
                 manifest.base_path + ep.path,
                 handler,
@@ -67,13 +76,76 @@ def mount(app: FastAPI, manifests: list[Manifest], upstream: httpx.AsyncClient) 
             )
 
 
+def mount_live(app: FastAPI) -> None:
+    """GET /api/v1/live: eventos ao vivo de quem chama, só da sua organização e para si."""
+
+    async def live(who: Principal = Depends(principal)) -> StreamingResponse:
+        if not who.tenant:
+            raise ServiceError("ERRO_TENANT_REQUIRED", "Selecione uma organização para continuar.", status=403)
+        expires_at = who.expires_at or time.time() + 3600
+
+        async def events():
+            async with bus.live_feed(who) as queue:
+                yield b": conectado\n\n"
+                while (remaining := expires_at - time.time()) > 0:
+                    try:
+                        topic, data = await asyncio.wait_for(queue.get(), timeout=min(HEARTBEAT_SECONDS, remaining))
+                    except TimeoutError:
+                        yield b": ping\n\n"
+                        continue
+                    yield sse(topic, data.decode())
+                yield sse("expired", "{}")  # token venceu: o cliente reabre com o token renovado
+
+        return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    app.add_api_route(LIVE_PATH, live, methods=["GET"], name="gateway live")
+
+
+def _upstream_request(ep: Endpoint, request: Request, body: bytes) -> tuple[str, dict[str, str]]:
+    url = ep.target_url.format_map({k: quote(str(v), safe="") for k, v in request.path_params.items()})
+    allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ())
+    headers = {k: v for k, v in request.headers.items() if k in allowed}
+    headers.setdefault("x-request-id", uuid.uuid4().hex)
+    return url, headers
+
+
+def _forward_stream(ep: Endpoint, upstream: httpx.AsyncClient):
+    async def forward(request: Request) -> Response:
+        url, headers = _upstream_request(ep, request, body := await _read_body(request))
+        outgoing = upstream.build_request(
+            request.method, url, content=body, params=request.query_params.multi_items(), headers=headers,
+            timeout=ep.timeout,  # vale entre um pedaço e outro, não para a resposta inteira
+        )
+        try:
+            reply = await upstream.send(outgoing, stream=True)
+        except httpx.TimeoutException:
+            raise ServiceError("ERRO_GATEWAY_TIMEOUT", "O serviço não respondeu a tempo.", status=504) from None
+        except httpx.TransportError:
+            raise ServiceError("ERRO_GATEWAY_UNAVAILABLE", "Serviço indisponível.", status=502) from None
+        if not reply.headers.get("content-type", "").startswith("text/event-stream"):
+            content = await reply.aread()  # erro antes de começar (401, 422...): sai no envelope de sempre
+            await reply.aclose()
+            return Response(content, status_code=reply.status_code, media_type=reply.headers.get("content-type"))
+
+        async def chunks():
+            try:
+                async for chunk in reply.aiter_raw():
+                    yield chunk
+            except httpx.TimeoutException:
+                failure = ResponseEnvelope.failure("ERRO_GATEWAY_TIMEOUT", "O serviço parou de responder.", "gateway", 504)
+                yield sse("error", failure.model_dump_json())
+            finally:
+                await reply.aclose()
+
+        return StreamingResponse(chunks(), status_code=reply.status_code, media_type="text/event-stream", headers=SSE_HEADERS)
+
+    return forward
+
+
 def _forward(ep: Endpoint, upstream: httpx.AsyncClient):
     async def forward(request: Request) -> Response:
         body = await _read_body(request)
-        url = ep.target_url.format_map({k: quote(str(v), safe="") for k, v in request.path_params.items()})
-        allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ())
-        headers = {k: v for k, v in request.headers.items() if k in allowed}
-        headers.setdefault("x-request-id", uuid.uuid4().hex)
+        url, headers = _upstream_request(ep, request, body)
         try:
             reply = await upstream.request(
                 request.method,

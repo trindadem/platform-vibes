@@ -73,7 +73,8 @@ TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio
 
 ## 3. Fluxo de Execução
 1. Persistência SurrealDB — tabela por organização: __SNAKE___records (o core grava e filtra o tenant)
-2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult)
+2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult) e, ao vivo para a tela da
+   organização, __NAME__.processado (bus.live)
 3. Temporal — __PASCAL__Workflow → activity __NAME__.process_task (timeout 5 min, 3 tentativas)
 
 ## 4. Casos de Borda e Erros Mapeados
@@ -92,6 +93,7 @@ SERVICE = "svc-__NAME__"
 TASK_QUEUE = "__NAME__-queue"
 TRIGGER_SUBJECT = "events.__NAME__.trigger"
 PROCESSED_SUBJECT = "events.__NAME__.processed"
+PROCESSED_LIVE = "__NAME__.processado"  # ao vivo para a organização (README §5.10)
 TABLE = "__SNAKE___records"
 
 
@@ -118,7 +120,7 @@ from core.nats_bus import bus
 from core.surreal import db
 from core.temporal_runner import activities
 
-from schemas import PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult
+from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult
 
 
 @activities("__NAME__")
@@ -127,6 +129,7 @@ class __PASCAL__Service:
         record = await db.create(TABLE, data.model_dump())
         result = ExecutionResult(task_id=str(record["id"]), status="SUCCESS", data=record)
         await bus.publish(PROCESSED_SUBJECT, result, msg_id=result.task_id)
+        await bus.live(PROCESSED_LIVE, result)  # telas abertas da organização atualizam sozinhas
         return result
 EOF
 
@@ -214,6 +217,11 @@ render "$STAGE/endpoint.yaml" <<'EOF'
 service: __NAME__
 base_path: /api/v1/__NAME__
 
+# Eventos ao vivo que o serviço emite (bus.live): viram tipos no frontend (useLive / useLiveQuery).
+live:
+  - topic: processado
+    model: ExecutionResult
+
 endpoints:
   - path: /execute
     method: POST
@@ -245,7 +253,7 @@ from pydantic import ValidationError
 from core.security import Principal, acting_as, current_tenant
 
 import service
-from schemas import PROCESSED_SUBJECT, ExecutionInput, ExecutionResult
+from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, ExecutionInput, ExecutionResult
 
 
 @pytest.fixture
@@ -259,8 +267,12 @@ def published(monkeypatch):
     async def publish(subject, message, msg_id=None):
         events.append((subject, message))
 
+    async def live(topic, message, user=None):
+        events.append((topic, message))
+
     monkeypatch.setattr(service.db, "create", create)
     monkeypatch.setattr(service.bus, "publish", publish)
+    monkeypatch.setattr(service.bus, "live", live)
     with acting_as(Principal(sub="u1", tenant="t1")):
         yield events
 
@@ -269,7 +281,7 @@ def test_process_task(published):
     result = asyncio.run(service.__PASCAL__Service().process_task(ExecutionInput(payload={"x": 1})))
     assert isinstance(result, ExecutionResult) and result.status == "SUCCESS"
     assert result.data["tenant"] == "t1"
-    assert [subject for subject, _ in published] == [PROCESSED_SUBJECT]
+    assert [subject for subject, _ in published] == [PROCESSED_SUBJECT, PROCESSED_LIVE]
 
 
 def test_organizacao_nao_vem_do_corpo():

@@ -1,7 +1,8 @@
 """Temporal: cliente, worker e a metaprogramação que transforma o service em activities.
 
 @activities("<serviço>") faz de cada método público a activity "<serviço>.<método>" e valida o trilho no
-import: async def m(self, data: Modelo) -> Modelo. ServiceError com status < 500 vira erro não
+import: async def m(self, data: Modelo) -> Modelo. Método de streaming (README §5.10) é um gerador assíncrono,
+async def m(self, data: Modelo) -> AsyncIterator[...], e não vira activity. ServiceError com status < 500 vira erro não
 re-tentável (regra de negócio não melhora tentando de novo); qualquer outra falha é re-tentada.
 
 Quem age viaja junto (README §5.9): start_workflow grava o Principal do contexto num cabeçalho do Temporal, o
@@ -50,6 +51,9 @@ def activities(prefix: str) -> Callable[[type], type]:
     def apply(cls: type) -> type:
         for name, fn in list(vars(cls).items()):
             if name.startswith("_") or not inspect.isfunction(fn):
+                continue
+            if inspect.isasyncgenfunction(fn):
+                _check_stream_rail(cls, name, fn)  # entrega pedaços pelo HTTP; activity não faz streaming
                 continue
             _check_rail(cls, name, fn)
             wrapped = _business_errors_are_final(fn)
@@ -190,6 +194,16 @@ def _check_rail(cls: type, name: str, fn: Callable[..., Any]) -> None:
         raise TypeError(
             f"{cls.__name__}.{name} viola o trilho: use 'async def {name}(self, data: <Modelo>) -> <Modelo>' "
             f"com modelos de schemas.py, ou renomeie para _{name} se for helper."
+        )
+
+
+def _check_stream_rail(cls: type, name: str, fn: Callable[..., Any]) -> None:
+    hints = typing.get_type_hints(fn)
+    params = list(inspect.signature(fn).parameters)[1:]
+    if not (len(params) == 1 and _is_model(hints.get(params[0])) and "return" in hints):
+        raise TypeError(
+            f"{cls.__name__}.{name} viola o trilho de streaming: use "
+            f"'async def {name}(self, data: <Modelo>) -> AsyncIterator[<Pedaço> | <Final>]' com modelos de schemas.py."
         )
 
 

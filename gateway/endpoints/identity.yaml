@@ -3,6 +3,13 @@
 service: identity
 base_path: /api/v1/identity
 
+# Ao vivo (README §5.10): membros da organização mudaram; e, só para a pessoa, o acesso dela mudou.
+live:
+  - topic: membros
+    model: MembersChanged
+  - topic: acesso
+    model: AccessChanged
+
 endpoints:
   # Públicas: as mesmas de PUBLIC_PATHS no install_security do serviço.
   - path: /signup

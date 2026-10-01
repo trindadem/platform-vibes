@@ -3,6 +3,8 @@
 Junta os manifestos (gateway/endpoints/*.yaml: rota, método, request/response) com os modelos Pydantic de
 services/svc-<nome>/schemas.py e escreve tipos TypeScript e uma função por rota. O frontend nunca adivinha
 caminho nem campo: se errar, o TypeScript acusa. Modelo citado no manifesto e ausente no schemas.py é erro.
+Rota stream: true vira função com options.onDelta (pedaços tipados) que resolve com o resultado final; os tópicos
+live: viram a interface LiveTopics, que dá o tipo de cada evento em useLive/useLiveQuery (README §5.10).
 
 Rodar (da raiz):  uv run python gateway/contracts.py           gera o arquivo
                   uv run python gateway/contracts.py --check   falha se o arquivo estiver desatualizado
@@ -30,7 +32,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 HEADER = """\
 // Gerado por gateway/contracts.py a partir de gateway/endpoints/*.yaml e services/*/schemas.py. Não edite:
 // depois de mudar um manifesto ou um schemas.py, rode (da raiz) `uv run python gateway/contracts.py`.
-import { request, type RequestOptions } from "./api";
+import { __IMPORTS__ } from "./api";
 
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */
 export interface Dispatched {
@@ -52,13 +54,23 @@ export const gateway = {
 
 
 def generate(endpoints_dir: Path = ENDPOINTS_DIR, services_dir: Path = SERVICES_DIR) -> str:
-    sections = [HEADER]
+    sections, topics = [HEADER], []
     for manifest in load_manifests(endpoints_dir):
-        sections.append(_service_section(manifest, services_dir))
+        section, service_topics = _service_section(manifest, services_dir)
+        sections.append(section)
+        topics += service_topics
+    streams = any(ep.stream for manifest in load_manifests(endpoints_dir) for ep in manifest.endpoints)
+    imports = "request, stream, type RequestOptions, type StreamOptions" if streams else "request, type RequestOptions"
+    sections[0] = HEADER.replace("__IMPORTS__", imports)
+    lines = "".join(f"  /** {doc} */\n  {json.dumps(name)}: {ts};\n" for name, ts, doc in topics)
+    sections.append(
+        "/** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */\n"
+        f"export interface LiveTopics {{\n{lines}}}\n"
+    )
     return "\n".join(sections)
 
 
-def _service_section(manifest: Manifest, services_dir: Path) -> str:
+def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[tuple[str, str, str]]]:
     prefix = _pascal(manifest.service)
     module = _load_schemas(services_dir / f"svc-{manifest.service}" / "schemas.py", manifest.service)
     types: dict[str, str] = {}
@@ -69,12 +81,18 @@ def _service_section(manifest: Manifest, services_dir: Path) -> str:
         result = "Dispatched" if ep.target_type == "nats" else (
             _declare(module, ep.response, prefix, types, where, response=True) if ep.response else "unknown"
         )
-        functions.append(_function(manifest, ep, body, result))
+        delta = _declare(module, ep.delta, prefix, types, where, response=True) if ep.delta else None
+        functions.append(_function(manifest, ep, body, result, delta))
+    topics = [
+        (f"{manifest.service}.{t.topic}", _declare(module, t.model, prefix, types, f"{manifest.service}: live {t.topic}", response=True),
+         f"svc-{manifest.service} · bus.live(\"{manifest.service}.{t.topic}\", ...)")
+        for t in manifest.live
+    ]
     client = f"/** svc-{manifest.service} · {manifest.base_path} */\nexport const {_camel(manifest.service)} = {{\n" + "\n".join(functions) + "\n};\n"
-    return "\n".join([*types.values(), client])
+    return "\n".join([*types.values(), client]), topics
 
 
-def _function(manifest: Manifest, ep: Endpoint, body: str, result: str) -> str:
+def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: str | None = None) -> str:
     url = manifest.base_path + ep.path
     params = ep.params()
     path = f'"{url}"'
@@ -86,11 +104,11 @@ def _function(manifest: Manifest, ep: Endpoint, body: str, result: str) -> str:
     has_body = ep.method in ("POST", "PUT", "PATCH")
     if has_body:
         args.append(f"body: {body}")
-    args.append("options?: RequestOptions")
+    args.append(f"options?: StreamOptions<{delta}>" if delta else "options?: RequestOptions")
     target = (
         f"NATS {ep.nats_subject}: durável; passe options.idempotencyKey para repetir com segurança"
         if ep.target_type == "nats"
-        else "http"
+        else "http · em pedaços (options.onDelta)" if delta else "http"
     )
     access = "pública" if ep.auth == "public" else "exige token" + (f" com papéis {', '.join(ep.roles)}" if ep.roles else "")
     if ep.cookies:
@@ -98,7 +116,7 @@ def _function(manifest: Manifest, ep: Endpoint, body: str, result: str) -> str:
     return (
         f"  /** {ep.method} {url} · {target} · {access} */\n"
         f"  {_key(ep.operation())}: ({', '.join(args)}) =>\n"
-        f'    request<{result}>("{ep.method}", {path}, {"body" if has_body else "undefined"}, options),'
+        f'    {f"stream<{delta}, {result}>" if delta else f"request<{result}>"}("{ep.method}", {path}, {"body" if has_body else "undefined"}, options),'
     )
 
 

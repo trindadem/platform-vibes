@@ -33,10 +33,10 @@ cogniventure/
 │   └── <service_name>.py
 │
 ├── core/                        # Recursos compartilhados (estritamente 1 arquivo .py por recurso)
-│   ├── envelope.py              # Envelope canônico de I/O + handlers de erro
+│   ├── envelope.py              # Envelope canônico de I/O, resposta em pedaços (SSE) e handlers de erro
 │   ├── security.py              # Autenticação, autorização, quem age (contexto), senhas, cabeçalhos, SSRF (seção 5.7)
 │   ├── surreal.py               # Conexão multiplexada, queries parametrizadas e isolamento por organização (seção 5.9)
-│   ├── nats_bus.py              # Eventos duráveis (JetStream) e RPC
+│   ├── nats_bus.py              # Eventos duráveis (JetStream), RPC e avisos ao vivo para a tela
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
 │   └── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
 │
@@ -90,6 +90,7 @@ Exemplo para `user-auth`:
 | Rota pública | `/api/v1/user-auth` | kebab |
 | Eventos NATS (duráveis) | `events.user-auth.trigger`, `events.user-auth.processed` | kebab |
 | RPC NATS (request/reply) | `rpc.user-auth.<método>` | kebab |
+| Tópicos ao vivo (`bus.live`) | `user-auth.<evento>` | kebab |
 | Task queue e activities | `user-auth-queue`, `user-auth.<método>` | kebab |
 | Tabela SurrealDB | `user_auth_records` | snake |
 | Classes Python | `UserAuthService`, `UserAuthWorkflow` | Pascal |
@@ -148,7 +149,7 @@ Cada `services/svc-<service_name>/` contém apenas e unicamente:
 | Arquivo | Conteúdo | Trilho |
 |---|---|---|
 | `schemas.py` | Nomes canônicos (literais), DTOs Pydantic, enums, `BaseSettings` do serviço | Nenhuma lógica |
-| `service.py` | `<Pascal>Service` decorada com `@activities("<service_name>")`: lógica pura, SurrealQL, helpers `_privados` | Todo método público é `async def m(self, data: Modelo) -> Modelo` |
+| `service.py` | `<Pascal>Service` decorada com `@activities("<service_name>")`: lógica pura, SurrealQL, helpers `_privados` | Todo método público é `async def m(self, data: Modelo) -> Modelo`, ou um gerador de pedaços para streaming (seção 5.10) |
 | `workflows.py` | `<Pascal>Workflow`: encadeia `workflow.execute_activity_method(<Pascal>Service.m, ...)` | Sem I/O; imports dentro de `workflow.unsafe.imports_passed_through()` |
 | `main.py` | FastAPI + assinatura NATS + worker Temporal no mesmo loop | Só ingress; nenhuma regra de negócio |
 
@@ -208,9 +209,9 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 
 | Arquivo | Expõe |
 |---|---|
-| `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)` |
+| `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)`, `stream_response(gerador, service, final=Modelo)` |
 | `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
-| `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)` |
+| `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)`, `bus.live(tópico, model, user=None)`, `bus.live_feed(principal)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
 | `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
@@ -280,12 +281,24 @@ endpoints:
     request: FaturaIn               # modelo do schemas.py esperado no corpo; NATS responde { message_id }
     target_type: nats
     nats_subject: events.billing.trigger
+  - path: /resumo
+    method: POST
+    auth: client_jwt
+    stream: true                    # resposta em pedaços (SSE, seção 5.10); exige delta
+    request: ResumoIn
+    delta: Trecho                   # modelo de cada pedaço; response é o resultado final
+    response: Resumo
+    target_type: http
+    target_url: http://svc-billing:8000/resumo
+live:                               # eventos ao vivo que o serviço emite (bus.live): billing.<topic>
+  - topic: fatura-paga
+    model: Fatura
 ```
 
 - **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
 - **HTTP:** repassa corpo, query e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`. O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
-- **Limites:** corpo acima de 1 MiB → 413 (no Traefik e no gateway). Rate limit por IP no Traefik (50 req/s, rajada de 100).
+- **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
 - **Cookies:** só rotas com `cookies: true` recebem o `Cookie` do navegador e devolvem o `Set-Cookie` do serviço; nas outras, cookie nunca passa. O gateway não guarda cookie entre requisições.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
@@ -307,6 +320,15 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 - **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só o serviço de identidade (usuários, organizações, sessões) as usa.
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
+### 5.10 Tempo real e streaming
+
+Dois casos, ambos por SSE (servidor → tela, sobre HTTP); o caminho tela → servidor continua sendo POST.
+
+- **Resposta em pedaços** (tokens de IA, progresso de uma tarefa longa): o método do service é um gerador, `async def m(self, data: Modelo) -> AsyncIterator[Pedaco | Final]` (não vira activity), e a rota devolve `stream_response(svc.m(data), SERVICE, final=Final)`. Sai `event: delta` a cada pedaço, `event: done` com o envelope do resultado e `event: error` com o envelope do erro (mesmas regras de sempre), com batimento a cada 15 s. Quem fecha a tela cancela o gerador. No manifesto: `stream: true` e `delta: <Modelo>`; o gateway repassa sem juntar, com `timeout` valendo entre um pedaço e outro.
+- **Avisos ao vivo** (listas e painéis que atualizam sozinhos): `await bus.live("<service>.<evento>", modelo)` avisa a organização inteira; `user=<sub>` avisa só uma pessoa. A organização vem sempre do contexto: não há como avisar outra. Só o próprio serviço emite seus tópicos, que ficam declarados em `live:` no manifesto. É efêmero (NATS simples): quem estava fora do ar busca de novo no banco.
+- **Conexão:** `GET /api/v1/live` (gateway) entrega a quem chama só os avisos da organização do token e os endereçados a essa pessoa. Fecha quando o token vence; o frontend reabre com o token renovado e ao trocar de organização.
+- **Frontend:** uma conexão por aba, compartilhada. `useStream(fn)` acumula os pedaços (`deltas`, `result`, `cancel`); `useLiveQuery("tópico", fn, ...args)` é um `useQuery` que recarrega quando o aviso chega e quando a conexão volta; `useLive("tópico", fn)` reage a cada aviso. Os tópicos e seus modelos vêm tipados de `contracts.ts` (`LiveTopics`).
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -317,7 +339,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). `Money`, `DateTime` e `StatusBadge` formatam em pt-BR. Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money`, `DateTime` e `StatusBadge` formatam em pt-BR. Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };
