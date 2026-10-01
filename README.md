@@ -16,6 +16,7 @@
 ```text
 cogniventure/
 ├── README.md                    # Esta especificação
+├── LICENSE                      # MIT: uso livre, mantendo o aviso de copyright
 ├── sprint.md                    # Log de bloqueios e revisões de contrato (seção 8)
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
