@@ -11,7 +11,7 @@ SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER, SURREAL_PASSWORD.
 """
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Any, LiteralString
 
@@ -38,9 +38,17 @@ class Database:
         self._lock = asyncio.Lock()
 
     @asynccontextmanager
-    async def connected(self) -> AsyncIterator["Database"]:
-        """Conecta no boot (falha cedo se faltar credencial) e fecha no desligamento."""
+    async def connected(self, tables: Iterable[str] = ()) -> AsyncIterator["Database"]:
+        """Conecta no boot (falha cedo se faltar credencial) e garante as tabelas do serviço.
+
+        O SurrealDB 3 recusa SELECT em tabela que nunca recebeu registro; declarar no boot faz a primeira
+        listagem devolver [] em vez de erro. Idempotente.
+        """
+        names = [_ident(table) for table in tables]
         await self._connection()
+        for name in names:
+            # Nome validado por _ident (só a-z, 0-9, _): seguro fora de parâmetro, que DEFINE não aceita.
+            await self._call("query", f"DEFINE TABLE IF NOT EXISTS {name} SCHEMALESS", None)
         try:
             yield self
         finally:

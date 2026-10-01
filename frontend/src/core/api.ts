@@ -4,8 +4,14 @@
  * - Desembrulha o envelope: sucesso devolve `data`; erro vira ApiError com o código do backend.
  * - Envia o token da sessão; resposta 401 encerra a sessão local.
  * - Timeout de 30 s. Gatilhos assíncronos (rotas NATS) aceitam Idempotency-Key: newIdempotencyKey().
+ *
+ * Páginas nunca chamam request: usam as funções geradas em contracts.ts através dos hooks
+ *   const faturas = useQuery(loja.listar);                        // GET ao abrir a tela
+ *   const fatura  = useQuery(loja.detalhe, { fatura_id });        // com parâmetros
+ *   const criar   = useAction(loja.criar, { onSuccess: faturas.reload });
+ * e entregam o estado aos componentes de receita (QueryTable, QueryView, ActionForm, ResourcePage).
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken, signOut } from "./auth";
 
 export interface ApiErrorDetail {
@@ -81,46 +87,90 @@ export async function request<T>(method: Method, path: string, body?: unknown, o
   return envelope.data as T;
 }
 
-export const api = {
-  get: <T>(path: string, options?: RequestOptions) => request<T>("GET", path, undefined, options),
-  post: <T>(path: string, body: unknown, options?: RequestOptions) => request<T>("POST", path, body, options),
-  put: <T>(path: string, body: unknown, options?: RequestOptions) => request<T>("PUT", path, body, options),
-  patch: <T>(path: string, body: unknown, options?: RequestOptions) => request<T>("PATCH", path, body, options),
-  delete: <T>(path: string, options?: RequestOptions) => request<T>("DELETE", path, undefined, options),
-};
-
 /** Chave para repetir um gatilho com segurança: a mesma chave nunca dispara dois workflows. */
 export function newIdempotencyKey(): string {
   return crypto.randomUUID();
 }
 
-export interface ApiState<T> {
+/** Estado de uma consulta: o que QueryView, QueryTable e ResourcePage recebem. */
+export interface QueryState<T> {
   data: T | null;
   error: ApiError | null;
   loading: boolean;
+  /** Busca de novo (ex.: depois de criar um item). */
   reload: () => void;
 }
 
-/** Hook: GET ao montar a tela (path null = não carrega). Uso: const { data, error, loading } = useApi<T>("/api/v1/..."). */
-export function useApi<T>(path: string | null): ApiState<T> {
-  const [state, setState] = useState<Omit<ApiState<T>, "reload">>({ data: null, error: null, loading: path !== null });
+/**
+ * Hook: chama uma função de contracts.ts ao montar a tela e quando os argumentos mudam.
+ * Uso: useQuery(gateway.health) ou useQuery(loja.detalhe, { fatura_id }). Tipos inferidos do contrato.
+ */
+export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOptions?]) => Promise<T>, ...args: A): QueryState<T> {
+  const [state, setState] = useState<Omit<QueryState<T>, "reload">>({ data: null, error: null, loading: true });
   const [version, setVersion] = useState(0);
+  // A busca depende só dos argumentos: função criada na hora (useQuery(() => ...)) não vira loop de requisições.
+  const key = JSON.stringify(args);
+  const latest = useRef({ fn, args });
+  latest.current = { fn, args };
 
   useEffect(() => {
-    if (path === null) return;
     const controller = new AbortController();
     setState((previous) => ({ ...previous, loading: true, error: null }));
-    api
-      .get<T>(path, { signal: controller.signal })
+    latest.current
+      .fn(...latest.current.args, { signal: controller.signal })
       .then((data) => setState({ data, error: null, loading: false }))
       .catch((error: unknown) => {
-        if (controller.signal.aborted) return;
-        const apiError = error instanceof ApiError ? error : new ApiError("ERRO_FRONT_UNKNOWN", String(error), 0);
-        setState({ data: null, error: apiError, loading: false });
+        if (!controller.signal.aborted) setState({ data: null, error: toApiError(error), loading: false });
       });
     return () => controller.abort();
-  }, [path, version]);
+  }, [key, version]);
 
   const reload = useCallback(() => setVersion((v) => v + 1), []);
   return { ...state, reload };
+}
+
+/** Estado de uma ação: o que ActionForm e ResourcePage recebem. */
+export interface ActionState<A extends unknown[], T> {
+  /** Executa a ação; ignora cliques enquanto a anterior não termina. Devolve o resultado ou undefined se falhou. */
+  run: (...args: A) => Promise<T | undefined>;
+  running: boolean;
+  error: ApiError | null;
+  result: T | null;
+  reset: () => void;
+}
+
+/**
+ * Hook: prepara uma ação (POST/PUT/PATCH/DELETE) de contracts.ts com estado de envio, erro e resultado.
+ * Uso: const criar = useAction(loja.criar, { onSuccess: faturas.reload }); depois criar.run(corpo).
+ * Para adaptar o formulário ao contrato: useAction((v: { valor: number }) => billing.execute({ ... })).
+ */
+export function useAction<A extends unknown[], T>(fn: (...args: A) => Promise<T>, options: { onSuccess?: (result: T) => void } = {}): ActionState<A, T> {
+  const [state, setState] = useState<{ running: boolean; error: ApiError | null; result: T | null }>({ running: false, error: null, result: null });
+  const running = useRef(false);
+  const latest = useRef({ fn, onSuccess: options.onSuccess });
+  latest.current = { fn, onSuccess: options.onSuccess };
+
+  const run = useCallback(async (...args: A) => {
+    if (running.current) return undefined;
+    running.current = true;
+    setState((previous) => ({ ...previous, running: true, error: null }));
+    try {
+      const result = await latest.current.fn(...args);
+      setState({ running: false, error: null, result });
+      latest.current.onSuccess?.(result);
+      return result;
+    } catch (error) {
+      setState((previous) => ({ ...previous, running: false, error: toApiError(error) }));
+      return undefined;
+    } finally {
+      running.current = false;
+    }
+  }, []);
+
+  const reset = useCallback(() => setState({ running: false, error: null, result: null }), []);
+  return { ...state, run, reset };
+}
+
+function toApiError(error: unknown): ApiError {
+  return error instanceof ApiError ? error : new ApiError("ERRO_FRONT_UNKNOWN", String(error), 0);
 }

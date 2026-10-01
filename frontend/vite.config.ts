@@ -6,7 +6,8 @@
  * - src/components/<Nome>.tsx: exporta <Nome> com JSDoc e <Nome>Props; não importa core/, modules/ nem App.
  * - src/components/ui/<nome>.tsx: primitivos do shadcn/ui (npx shadcn add <nome>), código de origem preservado.
  *   Só componentes do catálogo os usam; página nunca importa de ui/.
- * - Requisição só em src/core/api.ts; .css só src/core/theme.css, importado por main.tsx.
+ * - Requisição só em src/core/api.ts; página chama serviços pelas funções de core/contracts.ts (useQuery/useAction).
+ * - .css só src/core/theme.css, importado por main.tsx.
  * - Módulo não importa outro módulo. Arquivo fora da topologia é erro.
  *
  * Também gera src/components/CATALOG.md a partir do próprio código: é o que existe para compor.
@@ -110,10 +111,14 @@ function checkSource(file: string, code: string): Violation[] {
   walk(program as Node, (node) => {
     const callee = node.type === "CallExpression" || node.type === "NewExpression" ? calleeName(node.callee) : null;
     if (callee && NETWORK.has(callee) && r !== "core/api.ts") {
-      fail(`${callee} fora de src/core/api.ts: toda requisição passa por api.get/api.post/useApi`);
+      fail(`${callee} fora de src/core/api.ts: use as funções de @/core/contracts com useQuery/useAction`);
     }
     if (node.source?.type === "Literal" && typeof node.source.value === "string") {
       checkImport(node.source.value, file, r, kind, fail);
+      const direct = (node.specifiers ?? []).some((s: Node) => s.imported?.name === "request");
+      if (kind === "module" && direct && /(^@\/core\/api|\/core\/api)$/.test(node.source.value)) {
+        fail("página não chama request: use as funções de @/core/contracts com useQuery/useAction");
+      }
     }
     if (kind === "module" && node.type === "JSXOpeningElement" && isIntrinsic(node.name)) {
       fail(`<${node.name.name}> em página: páginas só compõem componentes de src/components (veja CATALOG.md)`);

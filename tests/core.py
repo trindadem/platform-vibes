@@ -249,7 +249,24 @@ def test_payload_invalido_nao_ecoa_o_valor(auth_env):
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "ERRO_TESTE_INVALID_PAYLOAD"
     assert r.json()["error"]["details"][0]["loc"] == ["body", "quantidade"]
+    assert r.json()["error"]["details"][0]["msg"] == "Campo obrigatório."
     assert "s3nh4-secreta" not in r.text
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ({"type": "string_too_short", "msg": "String should have at least 2 characters", "ctx": {"min_length": 2}}, "Mínimo de 2 caracteres."),
+        ({"type": "greater_than", "msg": "Input should be greater than 0", "ctx": {"gt": 0}}, "Deve ser maior que 0."),
+        ({"type": "greater_than", "msg": "Input should be greater than 0", "ctx": {"gt": 0.0}}, "Deve ser maior que 0."),
+        ({"type": "less_than_equal", "msg": "...", "ctx": {"le": 9.5}}, "Deve ser menor ou igual a 9.5."),
+        ({"type": "literal_error", "msg": "...", "ctx": {"expected": "'aberta' or 'paga'"}}, "Valor não permitido (aceitos: 'aberta' ou 'paga')."),
+        ({"type": "value_error", "msg": "Value error, CPF inválido"}, "Value error, CPF inválido"),
+        ({"type": "greater_than", "msg": "Input should be greater than 0"}, "Input should be greater than 0"),
+    ],
+)
+def test_mensagem_de_validacao_em_portugues(error, expected):
+    assert envelope.validation_message(error) == expected
 
 
 def test_erro_de_negocio_sai_no_envelope(auth_env):
@@ -388,6 +405,15 @@ def test_bus_desconectado_explica_o_que_fazer():
 def test_nome_de_tabela_injetado_e_recusado(table):
     with pytest.raises(ValueError, match="tabela inválido"):
         asyncio.run(surreal.Database().create(table, {}))
+
+
+def test_tabela_declarada_no_boot_e_validada_antes_de_conectar():
+    async def boot():
+        async with surreal.Database().connected(tables=["faturas; REMOVE TABLE users"]):
+            pass
+
+    with pytest.raises(ValueError, match="tabela inválido"):
+        asyncio.run(boot())
 
 
 def test_resultados_do_surreal_viram_tipos_simples():

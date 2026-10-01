@@ -18,6 +18,31 @@ from starlette.exceptions import HTTPException
 
 log = logging.getLogger("core.envelope")
 
+# Mensagens de validação em pt-BR, com os limites do próprio modelo. Tipo não listado: mensagem original.
+_VALIDATION_MESSAGES = {
+    "missing": "Campo obrigatório.",
+    "extra_forbidden": "Campo não permitido.",
+    "string_too_short": "Mínimo de {min_length} caracteres.",
+    "string_too_long": "Máximo de {max_length} caracteres.",
+    "too_short": "Mínimo de {min_length} itens.",
+    "too_long": "Máximo de {max_length} itens.",
+    "greater_than": "Deve ser maior que {gt}.",
+    "greater_than_equal": "Deve ser maior ou igual a {ge}.",
+    "less_than": "Deve ser menor que {lt}.",
+    "less_than_equal": "Deve ser menor ou igual a {le}.",
+    "string_type": "Deve ser um texto.",
+    "string_pattern_mismatch": "Formato inválido.",
+    "int_type": "Deve ser um número inteiro.",
+    "int_parsing": "Deve ser um número inteiro.",
+    "float_type": "Deve ser um número.",
+    "float_parsing": "Deve ser um número.",
+    "bool_type": "Deve ser verdadeiro ou falso.",
+    "bool_parsing": "Deve ser verdadeiro ou falso.",
+    "literal_error": "Valor não permitido (aceitos: {expected}).",
+    "enum": "Valor não permitido (aceitos: {expected}).",
+    "json_invalid": "JSON inválido.",
+}
+
 
 class ErrorInfo(BaseModel):
     code: str
@@ -69,6 +94,18 @@ def error_response(
     return JSONResponse(body.model_dump(mode="json"), status_code=status, headers=headers)
 
 
+def validation_message(error: dict[str, Any]) -> str:
+    """Mensagem pt-BR para um erro do Pydantic (usa ctx: min_length, gt, expected...)."""
+    template = _VALIDATION_MESSAGES.get(error.get("type", ""))
+    ctx = {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in error.get("ctx", {}).items()}
+    if "expected" in ctx:
+        ctx["expected"] = str(ctx["expected"]).replace(" or ", " ou ")
+    try:
+        return template.format(**ctx) if template else error["msg"]
+    except (KeyError, IndexError):
+        return error["msg"]
+
+
 def install_envelope(app: FastAPI, service: str) -> None:
     """Faz todo erro do app (negócio, HTTP, validação, inesperado) sair no envelope."""
 
@@ -82,7 +119,7 @@ def install_envelope(app: FastAPI, service: str) -> None:
 
     async def on_invalid_payload(_: Request, exc: RequestValidationError) -> JSONResponse:
         # Sem "input": o erro aponta o campo, nunca ecoa o valor recebido (pode ser uma senha).
-        details = [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+        details = [{"loc": list(e["loc"]), "msg": validation_message(e), "type": e["type"]} for e in exc.errors()]
         return error_response(service, 422, error_code(service, "INVALID_PAYLOAD"), "Payload inválido.", details)
 
     async def on_unexpected(_: Request, exc: Exception) -> JSONResponse:

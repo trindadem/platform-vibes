@@ -176,7 +176,7 @@ from core.security import install_security
 from core.surreal import db
 from core.temporal_runner import runner
 
-from schemas import SERVICE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput
+from schemas import SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput
 from service import __PASCAL__Service
 from workflows import __PASCAL__Workflow
 
@@ -192,7 +192,7 @@ async def on_trigger(data: ExecutionInput) -> None:
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(),
+        db.connected(tables=[TABLE]),
         runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)

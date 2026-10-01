@@ -209,10 +209,12 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
-| `surreal.py` | `db.connected()`, `db.query(sql, **params)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
+| `surreal.py` | `db.connected(tables=[TABLE])`, `db.query(sql, **params)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
+
+Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio modelo ("Mínimo de 2 caracteres.", "Deve ser maior que 0."), e cada detalhe aponta o campo em `loc`. As tabelas declaradas em `db.connected(tables=[...])` são garantidas no boot (no SurrealDB 3, consultar tabela inexistente é erro; assim a primeira listagem devolve `[]`).
 
 ### 5.7 Segurança (`core/security.py`)
 
@@ -292,7 +294,33 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default), documentada com `/** ... */`, e `<Nome>Props` com cada prop documentada. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código (nome, descrição, props, tipos). Ler o catálogo antes de criar uma tela; nunca editá-lo à mão.
-- **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Chamadas a serviços usam o cliente gerado em `src/core/contracts.ts` (`import { billing } from "@/core/contracts"`): rota, corpo e resposta tipados; nunca digitar caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
+- **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). `Money`, `DateTime` e `StatusBadge` formatam em pt-BR. Peça avulsa só quando a receita não serve.
+
+```tsx
+export const meta: PageMeta = { title: "Faturas", order: 3 };
+
+export default function Faturas() {
+  const faturas = useQuery(loja.listar);
+  const criar = useAction(loja.criar, { onSuccess: faturas.reload });
+  return (
+    <ResourcePage
+      title="Faturas"
+      query={faturas}
+      rowKey={(f) => f.id}
+      columns={[
+        { key: "cliente", header: "Cliente" },
+        { key: "valor", header: "Valor", render: (f) => <Money value={f.valor} /> },
+        { key: "status", header: "Status", render: (f) => <StatusBadge value={f.status} /> },
+      ]}
+      create={{ label: "Nova fatura", action: criar, fields: [
+        { name: "cliente", label: "Cliente", required: true },
+        { name: "valor", label: "Valor (R$)", kind: "number", required: true },
+      ] }}
+    />
+  );
+}
+``` `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
 - **Sessão:** `src/core/auth.ts` (`useSession`, `signIn`, `signOut`, `hasRoles`). O conteúdo do token serve só para exibição; quem decide o acesso é o backend.
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
@@ -309,7 +337,7 @@ npm run check    # tipos (TypeScript) + build com os trilhos; regenera o CATALOG
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
 4. Rodar `tests/<service_name>.py` (seção 5.5) e `python gateway/contracts.py` (atualiza os tipos do frontend).
-5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx compondo componentes do CATALOG.md, seguindo o README."*
+5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx com as receitas do CATALOG.md (ResourcePage, QueryTable, ActionForm) e as funções de core/contracts.ts, seguindo o README."*
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
 

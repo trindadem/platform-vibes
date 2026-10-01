@@ -8,14 +8,14 @@ import { Spinner } from "@/components/Spinner";
 import { Stack } from "@/components/Stack";
 import { Stat } from "@/components/Stat";
 import { Text } from "@/components/Text";
-import { useApi } from "@/core/api";
-import type { GatewayHealth } from "@/core/contracts";
+import { useQuery } from "@/core/api";
+import { gateway } from "@/core/contracts";
 import { useSession } from "@/core/auth";
 
 export const meta: PageMeta = { title: "Início", order: 1 };
 
 export default function Inicio() {
-  const health = useApi<GatewayHealth>("/health");
+  const health = useQuery(gateway.health);
   const session = useSession();
   const online = health.data !== null;
 
