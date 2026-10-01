@@ -310,8 +310,8 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
 
-- **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente.
-- **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order }`. Vira a rota `/<module_name>` e um item do menu, sem registro manual. Um módulo tem só `page.tsx` e não importa outro módulo.
+- **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente. Navegação e parâmetros da URL vêm do `react-router` (`useSearchParams`, `useNavigate`); links, por `TextLink` ou `Button to=`.
+- **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order, access }`. Vira a rota `/<module_name>`, sem registro manual. `access` diz quem vê: `"private"` (padrão: exige sessão e aparece no menu; sem sessão, vai para `/entrar?next=`), `"public"` (aberta, fora do menu, ex.: `/convite`) ou `"guest"` (só sem sessão, ex.: `/entrar` e `/cadastro`). Um módulo tem só `page.tsx` e não importa outro módulo.
 - **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default) e `<Nome>Props` com cada prop documentada. O JSDoc da função começa com uma frase dizendo o que ele é e traz `@category` (uma das categorias do `vite.config.ts`: Receitas, Layout, Dados, Formatação, Formulários, Feedback, Texto, Aplicação) e `@example`: uma expressão JSX que usa o próprio componente e segue as regras de página. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
@@ -343,7 +343,7 @@ export default function Faturas() {
 }
 ```
 
-- **Sessão:** `src/core/auth.ts` (`useSession`, `signIn`, `signOut`, `hasRoles`). O conteúdo do token serve só para exibição; quem decide o acesso é o backend.
+- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `convite`, `membros` e `organizacoes`.
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
 ```bash
@@ -380,7 +380,7 @@ O `token` da linha de comando serve para testes rápidos. Conta de verdade: `POS
 
 | Endereço | O quê |
 |---|---|
-| `http://localhost:5173` | Frontend (`npm run dev` em `frontend/`); entre pela tela Sessão com um token de teste |
+| `http://localhost:5173` | Frontend (`npm run dev` em `frontend/`); crie a conta e a organização em `/cadastro` |
 | `http://localhost:8088` | API, pelo Traefik (`GATEWAY_PORT`) |
 | `http://localhost:8233` | Temporal UI: workflows, activities e histórico |
 | `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |

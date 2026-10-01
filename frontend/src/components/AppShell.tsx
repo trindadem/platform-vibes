@@ -24,6 +24,8 @@ export interface AppShellProps {
   nav: { to: string; label: string }[];
   /** Conteúdo no pé do menu lateral (ex.: SessionStatus). */
   aside?: ReactNode;
+  /** Seletor no topo do menu, abaixo da marca (ex.: TenantSwitcher). */
+  switcher?: ReactNode;
   children: ReactNode;
 }
 
@@ -36,7 +38,7 @@ export interface AppShellProps {
  *   <Text>Conteúdo</Text>
  * </AppShell>
  */
-export function AppShell({ brand, nav, aside, children }: AppShellProps) {
+export function AppShell({ brand, nav, aside, switcher, children }: AppShellProps) {
   const { pathname } = useLocation();
   const current = nav.find((item) => pathname.startsWith(item.to));
   return (
@@ -55,6 +57,7 @@ export function AppShell({ brand, nav, aside, children }: AppShellProps) {
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
+          {switcher}
         </SidebarHeader>
         <SidebarContent>
           <SidebarGroup>

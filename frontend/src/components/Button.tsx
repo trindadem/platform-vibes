@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Link } from "react-router";
 import { Button as UiButton } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 
@@ -16,6 +17,8 @@ export interface ButtonProps {
   loading?: boolean;
   disabled?: boolean;
   onClick?: () => void;
+  /** Navega para esta rota da aplicação em vez de executar onClick (ex.: "/cadastro"). */
+  to?: string;
   children: ReactNode;
 }
 
@@ -26,7 +29,14 @@ export interface ButtonProps {
  * @example
  * <Button variant="secondary" onClick={salvar}>Cancelar</Button>
  */
-export function Button({ variant = "primary", size = "md", type = "button", loading = false, disabled = false, onClick, children }: ButtonProps) {
+export function Button({ variant = "primary", size = "md", type = "button", loading = false, disabled = false, onClick, to, children }: ButtonProps) {
+  if (to) {
+    return (
+      <UiButton asChild variant={VARIANT[variant]} size={SIZE[size]}>
+        <Link to={to}>{children}</Link>
+      </UiButton>
+    );
+  }
   return (
     <UiButton type={type} variant={VARIANT[variant]} size={SIZE[size]} onClick={onClick} disabled={disabled || loading} aria-busy={loading}>
       {loading && <Spinner aria-hidden="true" role="presentation" aria-label={undefined} />}

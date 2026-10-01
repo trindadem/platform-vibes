@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (29)
+## Índice (34)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -39,7 +39,9 @@
 
 **Formulários**: campos e ações
 
-- [Button](#button): Botão de ação com variantes, tamanhos e estado de carregamento. `children, variant?, size?, type?, loading?, disabled?, onClick?`
+- [Button](#button): Botão de ação com variantes, tamanhos e estado de carregamento. `children, variant?, size?, type?, loading?, disabled?, onClick?, to?`
+- [ConfirmButton](#confirmbutton): Botão para ação destrutiva que pede um segundo clique de confirmação (volta sozinho em 4 s). `children, onConfirm, confirmLabel?, loading?, size?`
+- [CopyField](#copyfield): Texto somente leitura com botão de copiar, para links e códigos que a pessoa vai repassar. `label, value, hint?`
 - [Form](#form): Formulário com campos espaçados de forma uniforme e envio sem recarregar a página. `onSubmit, children, busy?`
 - [SelectField](#selectfield): Lista de opções com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, options, placeholder?, hint?, error?, required?`
 - [TextArea](#textarea): Campo de texto de várias linhas com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, rows?, hint?, error?, required?, placeholder?, monospace?`
@@ -55,11 +57,14 @@
 
 - [Heading](#heading): Título de seção dentro de uma tela (h2 ou h3). `children, level?`
 - [Text](#text): Parágrafo de texto com tom e tamanho padronizados. `children, tone?, size?`
+- [TextLink](#textlink): Link no meio do texto para outra tela da aplicação. `to, children`
 
 **Aplicação**: moldura e sessão (usados pelo App.tsx, não pelas páginas)
 
-- [AppShell](#appshell): Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, aside?`
-- [SessionStatus](#sessionstatus): Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão. `user, onSignOut`
+- [AppShell](#appshell): Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, aside?, switcher?`
+- [AuthShell](#authshell): Moldura das telas abertas (entrar, cadastro, convite): marca no topo e conteúdo numa coluna estreita e centralizada. `brand, children`
+- [SessionStatus](#sessionstatus): Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão. `user, onSignOut, detail?`
+- [TenantSwitcher](#tenantswitcher): Seletor da organização ativa no topo do menu lateral, com a opção de criar outra. `tenants, current, onSwitch, onCreate?`
 
 ---
 
@@ -81,7 +86,7 @@ Receita de formulário: campos a partir de uma lista, envio pela ação, erro do
 ```
 
 - `action`: `{ run: (body: B) => Promise<unknown>; running: boolean; error: { message: string; details?: { loc?: (string | number)[]; msg?: string; type?: string }[] } | null; }`: Estado de useAction(...) (src/core/api.ts): o formulário chama action.run(valores).
-- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options.
+- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options.
 - `submitLabel?`: `string`: Texto do botão de envio. Padrão: "Salvar".
 - `successMessage?`: `string`: Mensagem exibida após sucesso (o formulário é limpo).
 - `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo.
@@ -378,7 +383,38 @@ Botão de ação com variantes, tamanhos e estado de carregamento. _(Formulário
 - `loading?`: `boolean`: Mostra que a ação está em andamento e bloqueia novos cliques.
 - `disabled?`: `boolean`
 - `onClick?`: `() => void`
+- `to?`: `string`: Navega para esta rota da aplicação em vez de executar onClick (ex.: "/cadastro").
 - `children`: `ReactNode`
+
+---
+
+## ConfirmButton
+
+Botão para ação destrutiva que pede um segundo clique de confirmação (volta sozinho em 4 s). _(Formulários)_
+
+```tsx
+<ConfirmButton onConfirm={salvar} confirmLabel="Remover agora">Remover</ConfirmButton>
+```
+
+- `children`: `ReactNode`: Texto do botão antes de confirmar (ex.: "Remover").
+- `onConfirm`: `() => void`: Executa a ação depois da confirmação.
+- `confirmLabel?`: `string`: Texto do botão de confirmação. Padrão: "Confirmar".
+- `loading?`: `boolean`: Ação em andamento.
+- `size?`: `"sm" | "md"`: Altura. Padrão: sm.
+
+---
+
+## CopyField
+
+Texto somente leitura com botão de copiar, para links e códigos que a pessoa vai repassar. _(Formulários)_
+
+```tsx
+<CopyField label="Link do convite" value="https://app.exemplo.com/convite?codigo=abc" hint="Vale por 7 dias e para uma pessoa." />
+```
+
+- `label`: `string`: Rótulo visível.
+- `value`: `string`: Texto a copiar (ex.: um link de convite).
+- `hint?`: `string`: Ajuda abaixo do campo.
 
 ---
 
@@ -534,6 +570,19 @@ Parágrafo de texto com tom e tamanho padronizados. _(Texto)_
 
 ---
 
+## TextLink
+
+Link no meio do texto para outra tela da aplicação. _(Texto)_
+
+```tsx
+<Text>Não tem conta? <TextLink to="/cadastro">Criar conta</TextLink></Text>
+```
+
+- `to`: `string`: Rota de destino dentro da aplicação (ex.: "/cadastro").
+- `children`: `ReactNode`
+
+---
+
 ## AppShell
 
 Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. _(Aplicação)_
@@ -547,6 +596,22 @@ Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a t
 - `brand`: `string`: Nome exibido no topo do menu lateral.
 - `nav`: `{ to: string; label: string }[]`: Itens do menu: { to: "/rota", label: "Texto" }.
 - `aside?`: `ReactNode`: Conteúdo no pé do menu lateral (ex.: SessionStatus).
+- `switcher?`: `ReactNode`: Seletor no topo do menu, abaixo da marca (ex.: TenantSwitcher).
+- `children`: `ReactNode`
+
+---
+
+## AuthShell
+
+Moldura das telas abertas (entrar, cadastro, convite): marca no topo e conteúdo numa coluna estreita e centralizada. _(Aplicação)_
+
+```tsx
+<AuthShell brand="CV-Frame">
+  <Text>Conteúdo</Text>
+</AuthShell>
+```
+
+- `brand`: `string`: Nome exibido acima do conteúdo.
 - `children`: `ReactNode`
 
 ---
@@ -560,4 +625,20 @@ Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que n�
 ```
 
 - `user`: `string | null`: Usuário da sessão; null quando não há sessão.
+- `detail?`: `string`: Linha abaixo do nome (ex.: o e-mail).
 - `onSignOut`: `() => void`: Encerra a sessão.
+
+---
+
+## TenantSwitcher
+
+Seletor da organização ativa no topo do menu lateral, com a opção de criar outra. _(Aplicação)_
+
+```tsx
+<TenantSwitcher tenants={[{ id: "acme", name: "Acme" }, { id: "beta", name: "Beta" }]} current="acme" onSwitch={setNome} onCreate={salvar} />
+```
+
+- `tenants`: `{ id: string; name: string }[]`: Organizações da pessoa: { id, name }.
+- `current`: `string | null`: Id da organização ativa (null se nenhuma).
+- `onSwitch`: `(id: string) => void`: Troca a organização ativa.
+- `onCreate?`: `() => void`: Abre a criação de uma organização nova.

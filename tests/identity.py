@@ -171,7 +171,7 @@ def test_refresh_gira_e_o_antigo_nao_vale_mais(events):
     async def scenario(svc):
         first = await signup(svc)
         second = await svc.refresh(RefreshInput(refresh_token=first.refresh_token))
-        with pytest.raises(ServiceError) as reuse:  # dentro dos 30 s: corrida entre abas, não revoga
+        with pytest.raises(ServiceError) as reuse:  # dentro dos 30 s: corrida entre abas, não revoga nem desloga
             await svc.refresh(RefreshInput(refresh_token=first.refresh_token))
         third = await svc.refresh(RefreshInput(refresh_token=second.refresh_token))
         return first, second, third, reuse
@@ -179,7 +179,7 @@ def test_refresh_gira_e_o_antigo_nao_vale_mais(events):
     first, second, third, reuse = run(scenario)
     assert len({first.refresh_token, second.refresh_token, third.refresh_token}) == 3
     assert third.auth.tenant.id == first.auth.tenant.id
-    _error(reuse, "ERRO_IDENTITY_INVALID_SESSION", 401)
+    _error(reuse, "ERRO_IDENTITY_SESSION_ROTATED", 401)
 
 
 def test_refresh_antigo_reaparecendo_depois_revoga_a_sessao_inteira(events):
@@ -279,7 +279,7 @@ def test_nova_organizacao_e_troca_de_sessao(events):
     nova, renewed, old = run(scenario)
     assert (nova.auth.tenant.name, nova.auth.tenant.roles) == ("Nova", ["owner"])
     assert renewed.auth.tenant.name == "Nova"
-    _error(old, "ERRO_IDENTITY_INVALID_SESSION", 401)
+    _error(old, "ERRO_IDENTITY_SESSION_ROTATED", 401)  # trocado há menos de 30 s: não vale, mas não derruba
 
 
 def test_remocao_de_membros(events):

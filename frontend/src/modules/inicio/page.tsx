@@ -29,11 +29,7 @@ export default function Inicio() {
           hint={health.error?.message}
         />
         <Stat label="Rotas publicadas" value={health.data?.routes ?? "—"} hint="Uma por endpoint em gateway/endpoints/*.yaml" />
-        <Stat
-          label="Sessão"
-          value={session?.sub ?? "Nenhuma"}
-          hint={session ? `Expira às ${session.expiresAt.toLocaleTimeString("pt-BR")}` : "Entre pela tela Sessão"}
-        />
+        <Stat label="Organização" value={session?.tenant?.name ?? "Nenhuma"} hint={session ? `Você entrou como ${session.user.name}` : undefined} />
       </Grid>
 
       {health.error && (

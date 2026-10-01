@@ -157,13 +157,14 @@ class IdentityService:
         if session.get("rotated_at") is not None:
             if _now() - session["rotated_at"] > timedelta(seconds=REUSE_GRACE_SECONDS):
                 await self._revoke_family(session["family"])  # refresh antigo reapareceu: cópia roubada
-            raise _invalid_session()
+                raise _invalid_session()
+            raise _rotated()  # outra aba girou há pouco: o cookie do navegador já é o novo
         claimed = await db.query_shared(
             "UPDATE $id SET rotated_at = time::now() WHERE rotated_at = NONE AND revoked = false RETURN AFTER",
             id=_rid(session["id"]),
         )
         if not claimed:
-            raise _invalid_session()  # outra aba girou o mesmo refresh primeiro
+            raise _rotated()  # outra aba girou o mesmo refresh no mesmo instante
         tenant = _key(session["tenant"]) if session.get("tenant") else None
         return await self._issue(_key(session["user"]), tenant, family=session["family"])
 
@@ -423,6 +424,10 @@ def _bad_credentials() -> ServiceError:
 
 def _invalid_session() -> ServiceError:
     return ServiceError("ERRO_IDENTITY_INVALID_SESSION", "Sessão expirada. Entre de novo.", 401)
+
+
+def _rotated() -> ServiceError:
+    return ServiceError("ERRO_IDENTITY_SESSION_ROTATED", "Sessão renovada em outra aba. Tente de novo.", 401)
 
 
 def _invite_invalid() -> ServiceError:

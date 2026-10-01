@@ -38,7 +38,9 @@ cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em
 - `ERRO_IDENTITY_LOCKED` (429): 5 erros seguidos bloqueiam o login por 15 min.
 - `ERRO_IDENTITY_EMAIL_TAKEN` (409) · `ERRO_IDENTITY_ALREADY_MEMBER` (409) · `ERRO_IDENTITY_LAST_OWNER` (409).
 - `ERRO_IDENTITY_INVALID_SESSION` (401): refresh ausente, vencido, revogado ou reusado. Refresh já trocado que
-  reaparece depois de 30 s revoga a sessão inteira (cópia roubada); dentro dos 30 s é corrida entre abas.
+  reaparece depois de 30 s revoga a sessão inteira (cópia roubada).
+- `ERRO_IDENTITY_SESSION_ROTATED` (401): o mesmo refresh foi trocado há menos de 30 s (corrida entre abas); o cookie
+  do navegador já é o novo, então o cliente tenta de novo uma vez.
 - `ERRO_IDENTITY_NOT_MEMBER` (403) · `ERRO_IDENTITY_FORBIDDEN` (403: só owner/admin convidam e removem; admin não
   remove owner) · `ERRO_IDENTITY_INVITE_INVALID` (404) · `ERRO_IDENTITY_MEMBER_NOT_FOUND` (404).
 - Limites: nome e organização 2–80 caracteres, e-mail até 254 (guardado em minúsculas), senha 8–1024.

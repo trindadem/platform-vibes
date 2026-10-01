@@ -2,7 +2,8 @@
  * Única porta para o backend (README §6): toda requisição passa pelo gateway por aqui.
  *
  * - Desembrulha o envelope: sucesso devolve `data`; erro vira ApiError com o código do backend.
- * - Envia o token da sessão; resposta 401 encerra a sessão local.
+ * - Envia o token da sessão (core/auth.ts se registra em configureSession). Resposta 401 de uma chamada com token
+ *   renova a sessão pelo cookie uma vez e repete; se não der, encerra a sessão local.
  * - Timeout de 30 s. Gatilhos assíncronos (rotas NATS) aceitam Idempotency-Key: newIdempotencyKey().
  *
  * Páginas nunca chamam request: usam as funções geradas em contracts.ts através dos hooks
@@ -12,7 +13,6 @@
  * e entregam o estado aos componentes de receita (QueryTable, QueryView, ActionForm, ResourcePage).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getToken, signOut } from "./auth";
 
 export interface ApiErrorDetail {
   loc?: (string | number)[];
@@ -36,6 +36,24 @@ export interface RequestOptions {
   idempotencyKey?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Sem token e sem renovação automática: só para as rotas de sessão (login, cadastro, refresh, logout). */
+  anonymous?: boolean;
+}
+
+/** Como a sessão se liga às requisições. Registrado uma vez por core/auth.ts (api.ts não importa auth.ts). */
+export interface SessionHooks {
+  /** Token de acesso atual, ou null. */
+  token: () => string | null;
+  /** Renova a sessão (cookie de refresh). true se há um token novo. */
+  renew: () => Promise<boolean>;
+  /** A sessão acabou: limpa o estado local. */
+  expired: () => void;
+}
+
+let session: SessionHooks = { token: () => null, renew: async () => false, expired: () => {} };
+
+export function configureSession(hooks: SessionHooks): void {
+  session = hooks;
 }
 
 type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -51,8 +69,22 @@ export async function request<T>(method: Method, path: string, body?: unknown, o
   if (!path.startsWith("/api/") && path !== "/health") {
     throw new ApiError("ERRO_FRONT_INVALID_PATH", `Caminho fora do gateway: ${path}`, 0);
   }
+  const token = options.anonymous ? null : session.token();
+  try {
+    return await send<T>(method, path, body, options, token);
+  } catch (error) {
+    // Token vencido ou revogado: renova pelo cookie uma vez e repete com o token novo.
+    if (!(error instanceof ApiError) || error.status !== 401 || !token) throw error;
+    if (!(await session.renew())) {
+      session.expired();
+      throw error;
+    }
+    return send<T>(method, path, body, options, session.token());
+  }
+}
+
+async function send<T>(method: Method, path: string, body: unknown, options: RequestOptions, token: string | null): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
@@ -66,7 +98,7 @@ export async function request<T>(method: Method, path: string, body?: unknown, o
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
-      credentials: "omit",
+      credentials: "same-origin", // o cookie de refresh só existe em /api/v1/identity (Path do cookie)
     });
   } catch (cause) {
     if (options.signal?.aborted) throw cause;
@@ -75,7 +107,6 @@ export async function request<T>(method: Method, path: string, body?: unknown, o
       : new ApiError("ERRO_FRONT_NETWORK", "Sem conexão com o servidor.", 0);
   }
 
-  if (response.status === 401) signOut();
   const envelope = (await response.json().catch(() => null)) as Envelope<T> | null;
   if (!envelope || typeof envelope.ok !== "boolean") {
     throw new ApiError("ERRO_FRONT_INVALID_RESPONSE", "Resposta fora do envelope.", response.status);

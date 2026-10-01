@@ -25,6 +25,8 @@ export interface ActionFormProps<B> {
     placeholder?: string;
     hint?: string;
     options?: { value: string; label: string }[];
+    /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */
+    autoComplete?: string;
   }[];
   /** Texto do botão de envio. Padrão: "Salvar". */
   submitLabel?: string;
@@ -105,7 +107,7 @@ export function ActionForm<B>({ action, fields, submitLabel = "Salvar", successM
         };
         if (field.kind === "textarea") return <TextArea key={field.name} {...common} />;
         if (field.kind === "select") return <SelectField key={field.name} {...common} options={field.options ?? []} />;
-        return <TextField key={field.name} {...common} type={field.kind ?? "text"} />;
+        return <TextField key={field.name} {...common} type={field.kind ?? "text"} autoComplete={field.autoComplete} />;
       })}
       <Row>
         <Button type="submit" loading={action.running}>
