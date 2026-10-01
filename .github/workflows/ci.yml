@@ -2,6 +2,7 @@
 #   backend:  testes do core, do gateway e de cada serviço (tests/<serviço>.py) + contracts.ts em dia
 #   frontend: trilhos do Vite, build, TypeScript e exemplos do catálogo (npm run check)
 #   scaffold: um serviço novo nasce do service.sh, passa nos próprios testes, entra no contrato e no compose
+#   production: .env de produção, compose.prod.yaml válido (só 80 e 443 abertas) e a imagem do frontend
 name: ci
 
 on:
@@ -101,3 +102,32 @@ jobs:
         run: |
           npm ci
           npm run check
+
+  production:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0 # só há versões completas (sem etiqueta v10)
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: .env de produção e compose.prod.yaml válido
+        run: |
+          uv run python -m core.security keygen --production app.exemplo.com
+          sed -i 's|^SMTP_URL=$|SMTP_URL=smtps://ci:ci@smtp.exemplo.com:465|' .env
+          docker compose -f compose.yaml -f compose.prod.yaml config --quiet
+      - name: Em produção, só o Traefik publica portas (80 e 443)
+        run: |
+          docker compose -f compose.yaml -f compose.prod.yaml config --format json | python3 -c '
+          import json, sys
+          services = json.load(sys.stdin)["services"]
+          published = {name: sorted(str(p.get("published")) for p in svc.get("ports", [])) for name, svc in services.items()}
+          assert {n: p for n, p in published.items() if p} == {"traefik": ["443", "80"]}, published
+          assert all(svc.get("environment", {}).get("ENVIRONMENT") == "production" for n, svc in services.items() if n.startswith("svc-") or n == "gateway")
+          print("ok")'
+      - name: Imagem do frontend de produção
+        run: docker build -f frontend/Dockerfile -t cv-frame-web .
+

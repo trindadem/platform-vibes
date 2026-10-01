@@ -2,6 +2,8 @@
 #   docker compose up --build -d   → API em http://localhost:8088/api/v1/..., Temporal UI em http://localhost:8233,
 #                                    Grafana (traces, métricas e logs) em http://localhost:3000
 # Toda porta é publicada só em 127.0.0.1: nada fica exposto na rede.
+# Produção (README §9): o mesmo arquivo, com o .env de produção e a sobreposição compose.prod.yaml. Por isso as diferenças
+# de ambiente entram aqui como variáveis com o padrão local: todo serviço, inclusive os que o service.sh acrescentar, as recebe.
 # O service.sh acrescenta cada serviço no FIM deste arquivo: mantenha "services:" como a última seção.
 name: cv-frame
 
@@ -12,9 +14,10 @@ x-auth-env: &auth-env
   AUTH_PUBLIC_KEY: ${AUTH_PUBLIC_KEY:?rode uv run python -m core.security keygen}
   NATS_URL: nats://nats:4222
 
-# Observabilidade (README §5.18): traces, métricas e logs por OTLP para o Grafana local (serviço otel).
+# Observabilidade (README §5.18): traces, métricas e logs por OTLP para o Grafana local (serviço otel). Definida e vazia
+# no .env (produção sem backend), nada é exportado.
 x-telemetry-env: &telemetry-env
-  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4318
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel:4318}
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
 
 x-service: &service
@@ -28,14 +31,21 @@ x-service: &service
     SURREAL_DATABASE: ${SURREAL_DATABASE:?rode uv run python -m core.security keygen}
     SURREAL_USER: ${SURREAL_USER:?rode uv run python -m core.security keygen}
     SURREAL_PASSWORD: ${SURREAL_PASSWORD:?rode uv run python -m core.security keygen}
-    TEMPORAL_ADDRESS: temporal:7233
+    # NATS com senha só quando o .env a traz (produção): o usuário dos serviços (README §5.7).
+    NATS_USER: ${NATS_SERVICES_PASSWORD:+services}
+    NATS_PASSWORD: ${NATS_SERVICES_PASSWORD:-}
+    # Temporal do compose ou o Temporal Cloud (endereço, namespace e API key no .env); payloads cifrados com a chave.
+    TEMPORAL_ADDRESS: ${TEMPORAL_ADDRESS:-temporal:7233}
+    TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+    TEMPORAL_API_KEY: ${TEMPORAL_API_KEY:-}
+    TEMPORAL_PAYLOAD_KEY: ${TEMPORAL_PAYLOAD_KEY:-}
     # Arquivos (README §5.14): o serviço fala com o armazenamento por dentro; o navegador, pelo endereço público.
     STORAGE_URL: http://storage:9000
     STORAGE_PUBLIC_URL: ${STORAGE_PUBLIC_URL:-http://localhost:9000}
     STORAGE_BUCKET: ${STORAGE_BUCKET:?rode uv run python -m core.security keygen}
     STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?rode uv run python -m core.security keygen}
     STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:?rode uv run python -m core.security keygen}
-    STORAGE_CORS_ORIGINS: ${CORS_ORIGINS:-}
+    STORAGE_CORS_ORIGINS: ${STORAGE_CORS_ORIGINS:-${CORS_ORIGINS:-}}
   depends_on:
     nats: { condition: service_healthy }
     surreal-init: { condition: service_completed_successfully }
@@ -75,6 +85,9 @@ services:
     environment:
       <<: [*auth-env, *telemetry-env]
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # O gateway tem usuário próprio no NATS, restrito (compose.prod.yaml): publica gatilhos e lê os avisos ao vivo.
+      NATS_USER: ${NATS_GATEWAY_PASSWORD:+gateway}
+      NATS_PASSWORD: ${NATS_GATEWAY_PASSWORD:-}
     depends_on:
       nats: { condition: service_healthy }
     healthcheck: *service-health
@@ -88,6 +101,14 @@ services:
       traefik.http.routers.gateway.middlewares: gateway-ratelimit
       traefik.http.middlewares.gateway-ratelimit.ratelimit.average: "50"
       traefik.http.middlewares.gateway-ratelimit.ratelimit.burst: "100"
+      # Entrada (login, cadastro, senha esquecida): 20 por minuto por IP, além do bloqueio por conta do svc-identity.
+      traefik.http.routers.gateway-auth.rule: "Path(`/api/v1/identity/login`) || Path(`/api/v1/identity/signup`) || PathPrefix(`/api/v1/identity/password/`)"
+      traefik.http.routers.gateway-auth.entrypoints: web
+      traefik.http.routers.gateway-auth.service: gateway
+      traefik.http.routers.gateway-auth.middlewares: gateway-auth-ratelimit
+      traefik.http.middlewares.gateway-auth-ratelimit.ratelimit.average: "20"
+      traefik.http.middlewares.gateway-auth-ratelimit.ratelimit.period: "1m"
+      traefik.http.middlewares.gateway-auth-ratelimit.ratelimit.burst: "10"
       traefik.http.services.gateway.loadbalancer.server.port: "8000"
 
   nats:
@@ -101,9 +122,18 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # A imagem do SurrealDB roda como nonroot (uid 65532) e não tem shell; o volume nasce do root. Este passo (com a imagem
+  # do curl, que já está aqui) ajusta o dono e sai.
+  surreal-volume:
+    image: curlimages/curl:8.22.0
+    user: root
+    entrypoint: ["sh", "-c", "chown -R 65532:65532 /data"]
+    volumes: ["surreal-data:/data"]
+
   surrealdb:
     image: surrealdb/surrealdb:v3.3.0
-    user: root  # a imagem roda como nonroot e não grava no volume; é o que a documentação oficial indica
+    depends_on:
+      surreal-volume: { condition: service_completed_successfully }
     command: ["start", "--user", "root", "--pass", "${SURREAL_ROOT_PASSWORD:?rode uv run python -m core.security keygen}", "surrealkv:/data/db"]
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["surreal-data:/data"]

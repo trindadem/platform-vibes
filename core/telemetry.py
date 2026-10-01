@@ -57,7 +57,7 @@ TRACE_HEADER = "x-trace-id"  # devolvido em toda resposta: o mesmo id do trace e
 _INCOMING_CONTEXT = (b"traceparent", b"tracestate", b"baggage")
 _QUIET = {name: logging.WARNING for name in ("httpx", "httpx2", "httpcore", "opentelemetry")}  # a linha por requisição já basta
 # Atributos que todo LogRecord já tem: o resto (extra=) vai para o JSON, mascarado por redact.
-_RECORD_FIELDS = set(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime", "taskName"}
+_RECORD_FIELDS = set(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime", "taskName", "color_message"}
 _CONTEXT_FIELDS = ("service", "trace_id", "span_id", "tenant", "user")
 
 log = logging.getLogger("core.telemetry")

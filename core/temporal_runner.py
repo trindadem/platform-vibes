@@ -17,11 +17,20 @@ pessoa por trás (agendamento, migração) roda como system("svc-<serviço>").
 Trace (README §5.18): o interceptor do OpenTelemetry do próprio SDK continua o trace de quem iniciou o workflow em cada
 workflow e activity (StartWorkflow → RunWorkflow → StartActivity → RunActivity).
 
+Payloads cifrados (README §5.7): com TEMPORAL_PAYLOAD_KEY, tudo o que vai ao Temporal (entradas, resultados e cabeçalhos
+de cada workflow e activity) sai em AES-256-GCM: o histórico, guardado pelo Temporal ou pelo Temporal Cloud, não tem
+e-mail, link de senha nem conteúdo de aviso em claro. Obrigatória com ENVIRONMENT=production. A tela do Temporal
+mostra esses payloads cifrados.
+
 Variáveis: TEMPORAL_ADDRESS (padrão localhost:7233), TEMPORAL_NAMESPACE (padrão default),
-TEMPORAL_API_KEY (Temporal Cloud; liga TLS).
+TEMPORAL_API_KEY (Temporal Cloud; liga TLS), TEMPORAL_PAYLOAD_KEY (32 bytes em base64url; o keygen gera).
 """
+import base64
+import dataclasses
 import functools
+import hashlib
 import inspect
+import os
 import logging
 import re
 import typing
@@ -30,9 +39,10 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, SecretStr
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from temporalio import activity, client, worker
 from temporalio import client as client_module
@@ -47,9 +57,11 @@ from temporalio.client import (
     ScheduleUpdate,
     WorkflowHandle,
 )
+from temporalio.client import HeaderCodecBehavior
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.converter import PayloadCodec
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
@@ -88,11 +100,50 @@ class Schedule:
 
 
 class TemporalSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TEMPORAL_")
+    model_config = SettingsConfigDict(env_prefix="TEMPORAL_", env_ignore_empty=True)  # variável vazia no compose = não definida
 
     address: str = "localhost:7233"
     namespace: str = "default"
     api_key: SecretStr | None = None
+    payload_key: SecretStr | None = None
+    environment: Literal["production", "development"] = Field("production", validation_alias="ENVIRONMENT")
+
+    @model_validator(mode="after")
+    def _encrypted_in_production(self) -> "TemporalSettings":
+        if self.environment == "production" and not self.payload_key:
+            raise ValueError("produção exige TEMPORAL_PAYLOAD_KEY: o histórico do Temporal não guarda dado em claro (README §5.7)")
+        return self
+
+
+class EncryptedPayloads(PayloadCodec):
+    """AES-256-GCM em cada payload. O id da chave vai junto: payload de outra chave falha alto, nunca vira lixo."""
+
+    ENCODING = b"binary/encrypted"
+
+    def __init__(self, key: bytes) -> None:
+        if len(key) != 32:
+            raise ValueError("TEMPORAL_PAYLOAD_KEY precisa de 32 bytes (base64url): rode uv run python -m core.security keygen")
+        self._aead = AESGCM(key)
+        self._key_id = hashlib.sha256(key).hexdigest()[:12].encode()
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        sealed = []
+        for payload in payloads:
+            nonce = os.urandom(12)
+            data = nonce + self._aead.encrypt(nonce, payload.SerializeToString(), self._key_id)
+            sealed.append(Payload(metadata={"encoding": self.ENCODING, "encryption-key-id": self._key_id}, data=data))
+        return sealed
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        opened = []
+        for payload in payloads:
+            if payload.metadata.get("encoding") != self.ENCODING:
+                opened.append(payload)  # gravado antes da chave existir: segue como veio
+                continue
+            if payload.metadata.get("encryption-key-id") != self._key_id:
+                raise ValueError("payload do Temporal cifrado com outra TEMPORAL_PAYLOAD_KEY")
+            opened.append(Payload.FromString(self._aead.decrypt(payload.data[:12], payload.data[12:], self._key_id)))
+        return opened
 
 
 def activities(prefix: str) -> Callable[[type], type]:
@@ -120,14 +171,19 @@ class Runner:
 
     async def client(self) -> Client:
         if self._client is None:
-            s = TemporalSettings()
+            try:
+                s = TemporalSettings()
+            except ValidationError as exc:
+                raise RuntimeError(f"core.temporal_runner: configuração ausente ou insegura (README §5.7)\n{exc}") from None
             api_key = s.api_key.get_secret_value() if s.api_key else None
+            codec = EncryptedPayloads(_b64d(s.payload_key.get_secret_value())) if s.payload_key else None
             self._client = await Client.connect(
                 s.address,
                 namespace=s.namespace,
                 api_key=api_key,
                 tls=api_key is not None,
-                data_converter=pydantic_data_converter,
+                data_converter=dataclasses.replace(pydantic_data_converter, payload_codec=codec),
+                header_codec_behavior=HeaderCodecBehavior.CODEC if codec else HeaderCodecBehavior.NO_CODEC,
                 # Valem também para os workers criados com este cliente: quem age e o trace atravessam o Temporal.
                 interceptors=[_PrincipalPropagation(), TracingInterceptor()],
             )
@@ -185,6 +241,10 @@ class Runner:
             )
         except WorkflowAlreadyStartedError:
             return client.get_workflow_handle(workflow_id)
+
+
+def _b64d(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 # ── Propagação de quem age (cliente → workflow → activities) ────────────────

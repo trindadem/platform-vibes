@@ -1,4 +1,5 @@
 # O build usa a raiz como contexto: nada disto deve chegar ao Docker (segredos, histórico, lixo local).
+# O frontend entra (frontend/Dockerfile), sem as dependências e os gerados: o build os refaz.
 .env
 .env.*
 .git/
@@ -7,6 +8,8 @@
 **/__pycache__/
 **/*.pyc
 .pytest_cache/
-frontend/
+frontend/node_modules/
+frontend/dist/
+frontend/.cv/
 specs/
 tests/

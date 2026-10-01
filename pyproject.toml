@@ -1,6 +1,6 @@
 [project]
 name = "cv-frame"
-version = "0.1.0"
+version = "1.0.0"
 description = "Cogniventure Core Architecture: microsserviços com trilhos para engenharia assistida por IA."
 license = "MIT"
 requires-python = ">=3.12"

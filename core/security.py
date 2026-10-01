@@ -17,6 +17,7 @@ CORS_ORIGINS (origens separadas por vírgula; "*" é recusado).
 
 Ambiente local: uv run python -m core.security keygen (cria o .env) e
 uv run python -m core.security token <sub> [--tenant <organização>] [papel...].
+Produção: uv run python -m core.security keygen --production <domínio> (README §9).
 """
 import asyncio
 import base64
@@ -435,27 +436,78 @@ WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
 # PLATFORM_TENANT=
 """
 
+_PRODUCTION_ENV = """\
+# Produção (README §9). Gerado por: uv run python -m core.security keygen --production {domain}. Nunca versionar.
+# Suba com: docker compose -f compose.yaml -f compose.prod.yaml up -d --build
+# Estes segredos são o ponto de partida: guarde-os no gerenciador de segredos do provedor e troque se vazarem.
+ENVIRONMENT=production
+DOMAIN={domain}
+ACME_EMAIL=ops@{domain}
+AUTH_ISSUER=https://{domain}
+AUTH_AUDIENCE=cv-frame
+AUTH_PRIVATE_KEY={private}
+AUTH_PUBLIC_KEY={public}
+SURREAL_NAMESPACE=cv
+SURREAL_DATABASE=app
+SURREAL_USER=app
+SURREAL_PASSWORD={surreal_password}
+SURREAL_ROOT_PASSWORD={surreal_root_password}
+STORAGE_BUCKET=cv-frame
+STORAGE_ACCESS_KEY={storage_access_key}
+STORAGE_SECRET_KEY={storage_secret_key}
+STORAGE_PUBLIC_URL=https://files.{domain}
+STORAGE_CORS_ORIGINS=https://{domain}
+AI_SECRETS_KEY={ai_secrets_key}
+WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
+# Payloads do Temporal cifrados (AES-256-GCM): trocar esta chave torna ilegíveis os workflows em andamento.
+TEMPORAL_PAYLOAD_KEY={temporal_payload_key}
+# NATS com autenticação: um usuário para os serviços e outro, restrito, para o gateway.
+NATS_SERVICES_PASSWORD={nats_services_password}
+NATS_GATEWAY_PASSWORD={nats_gateway_password}
+APP_URL=https://{domain}
+APP_NAME=CV-Frame
+MAIL_FROM=CV-Frame <nao-responda@{domain}>
+# Obrigatório: o servidor de e-mail de verdade (smtps:// ou smtp:// com STARTTLS). Ex.: Amazon SES, Postmark, Resend.
+SMTP_URL=
+# Opcional: para onde vão traces, métricas e logs (OTLP/HTTP). Vazio: só os logs em stdout.
+OTEL_EXPORTER_OTLP_ENDPOINT=
+# Opcional: Temporal Cloud no lugar do Temporal do compose (TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_API_KEY).
+# Organização que administra a plataforma (IA e planos): o id dela, depois de criada pela tela de cadastro.
+# PLATFORM_TENANT=
+"""
+_DOMAIN = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
 _USAGE = """uso:
   uv run python -m core.security keygen                                   cria o .env local (chaves e senhas aleatórias)
+  uv run python -m core.security keygen --production <domínio>            cria o .env de produção (README §9)
   uv run python -m core.security token <sub> [--tenant <org>] [papel...]  emite um token de teste com as chaves do .env"""
 
 
-def _keygen(env_file: Path) -> None:
+def _keygen(env_file: Path, domain: str | None = None) -> None:
     if env_file.exists():
         sys.exit(f"{env_file} já existe; nada foi alterado. Apague-o para gerar chaves novas.")
+    if domain is not None and not _DOMAIN.match(domain):
+        sys.exit(f"domínio inválido: {domain!r} (ex.: app.minhaempresa.com)")
     key = Ed25519PrivateKey.generate()
-    env_file.write_text(_LOCAL_ENV.format(
+    template = _LOCAL_ENV if domain is None else _PRODUCTION_ENV
+    env_file.write_text(template.format(
+        domain=domain,
         private=_b64e(key.private_bytes_raw()),
         public=_b64e(key.public_key().public_bytes_raw()),
         surreal_password=new_secret(24),
         surreal_root_password=new_secret(24),
         ai_secrets_key=new_secret(32),
         webhooks_secrets_key=new_secret(32),
+        temporal_payload_key=new_secret(32),
+        nats_services_password=new_secret(24),
+        nats_gateway_password=new_secret(24),
         storage_access_key="cv" + new_secret(9).lower().replace("_", "").replace("-", "")[:10],
         storage_secret_key=new_secret(24),
     ))
     env_file.chmod(0o600)
     print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")
+    if domain is not None:
+        print("Falta só o SMTP_URL (servidor de e-mail). Depois: docker compose -f compose.yaml -f compose.prod.yaml up -d --build")
 
 
 def _token(env_file: Path, sub: str, args: list[str]) -> None:
@@ -477,6 +529,8 @@ if __name__ == "__main__":
     match sys.argv[1:]:
         case ["keygen"]:
             _keygen(Path(".env"))
+        case ["keygen", "--production", domain]:
+            _keygen(Path(".env"), domain.strip().lower())
         case ["token", sub, *args]:
             _token(Path(".env"), sub, args)
         case _:

@@ -22,6 +22,7 @@ cogniventure/
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
 ├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, RustFS, Mailpit, Grafana, gateway e serviços
+├── compose.prod.yaml            # Produção num host só, sobre o compose.yaml: HTTPS, frontend, NATS com senha (seção 9)
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
@@ -63,6 +64,7 @@ cogniventure/
 │       └── main.py
 │
 └── frontend/                    # Vite + React + TypeScript + Tailwind (composição pura)
+    ├── Dockerfile               # Produção: build do Vite servido por nginx sem root, com CSP (seção 9)
     ├── index.html               # Entrada do Vite
     ├── components.json          # Configuração do shadcn/ui (preset radix-nova; primitivos em src/components/ui)
     ├── package.json
@@ -200,7 +202,7 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Gateway declarativo:** zero rotas de negócio no código do Gateway. Toda rota pública vive em `gateway/endpoints/<service_name>.yaml` (seção 5.8). Rotas nascem com `auth: client_jwt`; `auth: public` só quando o spec §2 declarar.
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
-- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), já com o bytecode compilado (o container sobe sem recompilar as bibliotecas), copia apenas `core/` e a pasta do app e roda sem root.
+- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), já com o bytecode compilado (o container sobe sem recompilar as bibliotecas), copia apenas `core/` e a pasta do app e roda sem root. O frontend tem a sua, `frontend/Dockerfile` (seção 9).
 - **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), com as tabelas e os índices do boot, executando a SurrealQL de verdade. O motor embutido é o 2.x e o servidor é o 3.x: o core cuida das diferenças conhecidas (seção 5.12).
 
   ```bash
@@ -243,11 +245,12 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
 - **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
-- **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). Rede interna (`allow_private=True`) só com `ENVIRONMENT=development`: em produção o próprio core recusa. NATS em produção com `NATS_CREDS` e permissões por subject.
+- **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). Rede interna (`allow_private=True`) só com `ENVIRONMENT=development`: em produção o próprio core recusa. NATS em produção com credencial (`NATS_USER`/`NATS_PASSWORD` ou `NATS_CREDS`) e permissões por subject: o gateway só publica gatilhos e lê avisos ao vivo (seção 9).
+- **Temporal:** em produção, todo payload (entradas, resultados e cabeçalhos de workflows e activities) vai cifrado com AES-256-GCM (`TEMPORAL_PAYLOAD_KEY`): o histórico não guarda e-mail, link de senha nem conteúdo de aviso em claro.
 - **IA:** chave de provedor só no `svc-ai`, criptografada; o serviço chama modelo só pelo `core/llm.py`, sem ver a chave (seção 5.11).
 - **Respostas:** cabeçalhos de segurança em toda resposta (HSTS e CSP em produção), `cache-control: no-store`, erro 500 sem detalhe interno, CORS só com origens listadas (`*` é recusado).
 - **Segredos e logs:** segredos só no `.env` (fora do Git). Antes de logar dados, `redact(...)`.
-- **Configuração insegura não sobe:** falta de chave, CORS `*`, JWKS sem https ou par de chaves trocado impedem o boot.
+- **Configuração insegura não sobe:** falta de chave, CORS `*`, JWKS sem https ou par de chaves trocado impedem o boot; em produção, também NATS sem credencial e Temporal sem `TEMPORAL_PAYLOAD_KEY`.
 
 Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 
@@ -260,8 +263,9 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `AUTH_TOKEN_TTL_SECONDS`, `AUTH_ROLES_CLAIM`, `AUTH_TENANT_CLAIM`, `CORS_ORIGINS` | Opcionais (900, `roles`, `tenant`, nenhuma) |
 | `SURREAL_URL`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USER`, `SURREAL_PASSWORD` | Banco; só a URL tem padrão |
 | `SURREAL_ROOT_PASSWORD`, `GATEWAY_PORT` | Só no compose: senha root do SurrealDB (nenhum serviço a recebe) e porta local da API (8088) |
-| `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
-| `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
+| `NATS_URL`, `NATS_USER`, `NATS_PASSWORD`, `NATS_CREDS` | Mensageria; credencial obrigatória em produção (no compose, vem de `NATS_SERVICES_PASSWORD` e `NATS_GATEWAY_PASSWORD`, seção 9) |
+| `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_PAYLOAD_KEY` | Orquestração; a API key liga TLS (Temporal Cloud); a chave cifra os payloads e é obrigatória em produção |
+| `DOMAIN`, `ACME_EMAIL` | Só no `compose.prod.yaml`: o domínio (a tela em `DOMAIN`, os arquivos em `files.DOMAIN`) e o e-mail do certificado (seção 9) |
 | `AI_SECRETS_KEY`, `PLATFORM_TENANT` | A chave que criptografa as chaves dos provedores (o `keygen` gera; só no `svc-ai`) e a organização que administra a plataforma: provedores de IA para todas (`svc-ai`, seção 5.11) e os planos (`svc-plans`, seção 5.17); opcional |
 | `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails (seção 5.15) |
 | `WEBHOOKS_SECRETS_KEY` | Só no `svc-webhooks`: a chave que criptografa os segredos de assinatura dos endereços (o `keygen` gera; seção 5.16) |
@@ -296,7 +300,7 @@ endpoints:
     auth: client_jwt
     request: FaturaIn               # modelo do schemas.py esperado no corpo; NATS responde { message_id }
     target_type: nats
-    nats_subject: events.billing.trigger
+    nats_subject: events.billing.trigger  # sempre o gatilho do serviço
   - path: /faturas
     name: listar
     method: GET
@@ -319,10 +323,10 @@ live:                               # eventos ao vivo que o serviço emite (bus.
     model: Fatura
 ```
 
-- **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
+- **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.trigger` (o gatilho do serviço; mais de uma ação vai num campo do payload), ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
 - **HTTP:** repassa corpo (byte a byte), query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`; `headers: [stripe-signature]` libera outros numa rota HTTP POST (a assinatura de um webhook que chega, seção 5.16), nunca os de sessão ou roteamento (`cookie`, `host`, `x-forwarded-*`...). O serviço verifica o token de novo e continua o trace do gateway (`traceparent`, seção 5.18). Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
-- **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
+- **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100; login, cadastro e senha esquecida: 20 por minuto). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
 - **Cookies:** só rotas com `cookies: true` recebem o `Cookie` do navegador e devolvem o `Set-Cookie` do serviço; nas outras, cookie nunca passa. O gateway não guarda cookie entre requisições.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
@@ -619,7 +623,7 @@ npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + Ty
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
 
-Em todo push, o CI (`.github/workflows/ci.yml`) repete o que roda à mão: testes do core, do gateway e de cada serviço, `contracts.ts` em dia, `npm run check` com o `CATALOG.md` versionado igual ao gerado, e um serviço novo nascendo do `service.sh` e passando nos próprios testes, no contrato, no compose e no frontend. Vermelho no GitHub = algo quebrou o contrato.
+Em todo push, o CI (`.github/workflows/ci.yml`) repete o que roda à mão: testes do core, do gateway e de cada serviço, `contracts.ts` em dia, `npm run check` com o `CATALOG.md` versionado igual ao gerado, um serviço novo nascendo do `service.sh` e passando nos próprios testes, no contrato, no compose e no frontend, e a produção (seção 9): `compose.prod.yaml` válido, só as portas 80 e 443 abertas e a imagem do frontend construída. Vermelho no GitHub = algo quebrou o contrato.
 
 ### Ambiente local (`compose.yaml`)
 
@@ -668,3 +672,21 @@ A IA apenas registra o bloqueio em `sprint.md`, com no máximo 400 caracteres, s
 ```text
 - [YYYY-MM-DD HH:MM] [TARGET]: <conflito contratual direto + proposta mínima de solução técnica para aprovação>
 ```
+
+## 9. Produção
+
+Um host com Docker e um domínio bastam: o `compose.prod.yaml` se sobrepõe ao `compose.yaml` e muda só a estrutura. As diferenças de ambiente chegam a todos os serviços, inclusive aos que o `service.sh` criar depois, pelo `.env`.
+
+```bash
+uv run python -m core.security keygen --production app.minhaempresa.com   # .env de produção (chaves e senhas novas)
+# preencher SMTP_URL no .env; apontar o DNS de app.minhaempresa.com e files.app.minhaempresa.com para o host
+docker compose -f compose.yaml -f compose.prod.yaml up -d --build
+```
+
+- **Borda:** HTTPS com certificado do Let's Encrypt (renovação automática), HTTP redireciona, HTTP/2 e só as portas 80 e 443 abertas. O Traefik descobre as rotas por um proxy do Docker somente leitura, sem receber o socket. A tela fica em `DOMAIN` e os arquivos em `files.DOMAIN` (link assinado, seção 5.14).
+- **Frontend:** `frontend/Dockerfile` faz o build com os trilhos e serve o `dist/` por um nginx sem root, com CSP (só scripts do próprio site; imagem e envio só do próprio site e do armazenamento), HSTS, `X-Frame-Options`, cache longo nos arquivos com hash e o `index.html` conferido a cada visita.
+- **NATS:** sem acesso anônimo. Os serviços usam o usuário `services`; o gateway, que fala com a internet, tem um usuário restrito: publica só `events.<serviço>.trigger` e lê os avisos ao vivo. Ele não chama RPC (como o `rpc.ai.resolve`, que devolve chave de IA) nem publica evento de outro serviço.
+- **Dados:** payloads do Temporal cifrados (`TEMPORAL_PAYLOAD_KEY`; trocar a chave torna ilegíveis os workflows em andamento), SurrealDB sem root, `ENVIRONMENT=production` em tudo (HSTS e CSP na API, cookie de sessão `Secure`, SMTP com TLS, sem `/docs`, sem rede interna para webhooks e IA). Toda porta de infraestrutura fica só na rede interna.
+- **Fora do host:** e-mail pelo `SMTP_URL` (SES, Postmark, Resend...); observabilidade pelo `OTEL_EXPORTER_OTLP_ENDPOINT` (vazio: só logs em stdout). Mailpit e Grafana local não sobem.
+- **Por conta da operação:** backup dos volumes (`surreal-data`, `storage-data`, `temporal-data`) e dos segredos do `.env`. O Temporal e o armazenamento do compose servem a um host; para alta disponibilidade, Temporal Cloud (`TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`) e um S3 (`STORAGE_URL`, `STORAGE_PUBLIC_URL` e credenciais) entram pelo `.env`, sem mudar código.
+- **Conferido no CI:** a configuração de produção (`docker compose ... config`) e o build da imagem do frontend, em todo push.

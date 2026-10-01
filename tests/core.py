@@ -1940,3 +1940,61 @@ def test_metricas_do_servico_levam_o_prefixo(spans):
     contador = telemetry.counter("faturas_pagas", "Faturas pagas")
     assert contador.name == "cv.teste.faturas_pagas"
 
+
+
+# ── Produção: credencial no NATS, payloads cifrados no Temporal e .env de produção (README §5.7 e §9) ──────
+
+from temporalio.api.common.v1 import Payload  # noqa: E402
+
+from core.temporal_runner import EncryptedPayloads, TemporalSettings  # noqa: E402
+
+
+def test_producao_exige_credencial_no_nats_e_chave_no_temporal(monkeypatch):
+    for name in ("ENVIRONMENT", "NATS_USER", "NATS_PASSWORD", "NATS_CREDS", "TEMPORAL_PAYLOAD_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValidationError, match="NATS_USER/NATS_PASSWORD ou NATS_CREDS"):
+        nats_bus.NatsSettings()
+    with pytest.raises(ValidationError, match="TEMPORAL_PAYLOAD_KEY"):
+        TemporalSettings()
+    with pytest.raises(RuntimeError, match="configuração ausente ou insegura"):
+        asyncio.run(nats_bus.Bus().connected("svc-teste").__aenter__())
+    monkeypatch.setenv("NATS_USER", "services")
+    monkeypatch.setenv("NATS_PASSWORD", "")  # vazio no compose = não definida: senha faltando
+    with pytest.raises(ValidationError, match="andam juntos"):
+        nats_bus.NatsSettings()
+    monkeypatch.setenv("NATS_PASSWORD", "segredo")
+    monkeypatch.setenv("TEMPORAL_PAYLOAD_KEY", security._b64e(b"k" * 32))
+    assert nats_bus.NatsSettings().user == "services" and TemporalSettings().payload_key is not None
+    monkeypatch.setenv("ENVIRONMENT", "development")  # local: sem senha e sem cifra, como antes
+    for name in ("NATS_USER", "NATS_PASSWORD", "TEMPORAL_PAYLOAD_KEY"):
+        monkeypatch.setenv(name, "")
+    assert (nats_bus.NatsSettings().user, TemporalSettings().payload_key) == (None, None)
+
+
+def test_payloads_do_temporal_saem_cifrados_e_presos_a_chave():
+    codec = EncryptedPayloads(b"k" * 32)
+    original = Payload(metadata={"encoding": b"json/plain"}, data=b'{"email": "ana@acme.com", "link": "/redefinir?codigo=x"}')
+    (sealed,) = asyncio.run(codec.encode([original]))
+    assert sealed.metadata["encoding"] == b"binary/encrypted" and b"ana@acme.com" not in sealed.data
+    assert asyncio.run(codec.decode([sealed])) == [original]
+    antigo = Payload(metadata={"encoding": b"json/plain"}, data=b"{}")  # gravado antes da chave: segue como veio
+    assert asyncio.run(codec.decode([antigo])) == [antigo]
+    with pytest.raises(ValueError, match="outra TEMPORAL_PAYLOAD_KEY"):
+        asyncio.run(EncryptedPayloads(b"z" * 32).decode([sealed]))
+    with pytest.raises(ValueError, match="32 bytes"):
+        EncryptedPayloads(b"curta")
+
+
+def test_keygen_de_producao(tmp_path, capsys):
+    env = tmp_path / ".env"
+    security._keygen(env, "app.exemplo.com")
+    values = dict(line.split("=", 1) for line in env.read_text().splitlines() if line and not line.startswith("#"))
+    assert values["ENVIRONMENT"] == "production" and values["AUTH_ISSUER"] == "https://app.exemplo.com"
+    assert values["STORAGE_PUBLIC_URL"] == "https://files.app.exemplo.com" and values["SMTP_URL"] == ""
+    assert values["STORAGE_CORS_ORIGINS"] == "https://app.exemplo.com"  # o navegador envia arquivo direto ao armazenamento
+    assert len(security._b64d(values["TEMPORAL_PAYLOAD_KEY"])) == 32 and values["NATS_GATEWAY_PASSWORD"] != values["NATS_SERVICES_PASSWORD"]
+    assert oct(env.stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(SystemExit, match="já existe"):
+        security._keygen(env, "app.exemplo.com")
+    with pytest.raises(SystemExit, match="domínio inválido"):
+        security._keygen(tmp_path / "outro.env", "nao é domínio")

@@ -2,7 +2,7 @@
 
 Trilhos (manifesto fora deles impede o boot do gateway):
 - Cada manifesto só aponta para o próprio serviço: target_url = http://svc-<service>:8000/...,
-  nats_subject = events.<service>.<ação>. Nunca para outro serviço nem para fora.
+  nats_subject = events.<service>.trigger (o gatilho assíncrono). Nunca para outro serviço nem para fora.
 - NATS só aceita POST. Rota pública não tem papéis nem parâmetros no caminho.
 - cookies: true (só HTTP e POST) é a única forma de um cookie passar pelo gateway: a rota recebe o Cookie do
   navegador e devolve o Set-Cookie do serviço. As demais nunca veem cookie (sessão de login, README §5.8).
@@ -25,7 +25,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 SERVICE_PORT = 8000
 _NAME = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 _PATH = re.compile(r"^(/([a-z0-9_-]+|\{[a-z_][a-z0-9_]*\}))+$")
-_SUBJECT = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
 _MODEL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _OPERATION = re.compile(r"^[a-z][A-Za-z0-9]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
@@ -161,5 +160,6 @@ class Manifest(BaseModel):
             raise ValueError(f"{where}: rota NATS só aceita POST")
         if ep.response is not None:
             raise ValueError(f"{where}: rota NATS sempre responde {{ message_id }}; remova response")
-        if not ep.nats_subject.startswith(f"events.{self.service}.") or not _SUBJECT.match(ep.nats_subject):
-            raise ValueError(f"{where}: nats_subject deve ser events.{self.service}.<ação>")
+        if ep.nats_subject != f"events.{self.service}.trigger":
+            # O gatilho do serviço. Em produção, é o único subject em que o gateway pode publicar (compose.prod.yaml).
+            raise ValueError(f"{where}: nats_subject deve ser events.{self.service}.trigger (mais de uma ação: um campo no payload)")

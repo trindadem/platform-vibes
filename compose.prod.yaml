@@ -1,0 +1,122 @@
+# Produção num host só (README §9), sobre o compose.yaml:
+#   uv run python -m core.security keygen --production <domínio>      # uma vez: cria o .env (preencha o SMTP_URL)
+#   docker compose -f compose.yaml -f compose.prod.yaml up -d --build
+# O que muda em relação ao ambiente local (as variáveis de produção chegam a todos os serviços pelo .env):
+# - HTTPS com certificado do Let's Encrypt em <domínio> e files.<domínio>, HTTP redirecionando e HTTP/2; só as portas
+#   80 e 443 abertas;
+# - o Traefik lê o Docker por um proxy somente leitura, sem o socket;
+# - o frontend é servido pelo nginx (frontend/Dockerfile) com CSP; os arquivos, em files.<domínio>;
+# - NATS com senha, e o gateway com um usuário restrito: publica só os gatilhos (events.<serviço>.trigger) e lê os
+#   avisos ao vivo; nunca chama um RPC (como o rpc.ai.resolve) nem publica evento de outro serviço;
+# - sem Mailpit e sem o Grafana local: SMTP_URL e OTEL_EXPORTER_OTLP_ENDPOINT apontam para fora.
+# Por conta da operação: DNS de <domínio> e files.<domínio> para este host, backup dos volumes (surreal-data,
+# storage-data, temporal-data) e, para alta disponibilidade, Temporal Cloud e S3 no lugar dos locais (variáveis no .env).
+
+services:
+  traefik:
+    command:
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://docker-socket:2375
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?defina ACME_EMAIL no .env}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --accesslog=true
+      - --accesslog.format=json
+    ports: !override ["80:80", "443:443"]
+    volumes: !override ["letsencrypt:/letsencrypt"]
+    depends_on: [docker-socket]
+
+  # Só listar containers, somente leitura: o Traefik descobre as rotas pelos labels sem receber o socket do Docker.
+  docker-socket:
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    environment:
+      CONTAINERS: 1
+      DISABLE_IPV6: 1  # a rede interna do compose é IPv4; sem isto o proxy não sobe em host sem IPv6
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+    restart: unless-stopped
+
+  gateway:
+    labels:
+      traefik.http.routers.gateway.rule: "Host(`${DOMAIN:?defina DOMAIN no .env}`) && (PathPrefix(`/api`) || Path(`/health`))"
+      traefik.http.routers.gateway.entrypoints: websecure
+      traefik.http.routers.gateway-auth.rule: "Host(`${DOMAIN}`) && (Path(`/api/v1/identity/login`) || Path(`/api/v1/identity/signup`) || PathPrefix(`/api/v1/identity/password/`))"
+      traefik.http.routers.gateway-auth.entrypoints: websecure
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      STORAGE_PUBLIC_URL: ${STORAGE_PUBLIC_URL:?defina STORAGE_PUBLIC_URL no .env}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      retries: 3
+    restart: unless-stopped
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.web.rule: "Host(`${DOMAIN}`)"
+      traefik.http.routers.web.entrypoints: websecure
+      traefik.http.routers.web.priority: "1"  # /api e /health ficam com o gateway
+      traefik.http.services.web.loadbalancer.server.port: "8080"
+
+  # Arquivos: o navegador envia e baixa por link assinado em files.<domínio> (o mesmo do STORAGE_PUBLIC_URL).
+  storage:
+    ports: !reset []
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.storage.rule: "Host(`files.${DOMAIN}`)"
+      traefik.http.routers.storage.entrypoints: websecure
+      traefik.http.services.storage.loadbalancer.server.port: "9000"
+
+  # Um usuário para os serviços e outro, restrito, para o gateway (README §5.7). A configuração nasce das senhas do .env.
+  nats:
+    ports: !reset []
+    environment:
+      SERVICES_PASSWORD: ${NATS_SERVICES_PASSWORD:?rode uv run python -m core.security keygen --production <domínio>}
+      GATEWAY_PASSWORD: ${NATS_GATEWAY_PASSWORD:?rode uv run python -m core.security keygen --production <domínio>}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat > /tmp/nats.conf <<EOF
+        port: 4222
+        http_port: 8222
+        jetstream { store_dir: /data }
+        authorization {
+          users = [
+            { user: services, password: "$$SERVICES_PASSWORD", permissions: {
+                publish: { allow: [">"] }
+                subscribe: { allow: [">"], deny: ["live.>"] } } }
+            { user: gateway, password: "$$GATEWAY_PASSWORD", permissions: {
+                publish: { allow: ["events.*.trigger", "\$$JS.API.STREAM.INFO.EVENTS", "\$$JS.API.STREAM.CREATE.EVENTS"] }
+                subscribe: { allow: ["live.>", "_INBOX.>"] } } }
+          ]
+        }
+        EOF
+        exec nats-server -c /tmp/nats.conf
+
+  surrealdb:
+    ports: !reset []
+
+  temporal:
+    ports: !reset []
+
+  # Só no ambiente local: em produção o e-mail sai pelo SMTP_URL e a observabilidade pelo OTEL_EXPORTER_OTLP_ENDPOINT.
+  mailpit:
+    profiles: [local]
+
+  otel:
+    profiles: [local]
+
+  svc-notify:
+    environment:
+      SMTP_URL: ${SMTP_URL:?defina SMTP_URL no .env (servidor de e-mail de verdade)}
+
+volumes:
+  letsencrypt:

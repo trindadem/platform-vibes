@@ -18,8 +18,9 @@ O trace viaja junto (README §5.18): publish e request levam o traceparent no ca
 mesmo trace, num span por mensagem, e contam cada resultado em cv.nats.processed (ok, retry, dropped, invalid).
 
 Mensagem inválida é descartada sem reentrega; handler que falha é re-tentado com espera crescente.
-O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e NATS_CREDS
-(arquivo .creds com permissões por subject; obrigatório em produção, conforme README §5.7).
+O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e a credencial: NATS_USER e
+NATS_PASSWORD (o compose.prod.yaml cria um usuário para os serviços e outro, restrito, para o gateway) ou NATS_CREDS
+(arquivo .creds de contas NATS). Com ENVIRONMENT=production, conexão sem credencial não sobe (README §5.7).
 """
 import asyncio
 import contextvars
@@ -28,7 +29,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import time
 
@@ -37,7 +38,7 @@ from nats.js.api import ConsumerConfig, StreamConfig
 from opentelemetry import metrics, propagate, trace
 from opentelemetry.trace import SpanKind, StatusCode
 from nats.js.errors import NotFoundError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.envelope import ResponseEnvelope, ServiceError, error_code
@@ -61,10 +62,21 @@ _duration = _meter.create_histogram("cv.nats.duration", unit="s", description="T
 
 
 class NatsSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="NATS_")
+    model_config = SettingsConfigDict(env_prefix="NATS_", env_ignore_empty=True)  # variável vazia no compose = não definida
 
     url: str = "nats://localhost:4222"
     creds: str | None = None
+    user: str | None = None
+    password: SecretStr | None = None
+    environment: Literal["production", "development"] = Field("production", validation_alias="ENVIRONMENT")
+
+    @model_validator(mode="after")
+    def _authenticated_in_production(self) -> "NatsSettings":
+        if bool(self.user) != bool(self.password):
+            raise ValueError("NATS_USER e NATS_PASSWORD andam juntos")
+        if self.environment == "production" and not (self.creds or self.user):
+            raise ValueError("produção exige credencial no NATS: NATS_USER/NATS_PASSWORD ou NATS_CREDS (README §5.7)")
+        return self
 
 
 class Bus:
@@ -76,12 +88,17 @@ class Bus:
     @asynccontextmanager
     async def connected(self, service: str) -> AsyncIterator["Bus"]:
         """Conecta no boot; no desligamento, termina o que está em andamento (drain) e fecha."""
-        s = NatsSettings()
+        try:
+            s = NatsSettings()
+        except ValidationError as exc:
+            raise RuntimeError(f"core.nats_bus: configuração ausente ou insegura (README §5.7)\n{exc}") from None
         self._service = service
         self._nc = await nats.connect(
             servers=[s.url],
             name=service,
             user_credentials=s.creds,
+            user=s.user,
+            password=s.password.get_secret_value() if s.password else None,
             max_reconnect_attempts=-1,
             error_cb=_log_error,
         )
