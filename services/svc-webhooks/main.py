@@ -12,6 +12,7 @@ from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import install_security
 from core.surreal import db
 from core.temporal_runner import runner
@@ -20,6 +21,7 @@ from core.webhooks import webhooks
 from schemas import (
     CATALOG_SUBJECT,
     EMIT_SUBJECT,
+    LIMITS,
     RETRY_SUBJECT,
     SERVICE,
     SHARED_TABLES,
@@ -71,6 +73,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(EMIT_SUBJECT, on_emit, model=Emitted)
         await bus.subscribe(RETRY_SUBJECT, on_retry, model=DeliveryRef)
         await webhooks.declare(WEBHOOKS)  # o próprio webhooks.teste entra no catálogo
+        await plans.declare(LIMITS)  # endereços por organização no catálogo de limites dos planos (README §5.17)
         yield
 
 

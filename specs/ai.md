@@ -47,3 +47,6 @@ organização `PLATFORM_TENANT`).
 - Modelo descoberto nasce desativado; quem administra ativa, dá apelido e preço (por milhão de tokens).
 - Custo = tokens × preço do momento da chamada. Sem preço informado, custo zero (tokens continuam contados).
   Preços e custos em dólar (US$), a moeda em que os provedores cobram.
+- Plano (README §5.17): cada uso gravado soma `ai.custo` (US$) e `ai.tokens` no mês da organização, com key fixa por
+  mensagem (a reentrega soma uma vez). Quem já chegou ao limite do mês recebe `ERRO_PLAN_LIMIT` (402) do
+  `core/llm.py` antes de o provedor ser chamado.

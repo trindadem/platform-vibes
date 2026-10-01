@@ -13,6 +13,7 @@ from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import install_security
 from core.surreal import db
 from core.temporal_runner import runner
@@ -23,6 +24,7 @@ from schemas import (
     SHARED_TABLES,
     TASK_QUEUE,
     TENANT_TABLES,
+    LIMITS,
     SEARCH,
     TRIGGER_SUBJECT,
     UNIQUE,
@@ -62,6 +64,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ProviderRef)
         await bus.subscribe(USAGE_SUBJECT, on_usage, model=UsageEvent)
         await bus.respond(RESOLVE_SUBJECT, svc.resolve, model=ResolveRequest)
+        await plans.declare(LIMITS)  # custo e tokens do mês entram no catálogo de limites dos planos
         yield
 
 

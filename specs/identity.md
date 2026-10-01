@@ -59,6 +59,9 @@ cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em
 - Limites: nome e organização 2–80 caracteres, e-mail até 254 (guardado em minúsculas), senha 8–1024.
 - Membro removido perde na hora as sessões daquela organização; o token de acesso já emitido vale até expirar (≤ 15 min).
 - `ERRO_IDENTITY_RESET_INVALID` (404): link de senha inexistente, vencido ou já usado.
+- `ERRO_PLAN_LIMIT` (402, do core): a organização já tem as pessoas que o plano permite (limite `identity.membros`;
+  sem plano, sem limite, README §5.17). Conferido ao criar o convite e de novo ao aceitar (cadastro com convite ou
+  `POST /join`): um convite criado antes de lotar também para. Cada entrada ou remoção informa o total ao plano.
 - Senha esquecida: no máximo 3 links por pessoa por hora (o resto é ignorado em silêncio, para não inundar a caixa
   de ninguém); o link vale 30 min e uma vez. Trocar a senha encerra todas as sessões, invalida os outros links e
   avisa a pessoa por e-mail.

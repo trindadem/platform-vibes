@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from core.envelope import ResponseEnvelope, ServiceError, error_response, install_envelope
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import install_security
 from core.storage import storage
 from core.surreal import db
@@ -24,6 +25,7 @@ from core.webhooks import webhooks
 from schemas import (
     CONTACTS_SUBJECT,
     COOKIE_PATH,
+    LIMITS,
     PUBLIC_PATHS,
     REFRESH_COOKIE,
     SERVICE,
@@ -74,6 +76,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
         await webhooks.declare(WEBHOOKS)  # membro-entrou e membro-saiu no catálogo (README §5.16)
+        await plans.declare(LIMITS)  # pessoas por organização no catálogo de limites dos planos (README §5.17)
         yield
 
 

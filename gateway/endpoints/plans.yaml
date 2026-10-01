@@ -1,0 +1,66 @@
+# svc-plans · rotas públicas no Gateway. Fonte da verdade: specs/plans.md §2
+service: plans
+base_path: /api/v1/plans
+
+# Eventos ao vivo que o serviço emite (bus.live): viram tipos no frontend (useLive / useLiveQuery).
+live:
+  - topic: uso
+    model: UsageChanged
+
+endpoints:
+  - path: /current
+    method: GET
+    auth: client_jwt
+    response: Current
+    target_type: http
+    target_url: http://svc-plans:8000/current
+
+  - path: /plans
+    name: list
+    method: GET
+    auth: client_jwt
+    response: PlanList
+    target_type: http
+    target_url: http://svc-plans:8000/plans
+
+  - path: /limits
+    method: GET
+    auth: client_jwt
+    response: LimitList
+    target_type: http
+    target_url: http://svc-plans:8000/limits
+
+  - path: /plans
+    name: createPlan
+    method: POST
+    auth: client_jwt
+    request: PlanInput
+    response: Plan
+    target_type: http
+    target_url: http://svc-plans:8000/plans
+
+  - path: /plans/update
+    name: updatePlan
+    method: POST
+    auth: client_jwt
+    request: PlanUpdate
+    response: Plan
+    target_type: http
+    target_url: http://svc-plans:8000/plans/update
+
+  - path: /plans/remove
+    name: removePlan
+    method: POST
+    auth: client_jwt
+    request: PlanRef
+    response: PlanList
+    target_type: http
+    target_url: http://svc-plans:8000/plans/remove
+
+  - path: /assign
+    method: POST
+    auth: client_jwt
+    request: AssignInput
+    response: Account
+    target_type: http
+    target_url: http://svc-plans:8000/assign

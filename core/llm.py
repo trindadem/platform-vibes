@@ -19,6 +19,8 @@ Trilhos:
 - Provedor que recusa vira ServiceError sem ecoar a mensagem dele (às vezes traz pedaços da chave):
   401/403 → ERRO_AI_PROVIDER_AUTH, 429 → ERRO_AI_RATE_LIMITED, resto → ERRO_AI_PROVIDER.
 - Endereço de provedor da organização é conferido contra SSRF antes de cada uso; HTTP sem redirect e sem cookie.
+- Plano (README §5.17): antes de cada chamada, o core confere os limites do mês da organização (ai.custo e ai.tokens,
+  somados pelo svc-ai). Quem já chegou ao limite recebe 402 ERRO_PLAN_LIMIT, sem chamar o provedor.
 """
 import logging
 import os
@@ -41,12 +43,14 @@ from pydantic import BaseModel, Field, SecretStr, field_serializer
 from core.envelope import ServiceError
 from core.http_client import no_cookie_jar
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import assert_public_url, current_tenant
 
 __all__ = ["Image", "llm", "Llm", "Resolved", "ResolveRequest", "UsageEvent", "RESOLVE_SUBJECT", "USAGE_SUBJECT"]
 
 RESOLVE_SUBJECT = "rpc.ai.resolve"
 USAGE_SUBJECT = "events.ai.usage"
+PLAN_LIMITS = ("ai.custo", "ai.tokens")  # declarados pelo svc-ai; conferidos antes de cada chamada (README §5.17)
 CACHE_SECONDS = 60
 _MODEL = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}/\S{1,200}$")
 
@@ -195,6 +199,8 @@ class Llm:
     async def _resolve(self, model: str, kind: Literal["chat", "embedding"]) -> Resolved:
         if not _MODEL.match(model):
             raise ValueError(f"modelo fora do trilho: {model!r} (use <provedor>/<modelo>, como cadastrado no svc-ai)")
+        for limit in PLAN_LIMITS:  # quem já gastou o mês do plano não chama o provedor
+            await plans.check(limit)
         key = (current_tenant(), model, kind)
         cached = self._cache.get(key)
         if cached and cached[0] > time.monotonic():

@@ -45,7 +45,8 @@ O que chega no endereço do cliente (POST, `content-type: application/json`):
 - `ERRO_WEBHOOKS_UNSAFE_URL` (422): endereço que não é `https` público. `http` e rede interna só com
   `ENVIRONMENT=development` (receptor local). O endereço é conferido de novo a cada envio (DNS pode mudar).
 - `ERRO_WEBHOOKS_UNKNOWN_EVENT` (422): evento fora do catálogo · `ERRO_WEBHOOKS_ENDPOINT_NOT_FOUND` (404) ·
-  `ERRO_WEBHOOKS_DELIVERY_NOT_FOUND` (404) · `ERRO_WEBHOOKS_LIMIT` (409): mais de 20 endereços por organização.
+  `ERRO_WEBHOOKS_DELIVERY_NOT_FOUND` (404) · `ERRO_PLAN_LIMIT` (402, do core): mais endereços do que o plano permite
+  (limite `webhooks.enderecos`; sem plano, 20 por organização, README §5.17).
 - Resposta 2xx: entregue. `410 Gone`: o endereço é desativado na hora (o cliente pediu para parar). Outra resposta,
   redirecionamento (não seguido), tempo esgotado (15 s) ou falha de rede: nova tentativa. O corpo da resposta não é
   guardado (pode trazer dados do cliente); fica o código e o tempo.

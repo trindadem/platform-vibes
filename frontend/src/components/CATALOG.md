@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (43)
+## Índice (44)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -33,6 +33,7 @@
 - [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
 - [Picture](#picture): Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). `src, alt, size?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
+- [UsageMeter](#usagemeter): Barra de uso de um limite: quanto foi usado de quanto é permitido, em alerta a partir de 80% e cheia em 100%. `label, used, limit, format?, hint?`
 
 **Formatação**: dinheiro, datas, status e códigos
 
@@ -407,6 +408,22 @@ Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid. _(D
 - `value`: `ReactNode`: O valor em destaque.
 - `hint?`: `string`: Contexto curto abaixo do valor.
 - `tone?`: `"default" | "success" | "danger"`: Cor do valor. Padrão: default.
+
+---
+
+## UsageMeter
+
+Barra de uso de um limite: quanto foi usado de quanto é permitido, em alerta a partir de 80% e cheia em 100%. _(Dados)_
+
+```tsx
+<UsageMeter label="Pessoas na organização" used={4} limit={5} hint="no plano Pro" />
+```
+
+- `label`: `string`: O que se mede (ex.: "Pessoas na organização").
+- `used`: `number`: Quanto já foi usado.
+- `limit`: `number | null`: O máximo permitido; null: sem limite (sem barra); 0: não incluído.
+- `format?`: `(value: number) => ReactNode`: Como mostrar um valor (padrão: número em pt-BR). Ex.: (v) => <Money value={v} currency="USD" />.
+- `hint?`: `string`: Contexto curto abaixo da barra (ex.: "neste mês").
 
 ---
 

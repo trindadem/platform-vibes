@@ -21,6 +21,7 @@ from surrealdb import RecordID
 from core.envelope import ServiceError
 from core.http_client import http, no_cookie_jar
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import Principal, assert_public_url, current
 from core.surreal import Page, db
 from core.temporal_runner import activities
@@ -199,9 +200,11 @@ class AiService:
             if exc.code != "ERRO_RECORD_DUPLICATE":
                 raise
             row = (await db.query("SELECT * FROM ai_usage WHERE tenant = $tenant AND message = $m", m=message))[0]
-            return _recorded(row)  # reentrega: já avisado
+            await _count_in_plan(row, message)  # reentrega: o svc-plans soma uma vez só (mesma key)
+            return _recorded(row)  # já avisado
         recorded = _recorded(row)
         await bus.live(USAGE_LIVE, recorded)  # a aba Uso das telas abertas atualiza sozinha
+        await _count_in_plan(row, message)
         return recorded
 
     async def usage_summary(self, data: Empty) -> UsageSummary:
@@ -236,6 +239,13 @@ class AiService:
     async def _model_view(self, row: dict) -> Model:
         provider = await db.select(row["provider"])
         return _model_view({**row, "slug": provider["slug"] if provider else "?"})
+
+
+async def _count_in_plan(row: dict, message: str) -> None:
+    """Soma o uso no mês do plano da organização (README §5.17). A key fixa por mensagem não deixa contar duas vezes."""
+    key = message.replace("/", "-")[:100]
+    await plans.use("custo", row["cost"], key=f"{key}-custo")
+    await plans.use("tokens", row["input_tokens"] + row["output_tokens"], key=f"{key}-tokens")
 
 
 async def _fetch_model_ids(provider: dict) -> list[str]:

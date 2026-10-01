@@ -197,3 +197,11 @@ services:
       <<: *service-env
       # Só o svc-webhooks abre os segredos de assinatura dos endereços (README §5.16).
       WEBHOOKS_SECRETS_KEY: ${WEBHOOKS_SECRETS_KEY:?rode uv run python -m core.security keygen}
+
+  svc-plans:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: plans } }
+    environment:
+      <<: *service-env
+      # Quem administra a plataforma gerencia os planos (README §5.17); a mesma organização do svc-ai.
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}

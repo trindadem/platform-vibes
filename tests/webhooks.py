@@ -19,11 +19,13 @@ from surrealdb import AsyncSurreal
 from core import security
 from core.envelope import ServiceError
 from core.notify import SEND_SUBJECT
+from core.plans import PlanLimits
 from core.security import Principal, acting_as
 from core.webhooks import Catalog, CatalogEvent, Emitted, verify
 
 import service
 from schemas import (
+    LIMITS,
     RETRY_SUBJECT,
     SHARED_TABLES,
     TENANT_TABLES,
@@ -57,7 +59,7 @@ def hooks(monkeypatch):
         monkeypatch.setenv(name, value)
     security._settings.cache_clear()
     service.settings.cache_clear()
-    box = SimpleNamespace(posts=[], replies=[], published=[], live=[])
+    box = SimpleNamespace(posts=[], replies=[], published=[], live=[], counts=[])
 
     async def post(url, *, content, headers, timeout, allow_http, allow_private):
         await security.assert_public_url(url, allow_http=allow_http, allow_private=allow_private)
@@ -68,7 +70,15 @@ def hooks(monkeypatch):
         return httpx.Response(reply)
 
     async def publish(subject, message, msg_id=None):
-        box.published.append((subject, message))
+        if subject == "events.plans.count":  # plano (README §5.17): totais à parte
+            box.counts.append((message.name, message.total))
+        elif subject.startswith("events.plans."):
+            pass
+        else:
+            box.published.append((subject, message))
+
+    async def request(subject, message, response_model, timeout=5.0):  # svc-plans ainda sem o limite: vale o default (20)
+        return PlanLimits(plan=None, plan_name="Sem plano", month="2026-10", limits=[])
 
     async def live(topic, message, user=None):
         box.live.append((topic, message.status))
@@ -77,6 +87,11 @@ def hooks(monkeypatch):
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
     monkeypatch.setattr(service.bus, "_service", "svc-webhooks")
+    monkeypatch.setattr(service.bus, "request", request)
+    service.plans.clear()
+    monkeypatch.setattr(service.plans, "_declared", {})
+    asyncio.run(service.plans.declare(LIMITS))
+    box.counts.clear()
     yield box
     security._settings.cache_clear()
     service.settings.cache_clear()
@@ -281,7 +296,9 @@ def test_endereco_e_eventos_sao_conferidos(hooks, monkeypatch):
 
     unknown, limit, internal, plain = run(scenario)
     _error(unknown, "ERRO_WEBHOOKS_UNKNOWN_EVENT", 422)
-    _error(limit, "ERRO_WEBHOOKS_LIMIT", 409)
+    _error(limit, "ERRO_PLAN_LIMIT", 402)  # sem plano: o default declarado, 20 por organização
+    assert "Endereços de webhook, até 20 endereços" in limit.value.message
+    assert hooks.counts[-1] == ("webhooks.enderecos", 20)  # a tela Plano mostra "20 de 20"
     _error(internal, "ERRO_WEBHOOKS_UNSAFE_URL", 422)
     _error(plain, "ERRO_WEBHOOKS_UNSAFE_URL", 422)
 

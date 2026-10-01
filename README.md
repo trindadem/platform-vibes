@@ -42,7 +42,8 @@ cogniventure/
 │   ├── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
 │   ├── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
 │   ├── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
-│   └── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
+│   ├── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
+│   └── plans.py                 # Planos e limites: o que cada organização pode usar, conferido no serviço (seção 5.17)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -223,6 +224,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `storage.py` | `storage.connected(service)`, `storage.upload(pedido, accept, max_bytes, folder)`, `storage.keep(key)`, `storage.url(key, ttl, filename, content_type)`, `storage.delete(key)`, `UploadRequest`, `Upload`, `KeepRequest`, `StoredFile`, `IMAGES` (seção 5.14) |
 | `notify.py` | `notify.user(sub, title, body, link, action, send_email, key)`, `notify.roles(*papéis, title=...)`, `notify.email(endereço, title, body, link, action, key)` — o único jeito de avisar alguém (seção 5.15) |
 | `webhooks.py` | `WebhookEvent(nome, descrição, Modelo)`, `webhooks.declare(lista)`, `webhooks.emit(nome, modelo, key)`, `webhooks.verify(segredo, cabeçalhos, corpo)`, `sign`, `new_secret` (seção 5.16) |
+| `plans.py` | `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(lista)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.limits()`, `plans.assign(plano)` (seção 5.17) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -258,10 +260,10 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `SURREAL_ROOT_PASSWORD`, `GATEWAY_PORT` | Só no compose: senha root do SurrealDB (nenhum serviço a recebe) e porta local da API (8088) |
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
-| `AI_SECRETS_KEY`, `PLATFORM_TENANT` | Só no `svc-ai`: a chave que criptografa as chaves dos provedores (o `keygen` gera) e a organização dona da plataforma (opcional; seção 5.11) |
-| `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails nome nos e-mails (seção 5.15) |
+| `AI_SECRETS_KEY`, `PLATFORM_TENANT` | A chave que criptografa as chaves dos provedores (o `keygen` gera; só no `svc-ai`) e a organização que administra a plataforma: provedores de IA para todas (`svc-ai`, seção 5.11) e os planos (`svc-plans`, seção 5.17); opcional |
+| `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails (seção 5.15) |
 | `WEBHOOKS_SECRETS_KEY` | Só no `svc-webhooks`: a chave que criptografa os segredos de assinatura dos endereços (o `keygen` gera; seção 5.16) |
- o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
+O `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
 ```bash
 uv run python -m core.security keygen
@@ -337,7 +339,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
 - **Listas:** `db.page` (seção 5.12) filtra a organização sozinho, como `create` e `select`.
-- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`), o de avisos (registro de e-mails e preferências de cada pessoa) e o de webhooks (catálogo de eventos).
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`), o de avisos (registro de e-mails e preferências de cada pessoa), o de webhooks (catálogo de eventos) e o de planos (catálogo de limites, planos e o plano de cada organização, no campo `org`).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ### 5.10 Tempo real e streaming
@@ -370,7 +372,8 @@ agente  = await llm.agent("openrouter/claude", tools=[...])              # Agent
 - **Modelos:** a busca lê `GET {base_url}/models`, e o modelo descoberto nasce desativado. Quem administra ativa, dá apelido (`openrouter/claude`), marca o tipo (chat ou embedding) e informa o preço por milhão de tokens. Provedor sem `/models` aceita cadastro manual.
 - **Resolução:** o core pergunta ao `svc-ai` (`rpc.ai.resolve`), na organização de quem age, e guarda a resposta por 60 s: troca de chave ou de modelo vale em até 1 min. Modelo inexistente, desativado ou de outro tipo → 404 `ERRO_AI_MODEL_UNAVAILABLE`.
 - **Rede:** provedor de organização só em `https` com IP público, conferido ao salvar e a cada uso; rede interna (Ollama, vLLM) só nos provedores da plataforma. Sem redirect e sem cookie.
-- **Uso e custo:** toda chamada publica `events.ai.usage` (tokens, modelo, serviço); o `svc-ai` grava por organização com o preço do momento, sem contar duas vezes a mesma mensagem. `GET /api/v1/ai/usage` resume o mês.
+- **Uso e custo:** toda chamada publica `events.ai.usage` (tokens, modelo, serviço); o `svc-ai` grava por organização com o preço do momento, sem contar duas vezes a mesma mensagem, e soma no plano (`ai.custo` em US$ e `ai.tokens`, seção 5.17). `GET /api/v1/ai/usage` resume o mês.
+- **Limite do plano:** antes de cada chamada, o core confere o mês da organização; quem já chegou ao limite recebe 402 `ERRO_PLAN_LIMIT` sem que o provedor seja chamado.
 - **Erros do provedor** saem no envelope sem ecoar a mensagem dele: 401/403 → `ERRO_AI_PROVIDER_AUTH`, 429 → `ERRO_AI_RATE_LIMITED`, o resto → `ERRO_AI_PROVIDER`.
 - **Tela `/ia`:** donos e admins têm as abas Uso do mês (atualiza ao vivo pelo aviso `ai.uso`), Modelos (buscar, liberar, apelido, tipo e preço) e Provedores; membros veem só os modelos liberados. O provedor da plataforma aparece às outras organizações sem endereço e sem chave.
 - **Agno por baixo:** telemetria, banco, memória e conhecimento do Agno ficam desligados, porque não respeitam a organização. Histórico de conversa e documentos ficam em tabelas do serviço, pelo `core.surreal`.
@@ -492,6 +495,7 @@ await webhooks.emit("fatura-paga", FaturaPaga(id=..., valor=...), key=f"paga-{id
 - **Padrão Standard Webhooks:** POST com `{ "type", "timestamp", "data" }` e os cabeçalhos `webhook-id` (o mesmo em toda tentativa e em todo endereço: quem recebe usa para não processar duas vezes), `webhook-timestamp` e `webhook-signature` (`v1,` + HMAC-SHA256 em base64 de `{id}.{timestamp}.{corpo}`). O segredo (`whsec_...`) é de cada endereço, aparece só ao criar ou trocar e fica criptografado (`WEBHOOKS_SECRETS_KEY`, só no `svc-webhooks`). Qualquer biblioteca do padrão confere do outro lado.
 - **Entrega:** durável (`events.webhooks.emit`) e com até 10 tentativas, de 5 s a 5 h entre elas (cerca de 15 h). 2xx é entregue; `410 Gone` desativa o endereço; o resto (inclusive redirect, que não é seguido, e 15 s sem resposta) tenta de novo. 20 entregas seguidas sem sucesso desativam o endereço e avisam donos e administradores (seção 5.15). O corpo da resposta não é guardado; o registro de cada entrega fica 30 dias. Sem garantia de ordem: o `timestamp` diz quando aconteceu.
 - **Endereço:** `https` público, conferido ao salvar e a cada envio (SSRF, sem redirect). `http` e rede interna só com `ENVIRONMENT=development`, para testar com um receptor local.
+- **Limite:** endereços por organização vêm do plano (`webhooks.enderecos`; sem plano, 20).
 - **Tela `webhooks`** (donos e administradores): Endereços (cadastrar, escolher eventos, testar na hora, ativar, trocar o segredo, remover), Entregas (lista ao vivo, filtros, reenviar com o mesmo id e corpo) e Eventos (catálogo, campos e como conferir a assinatura).
 
 **Entrada:** um sistema de fora (pagamentos, assinatura eletrônica...) avisa um serviço. A rota é pública e libera o cabeçalho da assinatura; o corpo chega ao serviço byte a byte. Se o remetente segue o mesmo padrão (Svix, Resend, Clerk...), o core confere:
@@ -513,6 +517,31 @@ async def pagamentos(request: Request) -> ResponseEnvelope:
 
 Provedor com esquema próprio (`stripe-signature`, `x-hub-signature-256`) se confere com `hmac` e `core.security.same` (comparação em tempo constante). A organização dona do evento vem do conteúdo (a conta no provedor), nunca de um parâmetro da URL.
 
+### 5.17 Planos e limites (`core/plans.py` e `svc-plans`)
+
+Cada organização tem um plano, e o plano diz quanto ela pode usar. O serviço declara o que limita e confere com uma linha; quem guarda planos, consumo e avisos é o `svc-plans` (`specs/plans.md`).
+
+```python
+LIMITS = [
+    Limit("enderecos", "Endereços de webhook", default=20, unit="endereços"),           # total do que existe agora
+    Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD"),                 # consumo somado no mês
+]                                                                                         # schemas.py
+await plans.declare(LIMITS)                         # main.py, no lifespan (depois do bus)
+await plans.check("enderecos", used=total)          # antes de criar: 402 ERRO_PLAN_LIMIT se já chegou ao limite
+await plans.count("enderecos", total)               # depois de criar ou remover: a tela mostra "3 de 20"
+await plans.check("custo")                          # antes de gastar: quem já passou do limite do mês para aqui
+await plans.use("custo", 0.0123, key=message_id)    # depois de gastar: soma no mês
+```
+
+- **Nome:** `<serviço>.<limite>` (`webhooks.enderecos`). Só o próprio serviço declara, conta e soma os seus; conferir vale também com o nome completo de outro serviço (o `core/llm.py` confere `ai.custo` em quem chama a IA). Limite não declarado é erro.
+- **Valor:** o do plano da organização atual. O que o plano não cita, ou organização sem plano, vale o `default` declarado. `None`: sem limite; `0`: o recurso não está no plano.
+- **Total × mensal:** no total, quem conta é o serviço, dono dos dados (`used=`), antes de criar; duas criações ao mesmo tempo podem passar do limite em uma. No mensal, o `svc-plans` soma o mês (UTC), uma vez por mensagem; a chamada que cruza o limite termina e as seguintes param. Em 80% e em 100%, donos e administradores recebem um aviso (seção 5.15), uma vez por mês e por patamar.
+- **Resolução guardada 60 s** por processo: trocar de plano ou mudar um limite vale em até 1 min. Com o `svc-plans` fora do ar, vale a última resposta e, sem ela, nenhum limite: plano é regra comercial, não de segurança.
+- **Planos:** quem administra a plataforma (`owner` ou `admin` da organização `PLATFORM_TENANT`) cria os planos na tela, com preço (informativo), limites e se aparecem na comparação; um deles pode ser o padrão, que vale para quem não tem plano atribuído. Plano padrão ou em uso não sai.
+- **Troca de plano:** pela tela (aba Gerenciar, com o código que a organização vê na aba Uso) ou pelo serviço de pagamentos do produto, depois de confirmar o pagamento, como tarefa da plataforma: `with acting_as(system(SERVICE, org)): await plans.assign("pro")`. A cobrança fica no produto.
+- **Limites da plataforma:** `identity.membros` (pessoas na organização), `webhooks.enderecos` (sem plano, 20), `ai.custo` (US$, a moeda dos provedores, sem conversão) e `ai.tokens`.
+- **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Planos (comparação dos públicos e do atual) e, para quem administra a plataforma, Gerenciar (planos e atribuição).
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -523,7 +552,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). Uma ação que muda o que outra parte da tela mostra chama `refresh(contrato.funcao)`: toda consulta aberta com essa função busca de novo (ex.: marcar como lido atualiza o sino). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). Uma ação que muda o que outra parte da tela mostra chama `refresh(contrato.funcao)`: toda consulta aberta com essa função busca de novo (ex.: marcar como lido atualiza o sino). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR; `UsageMeter` mostra quanto foi usado de um limite. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };
@@ -550,7 +579,7 @@ export default function Faturas() {
 }
 ```
 
-- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes`, `ia` e `webhooks`, mais o sino de avisos na barra superior (seção 5.15).
+- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes`, `ia`, `webhooks` e `plano`, mais o sino de avisos na barra superior (seção 5.15).
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
 ```bash
@@ -606,7 +635,7 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 - importar código de outro serviço;
 - implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
 - abrir uma rota (`public=`) que o spec não declara pública;
-- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (identidade e IA), ou organização vinda do corpo (a única exceção são as migrações versionadas, seção 5.13);
+- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (seção 5.9), ou organização vinda do corpo (a única exceção são as migrações versionadas, seção 5.13);
 - chamar provedor de IA, montar cliente `openai` ou Agno, ou guardar chave de provedor fora de `core/llm.py` e do `svc-ai`;
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;

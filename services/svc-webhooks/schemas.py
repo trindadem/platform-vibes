@@ -5,6 +5,7 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings
 
+from core.plans import Limit
 from core.surreal import ListQuery, Page
 from core.webhooks import CATALOG_SUBJECT, EMIT_SUBJECT, Catalog, CatalogEvent, Emitted, WebhookEvent  # contrato do core
 
@@ -24,7 +25,6 @@ UNIQUE = {DELIVERIES: ["message", "endpoint"], EVENTS: ["name"]}
 
 MANAGERS = frozenset({"owner", "admin"})
 ALL_EVENTS = "*"
-MAX_ENDPOINTS = 20  # por organização
 DISABLE_AFTER = 20  # entregas seguidas sem sucesso desativam o endereço
 ATTEMPTS = 10  # 5 s, 20 s, 80 s... até 5 h entre tentativas: cerca de 15 h no total
 TIMEOUT_SECONDS = 15
@@ -57,6 +57,9 @@ class Ping(BaseModel):
     message: str = Field(..., description="Texto fixo do teste")
     endpoint: str = Field(..., description="Id do endereço testado")
 
+
+# Limite do plano (README §5.17): endereços por organização; sem plano, 20.
+LIMITS = [Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")]
 
 WEBHOOKS = [WebhookEvent("teste", "Teste enviado pela tela de webhooks, para conferir o endereço e a assinatura.", Ping)]
 

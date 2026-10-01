@@ -462,6 +462,149 @@ export const notify = {
     request<NotifyPreferences>("POST", "/api/v1/notify/preferences", body, options),
 };
 
+export interface PlansLimitState {
+  /** Nome completo: <serviço>.<limite> */
+  name: string;
+  service: string;
+  description: string;
+  /** Valor sem plano (ou que o plano não cita); null: sem limite */
+  default: number | null;
+  /** Consumo somado no mês (true) ou total do que existe agora (false) */
+  monthly: boolean;
+  unit: string;
+  currency: string | null;
+  /** O que o plano permite (ou o default); null: sem limite */
+  limit: number | null;
+  /** Mensal: soma do mês. Total: o último total que o serviço informou */
+  used: number;
+}
+
+export interface PlansPlan {
+  slug: string;
+  name: string;
+  description: string;
+  /** Preço por mês, informativo (a cobrança é do produto) */
+  price: number;
+  /** Moeda do preço */
+  currency: "BRL" | "USD" | "EUR";
+  /** Aparece para as organizações na comparação de planos */
+  public: boolean;
+  /** Plano de quem ainda não tem um atribuído */
+  default: boolean;
+  /** Limite → valor (null: sem limite); o que falta vale o default */
+  limits: Record<string, number | null>;
+}
+
+export interface PlansCurrent {
+  /** Id da organização: quem administra a plataforma atribui o plano por ele */
+  tenant: string;
+  /** Plano em vigor (atribuído ou o padrão); null: sem plano */
+  plan: PlansPlan | null;
+  /** AAAA-MM, em UTC: o mês dos consumos */
+  month: string;
+  limits: PlansLimitState[];
+  manages_platform: boolean;
+}
+
+export interface PlansPlanList {
+  items: PlansPlan[];
+  /** Slug do plano da organização ativa (null: sem plano) */
+  current: string | null;
+  /** Quem pede administra os planos da plataforma */
+  manages_platform: boolean;
+}
+
+export interface PlansCatalogLimit {
+  /** Nome completo: <serviço>.<limite> */
+  name: string;
+  service: string;
+  description: string;
+  /** Valor sem plano (ou que o plano não cita); null: sem limite */
+  default: number | null;
+  /** Consumo somado no mês (true) ou total do que existe agora (false) */
+  monthly: boolean;
+  unit: string;
+  currency: string | null;
+}
+
+export interface PlansLimitList {
+  items: PlansCatalogLimit[];
+}
+
+export interface PlansPlanInput {
+  /** Identificador curto e permanente (ex.: gratis, pro) */
+  slug: string;
+  name: string;
+  description?: string;
+  /** Preço por mês, informativo */
+  price?: number;
+  currency?: "BRL" | "USD" | "EUR";
+  public?: boolean;
+  default?: boolean;
+  /** Limite → valor (null: sem limite) */
+  limits?: Record<string, unknown>;
+}
+
+export interface PlansPlanUpdate {
+  slug: string;
+  name?: string | null;
+  description?: string | null;
+  price?: number | null;
+  currency?: "BRL" | "USD" | "EUR" | null;
+  public?: boolean | null;
+  default?: boolean | null;
+  /** Substitui a lista inteira */
+  limits?: Record<string, unknown> | null;
+}
+
+export interface PlansPlanRef {
+  slug: string;
+}
+
+export interface PlansAssignInput {
+  /** Id da organização (aparece para ela na tela Plano) */
+  tenant: string;
+  plan: string;
+}
+
+export interface PlansAccount {
+  tenant: string;
+  tenant_name: string;
+  plan: string;
+  plan_name: string;
+}
+
+/** Consumo ou total que mudou (também vai ao vivo para a tela da organização). */
+export interface PlansUsageChanged {
+  name: string;
+  used: number;
+}
+
+/** svc-plans · /api/v1/plans */
+export const plans = {
+  /** GET /api/v1/plans/current · http · exige token */
+  current: (options?: RequestOptions) =>
+    request<PlansCurrent>("GET", "/api/v1/plans/current", undefined, options),
+  /** GET /api/v1/plans/plans · http · exige token */
+  list: (options?: RequestOptions) =>
+    request<PlansPlanList>("GET", "/api/v1/plans/plans", undefined, options),
+  /** GET /api/v1/plans/limits · http · exige token */
+  limits: (options?: RequestOptions) =>
+    request<PlansLimitList>("GET", "/api/v1/plans/limits", undefined, options),
+  /** POST /api/v1/plans/plans · http · exige token */
+  createPlan: (body: PlansPlanInput, options?: RequestOptions) =>
+    request<PlansPlan>("POST", "/api/v1/plans/plans", body, options),
+  /** POST /api/v1/plans/plans/update · http · exige token */
+  updatePlan: (body: PlansPlanUpdate, options?: RequestOptions) =>
+    request<PlansPlan>("POST", "/api/v1/plans/plans/update", body, options),
+  /** POST /api/v1/plans/plans/remove · http · exige token */
+  removePlan: (body: PlansPlanRef, options?: RequestOptions) =>
+    request<PlansPlanList>("POST", "/api/v1/plans/plans/remove", body, options),
+  /** POST /api/v1/plans/assign · http · exige token */
+  assign: (body: PlansAssignInput, options?: RequestOptions) =>
+    request<PlansAccount>("POST", "/api/v1/plans/assign", body, options),
+};
+
 export interface WebhooksEndpoint {
   id: string;
   url: string;
@@ -607,6 +750,8 @@ export interface LiveTopics {
   "identity.acesso": IdentityAccessChanged;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
+  /** svc-plans · bus.live("plans.uso", ...) */
+  "plans.uso": PlansUsageChanged;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }

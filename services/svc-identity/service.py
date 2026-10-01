@@ -25,9 +25,11 @@ from core.security import (
     issue_token,
     new_secret,
     password_needs_rehash,
+    system,
     verify_password,
 )
 from core.notify import notify
+from core.plans import plans
 from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import activities
@@ -49,6 +51,7 @@ from schemas import (
     RESETS,
     RESET_MINUTES,
     REUSE_GRACE_SECONDS,
+    SERVICE,
     SESSIONS,
     TENANT_CREATED_SUBJECT,
     TENANTS,
@@ -138,6 +141,8 @@ class IdentityService:
             "password_hash": await hash_password(data.password),
             "failed_logins": 0,
         }
+        if data.invite is not None:
+            await self._room_for_one(data.invite)  # plano da organização com vaga (README §5.17)
         try:
             if data.organization is not None:
                 joined = await db.query_shared(_SIGNUP_WITH_ORGANIZATION, user=user, organization=data.organization)
@@ -285,6 +290,7 @@ class IdentityService:
 
     async def join(self, data: JoinRequest) -> Session:
         who = _who()
+        await self._room_for_one(data.code)
         try:
             joined = await db.query_shared(_JOIN, code_hash=_hash(data.code), user=RecordID(USERS, who.sub))
         except ServiceError as exc:
@@ -305,6 +311,7 @@ class IdentityService:
 
     async def create_invite(self, data: InviteInput) -> Invite:
         who, tenant = await self._manager()
+        await plans.check("membros", used=await _member_count(tenant))  # cedo, para quem convida; vale de novo ao aceitar
         code, expires_at = new_secret(24), _now() + timedelta(days=INVITE_DAYS)
         await db.create(INVITES, {
             "code_hash": _hash(code),
@@ -368,6 +375,7 @@ class IdentityService:
         )
         await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
         await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
+        await plans.count("membros", await _member_count(tenant))
         if gone is not None:
             await webhooks.emit(
                 "membro-saiu", MemberLeftHook(id=data.user, name=gone["name"], email=gone["email"]),
@@ -515,6 +523,18 @@ class IdentityService:
         membership = await self._membership(user_key, tenant_key)
         return membership["roles"] if membership else []
 
+    async def _room_for_one(self, code: str) -> None:
+        """Antes de aceitar um convite: a organização dele ainda tem vaga no plano? (convite inválido segue para o
+        bloco atômico, que responde ERRO_IDENTITY_INVITE_INVALID)."""
+        rows = await db.query_shared(
+            "SELECT VALUE tenant FROM identity_invites WHERE code_hash = $h AND used_at = NONE AND expires_at > time::now()",
+            h=_hash(code),
+        )
+        if rows:
+            tenant = _key(str(rows[0]))
+            with acting_as(system(SERVICE, tenant)):  # o limite é da organização do convite, não de quem entra
+                await plans.check("membros", used=await _member_count(tenant))
+
     async def _member(self) -> tuple[Principal, str]:
         """Quem age e a organização ativa, conferindo no banco que ainda é membro (o token pode ter até 15 min)."""
         who = _who()
@@ -548,6 +568,7 @@ class IdentityService:
                 msg_id=f"member-{tenant_key}-{user_key}",
             )
             await bus.live(MEMBERS_LIVE, MembersChanged(user=user_key, change="joined"))
+            await plans.count("membros", await _member_count(tenant_key))
             if created is None and name and email:  # entrou numa organização que já existia
                 await webhooks.emit(
                     "membro-entrou", MemberJoinedHook(id=user_key, name=name, email=email, role=role),
@@ -562,6 +583,14 @@ class IdentityService:
                     action="Ver membros",
                     key=f"joined-{tenant_key}-{user_key}",
                 )
+
+
+async def _member_count(tenant: str) -> int:
+    rows = await db.query_shared(
+        "SELECT count() AS total FROM (SELECT id FROM identity_memberships WHERE tenant = $t) GROUP ALL",
+        t=RecordID(TENANTS, tenant),
+    )
+    return rows[0]["total"] if rows else 0
 
 
 def _who() -> Principal:

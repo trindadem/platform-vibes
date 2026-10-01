@@ -15,7 +15,7 @@ from core.envelope import ServiceError
 from core.security import Principal, acting_as, current_tenant, new_secret
 
 import service
-from schemas import SEARCH, SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelQuery, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
+from schemas import LIMITS, SEARCH, SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelQuery, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
 
 PLATAFORMA = Principal(sub="ana", tenant="plat", roles=frozenset({"owner"}))
 ACME = Principal(sub="bia", tenant="acme", roles=frozenset({"owner"}))
@@ -25,6 +25,7 @@ MODELOS = {"object": "list", "data": [{"id": "llama3.2"}, {"id": "nomic-embed-te
 
 
 AO_VIVO = []
+PLANO = []  # consumo somado no plano (events.plans.usage): (limite, quantidade, msg_id, organização)
 
 
 @pytest.fixture(autouse=True)
@@ -34,11 +35,20 @@ def ambiente(monkeypatch):
     service.settings.cache_clear()
     pedidos = []
     AO_VIVO.clear()
+    PLANO.clear()
 
     async def live(topic, message, user=None):
         AO_VIVO.append((topic, message, current_tenant()))
 
+    async def publish(subject, message, msg_id=None):
+        if subject == "events.plans.usage":
+            PLANO.append((message.name, message.amount, msg_id, current_tenant()))
+
     monkeypatch.setattr(service.bus, "live", live)
+    monkeypatch.setattr(service.bus, "publish", publish)
+    monkeypatch.setattr(service.bus, "_service", "svc-ai")
+    monkeypatch.setattr(service.plans, "_declared", {})
+    asyncio.run(service.plans.declare(LIMITS))  # como o boot: custo e tokens no catálogo
 
     def provedor(request):
         pedidos.append(request)
@@ -271,6 +281,9 @@ def test_uso_e_custo_por_organizacao():
     assert [(i.model, i.service, i.calls) for i in acme.items] == [("local/rapido", "svc-pedidos", 2)]
     assert (beta.calls, beta.items[0].service) == (1, "svc-relatorios")
     _erro(membro, "ERRO_AI_FORBIDDEN")
+    # Cada uso soma custo e tokens no mês do plano da organização de quem usou (README §5.17).
+    assert [(nome, valor, org) for nome, valor, _, org in PLANO] == [
+        ("ai.custo", 2.0, "acme"), ("ai.tokens", 1_500_000, "acme")] * 2 + [("ai.custo", 2.0, "beta"), ("ai.tokens", 1_500_000, "beta")]
 
 
 def test_reentrega_do_mesmo_evento_nao_conta_duas_vezes():
@@ -289,3 +302,5 @@ def test_reentrega_do_mesmo_evento_nao_conta_duas_vezes():
     primeira, reentrega, resumo = run(cenario)
     assert primeira.id == reentrega.id and resumo.calls == 1
     assert len(AO_VIVO) == 1  # a reentrega não avisa de novo
+    # O plano recebe de novo, com a mesma key: o svc-plans soma uma vez só (specs/plans.md §3).
+    assert PLANO == [("ai.custo", 1e-05, "usage-svc-ai-EVENTS-42-custo", "acme"), ("ai.tokens", 10, "usage-svc-ai-EVENTS-42-tokens", "acme")] * 2

@@ -18,11 +18,13 @@ from core import storage as storage_module
 from core.envelope import ServiceError
 from core.security import acting_as
 from core.notify import SEND_SUBJECT, ContactsRequest
+from core.plans import COUNT_SUBJECT, LIMITS_SUBJECT, LimitState, PlanLimits
 from core.webhooks import EMIT_SUBJECT
 from core.storage import KeepRequest, UploadRequest
 
 import service
 from schemas import (
+    LIMITS,
     MEMBER_JOINED_SUBJECT,
     SHARED_TABLES,
     TENANT_CREATED_SUBJECT,
@@ -43,6 +45,7 @@ from schemas import (
 )
 
 PASSWORD = "senha-forte-1"
+PLANO = {"membros": None, "contagens": []}  # limite de pessoas do plano (None: sem limite) e totais informados
 
 
 @pytest.fixture
@@ -57,15 +60,29 @@ def events(monkeypatch):
     published = []
 
     async def publish(subject, message, msg_id=None):
-        published.append((subject, message, security.current()))
+        if subject == COUNT_SUBJECT:  # totais para a tela Plano (README §5.17): lista à parte
+            PLANO["contagens"].append((message.name, message.total, security.current_tenant()))
+        elif not subject.startswith("events.plans."):
+            published.append((subject, message, security.current()))
 
     async def live(topic, message, user=None):
         published.append((f"live:{topic}" + (f":{user}" if user else ""), message, security.current()))
 
+    async def request(subject, message, response_model, timeout=5.0):  # o svc-plans responde (rpc.plans.limits)
+        assert subject == LIMITS_SUBJECT, subject
+        state = LimitState(name="identity.membros", service="svc-identity", description="Pessoas na organização",
+                           default=None, monthly=False, unit="pessoas", limit=PLANO["membros"], used=0)
+        return PlanLimits(plan="teste", plan_name="Teste", month="2026-10", limits=[state])
+
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
     monkeypatch.setattr(service.bus, "_service", "svc-identity")  # core/notify diz quem pede
+    monkeypatch.setattr(service.bus, "request", request)
+    service.plans.clear()
+    monkeypatch.setattr(service.plans, "_declared", {})
+    PLANO.update(membros=None, contagens=[])
     asyncio.run(service.webhooks.declare(WEBHOOKS))  # como o boot: eventos no catálogo
+    asyncio.run(service.plans.declare(LIMITS))
     published.clear()
     yield published
     _clear()
@@ -504,3 +521,36 @@ def test_webhooks_de_entrada_e_saida_de_membros(events):
         ("identity.membro-entrou", {"id": bia.auth.user.id, "name": "Bia", "email": "bia@x.com", "role": "member"}, tenant),
         ("identity.membro-saiu", {"id": bia.auth.user.id, "name": "Bia", "email": "bia@x.com"}, tenant),
     ]
+
+
+# ── Plano: pessoas por organização (README §5.17) ───────────────────────────
+
+def test_limite_de_pessoas_do_plano_vale_ao_convidar_e_ao_aceitar(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        PLANO["membros"] = 2  # o plano muda (o core guardaria 60 s; aqui nada foi conferido ainda)
+        code = await _code(svc, ana)  # 1 de 2: convida
+        code_2 = await _code(svc, ana)
+        await signup(svc, email="bia@x.com", organization=None, invite=code, name="Bia")  # 2 de 2
+        with as_user(ana), pytest.raises(ServiceError) as invite:
+            await svc.create_invite(InviteInput())
+        with pytest.raises(ServiceError) as accept:  # convite criado antes de lotar também para
+            await signup(svc, email="caio@x.com", organization=None, invite=code_2, name="Caio")
+        dani = await signup(svc, email="dani@x.com", organization="Outra", name="Dani")
+        with as_user(dani), pytest.raises(ServiceError) as join:
+            await svc.join(JoinRequest(code=code_2))
+        users = await service.db.query_shared("SELECT VALUE email FROM identity_users")
+        with as_user(ana):
+            members = await svc.list_members(Empty())
+            await svc.remove_member(MemberRef(user=next(m.id for m in members.items if m.name == "Bia")))
+        return ana, invite, accept, join, users
+
+    ana, invite, accept, join, users = run(scenario)
+    for exc in (invite, accept, join):
+        _error(exc, "ERRO_PLAN_LIMIT", 402)
+    assert "Pessoas na organização, até 2 pessoas" in invite.value.message
+    assert "caio@x.com" not in users  # nada foi criado
+    acme = ana.auth.tenant.id
+    assert [(nome, total) for nome, total, org in PLANO["contagens"] if org == acme] == [
+        ("identity.membros", 1), ("identity.membros", 2), ("identity.membros", 1)]  # a tela Plano mostra "x de 2"
+

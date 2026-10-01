@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings
 
 from core.llm import RESOLVE_SUBJECT, USAGE_SUBJECT, Resolved, ResolveRequest, UsageEvent  # contrato com core/llm.py
+from core.plans import Limit
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -24,6 +25,12 @@ UNIQUE = {PROVIDERS: ["owner", "slug"], MODELS: ["owner", "provider", "model_id"
 SEARCH = {MODELS: ["model_id", "alias"]}  # busca por palavras na lista de modelos (README §5.12)
 PLATFORM = "platform"
 MANAGERS = frozenset({"owner", "admin"})
+
+# Limites do plano (README §5.17): somados aqui a cada uso gravado; o core/llm.py confere antes de cada chamada.
+LIMITS = [
+    Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD"),
+    Limit("tokens", "Tokens de IA no mês", monthly=True, unit="tokens"),
+]
 
 Scope = Literal["organization", "platform"]
 Kind = Literal["chat", "embedding"]

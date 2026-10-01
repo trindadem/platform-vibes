@@ -25,6 +25,7 @@ from core.envelope import ServiceError
 from core.http_client import http
 from core.nats_bus import bus
 from core.notify import notify
+from core.plans import plans
 from core.security import Principal, acting_as, assert_public_url, current, current_tenant, system
 from core.surreal import Migration, Page, db
 from core.temporal_runner import activities
@@ -38,7 +39,6 @@ from schemas import (
     ENDPOINTS,
     KEEP_DAYS,
     MANAGERS,
-    MAX_ENDPOINTS,
     RETRY_SUBJECT,
     SERVICE,
     TEST_EVENT,
@@ -87,11 +87,7 @@ class WebhooksService:
 
     async def create_endpoint(self, data: EndpointInput) -> EndpointSecret:
         _manager()
-        counted = await db.query(
-            "SELECT count() AS total FROM (SELECT id FROM webhook_endpoints WHERE tenant = $tenant) GROUP ALL"
-        )
-        if counted and counted[0]["total"] >= MAX_ENDPOINTS:
-            raise ServiceError("ERRO_WEBHOOKS_LIMIT", f"Limite de {MAX_ENDPOINTS} endereços por organização.", 409)
+        await plans.check("enderecos", used=await _endpoint_count())  # 402 ERRO_PLAN_LIMIT (README §5.17)
         await _check_url(data.url)
         events = await _check_events(data.events)
         row = await db.create(ENDPOINTS, {
@@ -100,6 +96,7 @@ class WebhooksService:
         })
         secret = new_secret()
         row = await db.merge(row["id"], {"secret": _encrypt(_key(row["id"]), secret)})  # preso a este endereço
+        await plans.count("enderecos", await _endpoint_count())
         return EndpointSecret(endpoint=_endpoint(row), secret=secret)
 
     async def update_endpoint(self, data: EndpointUpdate) -> Endpoint:
@@ -125,6 +122,7 @@ class WebhooksService:
         _manager()
         row = await _endpoint_row(data.id)
         await db.delete(row["id"])  # entregas pendentes viram skipped na próxima tentativa
+        await plans.count("enderecos", await _endpoint_count())
         return await self.list_endpoints(Empty())
 
     async def rotate_secret(self, data: EndpointRef) -> EndpointSecret:
@@ -310,6 +308,11 @@ def _manager() -> Principal:
     if who is None or not who.tenant or not MANAGERS & who.roles:
         raise ServiceError("ERRO_WEBHOOKS_FORBIDDEN", "Só donos e administradores gerenciam webhooks.", 403)
     return who
+
+
+async def _endpoint_count() -> int:
+    counted = await db.query("SELECT count() AS total FROM (SELECT id FROM webhook_endpoints WHERE tenant = $tenant) GROUP ALL")
+    return counted[0]["total"] if counted else 0
 
 
 async def _endpoint_row(endpoint_id: str) -> dict:

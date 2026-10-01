@@ -959,8 +959,10 @@ def ia(monkeypatch):
     """core.llm com resolução e NATS falsos; devolve (llm, pedidos ao provedor, eventos de uso, resoluções)."""
     from core import llm as llm_module
 
+    from core import plans as plans_module
+
     sent, usage_events, resolutions = [], [], []
-    state = {"handler": _fake_provider, "scope": "platform", "base_url": "http://provedor-interno:9000/v1", "auth": []}
+    state = {"handler": _fake_provider, "scope": "platform", "base_url": "http://provedor-interno:9000/v1", "auth": [], "plano": []}
 
     def transport(request):
         sent.append(json.loads(request.content or b"{}"))
@@ -968,6 +970,8 @@ def ia(monkeypatch):
         return state["handler"](request)
 
     async def request(subject, message, response_model, timeout=5.0):
+        if subject == plans_module.LIMITS_SUBJECT:  # o svc-plans responde os limites do mês da organização
+            return plans_module.PlanLimits(plan="pro", plan_name="Pro", month="2026-10", limits=state["plano"])
         resolutions.append((subject, message.model, message.kind, security.current_tenant()))
         resolved = llm_module.Resolved(provider=message.model.split("/")[0], scope=state["scope"], model="falso-1",
                                        base_url=state["base_url"], api_key="sk-segredo-abcd", price_input=3.0, price_output=15.0)
@@ -982,8 +986,10 @@ def ia(monkeypatch):
     monkeypatch.setattr(nats_bus.bus, "request", request)
     monkeypatch.setattr(nats_bus.bus, "publish", publish)
     monkeypatch.setattr(nats_bus.bus, "_service", "svc-pedidos")
+    plans_module.plans.clear()
     with security.acting_as(ACME):
         yield client, sent, usage_events, resolutions, state
+    plans_module.plans.clear()
 
 
 def test_ia_responde_e_registra_uso_e_guarda_a_resolucao(ia):
@@ -1075,6 +1081,19 @@ def test_ia_trilhos_de_nome_organizacao_e_rede(ia):
     with pytest.raises(ServiceError) as exc:
         asyncio.run(llm.ask("byok/modelo", "oi"))
     assert exc.value.code == "ERRO_SSRF_BLOCKED"
+
+
+def test_ia_para_antes_do_provedor_quando_o_plano_do_mes_acabou(ia):
+    from core.plans import LimitState
+
+    llm, sent, usage, resolutions, state = ia
+    custo = dict(name="ai.custo", service="svc-ai", description="Gasto com IA no mês", default=None, monthly=True, currency="USD")
+    state["plano"] = [LimitState(**custo, limit=5, used=5.01)]
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(llm.ask("local/rapido", "oi"))
+    assert (exc.value.code, exc.value.status) == ("ERRO_PLAN_LIMIT", 402)
+    assert "Gasto com IA no mês, até USD 5,00" in exc.value.message and "Pro" in exc.value.message
+    assert (sent, usage, resolutions) == ([], [], [])  # nem resolve o modelo nem chama o provedor
 
 
 # ── Listas: db.page no SurrealDB embutido, com a SurrealQL de verdade (README §5.12) ─
@@ -1635,3 +1654,164 @@ def test_webhook_exige_bus_conectado(monkeypatch):
     monkeypatch.setattr(nats_bus.bus, "_service", None)
     with pytest.raises(RuntimeError, match="bus não conectado"):
         asyncio.run(webhooks_module.webhooks.declare([]))
+
+
+# ── Planos e limites: core/plans.py (README §5.17) ───────────────────────────
+
+from core import plans as plans_module  # noqa: E402
+from core.plans import (  # noqa: E402
+    ASSIGN_SUBJECT,
+    COUNT_SUBJECT,
+    LIMITS_SUBJECT,
+    USAGE_SUBJECT,
+    Assigned,
+    Limit,
+    LimitState,
+    PlanLimits,
+    plans,
+)
+
+BETA = Principal(sub="bia", tenant="beta", roles=frozenset({"owner"}))
+ENDERECOS = Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")
+CUSTO = Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD")
+
+
+def _estado(name, limit, used=0, monthly=False, description="Endereços de webhook", unit="endereços", currency=None):
+    return LimitState(name=name, service="svc-x", description=description, default=None, monthly=monthly, unit=unit,
+                      currency=currency, limit=limit, used=used)
+
+
+@pytest.fixture
+def plano(monkeypatch):
+    """Serviço svc-faturas com dois limites declarados e um svc-plans de mentira. Devolve o que aconteceu."""
+    box = SimpleNamespace(published=[], requests=[], limits=[], plan="pro", fail=None)
+
+    async def publish(subject, message, msg_id=None):
+        box.published.append((subject, message, msg_id, security.current()))
+
+    async def request(subject, message, response_model, timeout=5.0):
+        box.requests.append((subject, security.current_tenant()))
+        if box.fail is not None:
+            raise box.fail
+        if subject == ASSIGN_SUBJECT:
+            return Assigned(tenant=security.current_tenant(), plan=message.plan, plan_name=message.plan.title())
+        return PlanLimits(plan=box.plan, plan_name=(box.plan or "").title(), month="2026-10", limits=box.limits)
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "request", request)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-faturas")
+    monkeypatch.setattr(plans, "_declared", {})
+    plans.clear()
+    asyncio.run(plans.declare([ENDERECOS, CUSTO]))
+    yield box
+    plans.clear()
+
+
+def _como(who, call):
+    async def go():
+        with security.acting_as(who):
+            return await call()
+
+    return asyncio.run(go())
+
+
+def _limite(call):
+    with pytest.raises(ServiceError) as exc:
+        call()
+    assert (exc.value.code, exc.value.status) == ("ERRO_PLAN_LIMIT", 402)
+    return exc.value.message
+
+
+def test_limites_declarados_vao_ao_catalogo(plano):
+    subject, catalog, msg_id, _ = plano.published[0]
+    assert (subject, catalog.service, msg_id.startswith("limits-svc-faturas-")) == ("events.plans.catalog", "svc-faturas", True)
+    assert [(c.name, c.default, c.monthly, c.unit, c.currency) for c in catalog.limits] == [
+        ("faturas.enderecos", 20, False, "endereços", None), ("faturas.custo", None, True, "", "USD")]
+    with pytest.raises(ValueError, match="repetido"):
+        asyncio.run(plans.declare([ENDERECOS, ENDERECOS]))
+    with pytest.raises(ValueError, match="kebab-case"):
+        Limit("Endereços", "Endereços de webhook")
+
+
+def test_limite_total_confere_quanto_existe_e_o_default_vale_sem_plano(plano):
+    plano.limits = [_estado("faturas.enderecos", 3)]
+    _como(ACME, lambda: plans.check("enderecos", used=2))  # 2 + 1 = 3: cabe
+    message = _limite(lambda: _como(ACME, lambda: plans.check("enderecos", used=3)))
+    assert message == "Limite do plano Pro atingido: Endereços de webhook, até 3 endereços. Veja em Plano."
+    _limite(lambda: _como(ACME, lambda: plans.check("enderecos", used=1, adding=3)))
+    plano.limits, plano.plan = [], None  # o svc-plans ainda não conhece o limite: vale o default declarado (20)
+    plans.clear()
+    _como(ACME, lambda: plans.check("enderecos", used=19))
+    assert "da organização atingido" in _limite(lambda: _como(ACME, lambda: plans.check("enderecos", used=20)))
+
+
+def test_limite_mensal_para_quem_ja_chegou_e_vale_por_nome_completo(plano):
+    plano.limits = [_estado("faturas.custo", 10, used=9.99, monthly=True, description="Gasto", unit="", currency="USD"),
+                    _estado("ai.tokens", 1000, used=1000, monthly=True, description="Tokens de IA no mês", unit="tokens")]
+    _como(ACME, lambda: plans.check("custo"))
+    assert "Tokens de IA no mês, até 1.000 tokens" in _limite(lambda: _como(ACME, lambda: plans.check("ai.tokens")))
+    _como(ACME, lambda: plans.check("ai.desconhecido"))  # limite que ninguém declarou: sem limite
+    assert plano.requests == [(LIMITS_SUBJECT, "acme")]  # uma consulta: o resto veio da resolução guardada (60 s)
+    _como(BETA, lambda: plans.check("custo"))
+    assert plano.requests[-1] == (LIMITS_SUBJECT, "beta")  # cada organização tem a sua
+    with pytest.raises(ValueError, match="mensal"):
+        _como(ACME, lambda: plans.check("custo", used=1))
+    with pytest.raises(ValueError, match="total"):
+        _como(ACME, lambda: plans.check("enderecos"))
+    with pytest.raises(ValueError, match="não declarado"):
+        _como(ACME, lambda: plans.check("outro", used=1))
+    with pytest.raises(ServiceError) as sem_org:
+        asyncio.run(plans.check("custo"))
+    assert sem_org.value.code == "ERRO_TENANT_REQUIRED"
+
+
+def test_consumo_e_total_vao_ao_svc_plans_na_organizacao_de_quem_age(plano):
+    plano.published.clear()
+    _como(ACME, lambda: plans.use("custo", 0.25, key="EVENTS-7-custo"))
+    _como(ACME, lambda: plans.use("custo", 0))  # nada a somar
+    _como(ACME, lambda: plans.count("enderecos", 4))
+    (s1, usage, id1, who1), (s2, count, id2, _) = plano.published
+    assert (s1, usage.name, usage.amount, id1, who1.tenant) == (USAGE_SUBJECT, "faturas.custo", 0.25, "usage-svc-faturas-EVENTS-7-custo", "acme")
+    assert usage.month == time.strftime("%Y-%m", time.gmtime())
+    assert (s2, count.name, count.total, id2) == (COUNT_SUBJECT, "faturas.enderecos", 4, None)
+    for call, erro in (
+        (lambda: plans.use("enderecos", 1), "mensal"),
+        (lambda: plans.count("custo", 1), "total"),
+        (lambda: plans.use("custo", -1), "negativo"),
+        (lambda: plans.use("custo", 1, key="tem espaço"), "key"),
+        (lambda: plans.use("outro", 1), "não declarado"),
+    ):
+        with pytest.raises(ValueError, match=erro):
+            _como(ACME, call)
+
+
+def test_svc_plans_fora_do_ar_usa_a_ultima_resposta_ou_nenhum_limite(plano):
+    plano.limits = [_estado("faturas.enderecos", 1)]
+    _limite(lambda: _como(ACME, lambda: plans.check("enderecos", used=1)))
+    plans._cache = {tenant: (0.0, resolved) for tenant, (_, resolved) in plans._cache.items()}  # os 60 s passaram
+    plano.fail = nats_bus.nats.errors.NoRespondersError()
+    _limite(lambda: _como(ACME, lambda: plans.check("enderecos", used=1)))  # vale a última resposta
+    plano.fail = TimeoutError()
+    _como(BETA, lambda: plans.check("enderecos", used=50))  # nunca respondeu para a Beta: sem limite
+    plano.fail = ServiceError("ERRO_TENANT_REQUIRED", "Selecione uma organização.", 403)
+    plans.clear()
+    with pytest.raises(ServiceError) as negado:  # erro de quem pergunta não é queda do serviço
+        _como(ACME, lambda: plans.check("enderecos", used=0))
+    assert negado.value.status == 403
+
+
+def test_trocar_de_plano_so_como_tarefa_da_plataforma(plano):
+    _como(ACME, lambda: plans.check("enderecos", used=0))  # resolução guardada para a Acme
+    with pytest.raises(PermissionError):
+        _como(ACME, lambda: plans.assign("pro"))
+    assigned = _como(security.system("svc-pagamentos", "acme"), lambda: plans.assign("pro"))
+    assert (assigned.tenant, assigned.plan, plano.requests[-1]) == ("acme", "pro", (ASSIGN_SUBJECT, "acme"))
+    _como(ACME, lambda: plans.check("enderecos", used=0))
+    assert [s for s, _ in plano.requests].count(LIMITS_SUBJECT) == 2  # trocar esquece a resolução guardada
+
+
+def test_planos_exigem_bus_conectado(monkeypatch):
+    monkeypatch.setattr(nats_bus.bus, "_service", None)
+    with pytest.raises(RuntimeError, match="bus não conectado"):
+        asyncio.run(plans_module.plans.declare([]))
+

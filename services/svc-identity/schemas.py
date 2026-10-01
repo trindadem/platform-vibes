@@ -7,6 +7,7 @@ from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
 from core.notify import CONTACTS_SUBJECT, Contact, Contacts, ContactsRequest  # avisos (README §5.15): contrato do core
+from core.plans import Limit  # planos (README §5.17)
 from core.storage import IMAGES, KeepRequest, Upload, UploadRequest  # arquivos (README §5.14): contrato do core
 from core.webhooks import WebhookEvent  # webhooks (README §5.16)
 
@@ -261,3 +262,8 @@ WEBHOOKS = [
     WebhookEvent("membro-entrou", "Uma pessoa entrou na organização (aceitou um convite).", MemberJoinedHook),
     WebhookEvent("membro-saiu", "Uma pessoa foi removida da organização.", MemberLeftHook),
 ]
+
+
+# ── Planos: o que este serviço limita (README §5.17) ─────────────────────────
+
+LIMITS = [Limit("membros", "Pessoas na organização", unit="pessoas")]  # sem plano: sem limite
