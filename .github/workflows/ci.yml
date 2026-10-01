@@ -1,0 +1,103 @@
+# CI do CV-Frame (README §7): em todo push, o que roda à mão roda aqui. Vermelho = algo quebrou o contrato.
+#   backend:  testes do core, do gateway e de cada serviço (tests/<serviço>.py) + contracts.ts em dia
+#   frontend: trilhos do Vite, build, TypeScript e exemplos do catálogo (npm run check)
+#   scaffold: um serviço novo nasce do service.sh, passa nos próprios testes, entra no contrato e no compose
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.7"   # o mesmo uv que gerou o uv.lock
+  PYTHON_VERSION: "3.12" # o mesmo Python da imagem (services/Dockerfile)
+  NODE_VERSION: "24"
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Dependências exatas do uv.lock
+        run: uv sync --locked
+      - name: Testes do core
+        run: uv run python -m pytest tests/core.py
+      - name: Testes do gateway
+        run: PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
+      - name: Testes de cada serviço (um processo por serviço, README §5.5)
+        run: |
+          for dir in services/svc-*/; do
+            name="${dir#services/svc-}"; name="${name%/}"
+            echo "::group::tests/${name}.py"
+            PYTHONPATH="$dir" uv run python -m pytest "tests/${name}.py"
+            echo "::endgroup::"
+          done
+      - name: contracts.ts em dia com manifestos e schemas.py
+        run: uv run python gateway/contracts.py --check
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Trilhos, build, TypeScript e exemplos do catálogo
+        run: npm run check
+      - name: CATALOG.md versionado igual ao gerado
+        run: git diff --exit-code -- src/components/CATALOG.md
+
+  scaffold:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: uv sync --locked
+      - name: Serviço novo pelo service.sh
+        run: ./service.sh exemplo-ci
+      - name: O serviço gerado passa nos próprios testes
+        run: PYTHONPATH=services/svc-exemplo-ci uv run python -m pytest tests/exemplo-ci.py
+      - name: Contrato regenerado e conferido pelo gateway
+        run: |
+          uv run python gateway/contracts.py
+          PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
+      - name: compose.yaml válido com o serviço registrado
+        run: |
+          uv run python -m core.security keygen
+          docker compose config --quiet
+          docker compose config --services | grep -qx svc-exemplo-ci
+      - name: Frontend compila com o contrato novo
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run check
