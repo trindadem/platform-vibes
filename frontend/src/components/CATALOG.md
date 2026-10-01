@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (40)
+## Índice (42)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -31,6 +31,7 @@
 - [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?, sort?, onSort?`
 - [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items`
 - [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
+- [Picture](#picture): Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). `src, alt, size?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
 
 **Formatação**: dinheiro, datas, status e códigos
@@ -47,6 +48,7 @@
 - [Button](#button): Botão de ação com variantes, tamanhos e estado de carregamento. `children, variant?, size?, type?, loading?, disabled?, onClick?, to?`
 - [ConfirmButton](#confirmbutton): Botão para ação destrutiva que pede um segundo clique de confirmação (volta sozinho em 4 s). `children, onConfirm, confirmLabel?, loading?, size?`
 - [CopyField](#copyfield): Texto somente leitura com botão de copiar, para links e códigos que a pessoa vai repassar. `label, value, hint?`
+- [FileField](#filefield): Escolha de um arquivo que é enviado na hora, direto ao armazenamento, com erro e estado de envio. `label, upload, accept?, hint?`
 - [Form](#form): Formulário com campos espaçados de forma uniforme e envio sem recarregar a página. `onSubmit, children, busy?`
 - [SelectField](#selectfield): Lista de opções com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, options, placeholder?, hint?, error?, required?`
 - [TextArea](#textarea): Campo de texto de várias linhas com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, rows?, hint?, error?, required?, placeholder?, monospace?`
@@ -378,6 +380,20 @@ Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões 
 
 ---
 
+## Picture
+
+Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). _(Dados)_
+
+```tsx
+<Picture src="https://exemplo.com/logo.png" alt="Logo da empresa" size={48} />
+```
+
+- `src`: `string`: Endereço da imagem (ex.: link assinado devolvido pelo serviço).
+- `alt`: `string`: Descrição para leitores de tela (obrigatória).
+- `size?`: `number`: Lado do quadrado em que a imagem cabe, em pixels, sem cortar. Padrão: 64.
+
+---
+
 ## Stat
 
 Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid. _(Dados)_
@@ -520,6 +536,21 @@ Texto somente leitura com botão de copiar, para links e códigos que a pessoa v
 - `label`: `string`: Rótulo visível.
 - `value`: `string`: Texto a copiar (ex.: um link de convite).
 - `hint?`: `string`: Ajuda abaixo do campo.
+
+---
+
+## FileField
+
+Escolha de um arquivo que é enviado na hora, direto ao armazenamento, com erro e estado de envio. _(Formulários)_
+
+```tsx
+<FileField label="Logo" upload={logo} accept="image/*" hint="Até 2 MB." />
+```
+
+- `label`: `string`: Rótulo visível (também é o nome acessível).
+- `upload`: `{ run: (file: File) => Promise<unknown>; running: boolean; error: { message: string } | null }`: Estado de useUpload(...) (src/core/api.ts): o campo chama upload.run(arquivo) assim que o arquivo é escolhido.
+- `accept?`: `string`: Tipos aceitos no seletor (ex.: "image/png,image/jpeg"). A validação de verdade é do serviço.
+- `hint?`: `string`: Ajuda abaixo do campo (tipos e tamanho máximo).
 
 ---
 

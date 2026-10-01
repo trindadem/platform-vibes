@@ -23,16 +23,25 @@ x-service: &service
     SURREAL_USER: ${SURREAL_USER:?rode uv run python -m core.security keygen}
     SURREAL_PASSWORD: ${SURREAL_PASSWORD:?rode uv run python -m core.security keygen}
     TEMPORAL_ADDRESS: temporal:7233
+    # Arquivos (README §5.14): o serviço fala com o armazenamento por dentro; o navegador, pelo endereço público.
+    STORAGE_URL: http://storage:9000
+    STORAGE_PUBLIC_URL: ${STORAGE_PUBLIC_URL:-http://localhost:9000}
+    STORAGE_BUCKET: ${STORAGE_BUCKET:?rode uv run python -m core.security keygen}
+    STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?rode uv run python -m core.security keygen}
+    STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY:?rode uv run python -m core.security keygen}
+    STORAGE_CORS_ORIGINS: ${CORS_ORIGINS:-}
   depends_on:
     nats: { condition: service_healthy }
     surreal-init: { condition: service_completed_successfully }
     temporal: { condition: service_healthy }
+    storage: { condition: service_healthy }
   restart: unless-stopped
 
 volumes:
   nats-data:
   surreal-data:
   temporal-data:
+  storage-data:
 
 services:
   traefik:
@@ -122,6 +131,22 @@ services:
       test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233", "--command-timeout", "3s"]
       interval: 3s
       retries: 40
+    restart: unless-stopped
+
+  # Armazenamento compatível com S3 (README §5.14). O navegador envia e baixa direto daqui (localhost:9000), sempre
+  # por link assinado pelo serviço; em produção, troque pelo S3/R2/B2 (STORAGE_URL e credenciais).
+  storage:
+    image: rustfs/rustfs:1.0.0
+    environment:
+      RUSTFS_ACCESS_KEY: ${STORAGE_ACCESS_KEY:?rode uv run python -m core.security keygen}
+      RUSTFS_SECRET_KEY: ${STORAGE_SECRET_KEY:?rode uv run python -m core.security keygen}
+      RUSTFS_CONSOLE_ENABLE: "false"
+    ports: ["127.0.0.1:9000:9000"]
+    volumes: ["storage-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 3s
+      retries: 30
     restart: unless-stopped
 
   # ── Serviços de negócio (acrescentados pelo service.sh) ──────────────────────

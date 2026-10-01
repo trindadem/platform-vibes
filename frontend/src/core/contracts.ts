@@ -277,6 +277,35 @@ export interface IdentityMemberRef {
   user: string;
 }
 
+export interface IdentityOrganization {
+  id: string;
+  name: string;
+  /** Link assinado da imagem do logo (vale 1 h) */
+  logo_url: string | null;
+}
+
+/** O que a tela diz antes de enviar: nome, tipo e tamanho do arquivo (o envio só vale para esse tamanho e tipo). */
+export interface IdentityUploadRequest {
+  filename: string;
+  content_type: string;
+  /** Tamanho em bytes */
+  size: number;
+}
+
+/** Link de envio: a tela faz PUT do arquivo em url com estes cabeçalhos e depois confirma a key no serviço. */
+export interface IdentityUpload {
+  key: string;
+  url: string;
+  /** Cabeçalhos que o PUT precisa levar exatamente assim */
+  headers: Record<string, string>;
+  expires_at: string;
+}
+
+export interface IdentityKeepRequest {
+  /** A key devolvida em Upload */
+  key: string;
+}
+
 export interface IdentityMembersChanged {
   /** Id de quem entrou ou saiu */
   user: string;
@@ -327,6 +356,18 @@ export const identity = {
   /** POST /api/v1/identity/members/remove · http · exige token */
   removeMember: (body: IdentityMemberRef, options?: RequestOptions) =>
     request<IdentityMemberList>("POST", "/api/v1/identity/members/remove", body, options),
+  /** GET /api/v1/identity/organization · http · exige token */
+  organization: (options?: RequestOptions) =>
+    request<IdentityOrganization>("GET", "/api/v1/identity/organization", undefined, options),
+  /** POST /api/v1/identity/organization/logo/upload · http · exige token */
+  logoUpload: (body: IdentityUploadRequest, options?: RequestOptions) =>
+    request<IdentityUpload>("POST", "/api/v1/identity/organization/logo/upload", body, options),
+  /** POST /api/v1/identity/organization/logo · http · exige token */
+  setLogo: (body: IdentityKeepRequest, options?: RequestOptions) =>
+    request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo", body, options),
+  /** POST /api/v1/identity/organization/logo/remove · http · exige token */
+  removeLogo: (body: unknown, options?: RequestOptions) =>
+    request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo/remove", body, options),
 };
 
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */

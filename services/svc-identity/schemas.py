@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
+from core.storage import IMAGES, KeepRequest, Upload, UploadRequest  # arquivos (README §5.14): contrato do core
+
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-identity"
 TASK_QUEUE = "identity-queue"
@@ -206,3 +208,16 @@ class AccessChanged(BaseModel):
 class Cleaned(BaseModel):
     sessions: int
     invites: int
+
+
+# ── Organização: nome e logo (arquivos, README §5.14) ─────────────────────────
+
+LOGO_TYPES = IMAGES
+LOGO_MAX_BYTES = 2_000_000
+LOGO_SECONDS = 3600  # o link da imagem vale 1 h: a tela pede de novo ao recarregar
+
+
+class Organization(BaseModel):
+    id: str
+    name: str
+    logo_url: str | None = Field(None, description="Link assinado da imagem do logo (vale 1 h)")

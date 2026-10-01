@@ -117,3 +117,38 @@ endpoints:
     response: MemberList
     target_type: http
     target_url: http://svc-identity:8000/members/remove
+
+  # Organização: nome e logo. O arquivo vai direto do navegador ao armazenamento (README §5.14):
+  # 1) logoUpload devolve o link assinado, 2) a tela envia, 3) setLogo confirma.
+  - path: /organization
+    method: GET
+    auth: client_jwt
+    response: Organization
+    target_type: http
+    target_url: http://svc-identity:8000/organization
+
+  - path: /organization/logo/upload
+    name: logoUpload
+    method: POST
+    auth: client_jwt
+    request: UploadRequest
+    response: Upload
+    target_type: http
+    target_url: http://svc-identity:8000/organization/logo/upload
+
+  - path: /organization/logo
+    name: setLogo
+    method: POST
+    auth: client_jwt
+    request: KeepRequest
+    response: Organization
+    target_type: http
+    target_url: http://svc-identity:8000/organization/logo
+
+  - path: /organization/logo/remove
+    name: removeLogo
+    method: POST
+    auth: client_jwt
+    response: Organization
+    target_type: http
+    target_url: http://svc-identity:8000/organization/logo/remove

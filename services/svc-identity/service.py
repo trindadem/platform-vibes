@@ -25,6 +25,7 @@ from core.security import (
     password_needs_rehash,
     verify_password,
 )
+from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import activities
 
@@ -33,6 +34,9 @@ from schemas import (
     INVITE_DAYS,
     INVITES,
     LOCK_MINUTES,
+    LOGO_MAX_BYTES,
+    LOGO_SECONDS,
+    LOGO_TYPES,
     MAX_FAILED_LOGINS,
     MEMBER_JOINED_SUBJECT,
     MEMBERS_LIVE,
@@ -52,6 +56,7 @@ from schemas import (
     InviteInfo,
     InviteInput,
     JoinRequest,
+    KeepRequest,
     LoginInput,
     Me,
     Member,
@@ -59,6 +64,7 @@ from schemas import (
     MemberList,
     MemberRef,
     MembersChanged,
+    Organization,
     RefreshInput,
     Session,
     SignupInput,
@@ -66,6 +72,8 @@ from schemas import (
     Tenant,
     TenantCreated,
     TenantRequest,
+    Upload,
+    UploadRequest,
     User,
 )
 
@@ -271,6 +279,43 @@ class IdentityService:
         await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
         await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
         return await self.list_members(Empty())
+
+    # ── Organização: nome e logo ────────────────────────────────────────────
+
+    async def organization(self, data: Empty) -> Organization:
+        _, tenant = await self._member()
+        return await self._organization(tenant)
+
+    async def logo_upload(self, data: UploadRequest) -> Upload:
+        """Link de envio do logo (imagem até 2 MB); a tela envia direto ao armazenamento e depois chama set_logo."""
+        await self._manager()
+        return await storage.upload(data, accept=LOGO_TYPES, max_bytes=LOGO_MAX_BYTES, folder="logo")
+
+    async def set_logo(self, data: KeepRequest) -> Organization:
+        _, tenant = await self._manager()
+        stored = await storage.keep(data.key)
+        record = await db.select(f"{TENANTS}:{tenant}")
+        old = (record or {}).get("logo")
+        await db.merge(f"{TENANTS}:{tenant}", {"logo": stored.model_dump(exclude={"size"})})
+        if old:
+            await storage.delete(old["key"])
+        return await self._organization(tenant)
+
+    async def remove_logo(self, data: Empty) -> Organization:
+        _, tenant = await self._manager()
+        record = await db.select(f"{TENANTS}:{tenant}")
+        if record and record.get("logo"):
+            await storage.delete(record["logo"]["key"])
+            await db.merge(f"{TENANTS}:{tenant}", {"logo": None})
+        return await self._organization(tenant)
+
+    async def _organization(self, tenant: str) -> Organization:
+        record = await db.select(f"{TENANTS}:{tenant}")
+        if record is None:
+            raise _not_member()
+        logo = record.get("logo")
+        url = storage.url(logo["key"], ttl=LOGO_SECONDS, filename=logo["filename"], content_type=logo["content_type"]) if logo else None
+        return Organization(id=tenant, name=record["name"], logo_url=url)
 
     # ── Manutenção (workflows.py) ───────────────────────────────────────────
 

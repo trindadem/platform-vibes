@@ -370,6 +370,43 @@ export function useAction<A extends unknown[], T>(fn: (...args: A) => Promise<T>
   return { ...state, run, reset };
 }
 
+/** O que uploadFile precisa dos contratos: pedido do link de envio e o link devolvido (ex.: identity.logoUpload). */
+export interface UploadTicket {
+  key: string;
+  url: string;
+  headers: Record<string, string>;
+}
+
+/**
+ * Envia um arquivo direto ao armazenamento (README §5.14): 1) pede o link assinado, 2) faz PUT do arquivo,
+ * 3) confirma a key no serviço, que devolve o registro atualizado. O arquivo não passa pelo gateway.
+ * Uso: await uploadFile(file, identity.logoUpload, identity.setLogo).
+ */
+export async function uploadFile<T>(
+  file: File,
+  sign: (body: { filename: string; content_type: string; size: number }) => Promise<UploadTicket>,
+  confirm: (body: { key: string }) => Promise<T>,
+): Promise<T> {
+  const ticket = await sign({ filename: file.name, content_type: file.type || "application/octet-stream", size: file.size });
+  let response: Response;
+  try {
+    response = await fetch(ticket.url, { method: "PUT", headers: ticket.headers, body: file });
+  } catch {
+    throw new ApiError("ERRO_FRONT_UPLOAD", "Não foi possível enviar o arquivo. Verifique a conexão e tente de novo.", 0);
+  }
+  if (!response.ok) throw new ApiError("ERRO_FRONT_UPLOAD", "O armazenamento recusou o arquivo.", response.status);
+  return confirm({ key: ticket.key });
+}
+
+/** Hook: prepara o envio de um arquivo (ver uploadFile) com estado de envio e erro. Uso: const logo = useUpload(identity.logoUpload, identity.setLogo); logo.run(file). */
+export function useUpload<T>(
+  sign: Parameters<typeof uploadFile<T>>[1],
+  confirm: Parameters<typeof uploadFile<T>>[2],
+  options: { onSuccess?: (result: T) => void } = {},
+): ActionState<[File], T> {
+  return useAction((file: File) => uploadFile(file, sign, confirm), options);
+}
+
 function toApiError(error: unknown): ApiError {
   return error instanceof ApiError ? error : new ApiError("ERRO_FRONT_UNKNOWN", String(error), 0);
 }

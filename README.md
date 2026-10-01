@@ -21,7 +21,7 @@ cogniventure/
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
-├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, gateway e serviços
+├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, armazenamento (RustFS), gateway e serviços
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
@@ -39,7 +39,8 @@ cogniventure/
 │   ├── nats_bus.py              # Eventos duráveis (JetStream), RPC e avisos ao vivo para a tela
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
 │   ├── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
-│   └── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
+│   ├── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
+│   └── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -217,6 +218,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...}, search={...}, migrations=[...], service=SERVICE)`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.page(TABLE, query, ModeloPage)`, `db.create`, `db.select`, `db.merge`, `db.delete`, `db.tenants(TABLE)`, `ListQuery`, `Page`, `Migration` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
 | `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
+| `storage.py` | `storage.connected(service)`, `storage.upload(pedido, accept, max_bytes, folder)`, `storage.keep(key)`, `storage.url(key, ttl, filename, content_type)`, `storage.delete(key)`, `UploadRequest`, `Upload`, `KeepRequest`, `StoredFile`, `IMAGES` (seção 5.14) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -431,6 +433,28 @@ db.connected(tables=[TABLE], migrations=MIGRATIONS, service=SERVICE)   # main.py
 - O registro fica em `cv_migrations`. Uma réplica roda e as outras esperam. Se falhar, o serviço não sobe, e a próxima subida tenta de novo depois da correção. Se ficar mais de 10 min "em andamento" (a réplica caiu), outra assume.
 - Índice `unique` que mudou de campos é um índice novo, criado no boot; o antigo sai por migração (`REMOVE INDEX ...`).
 
+### 5.14 Arquivos (`core/storage.py`)
+
+O arquivo nunca passa pelo gateway nem pelo serviço: a tela envia direto ao armazenamento (RustFS no ambiente local; S3, R2, B2… em produção), por um link assinado que o serviço emite.
+
+```python
+await storage.connected(SERVICE)                                         # main.py, no lifespan
+pedido = await storage.upload(data, accept=IMAGES, max_bytes=2_000_000)  # 1. link de envio (10 min)
+                                                                         # 2. a tela envia (useUpload)
+arquivo = await storage.keep(data.key)                                   # 3. confirma: sai da área temporária
+await db.merge(registro, {"logo": arquivo.key})                          #    e o serviço guarda a chave
+link = storage.url(arquivo.key)                                          # 4. link de download (5 min)
+await storage.delete(arquivo.key)                                        # 5. ao apagar o registro
+```
+
+- **Chave por organização.** O envio cai em `tmp/<org>/<serviço>/…` e, confirmado, vai para `t/<org>/<serviço>/…`. Ninguém escolhe a chave. Chave de outra organização é, para quem pede, inexistente (404 `ERRO_FILE_NOT_FOUND`).
+- **Tamanho e tipo na assinatura.** O serviço diz o que aceita (`accept=` tipos ou prefixos como `"image/"`) e o máximo (`max_bytes`). Fora disso sai 422 (`ERRO_FILE_TYPE`, `ERRO_FILE_TOO_LARGE`) antes de assinar, e o armazenamento recusa outro tamanho ou tipo no envio.
+- **Envio não confirmado some sozinho em 1 dia.** Regra de ciclo de vida da área `tmp/`, aplicada no boot junto com o CORS (`STORAGE_CORS_ORIGINS`). Se a infraestrutura de produção não der essa permissão, o core avisa e segue.
+- **Download seguro.** Imagens comuns e PDF abrem na tela. O resto, inclusive SVG e HTML, que podem trazer script, sai como anexo. O nome original vai só no `Content-Disposition`, nunca na chave.
+- Variáveis: `STORAGE_URL` (interno), `STORAGE_PUBLIC_URL` (o que o navegador alcança), `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `STORAGE_REGION`. O `keygen` cria as credenciais locais.
+
+Exemplo pronto: o logo da organização no `svc-identity` (`/organization/logo/upload` → envio → `/organization/logo`).
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -441,7 +465,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };
@@ -511,6 +535,7 @@ O `token` da linha de comando serve para testes rápidos. Conta de verdade: `POS
 | `http://localhost:8088` | API, pelo Traefik (`GATEWAY_PORT`) |
 | `http://localhost:8233` | Temporal UI: workflows, activities e histórico |
 | `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |
+| `localhost:9000` | Armazenamento de arquivos (RustFS, compatível com S3); o navegador envia e baixa daqui por link assinado |
 
 Toda porta é publicada só em `127.0.0.1`. O SurrealDB ganha no boot o usuário de banco dos serviços (`surreal-init`); a senha root fica só com ele.
 

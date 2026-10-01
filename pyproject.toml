@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "agno>=3.1.0",
     "argon2-cffi>=25.1",
+    "boto3>=1.43.106",
     "fastapi>=0.142",
     "httpx>=0.28",
     "nats-py>=2.16",
@@ -21,7 +22,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9.1"]
+dev = [
+    "moto[s3]>=5.2.3",
+    "pytest>=9.1",
+]
 
 [tool.pytest.ini_options]
 # Testes são importados pelo caminho (tests.core, tests.billing): nunca escondem core/ ou um serviço.

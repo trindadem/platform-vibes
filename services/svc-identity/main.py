@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from core.envelope import ResponseEnvelope, ServiceError, error_response, install_envelope
 from core.nats_bus import bus
 from core.security import install_security
+from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import runner
 
@@ -32,6 +33,7 @@ from schemas import (
     InviteCode,
     InviteInput,
     JoinRequest,
+    KeepRequest,
     LoginInput,
     MemberRef,
     RefreshInput,
@@ -41,6 +43,7 @@ from schemas import (
     SwitchRequest,
     TenantInput,
     TenantRequest,
+    UploadRequest,
 )
 from service import IdentityService, settings
 from workflows import SCHEDULES, IdentityWorkflow
@@ -61,6 +64,7 @@ async def lifespan(app: FastAPI):
         db.connected(shared=SHARED_TABLES, unique=UNIQUE),
         runner.worker(TASK_QUEUE, workflows=[IdentityWorkflow], service=svc, schedules=SCHEDULES),
     ):
+        await storage.connected(SERVICE)  # logo da organização (README §5.14)
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         yield
 
@@ -160,3 +164,23 @@ async def members() -> ResponseEnvelope:
 @app.post("/members/remove", response_model=ResponseEnvelope)
 async def remove_member(data: MemberRef) -> ResponseEnvelope:
     return _ok(await svc.remove_member(data))
+
+
+@app.get("/organization", response_model=ResponseEnvelope)
+async def organization() -> ResponseEnvelope:
+    return _ok(await svc.organization(Empty()))
+
+
+@app.post("/organization/logo/upload", response_model=ResponseEnvelope)
+async def logo_upload(data: UploadRequest) -> ResponseEnvelope:
+    return _ok(await svc.logo_upload(data))
+
+
+@app.post("/organization/logo", response_model=ResponseEnvelope)
+async def set_logo(data: KeepRequest) -> ResponseEnvelope:
+    return _ok(await svc.set_logo(data))
+
+
+@app.post("/organization/logo/remove", response_model=ResponseEnvelope)
+async def remove_logo() -> ResponseEnvelope:
+    return _ok(await svc.remove_logo(Empty()))

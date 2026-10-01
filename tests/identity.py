@@ -9,12 +9,15 @@ import asyncio
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from moto import mock_aws
 from pydantic import ValidationError
 from surrealdb import AsyncSurreal
 
 from core import security
+from core import storage as storage_module
 from core.envelope import ServiceError
 from core.security import acting_as
+from core.storage import KeepRequest, UploadRequest
 
 import service
 from schemas import (
@@ -329,3 +332,64 @@ def test_limpeza_apaga_sessoes_e_convites_vencidos(events):
 
     cleaned = run(scenario)
     assert (cleaned.sessions, cleaned.invites) == (1, 1)
+
+
+# ── Logo da organização (arquivos, README §5.14) ────────────────────────────
+
+@pytest.fixture
+def bucket(monkeypatch):
+    """Armazenamento S3 simulado no lugar do RustFS; devolve o client para simular o PUT do navegador."""
+    for name, value in {"STORAGE_URL": "https://s3.us-east-1.amazonaws.com", "STORAGE_BUCKET": "cv-teste",
+                        "STORAGE_ACCESS_KEY": "a", "STORAGE_SECRET_KEY": "b"}.items():
+        monkeypatch.setenv(name, value)
+    with mock_aws():
+        s = storage_module.Storage()
+        asyncio.run(s.connected("svc-identity"))
+        monkeypatch.setattr(service, "storage", s)
+        yield s._client
+
+
+async def _send_logo(svc, client, filename="logo.png"):
+    """O que a tela faz: pede o link, envia o arquivo (aqui, direto no S3 simulado) e confirma."""
+    upload = await svc.logo_upload(UploadRequest(filename=filename, content_type="image/png", size=4))
+    meta = {k.removeprefix("x-amz-meta-"): v for k, v in upload.headers.items() if k.startswith("x-amz-meta-")}
+    client.put_object(Bucket="cv-teste", Key=upload.key, Body=b"\x89PNG", ContentType="image/png", Metadata=meta)
+    return await svc.set_logo(KeepRequest(key=upload.key))
+
+
+def _stored(client):
+    return [o["Key"] for o in client.list_objects_v2(Bucket="cv-teste").get("Contents", [])]
+
+
+def test_logo_enviado_trocado_e_removido_so_por_quem_gerencia(events, bucket):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, ana))
+        caio = await signup(svc, email="caio@x.com", organization="Beta", name="Caio")
+        with as_user(ana):
+            first = await _send_logo(svc, bucket)
+            first_keys = _stored(bucket)
+            second = await _send_logo(svc, bucket, filename="novo.png")
+            second_keys = _stored(bucket)
+            other = await svc.logo_upload(UploadRequest(filename="x.png", content_type="image/png", size=4))
+        with as_user(bia):
+            seen_by_member = await svc.organization(Empty())
+            with pytest.raises(ServiceError) as member_upload:
+                await svc.logo_upload(UploadRequest(filename="x.png", content_type="image/png", size=4))
+        with as_user(caio), pytest.raises(ServiceError) as foreign_key:  # chave de outra organização
+            await svc.set_logo(KeepRequest(key=other.key))
+        with as_user(ana):
+            with pytest.raises(ServiceError) as wrong_type:
+                await svc.logo_upload(UploadRequest(filename="x.svg", content_type="image/svg+xml", size=4))
+            removed = await svc.remove_logo(Empty())
+        return first, first_keys, second, second_keys, seen_by_member, member_upload, foreign_key, wrong_type, removed
+
+    first, first_keys, second, second_keys, seen_by_member, member_upload, foreign_key, wrong_type, removed = run(scenario)
+    assert first.logo_url and "inline" in first.logo_url and "logo.png" in first.logo_url
+    assert len(first_keys) == 1 and first_keys[0].startswith(f"t/{first.id}/svc-identity/logo/")
+    assert "novo.png" in second.logo_url and len(second_keys) == 1 and second_keys != first_keys  # o antigo foi apagado
+    assert seen_by_member.logo_url  # membro vê o logo, só não troca
+    _error(member_upload, "ERRO_IDENTITY_FORBIDDEN", 403)
+    _error(foreign_key, "ERRO_FILE_NOT_FOUND", 404)
+    _error(wrong_type, "ERRO_FILE_TYPE", 422)
+    assert removed.logo_url is None and not [k for k in _stored(bucket) if k.startswith("t/")]

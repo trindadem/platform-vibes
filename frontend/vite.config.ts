@@ -319,6 +319,7 @@ function writeExamples(entries: Entry[]) {
     "export declare const lista: ListState<Fatura>;",
     "export declare const fatura: QueryState<Fatura>;",
     "export declare const criar: ActionState<[body: FaturaIn], Fatura>;",
+    "export declare const logo: ActionState<[file: File], unknown>;",
     "export declare const nome: string;",
     "export declare function setNome(value: string): void;",
     "export declare const usuario: string | null;",

@@ -1393,3 +1393,78 @@ def test_migracao_que_falha_em_comando_seguinte_nao_fica_como_feita():
     resultados, registro, _ = _migracoes([quebra])
     assert "#1 (quebra no segundo comando) falhou" in resultados[0]
     assert [(r["version"], r["status"]) for r in registro] == [(1, "failed")]
+
+
+# ── Arquivos (core/storage.py, README §5.14) — S3 simulado pelo moto ─────────
+
+from moto import mock_aws  # noqa: E402
+
+from core import storage as storage_module  # noqa: E402
+from core.storage import UploadRequest  # noqa: E402
+
+
+@pytest.fixture
+def arquivos(monkeypatch):
+    """storage conectado a um S3 simulado; devolve (storage, client) para simular o PUT do navegador."""
+    for name, value in {"STORAGE_URL": "https://s3.us-east-1.amazonaws.com", "STORAGE_BUCKET": "cv-teste", "STORAGE_ACCESS_KEY": "a",
+                        "STORAGE_SECRET_KEY": "b", "STORAGE_CORS_ORIGINS": "http://localhost:5173"}.items():
+        monkeypatch.setenv(name, value)
+    with mock_aws():
+        s = storage_module.Storage()
+        asyncio.run(s.connected("svc-notas"))
+        yield s, s._client
+
+
+def _envia(client, upload, body):
+    """O que o navegador faz com o link: PUT com os cabeçalhos devolvidos (aqui, direto no S3 simulado)."""
+    meta = {k.removeprefix("x-amz-meta-"): v for k, v in upload.headers.items() if k.startswith("x-amz-meta-")}
+    client.put_object(Bucket="cv-teste", Key=upload.key, Body=body, ContentType=upload.headers["Content-Type"], Metadata=meta)
+
+
+def test_arquivo_envio_assinado_guardado_e_baixado_so_pela_organizacao(arquivos):
+    s, client = arquivos
+    with security.acting_as(ACME):
+        upload = asyncio.run(s.upload(UploadRequest(filename="C:\\fotos\\logo final.png", content_type="image/png", size=4),
+                                      accept=storage_module.IMAGES, max_bytes=1000))
+        _envia(client, upload, b"\x89PNG")
+        guardado = asyncio.run(s.keep(upload.key))
+        link = s.url(guardado.key, filename=guardado.filename, content_type=guardado.content_type)
+    assert upload.key.startswith("tmp/acme/svc-notas/files/") and "Signature" in upload.url
+    assert "content-length" in upload.url.lower()  # o tamanho entra na assinatura: outro tamanho é recusado
+    assert (guardado.key.split("/")[:4], guardado.filename, guardado.size) == (["t", "acme", "svc-notas", "files"], "logo final.png", 4)
+    assert "inline" in link and "logo%2520final.png" in link  # imagem abre na tela, com o nome original
+    assert client.list_objects_v2(Bucket="cv-teste", Prefix="tmp/").get("KeyCount") == 0  # saiu da área temporária
+    with security.acting_as(Principal(sub="bia", tenant="beta")):
+        for tentativa in (lambda: s.url(guardado.key), lambda: asyncio.run(s.delete(guardado.key))):
+            with pytest.raises(ServiceError) as exc:
+                tentativa()
+            assert exc.value.code == "ERRO_FILE_NOT_FOUND"  # de outra organização: não existe
+    with security.acting_as(ACME):
+        with pytest.raises(ServiceError):  # confirmar de novo: o temporário já não existe
+            asyncio.run(s.keep(upload.key))
+        asyncio.run(s.delete(guardado.key))
+    assert client.list_objects_v2(Bucket="cv-teste").get("KeyCount") == 0
+
+
+def test_arquivo_recusado_antes_de_assinar_e_chaves_forjadas(arquivos):
+    s, client = arquivos
+    with security.acting_as(ACME):
+        for pedido, codigo in (
+            (UploadRequest(filename="a.html", content_type="text/html", size=10), "ERRO_FILE_TYPE"),
+            (UploadRequest(filename="a.png", content_type="image/png", size=5000), "ERRO_FILE_TOO_LARGE"),
+        ):
+            with pytest.raises(ServiceError) as exc:
+                asyncio.run(s.upload(pedido, accept=("image/",), max_bytes=1000))
+            assert (exc.value.code, exc.value.status) == (codigo, 422)
+        for forjada in ("tmp/beta/svc-notas/files/" + "a" * 32, "t/acme/svc-notas/files/" + "a" * 32, "tmp/acme/svc-outro/files/x",
+                        "tmp/acme/svc-notas/../../t/beta"):
+            with pytest.raises(ServiceError):
+                asyncio.run(s.keep(forjada))
+        pdf = s.url("t/acme/svc-notas/files/" + "b" * 32, filename="r.pdf", content_type="application/pdf")
+        svg = s.url("t/acme/svc-notas/files/" + "c" * 32, filename="x.svg", content_type="image/svg+xml")
+    assert "inline" in pdf and "attachment" in svg and "application%2Foctet-stream" in svg  # SVG pode ter script
+    lifecycle = client.get_bucket_lifecycle_configuration(Bucket="cv-teste")["Rules"]
+    assert any(r["Filter"]["Prefix"] == "tmp/" and r["Expiration"]["Days"] == 1 for r in lifecycle)
+    assert client.get_bucket_cors(Bucket="cv-teste")["CORSRules"][0]["AllowedOrigins"] == ["http://localhost:5173"]
+    with pytest.raises(ValidationError):
+        UploadRequest(filename="a", content_type="não é tipo", size=1)
