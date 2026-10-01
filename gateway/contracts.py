@@ -40,8 +40,12 @@ export interface Dispatched {
   message_id: string;
 }
 
-/** GET /health do gateway. */
+/** GET /health do gateway (README §5.18). */
 export interface GatewayHealth {
+  /** "ok" quando tudo responde (senão, a resposta é um erro 503). */
+  status: string;
+  /** Cada dependência do gateway e se respondeu ("ok"). */
+  checks: Record<string, string>;
   /** Quantas rotas os manifestos publicam. */
   routes: number;
 }

@@ -684,7 +684,7 @@ def test_evento_leva_quem_publicou():
     (_, headers), (_, sem_contexto) = b._js.published
     assert headers["Nats-Msg-Id"] == "m1"
     assert Principal.model_validate_json(headers[nats_bus.PRINCIPAL_HEADER]) == ACME
-    assert sem_contexto is None
+    assert nats_bus.PRINCIPAL_HEADER not in (sem_contexto or {})  # fora de contexto: ninguém age (o trace pode ir)
 
 
 def test_handler_roda_em_nome_de_quem_publicou():
@@ -1814,4 +1814,129 @@ def test_planos_exigem_bus_conectado(monkeypatch):
     monkeypatch.setattr(nats_bus.bus, "_service", None)
     with pytest.raises(RuntimeError, match="bus não conectado"):
         asyncio.run(plans_module.plans.declare([]))
+
+
+# ── Observabilidade: core/telemetry.py (README §5.18) ────────────────────────
+
+import logging  # noqa: E402
+
+from opentelemetry import trace as otel_trace  # noqa: E402
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter  # noqa: E402
+
+from core import telemetry as telemetry_module  # noqa: E402
+from core.telemetry import install_telemetry, telemetry  # noqa: E402
+
+_EXPORTER = InMemorySpanExporter()
+
+
+@pytest.fixture
+def spans(auth_env):
+    """Telemetria do processo ligada uma vez (como no boot) e os spans terminados guardados em memória."""
+    if telemetry.service is None:
+        telemetry.setup("svc-teste")
+        otel_trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(_EXPORTER))
+    _EXPORTER.clear()
+    yield _EXPORTER
+    _EXPORTER.clear()
+
+
+def _app_com_telemetria():
+    app = FastAPI()
+    envelope.install_envelope(app, service="svc-teste")
+    security.install_security(app, service="svc-teste")
+    install_telemetry(app, service="svc-teste")
+
+    @app.get("/itens/{item_id}")
+    async def item(item_id: str):
+        logging.getLogger("svc-teste").info("lendo item", extra={"item": item_id, "password": "nunca"})
+        return {"id": item_id}
+
+    @app.get("/quebra")
+    async def quebra():
+        raise RuntimeError("segredo-interno")
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _linhas(capsys):
+    return [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+
+
+def test_log_em_json_com_trace_organizacao_e_pessoa_e_uma_linha_por_requisicao(spans, auth_env, monkeypatch, capsys):
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    client = _app_com_telemetria()
+    token = security.issue_token("ana", tenant="acme")
+    r = client.get("/itens/i-42", headers=_bearer(token))
+    client.get("/itens/i-1")  # sem token: 401 também tem a sua linha
+    lendo, req, negado = [l for l in _linhas(capsys) if l["logger"].startswith("svc-teste")]
+    assert (lendo["message"], lendo["item"], lendo["password"]) == ("lendo item", "i-42", "***")  # extra= mascarado
+    assert (lendo["service"], lendo["tenant"], lendo["user"]) == ("svc-teste", "acme", "ana")
+    assert lendo["trace_id"] == req["trace_id"] == r.headers["x-trace-id"]  # o mesmo id no log e na resposta
+    assert (req["http_route"], req["http_status"], req["tenant"], req["user"]) == ("/itens/{item_id}", 200, "acme", "ana")
+    assert (negado["http_status"], negado.get("user")) == (401, None) and negado["trace_id"] != req["trace_id"]
+    server = [s for s in spans.get_finished_spans() if s.kind == otel_trace.SpanKind.SERVER]
+    assert [s.name for s in server][:1] == ["GET /itens/{item_id}"]  # o molde, nunca o id
+
+
+def test_erro_500_informa_o_trace_id_e_o_log_traz_o_erro(spans, auth_env, monkeypatch, capsys):
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    client = _app_com_telemetria()
+    r = client.get("/quebra", headers=_bearer(security.issue_token("ana", tenant="acme")))
+    trace_id = r.headers["x-trace-id"]
+    assert r.status_code == 500 and trace_id in r.json()["error"]["message"] and "segredo" not in r.text
+    erro = next(l for l in _linhas(capsys) if l["logger"] == "core.envelope")
+    assert erro["trace_id"] == trace_id and erro["error"]["type"] == "RuntimeError"
+
+
+def test_texto_legivel_no_desenvolvimento(spans):
+    record = logging.LogRecord("svc-teste", logging.INFO, __file__, 1, "olá %s", ("mundo",), None)
+    record.trace_id, record.tenant, record.user = "a" * 32, "acme", "ana"
+    linha = telemetry_module._TextFormatter().format(record)
+    assert linha.endswith("INFO    svc-teste: olá mundo  [trace=aaaaaaaa org=acme user=ana]")
+
+
+def test_trace_atravessa_o_nats_do_publish_ao_handler(spans):
+    b, vistos = _connected_bus(), []
+
+    async def handler(data):
+        vistos.append(otel_trace.get_current_span().get_span_context().trace_id)
+
+    async def run():
+        await b.subscribe("events.billing.trigger", handler, Entrada)
+        with otel_trace.get_tracer("teste").start_as_current_span("requisição") as origem:
+            await b.publish("events.billing.trigger", Entrada(valor=1))
+        _, headers = b._js.published[-1]
+        await b._js.callback(_FakeMsg(b'{"valor": 1}', headers))
+        return origem.get_span_context().trace_id
+
+    origem = asyncio.run(run())
+    assert vistos == [origem]  # o handler roda no mesmo trace de quem publicou
+    nomes = {s.name: s for s in spans.get_finished_spans()}
+    assert nomes["process events.billing.trigger"].attributes["cv.outcome"] == "ok"
+    assert nomes["process events.billing.trigger"].parent.span_id == nomes["publish events.billing.trigger"].context.span_id
+
+
+def test_consulta_vira_span_sem_os_valores(spans):
+    _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant AND cliente = $c", c="Padaria Aurora"))
+    consultas = [s for s in spans.get_finished_spans() if s.name == "surrealdb SELECT"]
+    assert consultas and consultas[-1].attributes["db.query.text"].startswith("SELECT * FROM faturas")
+    assert "Padaria" not in str(dict(consultas[-1].attributes))  # valores vão em parâmetros e nunca no span
+
+
+def test_saude_confere_o_que_o_processo_usa(spans, auth_env, monkeypatch):
+    client = _app_com_telemetria()
+    monkeypatch.setattr(nats_bus.bus, "_nc", SimpleNamespace(is_connected=True))
+    monkeypatch.setattr(surreal.db, "_conn", _FakeSurreal(query=[True]))
+    monkeypatch.setattr(_FakeSurreal, "query", lambda self, sql: asyncio.sleep(0), raising=False)
+    ok = client.get("/health")  # sem token: aberta, como manda o core
+    assert (ok.status_code, ok.json()["data"]) == (200, {"status": "ok", "checks": {"nats": "ok", "surrealdb": "ok"}})
+    monkeypatch.setattr(nats_bus.bus, "_nc", None)
+    caiu = client.get("/health")
+    assert (caiu.status_code, caiu.json()["error"]["details"]) == (503, [{"loc": ["nats"], "msg": "fora do ar"}])
+
+
+def test_metricas_do_servico_levam_o_prefixo(spans):
+    contador = telemetry.counter("faturas_pagas", "Faturas pagas")
+    assert contador.name == "cv.teste.faturas_pagas"
 

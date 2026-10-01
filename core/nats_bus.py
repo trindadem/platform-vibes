@@ -14,6 +14,9 @@ Quem age viaja junto (README §5.9): publish e request anexam o Principal do con
 subscribe e respond o restauram antes do handler, então current_tenant() funciona igual ao HTTP. O cabeçalho é
 confiável porque só a plataforma publica no NATS (em produção, NATS_CREDS com permissão por subject).
 
+O trace viaja junto (README §5.18): publish e request levam o traceparent no cabeçalho; subscribe e respond continuam o
+mesmo trace, num span por mensagem, e contam cada resultado em cv.nats.processed (ok, retry, dropped, invalid).
+
 Mensagem inválida é descartada sem reentrega; handler que falha é re-tentado com espera crescente.
 O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e NATS_CREDS
 (arquivo .creds com permissões por subject; obrigatório em produção, conforme README §5.7).
@@ -27,8 +30,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
+import time
+
 import nats
 from nats.js.api import ConsumerConfig, StreamConfig
+from opentelemetry import metrics, propagate, trace
+from opentelemetry.trace import SpanKind, StatusCode
 from nats.js.errors import NotFoundError
 from pydantic import BaseModel, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -47,6 +54,10 @@ _message_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("messag
 
 log = logging.getLogger("core.nats_bus")
 M = TypeVar("M", bound=BaseModel)
+_tracer = trace.get_tracer("core.nats_bus")
+_meter = metrics.get_meter("core.nats_bus")
+_processed = _meter.create_counter("cv.nats.processed", unit="{message}", description="Mensagens processadas, por subject e resultado")
+_duration = _meter.create_histogram("cv.nats.duration", unit="s", description="Tempo de processar uma mensagem ou um RPC")
 
 
 class NatsSettings(BaseSettings):
@@ -94,37 +105,52 @@ class Bus:
     async def publish(self, subject: str, message: BaseModel, *, msg_id: str | None = None) -> None:
         """Publica e espera a confirmação do JetStream. msg_id evita duplicata (janela de 2 min)."""
         _check(subject, "events")
-        headers = _context_headers({"Nats-Msg-Id": msg_id} if msg_id else {})
-        await self._jetstream().publish(subject, message.model_dump_json().encode(), headers=headers)
+        with _tracer.start_as_current_span(f"publish {subject}", kind=SpanKind.PRODUCER, attributes=_attributes(subject)):
+            headers = _context_headers({"Nats-Msg-Id": msg_id} if msg_id else {})
+            await self._jetstream().publish(subject, message.model_dump_json().encode(), headers=headers)
 
     async def subscribe(self, subject: str, handler: Callable[[M], Awaitable[None]], model: type[M]) -> None:
         _check(subject, "events")
         consumer = f"{self._service}-{subject}".replace(".", "_")  # estável: sobrevive a restarts
 
         async def on_message(msg: Any) -> None:
+            started = time.perf_counter()
+            parent = propagate.extract(msg.headers or {})  # continua o trace de quem publicou
+            with _tracer.start_as_current_span(f"process {subject}", context=parent, kind=SpanKind.CONSUMER, attributes=_attributes(subject)) as span:
+                outcome = await _process(msg)
+                span.set_attribute("cv.outcome", outcome)
+                if outcome != "ok":
+                    span.set_status(StatusCode.ERROR)
+            _processed.add(1, {"messaging.destination.name": subject, "cv.outcome": outcome})
+            _duration.record(time.perf_counter() - started, {"messaging.destination.name": subject})
+
+        async def _process(msg: Any) -> str:
             try:
                 data = model.model_validate_json(msg.data)
                 who = _principal_from(msg.headers)
             except ValidationError:
                 log.warning("mensagem inválida em %s descartada", subject)
                 await msg.term()
-                return
+                return "invalid"
             meta = msg.metadata
             stable_id = (msg.headers or {}).get("Nats-Msg-Id") or f"{STREAM}-{meta.sequence.stream}"
             token = _message_id.set(stable_id)
             try:
                 with acting_as(who):
                     await handler(data)
-            except Exception:
+            except Exception as exc:
+                trace.get_current_span().record_exception(exc)
                 attempt = meta.num_delivered
                 if attempt >= MAX_DELIVER:
                     log.exception("mensagem em %s descartada após %d tentativas", subject, attempt)
                     await msg.term()
-                else:
-                    log.exception("falha em %s (tentativa %d/%d)", subject, attempt, MAX_DELIVER)
-                    await msg.nak(delay=min(2**attempt, 60))
+                    return "dropped"
+                log.exception("falha em %s (tentativa %d/%d)", subject, attempt, MAX_DELIVER)
+                await msg.nak(delay=min(2**attempt, 60))
+                return "retry"
             else:
                 await msg.ack()
+                return "ok"
             finally:
                 _message_id.reset(token)
 
@@ -140,7 +166,8 @@ class Bus:
         """RPC: envia, espera a resposta e devolve o modelo. Erro remoto vira ServiceError com o mesmo código."""
         _check(subject, "rpc")
         payload = message.model_dump_json().encode()
-        reply = await self._connection().request(subject, payload, timeout=timeout, headers=_context_headers({}))
+        with _tracer.start_as_current_span(f"request {subject}", kind=SpanKind.CLIENT, attributes=_attributes(subject)):
+            reply = await self._connection().request(subject, payload, timeout=timeout, headers=_context_headers({}))
         envelope = ResponseEnvelope.model_validate_json(reply.data)
         if not envelope.ok:
             raise ServiceError(envelope.error.code, envelope.error.message, status=envelope.error.status)
@@ -154,22 +181,32 @@ class Bus:
         service = self._service or "unknown"
 
         async def on_request(msg: Any) -> None:
-            try:
-                data, who = model.model_validate_json(msg.data), _principal_from(msg.headers)
-                with acting_as(who):
-                    envelope = ResponseEnvelope.success(await handler(data), service)
-            except ValidationError:
-                envelope = ResponseEnvelope.failure(
-                    error_code(service, "INVALID_PAYLOAD"), "Payload inválido.", service, 422
-                )
-            except ServiceError as exc:
-                envelope = ResponseEnvelope.failure(exc.code, exc.message, service, exc.status)
-            except Exception:
-                log.exception("falha no RPC %s", subject)
-                envelope = ResponseEnvelope.failure(
-                    error_code(service, "EXECUTION_FAILED"), "Falha interna.", service, 500
-                )
-            await msg.respond(envelope.model_dump_json().encode())
+            started = time.perf_counter()
+            parent = propagate.extract(msg.headers or {})
+            with _tracer.start_as_current_span(f"respond {subject}", context=parent, kind=SpanKind.SERVER, attributes=_attributes(subject)) as span:
+                try:
+                    data, who = model.model_validate_json(msg.data), _principal_from(msg.headers)
+                    with acting_as(who):
+                        envelope = ResponseEnvelope.success(await handler(data), service)
+                except ValidationError:
+                    envelope = ResponseEnvelope.failure(
+                        error_code(service, "INVALID_PAYLOAD"), "Payload inválido.", service, 422
+                    )
+                except ServiceError as exc:
+                    envelope = ResponseEnvelope.failure(exc.code, exc.message, service, exc.status)
+                except Exception as exc:
+                    span.record_exception(exc)
+                    log.exception("falha no RPC %s", subject)
+                    envelope = ResponseEnvelope.failure(
+                        error_code(service, "EXECUTION_FAILED"), "Falha interna.", service, 500
+                    )
+                outcome = "ok" if envelope.ok else f"error-{envelope.error.status}"
+                span.set_attribute("cv.outcome", outcome)
+                if not envelope.ok and envelope.error.status >= 500:
+                    span.set_status(StatusCode.ERROR)
+                await msg.respond(envelope.model_dump_json().encode())
+            _processed.add(1, {"messaging.destination.name": subject, "cv.outcome": outcome})
+            _duration.record(time.perf_counter() - started, {"messaging.destination.name": subject})
 
         await self._connection().subscribe(subject, queue=service, cb=on_request)
 
@@ -223,10 +260,16 @@ class Bus:
 
 
 def _context_headers(headers: dict[str, str]) -> dict[str, str] | None:
+    """Quem age (Cv-Principal) e o trace em andamento (traceparent) vão no cabeçalho da mensagem."""
     who = current()
     if who is not None:
         headers[PRINCIPAL_HEADER] = who.model_dump_json()
+    propagate.inject(headers)
     return headers or None
+
+
+def _attributes(subject: str) -> dict[str, str]:
+    return {"messaging.system": "nats", "messaging.destination.name": subject}
 
 
 def _principal_from(headers: dict[str, str] | None) -> Principal | None:

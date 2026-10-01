@@ -8,10 +8,11 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from core.envelope import ResponseEnvelope, install_envelope
+from core.envelope import install_envelope
 from core.http_client import no_cookie_jar
 from core.nats_bus import bus
 from core.security import install_security
+from core.telemetry import install_telemetry
 
 from interpreter import load_manifests, mount, mount_live, public_paths
 from schemas import Manifest
@@ -27,14 +28,11 @@ def create_app(manifests: list[Manifest], upstream: httpx.AsyncClient) -> FastAP
 
     app = FastAPI(title=SERVICE, lifespan=lifespan)
     install_envelope(app, service=SERVICE)
-    install_security(app, service=SERVICE, public=public_paths(manifests) | {"/health"})
+    install_security(app, service=SERVICE, public=public_paths(manifests))
+    # edge: cada requisição de fora começa um trace (traceparent de fora não entra); /health diz também as rotas.
+    install_telemetry(app, service=SERVICE, edge=True, health=lambda: {"routes": sum(len(m.endpoints) for m in manifests)})
     mount(app, manifests, upstream)
     mount_live(app)
-
-    @app.get("/health")
-    async def health() -> ResponseEnvelope:
-        return ResponseEnvelope.success({"routes": sum(len(m.endpoints) for m in manifests)}, SERVICE)
-
     return app
 
 

@@ -219,6 +219,7 @@ from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
 from core.security import install_security
 from core.surreal import db
+from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
@@ -247,6 +248,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=SERVICE, lifespan=lifespan)
 install_envelope(app, service=SERVICE)
 install_security(app, service=SERVICE)  # rota pública só se o spec §2 declarar: public=("/rota",)
+install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
 
 
 @app.post("/execute", response_model=ResponseEnvelope)

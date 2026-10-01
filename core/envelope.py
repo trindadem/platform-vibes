@@ -4,7 +4,7 @@
     {"ok": false, "service": "svc-x", "data": null,  "error": {"code": "...", "message": "...", "status": 409, "details": []}}
 
 Erro de negócio (spec §4): raise ServiceError("ERRO_X_LIMITE_EXCEDIDO", "mensagem", status=409).
-Exceção inesperada nunca vaza detalhe: o cliente recebe um id; o log recebe o traceback.
+Exceção inesperada nunca vaza detalhe: o cliente recebe um id (o trace_id, README §5.18); o log recebe o traceback.
 
 Resposta em pedaços (README §5.10): stream_response(gerador, service, final=Modelo) vira SSE com
     event: delta  data: <pedaço>            (cada item do gerador)
@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry import trace
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException
 
@@ -90,6 +91,16 @@ class ServiceError(Exception):
         self.code, self.message, self.status = code, message, status
 
 
+def trace_id() -> str | None:
+    """Id do trace em andamento (32 hex), o mesmo dos logs e do x-trace-id; None fora de um trace."""
+    span = trace.get_current_span().get_span_context()
+    return format(span.trace_id, "032x") if span.is_valid else None
+
+
+def _error_id() -> str:
+    return trace_id() or uuid.uuid4().hex[:12]
+
+
 def error_code(service: str, suffix: str) -> str:
     """svc-user-auth + INVALID_PAYLOAD → ERRO_USER_AUTH_INVALID_PAYLOAD (convenção do spec §4)."""
     return f"ERRO_{service.removeprefix('svc-').replace('-', '_').upper()}_{suffix}"
@@ -142,7 +153,7 @@ def stream_response(items: AsyncIterator[BaseModel], service: str, *, final: typ
         except ServiceError as exc:
             yield sse("error", ResponseEnvelope.failure(exc.code, exc.message, service, exc.status).model_dump_json())
         except Exception as exc:
-            error_id = uuid.uuid4().hex[:12]
+            error_id = _error_id()
             log.error("erro inesperado no stream de %s (id %s)", service, error_id, exc_info=exc)
             failure = ResponseEnvelope.failure(
                 error_code(service, "EXECUTION_FAILED"), f"Falha interna. Informe o id {error_id} ao suporte.", service, 500
@@ -207,7 +218,7 @@ def install_envelope(app: FastAPI, service: str) -> None:
 
 
 def _unexpected(service: str, exc: Exception) -> JSONResponse:
-    error_id = uuid.uuid4().hex[:12]
+    error_id = _error_id()
     log.error("erro inesperado em %s (id %s)", service, error_id, exc_info=exc)
     message = f"Falha interna. Informe o id {error_id} ao suporte."
     return error_response(service, 500, error_code(service, "EXECUTION_FAILED"), message)

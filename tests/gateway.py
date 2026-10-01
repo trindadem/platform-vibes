@@ -4,6 +4,7 @@ Rodar (da raiz): PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
 """
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -193,10 +194,28 @@ def test_papel_declarado_no_manifesto(gateway):
     assert (r.status_code, r.json()["error"]["code"], calls) == (403, "ERRO_AUTH_FORBIDDEN", [])
 
 
-def test_rota_publica_do_manifesto(gateway):
+def test_rota_publica_do_manifesto(gateway, monkeypatch):
     client, _, _ = gateway
     assert client.get("/api/v1/billing/ping").status_code == 201
-    assert client.get("/health").json()["data"] == {"routes": 4}
+    monkeypatch.setattr(bus, "_nc", SimpleNamespace(is_connected=True))
+    assert client.get("/health").json()["data"] == {"status": "ok", "checks": {"nats": "ok"}, "routes": 4}
+
+
+def test_saude_diz_qual_dependencia_caiu_sem_detalhe(gateway, monkeypatch):
+    client, _, _ = gateway
+    monkeypatch.setattr(bus, "_nc", SimpleNamespace(is_connected=False))
+    r = client.get("/health")
+    assert (r.status_code, r.json()["error"]["code"], r.json()["error"]["details"]) == (
+        503, "ERRO_UNHEALTHY", [{"loc": ["nats"], "msg": "fora do ar"}])
+
+
+def test_trace_comeca_no_gateway_e_vai_ao_servico(gateway):
+    client, calls, _ = gateway
+    de_fora = "00-11111111111111111111111111111111-2222222222222222-01"
+    r = client.post("/api/v1/billing/execute", content=b"{}", headers={**_bearer(), "traceparent": de_fora})
+    trace_id = r.headers["x-trace-id"]
+    assert len(trace_id) == 32 and trace_id != "1" * 32  # quem chama de fora não escolhe o trace
+    assert calls[-1].headers["traceparent"].split("-")[1] == trace_id  # o serviço continua o mesmo trace
 
 
 def test_servico_fora_do_ar_vira_502(gateway):

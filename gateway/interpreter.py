@@ -10,6 +10,7 @@ Nenhuma rota de negócio é escrita aqui: cada rota nasce de gateway/endpoints/<
 - GET /api/v1/live: conexão ao vivo (SSE) com os eventos da organização do token e da própria pessoa
   (core.nats_bus.live_feed). Fecha quando o token expira; o cliente reabre com o token novo.
 Corpo acima de 1 MiB é recusado antes de chegar ao serviço.
+O trace começa aqui (core/telemetry.py, edge): o traceparent de fora é ignorado e o do gateway segue para o serviço.
 """
 import asyncio
 import hashlib
@@ -24,6 +25,7 @@ import httpx
 import yaml
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry import propagate
 from pydantic import RootModel, ValidationError
 
 from core.envelope import HEARTBEAT_SECONDS, SSE_HEADERS, ResponseEnvelope, ServiceError, sse
@@ -106,6 +108,7 @@ def _upstream_request(ep: Endpoint, request: Request, body: bytes) -> tuple[str,
     allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ()) + ep.headers  # headers: declarados no manifesto
     headers = {k: v for k, v in request.headers.items() if k in allowed}
     headers.setdefault("x-request-id", uuid.uuid4().hex)
+    propagate.inject(headers)  # o serviço continua o trace que começou aqui (README §5.18)
     return url, headers
 
 

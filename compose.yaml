@@ -1,5 +1,6 @@
 # Ambiente local completo (README §7). Antes, uma vez: uv run python -m core.security keygen (cria o .env).
-#   docker compose up --build -d   → API em http://localhost:8088/api/v1/..., Temporal UI em http://localhost:8233
+#   docker compose up --build -d   → API em http://localhost:8088/api/v1/..., Temporal UI em http://localhost:8233,
+#                                    Grafana (traces, métricas e logs) em http://localhost:3000
 # Toda porta é publicada só em 127.0.0.1: nada fica exposto na rede.
 # O service.sh acrescenta cada serviço no FIM deste arquivo: mantenha "services:" como a última seção.
 name: cv-frame
@@ -11,12 +12,17 @@ x-auth-env: &auth-env
   AUTH_PUBLIC_KEY: ${AUTH_PUBLIC_KEY:?rode uv run python -m core.security keygen}
   NATS_URL: nats://nats:4222
 
+# Observabilidade (README §5.18): traces, métricas e logs por OTLP para o Grafana local (serviço otel).
+x-telemetry-env: &telemetry-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4318
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+
 x-service: &service
   build: &service-build
     context: .
     dockerfile: services/Dockerfile
   environment: &service-env
-    <<: *auth-env
+    <<: [*auth-env, *telemetry-env]
     SURREAL_URL: ws://surrealdb:8000
     SURREAL_NAMESPACE: ${SURREAL_NAMESPACE:?rode uv run python -m core.security keygen}
     SURREAL_DATABASE: ${SURREAL_DATABASE:?rode uv run python -m core.security keygen}
@@ -35,6 +41,13 @@ x-service: &service
     surreal-init: { condition: service_completed_successfully }
     temporal: { condition: service_healthy }
     storage: { condition: service_healthy }
+  # GET /health (core/telemetry.py) confere NATS, SurrealDB e Temporal do serviço.
+  healthcheck: &service-health
+    test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+    interval: 10s
+    timeout: 5s
+    start_period: 90s
+    retries: 3
   restart: unless-stopped
 
 volumes:
@@ -60,10 +73,11 @@ services:
       <<: *service-build
       args: { APP_DIR: gateway }
     environment:
-      <<: *auth-env
+      <<: [*auth-env, *telemetry-env]
       CORS_ORIGINS: ${CORS_ORIGINS:-}
     depends_on:
       nats: { condition: service_healthy }
+    healthcheck: *service-health
     restart: unless-stopped
     labels:
       traefik.enable: "true"
@@ -158,6 +172,14 @@ services:
       test: ["CMD", "/mailpit", "readyz"]
       interval: 3s
       retries: 20
+    restart: unless-stopped
+
+  # Observabilidade local (README §5.18): Grafana com traces (Tempo), métricas (Prometheus) e logs (Loki) em
+  # http://localhost:3000. Recebe OTLP do gateway e dos serviços pela rede interna (e do host em 127.0.0.1:4318).
+  # Os dados somem quando o container é recriado. Em produção, OTEL_EXPORTER_OTLP_ENDPOINT aponta para o seu backend.
+  otel:
+    image: grafana/otel-lgtm:0.34.0
+    ports: ["127.0.0.1:3000:3000", "127.0.0.1:4318:4318"]
     restart: unless-stopped
 
   # ── Serviços de negócio (acrescentados pelo service.sh) ──────────────────────

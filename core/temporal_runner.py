@@ -14,6 +14,9 @@ atualiza e remove os agendamentos do Temporal no boot, conforme a lista (id <tas
 pulada e, se o Temporal ficar fora do ar, só a última execução perdida (até 10 min) é recuperada. Activity sem
 pessoa por trás (agendamento, migração) roda como system("svc-<serviço>").
 
+Trace (README §5.18): o interceptor do OpenTelemetry do próprio SDK continua o trace de quem iniciou o workflow em cada
+workflow e activity (StartWorkflow → RunWorkflow → StartActivity → RunActivity).
+
 Variáveis: TEMPORAL_ADDRESS (padrão localhost:7233), TEMPORAL_NAMESPACE (padrão default),
 TEMPORAL_API_KEY (Temporal Cloud; liga TLS).
 """
@@ -45,6 +48,7 @@ from temporalio.client import (
     WorkflowHandle,
 )
 from temporalio.common import WorkflowIDReusePolicy
+from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.worker import Worker
@@ -124,7 +128,8 @@ class Runner:
                 api_key=api_key,
                 tls=api_key is not None,
                 data_converter=pydantic_data_converter,
-                interceptors=[_PrincipalPropagation()],  # vale também para os workers criados com este cliente
+                # Valem também para os workers criados com este cliente: quem age e o trace atravessam o Temporal.
+                interceptors=[_PrincipalPropagation(), TracingInterceptor()],
             )
         return self._client
 

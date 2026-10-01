@@ -12,6 +12,8 @@ Trilhos:
 - Login sempre como usuário do banco (DEFINE USER ... ON DATABASE), nunca root: menor privilégio.
 - Resultados voltam como tipos simples: "tabela:id" em vez de RecordID; select de um registro → dict | None.
 - Valor repetido em índice unique → ServiceError 409 ERRO_RECORD_DUPLICATE (sem ecoar o valor).
+- Trace (README §5.18): toda consulta vira um span "surrealdb <comando>" com o texto da SurrealQL (sem os valores, que
+  vão sempre como parâmetros) e entra em db.client.operation.duration.
 - Carimbos (README §5.13): toda tabela declarada ganha created_at, created_by, updated_at e updated_by, que o próprio
   banco preenche (inclusive na SurrealQL crua): created_* uma vez e imutáveis, updated_* a cada gravação. Quem age
   entra como $cv_actor em toda consulta do core (o sub do Principal; None sem ninguém). Gravar um carimbo à mão é erro.
@@ -34,6 +36,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, LiteralString, TypeVar
 
+from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from surrealdb import AsyncSurreal, ConnectionUnavailableError, RecordID, ServerError, Table
@@ -65,6 +69,11 @@ ANALYZER = "cv_busca"
 _ANALYZER_DEF = f"DEFINE ANALYZER IF NOT EXISTS {ANALYZER} TOKENIZERS blank,class,punct FILTERS lowercase,ascii,edgengram(1,20)"
 T = TypeVar("T")
 P = TypeVar("P", bound=BaseModel)
+_tracer = trace.get_tracer("core.surreal")
+_duration = metrics.get_meter("core.surreal").create_histogram(
+    "db.client.operation.duration", unit="s", description="Tempo de cada consulta ao SurrealDB"
+)
+_OPERATION = re.compile(r"^\s*\{?\s*(?:LET\s+\$\w+\s*=\s*\(?\s*)?([A-Za-z]+)")
 
 
 class ListQuery(BaseModel):
@@ -464,9 +473,23 @@ class Database:
             return self._conn
 
     async def _call(self, method: str, *args: Any) -> Any:
+        operation = method.upper()
+        attributes = {"db.system.name": "surrealdb"}
         if method == "query":  # quem age vai em toda consulta: o banco carimba created_by/updated_by com ele
             who = current()
             args = (args[0], {**(args[1] or {}), ACTOR: who.sub if who else None}, *args[2:])
+            found = _OPERATION.match(args[0])
+            operation = found.group(1).upper() if found else "QUERY"
+            attributes["db.query.text"] = args[0][:1000]  # só o texto: os valores vão em parâmetros e nunca entram
+        attributes["db.operation.name"] = operation
+        started = time.perf_counter()
+        with _tracer.start_as_current_span(f"surrealdb {operation}", kind=SpanKind.CLIENT, attributes=attributes):
+            try:
+                return await self._call_once(method, *args)
+            finally:
+                _duration.record(time.perf_counter() - started, {"db.system.name": "surrealdb", "db.operation.name": operation})
+
+    async def _call_once(self, method: str, *args: Any) -> Any:
         # Conexão caiu (restart do banco, rede): reconecta uma vez e repete.
         for attempt in (1, 2):
             conn = await self._connection()

@@ -15,6 +15,7 @@ from core.nats_bus import bus
 from core.plans import plans
 from core.security import install_security
 from core.surreal import db
+from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 from core.webhooks import webhooks
 
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=SERVICE, lifespan=lifespan)
 install_envelope(app, service=SERVICE)
 install_security(app, service=SERVICE)  # nenhuma rota pública (specs/webhooks.md §2)
+install_telemetry(app, service=SERVICE)  # logs, trace, métricas e /health (README §5.18)
 
 
 def _ok(data: object) -> ResponseEnvelope:

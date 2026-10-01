@@ -2,6 +2,7 @@
 
 Regras (README §5.7):
 - Nega por padrão: install_security(app) exige token válido em TODA rota. Abrir é explícito: public=("/rota",).
+  A exceção é /health (core/telemetry.py), que só diz se as dependências respondem.
 - Identidade vem do token (Principal), nunca do payload. Durante a requisição, o evento ou a activity, ela
   fica no contexto: current() diz quem age e current_tenant() de qual organização (README §5.9).
 - Tokens JWT só com chave assimétrica: EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk,
@@ -49,6 +50,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from core.envelope import ServiceError, error_response
 
+HEALTH_PATH = "/health"  # saúde do processo (core/telemetry.py): sempre aberta, sem dado nenhum na resposta
 _JWKS_ALGORITHMS = ["RS256", "ES256", "EdDSA"]
 _LEEWAY_SECONDS = 30
 _SENSITIVE_KEY = re.compile(r"pass|secret|token|authorization|api[_-]?key|cookie|credential|private", re.I)
@@ -257,7 +259,7 @@ def install_security(app: FastAPI, *, service: str, public: Iterable[str] = ()) 
     """Nega por padrão + cabeçalhos de segurança + CORS explícito. Sem configuração válida, o app não sobe."""
     s = _settings()
     _jwks() if s.auth_jwks_url else _own_keys()
-    open_paths = set(public)
+    open_paths = set(public) | {HEALTH_PATH}
     if s.environment == "development":
         open_paths |= {p for p in (app.docs_url, app.redoc_url, app.openapi_url) if p}
     app.add_middleware(_AuthMiddleware, service=service, public=frozenset(open_paths), jwks=bool(s.auth_jwks_url))

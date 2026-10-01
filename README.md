@@ -21,7 +21,7 @@ cogniventure/
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
-├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, RustFS, Mailpit, gateway e serviços
+├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, RustFS, Mailpit, Grafana, gateway e serviços
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
@@ -43,7 +43,8 @@ cogniventure/
 │   ├── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
 │   ├── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
 │   ├── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
-│   └── plans.py                 # Planos e limites: o que cada organização pode usar, conferido no serviço (seção 5.17)
+│   ├── plans.py                 # Planos e limites: o que cada organização pode usar, conferido no serviço (seção 5.17)
+│   └── telemetry.py             # Observabilidade: logs estruturados, trace ponta a ponta, métricas e /health (seção 5.18)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -225,6 +226,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `notify.py` | `notify.user(sub, title, body, link, action, send_email, key)`, `notify.roles(*papéis, title=...)`, `notify.email(endereço, title, body, link, action, key)` — o único jeito de avisar alguém (seção 5.15) |
 | `webhooks.py` | `WebhookEvent(nome, descrição, Modelo)`, `webhooks.declare(lista)`, `webhooks.emit(nome, modelo, key)`, `webhooks.verify(segredo, cabeçalhos, corpo)`, `sign`, `new_secret` (seção 5.16) |
 | `plans.py` | `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(lista)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.limits()`, `plans.assign(plano)` (seção 5.17) |
+| `telemetry.py` | `install_telemetry(app, service, edge, health)`, `telemetry.counter(nome, descrição)`, `telemetry.histogram(nome, descrição)` (seção 5.18) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -234,7 +236,7 @@ Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio 
 
 Segurança não se implementa por serviço: importa-se do core. Proibido reimplementar autenticação, hash de senha, verificação de token ou proteção de URL.
 
-- **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. Papéis: `Depends(require("admin"))`.
+- **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. A única exceção é `/health` (seção 5.18), que só diz se as dependências respondem. Papéis: `Depends(require("admin"))`.
 - **Identidade vem do token:** quem chama é o `Principal` (usuário, organização ativa e papéis nela; `Depends(principal)` ou `current()`), nunca um campo do payload.
 - **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
 - **Login e sessão:** o `svc-identity` (`specs/identity.md`) é o único emissor de tokens e o único container com `AUTH_PRIVATE_KEY`: cadastro, login, senha esquecida (link por e-mail de 30 min, uso único, que derruba as sessões), organizações, convites e membros. Token de acesso de 15 min; refresh de 30 dias só no cookie `cv_refresh` (HttpOnly, SameSite=Strict, `Path=/api/v1/identity`, Secure em produção), nunca no corpo, trocado a cada uso; um refresh antigo que reaparece derruba a sessão inteira.
@@ -263,6 +265,7 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `AI_SECRETS_KEY`, `PLATFORM_TENANT` | A chave que criptografa as chaves dos provedores (o `keygen` gera; só no `svc-ai`) e a organização que administra a plataforma: provedores de IA para todas (`svc-ai`, seção 5.11) e os planos (`svc-plans`, seção 5.17); opcional |
 | `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails (seção 5.15) |
 | `WEBHOOKS_SECRETS_KEY` | Só no `svc-webhooks`: a chave que criptografa os segredos de assinatura dos endereços (o `keygen` gera; seção 5.16) |
+| `LOG_LEVEL`, `LOG_FORMAT`, `OTEL_EXPORTER_OTLP_ENDPOINT` | Observabilidade (seção 5.18): nível (`INFO`), formato (`json`; `text` é o padrão em development) e para onde vão traces, métricas e logs (OTLP/HTTP; sem ela, nada sai do processo). Valem também as variáveis padrão do OpenTelemetry (`OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`...) |
 O `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
 ```bash
@@ -317,7 +320,7 @@ live:                               # eventos ao vivo que o serviço emite (bus.
 ```
 
 - **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
-- **HTTP:** repassa corpo (byte a byte), query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`; `headers: [stripe-signature]` libera outros numa rota HTTP POST (a assinatura de um webhook que chega, seção 5.16), nunca os de sessão ou roteamento (`cookie`, `host`, `x-forwarded-*`...). O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
+- **HTTP:** repassa corpo (byte a byte), query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`; `headers: [stripe-signature]` libera outros numa rota HTTP POST (a assinatura de um webhook que chega, seção 5.16), nunca os de sessão ou roteamento (`cookie`, `host`, `x-forwarded-*`...). O serviço verifica o token de novo e continua o trace do gateway (`traceparent`, seção 5.18). Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
 - **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
@@ -542,6 +545,23 @@ await plans.use("custo", 0.0123, key=message_id)    # depois de gastar: soma no 
 - **Limites da plataforma:** `identity.membros` (pessoas na organização), `webhooks.enderecos` (sem plano, 20), `ai.custo` (US$, a moeda dos provedores, sem conversão) e `ai.tokens`.
 - **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Planos (comparação dos públicos e do atual) e, para quem administra a plataforma, Gerenciar (planos e atribuição).
 
+### 5.18 Observabilidade (`core/telemetry.py`)
+
+Logs, traces e métricas saem do core, sem código no serviço. Uma linha no `main.py` (o `service.sh` já gera):
+
+```python
+install_telemetry(app, service=SERVICE)                            # depois de install_envelope e install_security
+pagas = telemetry.counter("faturas_pagas", "Faturas pagas")        # métrica do serviço: cv.<serviço>.faturas_pagas
+pagas.add(1, {"forma": "pix"})                                     # atributo de baixa cardinalidade; nunca a organização
+```
+
+- **Logs:** uma linha JSON por evento em stdout (em development, texto legível), com `service`, `trace_id`, `span_id`, `tenant` e `user` (o `sub`; nunca nome, e-mail, corpo nem segredo). Campos em `extra=` entram mascarados por `redact`. Toda requisição gera uma linha com método, rota (o molde `/itens/{id}`, não o id), status, duração, organização e pessoa; o log de acesso do uvicorn sai.
+- **Trace ponta a ponta (OpenTelemetry):** a requisição HTTP, as chamadas HTTP de saída, cada mensagem NATS (publicar e processar, RPC), cada workflow e activity do Temporal e cada consulta ao SurrealDB (o texto da SurrealQL, nunca os valores) entram no mesmo trace: gateway → serviço → NATS → Temporal → banco. O trace começa no gateway: `traceparent` vindo de fora é ignorado, e não há baggage.
+- **Id para o suporte:** toda resposta leva `x-trace-id`; o erro 500 informa esse mesmo id. Com ele se acha o trace e todos os logs da requisição, em todos os serviços.
+- **Métricas:** duração das requisições HTTP (servidor e cliente, no padrão estável), das mensagens NATS com o resultado (`cv.nats.processed`: ok, retry, dropped, invalid) e das consultas (`db.client.operation.duration`). Organização e pessoa nunca viram atributo de métrica (cardinalidade): ficam no trace e no log.
+- **Exportação:** OTLP/HTTP para `OTEL_EXPORTER_OTLP_ENDPOINT` (Grafana Cloud, Tempo, Jaeger, Honeycomb, Datadog...). Sem a variável, nada sai do processo e os ids continuam nos logs. No ambiente local, o Grafana (`grafana/otel-lgtm`) recebe tudo e mostra traces (Tempo), métricas (Prometheus) e logs (Loki) em `http://localhost:3000`.
+- **Saúde:** `GET /health` em cada serviço e no gateway confere NATS, SurrealDB e Temporal do processo (`200` ou `503` dizendo qual caiu, sem detalhe interno). É aberto, não gera trace nem log e serve ao `healthcheck` do compose e ao orquestrador de produção.
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -607,7 +627,7 @@ Pré-requisitos: `uv` (instala o Python e as dependências sozinho), Node e Dock
 
 ```bash
 uv run python -m core.security keygen   # uma vez: cria o .env
-docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal, RustFS, Mailpit e os serviços
+docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal, RustFS, Mailpit, Grafana e os serviços
 TOKEN=$(uv run python -m core.security token ana --tenant acme)
 curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" -d '{"payload": {}}'
@@ -624,6 +644,7 @@ O `token` da linha de comando serve para testes rápidos. Conta de verdade: `POS
 | `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |
 | `localhost:9000` | Armazenamento de arquivos (RustFS, compatível com S3); o navegador envia e baixa daqui por link assinado |
 | `http://localhost:8025` | Mailpit: todo e-mail que a plataforma envia no ambiente local (convites, senha, avisos) |
+| `http://localhost:3000` | Grafana: traces, métricas e logs de todos os serviços (busque pelo `x-trace-id` de uma resposta) |
 
 Toda porta é publicada só em `127.0.0.1`. O SurrealDB ganha no boot o usuário de banco dos serviços (`surreal-init`); a senha root fica só com ele.
 
