@@ -38,7 +38,8 @@ cogniventure/
 │   ├── surreal.py               # Conexão multiplexada, queries parametrizadas e isolamento por organização (seção 5.9)
 │   ├── nats_bus.py              # Eventos duráveis (JetStream), RPC e avisos ao vivo para a tela
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
-│   └── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
+│   ├── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
+│   └── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -215,6 +216,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
 | `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
+| `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -232,6 +234,7 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
 - **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
 - **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). NATS em produção com `NATS_CREDS` e permissões por subject.
+- **IA:** chave de provedor só no `svc-ai`, criptografada; o serviço chama modelo só pelo `core/llm.py`, sem ver a chave (seção 5.11).
 - **Respostas:** cabeçalhos de segurança em toda resposta (HSTS e CSP em produção), `cache-control: no-store`, erro 500 sem detalhe interno, CORS só com origens listadas (`*` é recusado).
 - **Segredos e logs:** segredos só no `.env` (fora do Git). Antes de logar dados, `redact(...)`.
 - **Configuração insegura não sobe:** falta de chave, CORS `*`, JWKS sem https ou par de chaves trocado impedem o boot.
@@ -249,6 +252,7 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `SURREAL_ROOT_PASSWORD`, `GATEWAY_PORT` | Só no compose: senha root do SurrealDB (nenhum serviço a recebe) e porta local da API (8088) |
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
+| `AI_SECRETS_KEY`, `PLATFORM_TENANT` | Só no `svc-ai`: a chave que criptografa as chaves dos provedores (o `keygen` gera) e a organização dona da plataforma (opcional; seção 5.11) |
 
 Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
@@ -317,7 +321,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
   ```
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
-- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só o serviço de identidade (usuários, organizações, sessões) as usa.
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões) e o de IA (provedores e modelos, com o dono no campo `owner`).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ### 5.10 Tempo real e streaming
@@ -328,6 +332,39 @@ Dois casos, ambos por SSE (servidor → tela, sobre HTTP); o caminho tela → se
 - **Avisos ao vivo** (listas e painéis que atualizam sozinhos): `await bus.live("<service>.<evento>", modelo)` avisa a organização inteira; `user=<sub>` avisa só uma pessoa. A organização vem sempre do contexto: não há como avisar outra. Só o próprio serviço emite seus tópicos, que ficam declarados em `live:` no manifesto. É efêmero (NATS simples): quem estava fora do ar busca de novo no banco.
 - **Conexão:** `GET /api/v1/live` (gateway) entrega a quem chama só os avisos da organização do token e os endereçados a essa pessoa. Fecha quando o token vence; o frontend reabre com o token renovado e ao trocar de organização.
 - **Frontend:** uma conexão por aba, compartilhada. `useStream(fn)` acumula os pedaços (`deltas`, `result`, `cancel`); `useLiveQuery("tópico", fn, ...args)` é um `useQuery` que recarrega quando o aviso chega e quando a conexão volta; `useLive("tópico", fn)` reage a cada aviso. Os tópicos e seus modelos vêm tipados de `contracts.ts` (`LiveTopics`).
+
+### 5.11 IA (`core/llm.py` e `svc-ai`)
+
+Qualquer API compatível com a da OpenAI: OpenAI, OpenRouter, Groq, DeepSeek, Mistral, Gemini e modelos locais (Ollama, vLLM, LM Studio). O serviço nunca vê chave nem monta cliente de provedor: pede o modelo pelo nome `<provedor>/<modelo>`, e o core resolve o resto.
+
+```python
+from core.llm import Image, llm
+
+texto   = await llm.ask("openrouter/claude", "Resuma: ...", instructions="Seja breve.")
+fatura  = await llm.ask("local/llama", texto, output=Fatura)             # saída estruturada (modelo Pydantic)
+legenda = await llm.ask("openai/gpt", "O que há na foto?", images=[Image(url="https://...")])
+texto   = await llm.ask("openai/gpt", pergunta, tools=[buscar_cliente])  # ferramentas: funções async com docstring
+async for pedaco in llm.stream("openrouter/claude", pergunta): ...       # dentro do gerador de stream_response
+vetores = await llm.embed("openai/vetores", ["a", "b"])
+agente  = await llm.agent("openrouter/claude", tools=[...])              # Agent do Agno, para casos avançados
+```
+
+- **Provedores e chaves** (`svc-ai`, `specs/ai.md`): donos e admins cadastram o endereço base e a chave. A chave é guardada criptografada (AES-256-GCM com `AI_SECRETS_KEY`, que só o `svc-ai` recebe) e nunca volta inteira: a tela mostra só `…abcd`. Os provedores da plataforma valem para todas as organizações e são geridos pela organização cujo id está em `PLATFORM_TENANT`; sem ela, cada organização traz a sua chave.
+- **Prioridade:** o provedor da organização esconde o da plataforma com o mesmo apelido, sem misturar chaves nem custos.
+- **Modelos:** a busca lê `GET {base_url}/models`, e o modelo descoberto nasce desativado. Quem administra ativa, dá apelido (`openrouter/claude`), marca o tipo (chat ou embedding) e informa o preço por milhão de tokens. Provedor sem `/models` aceita cadastro manual.
+- **Resolução:** o core pergunta ao `svc-ai` (`rpc.ai.resolve`), na organização de quem age, e guarda a resposta por 60 s: troca de chave ou de modelo vale em até 1 min. Modelo inexistente, desativado ou de outro tipo → 404 `ERRO_AI_MODEL_UNAVAILABLE`.
+- **Rede:** provedor de organização só em `https` com IP público, conferido ao salvar e a cada uso; rede interna (Ollama, vLLM) só nos provedores da plataforma. Sem redirect e sem cookie.
+- **Uso e custo:** toda chamada publica `events.ai.usage` (tokens, modelo, serviço); o `svc-ai` grava por organização com o preço do momento, sem contar duas vezes a mesma mensagem. `GET /api/v1/ai/usage` resume o mês.
+- **Erros do provedor** saem no envelope sem ecoar a mensagem dele: 401/403 → `ERRO_AI_PROVIDER_AUTH`, 429 → `ERRO_AI_RATE_LIMITED`, o resto → `ERRO_AI_PROVIDER`.
+- **Agno por baixo:** telemetria, banco, memória e conhecimento do Agno ficam desligados, porque não respeitam a organização. Histórico de conversa e documentos ficam em tabelas do serviço, pelo `core.surreal`.
+- **Busca semântica:** cada trecho é gravado com o seu vetor (`db.create(TRECHOS, {"texto": ..., "vetor": ...})`) numa tabela por organização, e a busca é exata, com o filtro de sempre. Serve até dezenas de milhares de trechos por organização:
+
+  ```python
+  q = (await llm.embed("openai/vetores", [pergunta]))[0]
+  achados = await db.query(
+      "SELECT texto, vector::similarity::cosine(vetor, $q) AS nota FROM trechos "
+      "WHERE tenant = $tenant ORDER BY nota DESC LIMIT 5", q=q)
+  ```
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -420,7 +457,8 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 - importar código de outro serviço;
 - implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
 - abrir uma rota (`public=`) que o spec não declara pública;
-- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora do serviço de identidade, ou organização vinda do corpo;
+- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (identidade e IA), ou organização vinda do corpo;
+- chamar provedor de IA, montar cliente `openai` ou Agno, ou guardar chave de provedor fora de `core/llm.py` e do `svc-ai`;
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;
 

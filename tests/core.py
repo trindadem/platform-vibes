@@ -23,6 +23,7 @@ from temporalio.testing import ActivityEnvironment
 from core import envelope, nats_bus, security, surreal, temporal_runner
 from core.envelope import ServiceError
 from core.http_client import HttpClient, http
+from core.llm import Image
 from core.security import Principal, principal, require
 
 
@@ -287,6 +288,13 @@ def test_erro_inesperado_nao_vaza_detalhe(auth_env):
     assert r.json()["error"]["code"] == "ERRO_TESTE_EXECUTION_FAILED"
     assert "Informe o id" in r.json()["error"]["message"]
     assert "segredo-interno" not in r.text and "RuntimeError" not in r.text
+
+
+def test_erro_inesperado_nao_chega_ao_servidor(auth_env):
+    """Se a exceção subisse até o uvicorn, ele fecharia a conexão (502 avulso no gateway, que reaproveita conexões)."""
+    client = TestClient(_app().app)  # raise_server_exceptions: exceção que chegasse ao servidor explodiria aqui
+    r = client.get("/quebra", headers=_bearer(security.issue_token("u1")))
+    assert (r.status_code, r.json()["error"]["code"]) == (500, "ERRO_TESTE_EXECUTION_FAILED")
 
 
 def test_rota_inexistente_tambem_sai_no_envelope(auth_env):
@@ -893,3 +901,161 @@ def test_metodo_de_streaming_nao_vira_activity_e_segue_trilho():
         class Ruim:
             async def responder(self, pergunta: str, extra: int):
                 yield pergunta
+
+
+# ── IA: core/llm.py contra um provedor OpenAI-compatível falso (README §5.11) ─
+
+def _fake_provider(request: httpx.Request) -> httpx.Response:
+    """/models, /chat/completions (com e sem stream, ferramenta) e /embeddings, como um provedor de verdade."""
+    body = json.loads(request.content or b"{}")
+    usage = lambda p, c: {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}  # noqa: E731
+    if request.url.path.endswith("/embeddings"):
+        data = [{"object": "embedding", "index": i, "embedding": [float(len(t)), 1.0]} for i, t in enumerate(body["input"])]
+        return httpx.Response(200, json={"object": "list", "model": body["model"], "data": data, "usage": {"prompt_tokens": 7, "total_tokens": 7}})
+    last, tools = body["messages"][-1], body.get("tools") or []
+    if tools and last["role"] != "tool":
+        call = {"id": "c1", "type": "function", "function": {"name": tools[0]["function"]["name"], "arguments": '{"nome": "Acme"}'}}
+        message = {"role": "assistant", "content": None, "tool_calls": [call]}
+        return httpx.Response(200, json={"id": "1", "object": "chat.completion", "created": 0, "model": body["model"],
+                                         "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}], "usage": usage(20, 5)})
+    if last["role"] == "tool":
+        text = f"Ferramenta disse: {last['content']}"
+    elif body.get("response_format") or "json" in json.dumps(body["messages"]).lower():
+        text = '{"texto": "estruturado"}'
+    else:
+        text = "Resposta para " + json.dumps(last["content"], ensure_ascii=False)[:60]
+    if body.get("stream"):
+        words = text.split(" ")
+        chunks = [{"id": "s", "object": "chat.completion.chunk", "created": 0, "model": body["model"],
+                   "choices": [{"index": 0, "delta": {"content": w + (" " if i < len(words) - 1 else "")}, "finish_reason": None}]}
+                  for i, w in enumerate(words)]
+        chunks.append({"id": "s", "object": "chat.completion.chunk", "created": 0, "model": body["model"],
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage(12, len(words))})
+        sse = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse.encode())
+    return httpx.Response(200, json={"id": "2", "object": "chat.completion", "created": 0, "model": body["model"],
+                                     "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                                     "usage": usage(12, 6)})
+
+
+@pytest.fixture
+def ia(monkeypatch):
+    """core.llm com resolução e NATS falsos; devolve (llm, pedidos ao provedor, eventos de uso, resoluções)."""
+    from core import llm as llm_module
+
+    sent, usage_events, resolutions = [], [], []
+    state = {"handler": _fake_provider, "scope": "platform", "base_url": "http://provedor-interno:9000/v1", "auth": []}
+
+    def transport(request):
+        sent.append(json.loads(request.content or b"{}"))
+        state["auth"].append(request.headers.get("authorization"))
+        return state["handler"](request)
+
+    async def request(subject, message, response_model, timeout=5.0):
+        resolutions.append((subject, message.model, message.kind, security.current_tenant()))
+        resolved = llm_module.Resolved(provider=message.model.split("/")[0], scope=state["scope"], model="falso-1",
+                                       base_url=state["base_url"], api_key="sk-segredo-abcd", price_input=3.0, price_output=15.0)
+        raw = envelope.ResponseEnvelope.success(resolved, "svc-ai").model_dump_json()  # como o bus.respond serializa
+        return response_model.model_validate(envelope.ResponseEnvelope.model_validate_json(raw).data)
+
+    async def publish(subject, message, msg_id=None):
+        usage_events.append((subject, message))
+
+    client = llm_module.Llm(max_retries=0)  # sem esperar novas tentativas nos testes de erro
+    client._transport = httpx.MockTransport(transport)
+    monkeypatch.setattr(nats_bus.bus, "request", request)
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-pedidos")
+    with security.acting_as(ACME):
+        yield client, sent, usage_events, resolutions, state
+
+
+def test_ia_responde_e_registra_uso_e_guarda_a_resolucao(ia):
+    llm, sent, usage, resolutions, state = ia
+    first = asyncio.run(llm.ask("local/rapido", "Olá", instructions="Seja breve."))
+    asyncio.run(llm.ask("local/rapido", "De novo"))
+    vectors = asyncio.run(llm.embed("local/vetores", ["um"]))
+    assert first.startswith("Resposta para") and vectors
+    assert state["auth"] == ["Bearer sk-segredo-abcd"] * 3  # a chave atravessa o rpc.ai.resolve inteira, não '****'
+    assert sent[0]["model"] == "falso-1" and sent[0]["messages"][0]["role"] == "system"
+    assert resolutions == [("rpc.ai.resolve", "local/rapido", "chat", "acme"),  # a segunda veio do cache
+                           ("rpc.ai.resolve", "local/vetores", "embedding", "acme")]
+    subject, event = usage[0]
+    assert subject == "events.ai.usage"
+    assert event.model_dump() == {"model": "local/rapido", "provider": "local", "kind": "chat", "service": "svc-pedidos",
+                                   "input_tokens": 12, "output_tokens": 6, "price_input": 3.0, "price_output": 15.0}
+
+
+def test_ia_chave_resolvida_mascarada_fora_do_json():
+    from core.llm import Resolved
+
+    resolved = Resolved(provider="p", scope="platform", model="m", base_url="https://x/v1", api_key="sk-segredo-abcd")
+    assert "sk-" not in repr(resolved) and "sk-" not in str(resolved.model_dump())
+    assert "sk-segredo-abcd" in resolved.model_dump_json()
+
+
+def test_ia_agente_sem_telemetria_nem_memoria(ia):
+    llm = ia[0]
+    agent = asyncio.run(llm.agent("local/rapido"))
+    assert agent.telemetry is False and agent.db is None and agent.post_hooks
+
+
+def test_ia_em_pedacos_saida_estruturada_ferramenta_e_imagem(ia):
+    llm, sent, usage, _, _ = ia
+
+    async def pedacos():  # como o stream_response consome: cada passo numa tarefa própria (batimento)
+        return [p async for p in envelope.with_heartbeat(llm.stream("local/rapido", "conte algo"))]
+
+    class Saida(BaseModel):
+        texto: str
+
+    async def buscar_cliente(nome: str) -> str:
+        """Busca um cliente pelo nome."""
+        return f"cliente {nome} encontrado"
+
+    parts = asyncio.run(pedacos())
+    assert len(parts) > 2 and "".join(parts).startswith("Resposta para")
+    assert asyncio.run(llm.ask("local/rapido", "responda em json", output=Saida)) == Saida(texto="estruturado")
+    assert asyncio.run(llm.ask("local/rapido", "busque", tools=[buscar_cliente])) == "Ferramenta disse: cliente Acme encontrado"
+    asyncio.run(llm.ask("local/rapido", "o que há na foto?", images=[Image(url="https://exemplo.com/foto.png")]))
+    assert any(part.get("type") == "image_url" for part in sent[-1]["messages"][-1]["content"])
+    assert [e.output_tokens > 0 for _, e in usage] == [True] * len(usage) and len(usage) == 4
+
+
+def test_ia_embeddings(ia):
+    llm, _, usage, resolutions, _ = ia
+    vectors = asyncio.run(llm.embed("local/vetores", ["um", "dois"]))
+    assert vectors == [[2.0, 1.0], [4.0, 1.0]]
+    assert resolutions[-1][2] == "embedding" and usage[-1][1].kind == "embedding" and usage[-1][1].input_tokens == 7
+
+
+@pytest.mark.parametrize(("status", "code"), [(401, "ERRO_AI_PROVIDER_AUTH"), (429, "ERRO_AI_RATE_LIMITED"), (500, "ERRO_AI_PROVIDER")])
+def test_ia_erro_do_provedor_vira_envelope_sem_ecoar_a_mensagem_dele(ia, status, code):
+    llm, _, _, _, state = ia
+    state["handler"] = lambda r: httpx.Response(status, headers={"retry-after-ms": "0"}, json={"error": {"message": "chave sk-...abcd inválida"}})
+
+    async def em_pedacos():
+        return [p async for p in llm.stream("local/rapido", "oi")]
+
+    async def em_pedacos_com_batimento():  # como o stream_response consome
+        return [p async for p in envelope.with_heartbeat(llm.stream("local/rapido", "oi"))]
+
+    calls = (lambda: llm.ask("local/rapido", "oi"), em_pedacos, em_pedacos_com_batimento, lambda: llm.embed("local/vetores", ["a"]))
+    for call in calls:
+        with pytest.raises(ServiceError) as exc:
+            asyncio.run(call())
+        assert exc.value.code == code and "sk-" not in exc.value.message
+
+
+def test_ia_trilhos_de_nome_organizacao_e_rede(ia):
+    llm, _, _, _, state = ia
+    with pytest.raises(ValueError, match="fora do trilho"):
+        asyncio.run(llm.ask("sem-provedor", "oi"))
+    with security.acting_as(Principal(sub="ana")), pytest.raises(ServiceError) as exc:
+        asyncio.run(llm.ask("local/rapido", "oi"))
+    assert exc.value.code == "ERRO_TENANT_REQUIRED"
+    state.update(scope="organization", base_url="https://10.0.0.5/v1")  # provedor da organização apontando para dentro
+    llm.clear()
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(llm.ask("byok/modelo", "oi"))
+    assert exc.value.code == "ERRO_SSRF_BLOCKED"

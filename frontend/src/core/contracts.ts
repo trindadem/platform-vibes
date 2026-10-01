@@ -19,6 +19,121 @@ export const gateway = {
   health: (options?: RequestOptions) => request<GatewayHealth>("GET", "/health", undefined, options),
 };
 
+export interface AiProvider {
+  id: string;
+  name: string;
+  slug: string;
+  base_url: string;
+  /** Só os últimos 4 caracteres da chave */
+  key_hint: string;
+  scope: "organization" | "platform";
+}
+
+export interface AiProviderList {
+  items: AiProvider[];
+}
+
+export interface AiProviderInput {
+  /** Nome para exibir */
+  name: string;
+  /** Apelido usado no nome do modelo (ex.: openrouter → openrouter/claude) */
+  slug: string;
+  /** Endereço base da API compatível com OpenAI (ex.: https://openrouter.ai/api/v1) */
+  base_url: string;
+  /** Chave do provedor (vazia para provedores locais sem chave) */
+  api_key?: string;
+  /** organization (só a sua organização) ou platform (todas) */
+  scope?: "organization" | "platform";
+}
+
+export interface AiProviderRef {
+  id: string;
+}
+
+export interface AiModel {
+  id: string;
+  /** O que se passa ao llm.*: <provedor>/<apelido ou id> */
+  name: string;
+  provider: string;
+  model_id: string;
+  alias: string | null;
+  kind: "chat" | "embedding";
+  enabled: boolean;
+  price_input: number;
+  price_output: number;
+  scope: "organization" | "platform";
+}
+
+export interface AiModelList {
+  items: AiModel[];
+}
+
+export interface AiModelInput {
+  /** Id do provedor */
+  provider: string;
+  model_id: string;
+  kind?: "chat" | "embedding";
+}
+
+export interface AiModelUpdate {
+  id: string;
+  enabled?: boolean | null;
+  /** Nome curto (ex.: claude → openrouter/claude) */
+  alias?: string | null;
+  kind?: "chat" | "embedding" | null;
+  /** Preço por milhão de tokens de entrada */
+  price_input?: number | null;
+  /** Preço por milhão de tokens de saída */
+  price_output?: number | null;
+}
+
+export interface AiUsageItem {
+  model: string;
+  service: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
+export interface AiUsageSummary {
+  /** AAAA-MM, em UTC */
+  month: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+  items: AiUsageItem[];
+}
+
+/** svc-ai · /api/v1/ai */
+export const ai = {
+  /** GET /api/v1/ai/providers · http · exige token */
+  providers: (options?: RequestOptions) =>
+    request<AiProviderList>("GET", "/api/v1/ai/providers", undefined, options),
+  /** POST /api/v1/ai/providers · http · exige token */
+  createProvider: (body: AiProviderInput, options?: RequestOptions) =>
+    request<AiProvider>("POST", "/api/v1/ai/providers", body, options),
+  /** POST /api/v1/ai/providers/remove · http · exige token */
+  removeProvider: (body: AiProviderRef, options?: RequestOptions) =>
+    request<AiProviderList>("POST", "/api/v1/ai/providers/remove", body, options),
+  /** POST /api/v1/ai/providers/discover · http · exige token */
+  discoverModels: (body: AiProviderRef, options?: RequestOptions) =>
+    request<AiModelList>("POST", "/api/v1/ai/providers/discover", body, options),
+  /** GET /api/v1/ai/models · http · exige token */
+  models: (options?: RequestOptions) =>
+    request<AiModelList>("GET", "/api/v1/ai/models", undefined, options),
+  /** POST /api/v1/ai/models · http · exige token */
+  addModel: (body: AiModelInput, options?: RequestOptions) =>
+    request<AiModel>("POST", "/api/v1/ai/models", body, options),
+  /** POST /api/v1/ai/models/update · http · exige token */
+  updateModel: (body: AiModelUpdate, options?: RequestOptions) =>
+    request<AiModel>("POST", "/api/v1/ai/models/update", body, options),
+  /** GET /api/v1/ai/usage · http · exige token */
+  usage: (options?: RequestOptions) =>
+    request<AiUsageSummary>("GET", "/api/v1/ai/usage", undefined, options),
+};
+
 export interface IdentitySignupInput {
   /** Nome da pessoa */
   name: string;

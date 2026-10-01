@@ -29,4 +29,6 @@ COPY ${APP_DIR}/ ./
 RUN useradd --create-home --uid 10001 app
 USER app
 EXPOSE 8000
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]
+# Conexão ociosa vive 120 s, mais que em quem chama (Traefik: 90 s; gateway: 5 s). Quem chama sempre a descarta
+# primeiro e nunca reaproveita uma que o servidor está fechando (502 avulso). O padrão do uvicorn é 5 s.
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header", "--timeout-keep-alive", "120"]

@@ -133,3 +133,12 @@ services:
       <<: *service-env
       # Só o serviço de identidade emite tokens: é o único container com a chave privada (README §5.7).
       AUTH_PRIVATE_KEY: ${AUTH_PRIVATE_KEY:?rode uv run python -m core.security keygen}
+
+  svc-ai:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: ai } }
+    environment:
+      <<: *service-env
+      # Só o svc-ai abre as chaves dos provedores de IA (README §5.11).
+      AI_SECRETS_KEY: ${AI_SECRETS_KEY:?rode uv run python -m core.security keygen}
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}

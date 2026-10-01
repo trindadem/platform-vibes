@@ -192,12 +192,46 @@ def install_envelope(app: FastAPI, service: str) -> None:
         return error_response(service, 422, error_code(service, "INVALID_PAYLOAD"), "Payload inválido.", details)
 
     async def on_unexpected(_: Request, exc: Exception) -> JSONResponse:
-        error_id = uuid.uuid4().hex[:12]
-        log.error("erro inesperado em %s (id %s)", service, error_id, exc_info=exc)
-        message = f"Falha interna. Informe o id {error_id} ao suporte."
-        return error_response(service, 500, error_code(service, "EXECUTION_FAILED"), message)
+        return _unexpected(service, exc)
 
     app.add_exception_handler(ServiceError, on_service_error)
     app.add_exception_handler(HTTPException, on_http_error)
     app.add_exception_handler(RequestValidationError, on_invalid_payload)
-    app.add_exception_handler(Exception, on_unexpected)
+    app.add_exception_handler(Exception, on_unexpected)  # o que escapar do middleware abaixo (ex.: outro middleware)
+    app.add_middleware(_UnexpectedErrors, service=service)
+
+
+def _unexpected(service: str, exc: Exception) -> JSONResponse:
+    error_id = uuid.uuid4().hex[:12]
+    log.error("erro inesperado em %s (id %s)", service, error_id, exc_info=exc)
+    message = f"Falha interna. Informe o id {error_id} ao suporte."
+    return error_response(service, 500, error_code(service, "EXECUTION_FAILED"), message)
+
+
+class _UnexpectedErrors:
+    """Erro inesperado vira o envelope 500 aqui, sem subir até o servidor.
+
+    Pelo handler de Exception, o Starlette responde e relança a exceção; o uvicorn então fecha a conexão. O gateway
+    reaproveita conexões com os serviços, e a próxima chamada podia cair justo na que estava fechando (502 avulso).
+    """
+
+    def __init__(self, app: Any, service: str) -> None:
+        self.app, self.service = app, service
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracking_send(message: Any) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:
+            if started:  # a resposta já começou: não há como trocá-la por um envelope
+                raise
+            await _unexpected(self.service, exc)(scope, receive, send)

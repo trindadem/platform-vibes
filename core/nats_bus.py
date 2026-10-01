@@ -82,6 +82,11 @@ class Bus:
             await self._nc.drain()
             self._nc = self._js = None
 
+    @property
+    def service(self) -> str | None:
+        """Nome do serviço conectado (svc-...), ou None antes do bus.connected."""
+        return self._service
+
     def message_id(self) -> str | None:
         """Id estável da mensagem em processamento (igual em toda reentrega). None fora de um handler."""
         return _message_id.get()

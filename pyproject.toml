@@ -5,10 +5,12 @@ description = "Cogniventure Core Architecture: microsserviços com trilhos para 
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+    "agno>=3.1.0",
     "argon2-cffi>=25.1",
     "fastapi>=0.142",
     "httpx>=0.28",
     "nats-py>=2.16",
+    "openai>=3.22.1",
     "pydantic>=2.13",
     "pydantic-settings>=2.15",
     "pyjwt[crypto]>=2.15",

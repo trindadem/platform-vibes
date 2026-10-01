@@ -1,0 +1,72 @@
+# svc-ai · rotas públicas no Gateway. Fonte da verdade: specs/ai.md §2
+# Todas exigem token; o serviço confere owner/admin para gerenciar. A chave do provedor entra e nunca volta.
+service: ai
+base_path: /api/v1/ai
+
+endpoints:
+  - path: /providers
+    method: GET
+    auth: client_jwt
+    response: ProviderList
+    target_type: http
+    target_url: http://svc-ai:8000/providers
+
+  - path: /providers
+    name: createProvider
+    method: POST
+    auth: client_jwt
+    request: ProviderInput
+    response: Provider
+    target_type: http
+    target_url: http://svc-ai:8000/providers
+
+  - path: /providers/remove
+    name: removeProvider
+    method: POST
+    auth: client_jwt
+    request: ProviderRef
+    response: ProviderList
+    target_type: http
+    target_url: http://svc-ai:8000/providers/remove
+
+  - path: /providers/discover
+    name: discoverModels
+    method: POST
+    auth: client_jwt
+    request: ProviderRef
+    response: ModelList
+    target_type: http
+    target_url: http://svc-ai:8000/providers/discover
+    timeout: 30
+
+  - path: /models
+    method: GET
+    auth: client_jwt
+    response: ModelList
+    target_type: http
+    target_url: http://svc-ai:8000/models
+
+  - path: /models
+    name: addModel
+    method: POST
+    auth: client_jwt
+    request: ModelInput
+    response: Model
+    target_type: http
+    target_url: http://svc-ai:8000/models
+
+  - path: /models/update
+    name: updateModel
+    method: POST
+    auth: client_jwt
+    request: ModelUpdate
+    response: Model
+    target_type: http
+    target_url: http://svc-ai:8000/models/update
+
+  - path: /usage
+    method: GET
+    auth: client_jwt
+    response: UsageSummary
+    target_type: http
+    target_url: http://svc-ai:8000/usage

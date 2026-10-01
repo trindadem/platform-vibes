@@ -389,6 +389,10 @@ SURREAL_DATABASE=app
 SURREAL_USER=app
 SURREAL_PASSWORD={surreal_password}
 SURREAL_ROOT_PASSWORD={surreal_root_password}
+# IA (README §5.11): chave que criptografa as chaves dos provedores; só o svc-ai a recebe.
+AI_SECRETS_KEY={ai_secrets_key}
+# Organização dona da plataforma (provedores de IA para todas): o id dela, depois de criada pela tela de cadastro.
+# PLATFORM_TENANT=
 """
 
 _USAGE = """uso:
@@ -405,6 +409,7 @@ def _keygen(env_file: Path) -> None:
         public=_b64e(key.public_key().public_bytes_raw()),
         surreal_password=new_secret(24),
         surreal_root_password=new_secret(24),
+        ai_secrets_key=new_secret(32),
     ))
     env_file.chmod(0o600)
     print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")

@@ -1,0 +1,130 @@
+"""svc-ai · contratos (DTOs, enums, constantes). Fonte da verdade: specs/ai.md §2"""
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+from pydantic_settings import BaseSettings
+
+from core.llm import RESOLVE_SUBJECT, USAGE_SUBJECT, Resolved, ResolveRequest, UsageEvent  # contrato com core/llm.py
+
+# Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
+SERVICE = "svc-ai"
+TASK_QUEUE = "ai-queue"
+TRIGGER_SUBJECT = "events.ai.trigger"
+
+# Tabelas: provedores e modelos são globais (owner = organização ou "platform"); uso é por organização.
+PROVIDERS = "ai_providers"
+MODELS = "ai_models"
+USAGE = "ai_usage"
+SHARED_TABLES = [PROVIDERS, MODELS]
+TENANT_TABLES = [USAGE]
+UNIQUE = {PROVIDERS: ["owner", "slug"], MODELS: ["owner", "provider", "model_id"], USAGE: ["message"]}
+PLATFORM = "platform"
+MANAGERS = frozenset({"owner", "admin"})
+
+Scope = Literal["organization", "platform"]
+Kind = Literal["chat", "embedding"]
+Slug = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[a-z0-9][a-z0-9-]{0,29}$")]
+Id = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+
+class AiSettings(BaseSettings):
+    ai_secrets_key: SecretStr = Field(..., description="Chave AES-256 (base64url) que criptografa as chaves dos provedores")
+    platform_tenant: str | None = Field(None, description="Organização dona da plataforma (provedores para todas)")
+
+
+class _Input(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
+
+
+class Empty(_Input):
+    pass
+
+
+class ProviderInput(_Input):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=60)] = Field(..., description="Nome para exibir")
+    slug: Slug = Field(..., description="Apelido usado no nome do modelo (ex.: openrouter → openrouter/claude)")
+    base_url: Annotated[str, StringConstraints(strip_whitespace=True, max_length=300, pattern=r"^https?://\S+$")] = Field(
+        ..., description="Endereço base da API compatível com OpenAI (ex.: https://openrouter.ai/api/v1)"
+    )
+    api_key: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] = Field(
+        "", description="Chave do provedor (vazia para provedores locais sem chave)"
+    )
+    scope: Scope = Field("organization", description="organization (só a sua organização) ou platform (todas)")
+
+
+class ProviderRef(_Input):
+    id: Id
+
+
+class Provider(BaseModel):
+    id: str
+    name: str
+    slug: str
+    base_url: str
+    key_hint: str = Field(..., description="Só os últimos 4 caracteres da chave")
+    scope: Scope
+
+
+class ProviderList(BaseModel):
+    items: list[Provider]
+
+
+class ModelInput(_Input):
+    provider: Id = Field(..., description="Id do provedor")
+    model_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    kind: Kind = "chat"
+
+
+class ModelUpdate(_Input):
+    id: Id
+    enabled: bool | None = None
+    alias: Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[a-z0-9][a-z0-9.-]{0,59}$")] | None = Field(
+        None, description="Nome curto (ex.: claude → openrouter/claude)"
+    )
+    kind: Kind | None = None
+    price_input: float | None = Field(None, ge=0, description="Preço por milhão de tokens de entrada")
+    price_output: float | None = Field(None, ge=0, description="Preço por milhão de tokens de saída")
+
+
+class Model(BaseModel):
+    id: str
+    name: str = Field(..., description="O que se passa ao llm.*: <provedor>/<apelido ou id>")
+    provider: str
+    model_id: str
+    alias: str | None
+    kind: Kind
+    enabled: bool
+    price_input: float
+    price_output: float
+    scope: Scope
+
+
+class ModelList(BaseModel):
+    items: list[Model]
+
+
+class UsageItem(BaseModel):
+    model: str
+    service: str
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cost: float
+
+
+class UsageSummary(BaseModel):
+    month: str = Field(..., description="AAAA-MM, em UTC")
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cost: float
+    items: list[UsageItem]
+
+
+class Recorded(BaseModel):
+    """Interno: uso gravado."""
+
+    id: str
+    cost: float
+    at: datetime
