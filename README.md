@@ -25,8 +25,9 @@ cogniventure/
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
 │   └── <service_name>.md
 │
-├── tests/                       # Testes (estritamente 1 arquivo .py por serviço, mais core.py)
+├── tests/                       # Testes (estritamente 1 arquivo .py por serviço, mais core.py e gateway.py)
 │   ├── core.py
+│   ├── gateway.py
 │   └── <service_name>.py
 │
 ├── core/                        # Recursos compartilhados (estritamente 1 arquivo .py por recurso)
@@ -45,7 +46,7 @@ cogniventure/
 │   └── main.py                  # Entrypoint FastAPI
 │
 ├── services/                    # Microsserviços de negócio
-│   ├── Dockerfile               # Único Dockerfile, parametrizado por SERVICE=<service_name>
+│   ├── Dockerfile               # Único Dockerfile (serviços e gateway): SERVICE=<service_name> ou APP_DIR=gateway
 │   └── svc-<service_name>/      # Regra estrita de 4 arquivos (seção 5.1)
 │       ├── schemas.py
 │       ├── service.py
@@ -101,7 +102,7 @@ O código vive somente em `service.sh` (este README não o duplica). O script:
 - valida o nome (seção 2) e aborta sem tocar em nada se o serviço ou a rota já existirem;
 - cria `specs/<service_name>.md` com o template de 4 tópicos — **ou preserva o spec, se já existir** (spec-first);
 - cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker);
-- cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py`;
+- cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py`, e registra o serviço no fim do `compose.yaml`;
 - gera tudo numa área temporária, verifica a sintaxe e só então publica (tudo ou nada).
 
 Arquivo de serviço criado à mão, fora do `service.sh`, é violação de contrato.
@@ -168,8 +169,11 @@ Novo passo de negócio = novo método público em `service.py` + uma chamada em 
 Cada serviço roda de dentro da própria pasta, com imports irmãos (`from schemas import ...`). A partir da raiz:
 
 ```bash
-python -m uvicorn --app-dir services/svc-<service_name> main:app
+python -m uvicorn --app-dir services/svc-<service_name> main:app --port 8100 --env-file .env
+python -m uvicorn --app-dir gateway main:app --port 8090 --env-file .env
 ```
+
+No host, use portas a partir de 8100: a 8000 é do SurrealDB no compose (seção 7).
 
 Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-<service_name>`, com hífen, não é importável como pacote. Consequência desejada: um `import` de outro serviço falha na hora.
 
@@ -177,15 +181,16 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 
 - **Sem acoplamento lateral:** um serviço importa apenas `core.*` e seus três arquivos irmãos. Nunca `services.*`, nunca `importlib` apontando para outro serviço. Serviços conversam por NATS ou pelo Gateway.
 - **Core canônico:** cada recurso compartilhado vive em um único arquivo de `core/` (seção 5.6).
-- **Gateway declarativo:** zero rotas de negócio no código do Gateway. Toda rota pública vive em `gateway/endpoints/<service_name>.yaml`. Rotas nascem com `auth: client_jwt`; `auth: public` só quando o spec §2 declarar.
+- **Gateway declarativo:** zero rotas de negócio no código do Gateway. Toda rota pública vive em `gateway/endpoints/<service_name>.yaml` (seção 5.8). Rotas nascem com `auth: client_jwt`; `auth: public` só quando o spec §2 declarar.
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz. Serviço não declara dependência própria.
-- **Imagem:** todo serviço usa `services/Dockerfile` com `SERVICE=<service_name>`; a imagem instala o `pyproject.toml` e copia apenas `core/` e a pasta do serviço.
+- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala o `pyproject.toml`, copia apenas `core/` e a pasta do app e roda sem root.
 - **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura (SurrealDB e NATS viram dublês):
 
   ```bash
   PYTHONPATH=services/svc-<service_name> python -m pytest tests/<service_name>.py
   python -m pytest tests/core.py
+  PYTHONPATH=gateway python -m pytest tests/gateway.py
   ```
 
 ### 5.6 Contrato do core
@@ -228,14 +233,45 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `AUTH_JWKS_URL` | Alternativa às chaves próprias: provedor externo (https) |
 | `AUTH_TOKEN_TTL_SECONDS`, `AUTH_ROLES_CLAIM`, `AUTH_CLIENT_CLAIM`, `CORS_ORIGINS` | Opcionais (900, `roles`, `client_id`, nenhuma) |
 | `SURREAL_URL`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USER`, `SURREAL_PASSWORD` | Banco; só a URL tem padrão |
+| `SURREAL_ROOT_PASSWORD`, `GATEWAY_PORT` | Só no compose: senha root do SurrealDB (nenhum serviço a recebe) e porta local da API (8088) |
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
 
-Chaves próprias, uma vez por ambiente:
+Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
 ```bash
 python -m core.security keygen
+python -m core.security token <sub> [papel ...]
 ```
+
+### 5.8 Gateway (`gateway/`)
+
+O gateway verifica o token, aplica os manifestos e despacha. Não contém regra de negócio: cada rota nasce de `gateway/endpoints/<service_name>.yaml`, validado por `gateway/schemas.py`. Manifesto fora do trilho impede o boot.
+
+```yaml
+service: billing
+base_path: /api/v1/billing          # sempre /api/v1/<service>
+endpoints:
+  - path: /faturas/{fatura_id}
+    method: GET                     # GET | POST | PUT | PATCH | DELETE
+    auth: client_jwt                # client_jwt | public
+    roles: [financeiro]             # opcional: papéis exigidos no token
+    target_type: http               # http | nats
+    target_url: http://svc-billing:8000/faturas/{fatura_id}
+    timeout: 30                     # segundos, até 120
+  - path: /trigger
+    method: POST                    # NATS só aceita POST
+    auth: client_jwt
+    target_type: nats
+    nats_subject: events.billing.trigger
+```
+
+- **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
+- **HTTP:** repassa corpo, query e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`. O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
+- **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
+- **Limites:** corpo acima de 1 MiB → 413 (no Traefik e no gateway). Rate limit por IP no Traefik (50 req/s, rajada de 100).
+- **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
+- **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -249,7 +285,27 @@ python -m core.security keygen
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
 4. Rodar `tests/<service_name>.py` (seção 5.5).
-5. Conflito com o contrato → seção 8.
+5. Subir e testar de verdade (abaixo).
+6. Conflito com o contrato → seção 8.
+
+### Ambiente local (`compose.yaml`)
+
+```bash
+python -m core.security keygen          # uma vez: cria o .env
+docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal e os serviços
+TOKEN=$(python -m core.security token ana)
+curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d '{"client_id": "c1"}'
+docker compose down                     # para tudo (com -v, apaga também os dados)
+```
+
+| Endereço | O quê |
+|---|---|
+| `http://localhost:8088` | API, pelo Traefik (`GATEWAY_PORT`) |
+| `http://localhost:8233` | Temporal UI: workflows, activities e histórico |
+| `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |
+
+Toda porta é publicada só em `127.0.0.1`. O SurrealDB ganha no boot o usuário de banco dos serviços (`surreal-init`); a senha root fica só com ele.
 
 ## 8. Cláusula de Interrupção & `sprint.md` (Circuit Breaker)
 

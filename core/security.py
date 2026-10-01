@@ -13,19 +13,22 @@ exatamente uma fonte de chave: AUTH_PUBLIC_KEY / AUTH_PRIVATE_KEY (chaves própr
 Opcionais: AUTH_TOKEN_TTL_SECONDS (900), AUTH_ROLES_CLAIM (roles), AUTH_CLIENT_CLAIM (client_id),
 CORS_ORIGINS (origens separadas por vírgula; "*" é recusado).
 
-Gerar chaves próprias (uma vez por ambiente):  python -m core.security keygen
+Ambiente local: python -m core.security keygen (cria o .env) e python -m core.security token <sub> [papel...].
 """
 import asyncio
 import base64
 import functools
 import hmac
 import ipaddress
+import os
 import re
 import secrets
 import socket
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -334,13 +337,56 @@ def _b64e(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-if __name__ == "__main__":
-    import sys
+# ── Linha de comando (desenvolvimento local) ─────────────────────────────────
 
-    if sys.argv[1:] != ["keygen"]:
-        sys.exit("uso: python -m core.security keygen")
+_LOCAL_ENV = """\
+# Desenvolvimento local. Gerado por: python -m core.security keygen. Nunca versionar.
+# Produção: segredos no gerenciador do provedor; AUTH_PRIVATE_KEY só no serviço que emite tokens.
+ENVIRONMENT=development
+AUTH_ISSUER=http://localhost:8088
+AUTH_AUDIENCE=cv-frame
+AUTH_PRIVATE_KEY={private}
+AUTH_PUBLIC_KEY={public}
+CORS_ORIGINS=http://localhost:5173
+SURREAL_NAMESPACE=cv
+SURREAL_DATABASE=app
+SURREAL_USER=app
+SURREAL_PASSWORD={surreal_password}
+SURREAL_ROOT_PASSWORD={surreal_root_password}
+"""
+
+_USAGE = """uso:
+  python -m core.security keygen                  cria o .env local (chaves e senhas aleatórias)
+  python -m core.security token <sub> [papel...]  emite um token de teste com as chaves do .env"""
+
+
+def _keygen(env_file: Path) -> None:
+    if env_file.exists():
+        sys.exit(f"{env_file} já existe; nada foi alterado. Apague-o para gerar chaves novas.")
     key = Ed25519PrivateKey.generate()
-    print("# Cole no .env (nunca no código nem no Git).")
-    print("# AUTH_PRIVATE_KEY só no serviço que emite tokens; AUTH_PUBLIC_KEY em todos os outros.")
-    print(f"AUTH_PRIVATE_KEY={_b64e(key.private_bytes_raw())}")
-    print(f"AUTH_PUBLIC_KEY={_b64e(key.public_key().public_bytes_raw())}")
+    env_file.write_text(_LOCAL_ENV.format(
+        private=_b64e(key.private_bytes_raw()),
+        public=_b64e(key.public_key().public_bytes_raw()),
+        surreal_password=new_secret(24),
+        surreal_root_password=new_secret(24),
+    ))
+    env_file.chmod(0o600)
+    print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")
+
+
+def _token(env_file: Path, sub: str, roles: list[str]) -> None:
+    for line in env_file.read_text().splitlines() if env_file.exists() else []:
+        name, sep, value = line.partition("=")
+        if sep and not name.startswith("#"):
+            os.environ.setdefault(name.strip(), value.strip())
+    print(issue_token(sub, roles=roles))
+
+
+if __name__ == "__main__":
+    match sys.argv[1:]:
+        case ["keygen"]:
+            _keygen(Path(".env"))
+        case ["token", sub, *roles]:
+            _token(Path(".env"), sub, roles)
+        case _:
+            sys.exit(_USAGE)

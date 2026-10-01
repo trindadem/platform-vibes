@@ -1,0 +1,126 @@
+# Ambiente local completo (README §7). Antes, uma vez: python -m core.security keygen (cria o .env).
+#   docker compose up --build -d   → API em http://localhost:8088/api/v1/..., Temporal UI em http://localhost:8233
+# Toda porta é publicada só em 127.0.0.1: nada fica exposto na rede.
+# O service.sh acrescenta cada serviço no FIM deste arquivo: mantenha "services:" como a última seção.
+name: cv-frame
+
+x-auth-env: &auth-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  AUTH_ISSUER: ${AUTH_ISSUER:?rode python -m core.security keygen}
+  AUTH_AUDIENCE: ${AUTH_AUDIENCE:?rode python -m core.security keygen}
+  AUTH_PUBLIC_KEY: ${AUTH_PUBLIC_KEY:?rode python -m core.security keygen}
+  NATS_URL: nats://nats:4222
+
+x-service: &service
+  build: &service-build
+    context: .
+    dockerfile: services/Dockerfile
+  environment:
+    <<: *auth-env
+    SURREAL_URL: ws://surrealdb:8000
+    SURREAL_NAMESPACE: ${SURREAL_NAMESPACE:?rode python -m core.security keygen}
+    SURREAL_DATABASE: ${SURREAL_DATABASE:?rode python -m core.security keygen}
+    SURREAL_USER: ${SURREAL_USER:?rode python -m core.security keygen}
+    SURREAL_PASSWORD: ${SURREAL_PASSWORD:?rode python -m core.security keygen}
+    TEMPORAL_ADDRESS: temporal:7233
+  depends_on:
+    nats: { condition: service_healthy }
+    surreal-init: { condition: service_completed_successfully }
+    temporal: { condition: service_healthy }
+  restart: unless-stopped
+
+volumes:
+  nats-data:
+  surreal-data:
+  temporal-data:
+
+services:
+  traefik:
+    image: traefik:v3.7
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --accesslog=true
+    ports: ["127.0.0.1:${GATEWAY_PORT:-8088}:80"]
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+    restart: unless-stopped
+
+  gateway:
+    build:
+      <<: *service-build
+      args: { APP_DIR: gateway }
+    environment:
+      <<: *auth-env
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    depends_on:
+      nats: { condition: service_healthy }
+    restart: unless-stopped
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.gateway.rule: "PathPrefix(`/api`) || Path(`/health`) || Path(`/docs`) || Path(`/openapi.json`)"
+      traefik.http.routers.gateway.entrypoints: web
+      traefik.http.routers.gateway.middlewares: gateway-ratelimit,gateway-bodylimit
+      traefik.http.middlewares.gateway-ratelimit.ratelimit.average: "50"
+      traefik.http.middlewares.gateway-ratelimit.ratelimit.burst: "100"
+      traefik.http.middlewares.gateway-bodylimit.buffering.maxRequestBodyBytes: "1048576"
+      traefik.http.services.gateway.loadbalancer.server.port: "8000"
+
+  nats:
+    image: nats:2.15-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports: ["127.0.0.1:4222:4222"]
+    volumes: ["nats-data:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 3s
+      retries: 30
+    restart: unless-stopped
+
+  surrealdb:
+    image: surrealdb/surrealdb:v3.3.0
+    user: root  # a imagem roda como nonroot e não grava no volume; é o que a documentação oficial indica
+    command: ["start", "--user", "root", "--pass", "${SURREAL_ROOT_PASSWORD:?rode python -m core.security keygen}", "surrealkv:/data/db"]
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["surreal-data:/data"]
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://127.0.0.1:8000"]
+      interval: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # Cria (ou atualiza a senha de) o usuário de banco dos serviços: menor privilégio, nunca root (README §5.7).
+  surreal-init:
+    image: curlimages/curl:8.22.0
+    depends_on:
+      surrealdb: { condition: service_healthy }
+    environment:
+      ROOT_PASSWORD: ${SURREAL_ROOT_PASSWORD:?rode python -m core.security keygen}
+      NS: ${SURREAL_NAMESPACE:?rode python -m core.security keygen}
+      DB: ${SURREAL_DATABASE:?rode python -m core.security keygen}
+      APP_USER: ${SURREAL_USER:?rode python -m core.security keygen}
+      APP_PASSWORD: ${SURREAL_PASSWORD:?rode python -m core.security keygen}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        reply=$$(curl -sS --fail-with-body -X POST http://surrealdb:8000/sql -u "root:$$ROOT_PASSWORD" \
+          -H "Accept: application/json" \
+          --data "DEFINE NAMESPACE IF NOT EXISTS $$NS; USE NS $$NS; DEFINE DATABASE IF NOT EXISTS $$DB; USE DB $$DB;
+                  DEFINE USER OVERWRITE $$APP_USER ON DATABASE PASSWORD '$$APP_PASSWORD' ROLES EDITOR;")
+        # O /sql responde 200 mesmo quando um statement falha: o erro vem como "status":"ERR" no corpo.
+        if echo "$$reply" | grep -q '"status":"ERR"'; then echo "$$reply"; exit 1; fi
+        echo "usuário $$APP_USER pronto em $$NS/$$DB"
+
+  temporal:
+    image: temporalio/temporal:1.9.1
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/home/temporal/temporal.db", "--ui-port", "8233"]
+    ports: ["127.0.0.1:7233:7233", "127.0.0.1:8233:8233"]
+    volumes: ["temporal-data:/home/temporal"]  # pasta do usuário da imagem: grava sem precisar de root
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233", "--command-timeout", "3s"]
+      interval: 3s
+      retries: 40
+    restart: unless-stopped
+
+  # ── Serviços de negócio (acrescentados pelo service.sh) ──────────────────────

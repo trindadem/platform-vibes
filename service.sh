@@ -38,11 +38,15 @@ SVC_DIR="services/svc-${NAME}"
 SPEC_FILE="specs/${NAME}.md"
 ENDPOINT_FILE="gateway/endpoints/${NAME}.yaml"
 TEST_FILE="tests/${NAME}.py"
+COMPOSE_FILE="compose.yaml"
 
 # 1. Idempotência: nada é tocado se o serviço, a rota ou o teste já existirem.
 for target in "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"; do
   if [[ -e "$target" ]]; then die "'$target' já existe. Nada foi alterado."; fi
 done
+if [[ -f "$COMPOSE_FILE" ]] && grep -q "^  svc-${NAME}:$" "$COMPOSE_FILE"; then
+  die "svc-${NAME} já está em ${COMPOSE_FILE}. Nada foi alterado."
+fi
 KEEP_SPEC=0
 if [[ -f "$SPEC_FILE" ]]; then KEEP_SPEC=1; fi
 
@@ -160,7 +164,7 @@ render "$STAGE/svc/main.py" <<'EOF'
 HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
 NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona, durável e idempotente).
 
-Rodar (da raiz): python -m uvicorn --app-dir services/svc-__NAME__ main:app
+Rodar (da raiz): python -m uvicorn --app-dir services/svc-__NAME__ main:app --port 8100 --env-file .env
 """
 from contextlib import asynccontextmanager
 
@@ -271,6 +275,19 @@ def test_campo_nao_declarado_e_rejeitado():
         ExecutionInput.model_validate({"client_id": "c1", "is_admin": True})
 EOF
 
+# O compose.yaml novo também nasce na área temporária: a troca é um rename, nunca um arquivo pela metade.
+COMPOSE_STATUS="ausente: serviço não registrado"
+if [[ -f "$COMPOSE_FILE" ]]; then
+  render "$STAGE/compose-block.yaml" <<'EOF'
+
+  svc-__NAME__:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: __NAME__ } }
+EOF
+  cat "$COMPOSE_FILE" "$STAGE/compose-block.yaml" > "$STAGE/compose.yaml"
+  COMPOSE_STATUS="svc-${NAME} registrado"
+fi
+
 # 3. Autoverificação: nenhum placeholder sobrando e Python sintaticamente válido.
 if grep -rl '__[A-Z][A-Z_]*__' "$STAGE" >/dev/null; then
   die "placeholder não substituído (bug do próprio service.sh)."
@@ -292,6 +309,13 @@ publish() {
   if [[ $KEEP_SPEC -eq 0 ]]; then
     mv "$STAGE/spec.md" "$SPEC_FILE" || { rm -rf "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"; return 1; }
   fi
+  if [[ -f "$STAGE/compose.yaml" ]]; then
+    mv "$STAGE/compose.yaml" "$COMPOSE_FILE" || {
+      rm -rf "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"
+      if [[ $KEEP_SPEC -eq 0 ]]; then rm -f "$SPEC_FILE"; fi
+      return 1
+    }
+  fi
 }
 publish || die "falha ao publicar; nada foi mantido."
 
@@ -302,6 +326,7 @@ cat <<EOF
     ${SVC_DIR}/{schemas,service,workflows,main}.py
     ${ENDPOINT_FILE}
     ${TEST_FILE}
+    ${COMPOSE_FILE}  (${COMPOSE_STATUS})
 
 Próximo passo: preencha ${SPEC_FILE} e peça à IA:
   "Implemente specs/${NAME}.md em ${SVC_DIR}/ seguindo o README."

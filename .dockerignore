@@ -1,0 +1,11 @@
+# O build usa a raiz como contexto: nada disto deve chegar ao Docker (segredos, histórico, lixo local).
+.env
+.env.*
+.git/
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+frontend/
+specs/
+tests/
