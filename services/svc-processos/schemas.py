@@ -5,7 +5,8 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from core.plans import Module
+from core.plans import Limit, Module
+from core.processes import CatalogAction, Condition, Flow, Fluxo, Step, Trigger
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -17,15 +18,26 @@ LIVE_PROCESSOS = "processos.processos"
 CONTEXTO_SUBJECT = "rpc.conhecimento.contexto"  # do svc-conhecimento: perfil e tópicos da empresa
 BUSCA_SUBJECT = "rpc.conhecimento.busca"  # do svc-conhecimento: busca no conhecimento
 
+LIVE_DESENHO = "processos.desenho"
+CATALOG_SUBJECT = "events.processos.catalogo"  # core/processes.py: os pacotes declaram as ações no boot
+
 PROCESSOS = "processos_processos"
-TABLES = [PROCESSOS]
+VERSOES = "processos_versoes"
+MENSAGENS = "processos_mensagens"
+ACOES = "processos_acoes"  # catálogo de ações dos pacotes (o mesmo para toda organização)
+TABLES = [PROCESSOS, VERSOES, MENSAGENS]
+SHARED = [ACOES]
+UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"]}
 SEARCH = {PROCESSOS: ["titulo", "descricao"]}
 WRITERS = frozenset({"owner", "admin"})
+UNDO = 20  # quantas alterações do rascunho dá para desfazer
+HISTORY = 20  # mensagens da conversa de desenho no contexto do agente
 
 MODULE = Module(
     "Processos",
-    "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos e aceitos",
+    "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados",
     category="Sua empresa",
+    limits=[Limit("ativos", "Processos publicados, rodando de forma contínua", unit="processos")],
 )
 
 
@@ -33,6 +45,7 @@ class ProcessosSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PROCESSOS_", extra="ignore")
 
     model: str = Field("cv/agente", description="Modelo dos agentes de descoberta e descrição, como cadastrado no svc-ai")
+    desenho_model: str = Field("cv/desenho", description="Modelo do agente de desenho (edita o fluxo); sem ele no svc-ai, vale o model")
 
 
 class _Input(BaseModel):
@@ -147,6 +160,7 @@ class Processo(BaseModel):
     origem: Literal["sugestao", "cliente"]
     status: Status
     prioridade: Prioridade = "media"
+    publicada: int | None = Field(None, description="Número da versão publicada (a que roda)")
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -217,6 +231,189 @@ class Resumo(BaseModel):
     sugeridos: int
     aceitos: int
     recusados: int
+    publicados: int = Field(0, description="Aceitos com versão publicada (rodando no motor)")
+
+
+# ── Desenho: versões, operações do agente, simulação e publicação ──────────
+
+StatusVersao = Literal["rascunho", "revisao", "publicada", "arquivada"]
+
+
+class Motor(BaseModel):
+    """O que o Camunda guardou na publicação."""
+
+    processo: str = Field(..., description="Id do processo BPMN no motor")
+    chave: str
+    versao: int
+
+
+class Versao(BaseModel):
+    id: str
+    processo: str
+    numero: int
+    status: StatusVersao
+    fluxo: Fluxo
+    alteracoes: int = Field(0, description="Operações aplicadas neste rascunho")
+    pode_desfazer: bool = False
+    motor: Motor | None = None
+    publicada_em: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
+
+
+class VersaoResumo(BaseModel):
+    numero: int
+    status: StatusVersao
+    motor_versao: int | None = None
+    publicada_em: datetime | None = None
+
+
+class Problema(BaseModel):
+    nivel: Literal["erro", "aviso"]
+    passo: str | None = None
+    texto: str
+
+
+class MensagemDesenho(BaseModel):
+    id: str
+    papel: Literal["cliente", "agente"]
+    texto: str
+    passos: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
+
+
+class Desenho(BaseModel):
+    """O desenho de um processo: a versão aberta (o rascunho, senão a publicada), o BPMN dela e a conversa."""
+
+    processo: Processo
+    versao: Versao
+    versoes: list[VersaoResumo]
+    bpmn: str = Field(..., description="O BPMN da versão aberta, com o diagrama (o mesmo que vai ao motor)")
+    problemas: list[Problema]
+    mensagens: list[MensagemDesenho]
+    exige_revisao: bool = Field(False, description="A versão traz ação irreversível ou conexão nova")
+
+
+class DesenhoRef(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class MensagemDesenhoIn(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    texto: str = Field(..., min_length=1, max_length=4000)
+
+
+class Cenario(_Input):
+    """Valores para a simulação; sem nada, valem os exemplos das ações e dos agentes."""
+
+    valores: dict[str, str | float | bool] = Field(default_factory=dict, description="<passo>.<campo> → valor")
+    excecoes: list[str] = Field(default_factory=list, description="Passos que caem na exceção (handoff)")
+    recusas: list[str] = Field(default_factory=list, description="Tarefas em que a pessoa diz não")
+
+
+class SimulacaoIn(Cenario):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class PassoSimulado(BaseModel):
+    id: str
+    nome: str
+    tipo: str
+    nota: str = Field("", description="O que aconteceu no passo (saída, condição avaliada)")
+
+
+class Simulacao(BaseModel):
+    caminho: list[str] = Field(..., description="Ids dos elementos percorridos no BPMN (passos e ligações)")
+    passos: list[PassoSimulado]
+    fim: str | None = Field(None, description="Como terminou; vazio se parou antes")
+    problemas: list[str] = Field(default_factory=list)
+
+
+class CatalogoAcoes(BaseModel):
+    itens: list[CatalogAction]
+
+
+class DesenhoMudou(BaseModel):
+    processo: str
+    action: Literal["alterado", "mensagem", "publicado", "ajustado", "descartado"]
+
+
+# Operações do agente de desenho (as ferramentas dele): dado estruturado, nunca BPMN nem FEEL.
+class NovoPasso(Step):
+    depois_de: str | None = Field(None, description="Passo depois do qual entra; o que vinha depois passa a vir depois do novo")
+
+
+class AlteracaoPasso(_Input):
+    id: str = Field(..., description="Passo a alterar")
+    nome: str | None = None
+    acao: str | None = None
+    objetivo: str | None = None
+    saidas: list[str] | None = None
+    exemplo: dict[str, str | float | bool] | None = None
+    responsavel: Literal["cliente", "staff"] | None = None
+    pergunta: str | None = None
+    espera: Literal["mensagem", "tempo"] | None = None
+    mensagem: str | None = None
+    chave: str | None = None
+    horas: float | None = None
+    excecao: bool | None = None
+    resultado: str | None = None
+
+
+class Ligacao(_Input):
+    de: str = Field(..., description="Passo de origem (ou inicio)")
+    para: str
+    condicao: Condition | None = Field(None, description="Obrigatória saindo de decisão, menos no caminho padrão")
+
+
+class Desligamento(_Input):
+    de: str
+    para: str
+
+
+class RemocaoPasso(_Input):
+    id: str
+
+
+class Parametro(_Input):
+    nome: str = Field(..., pattern=r"^[a-z][a-z0-9_]{0,39}$")
+    valor: str | float | bool
+
+
+PASSOS_DESENHO = {
+    "adicionar_passo": "Adicionando um passo",
+    "alterar_passo": "Ajustando um passo",
+    "remover_passo": "Removendo um passo",
+    "ligar": "Ligando passos",
+    "desligar": "Desfazendo uma ligação",
+    "definir_gatilho": "Definindo o gatilho",
+    "definir_parametro": "Definindo um parâmetro",
+    "simular": "Simulando o processo",
+}
+
+DESENHO_INSTRUCOES = """Você é o agente de desenho de processos da Cogniventure (BPO). Você conversa com o cliente e edita o fluxo do processo pelas ferramentas; o diagrama ao lado muda a cada operação. Você nunca escreve BPMN.
+
+O fluxo tem um gatilho (evento, agenda ou manual) e passos ligados:
+- acao: uma ação do catálogo (use o nome exato, ex.: financeiro.conferir_pedido); a saída dela fica sob o id do passo.
+- agente: um agente de IA faz o passo (objetivo, saidas que devolve e exemplo para simular); todo agente tem excecao=true (cai para o staff quando não pode decidir).
+- tarefa: uma pessoa decide (responsavel cliente ou staff, pergunta; a saída é aprovado = verdadeiro ou falso).
+- decisao: caminhos com condição (campo, operador, valor) e exatamente um caminho padrão sem condição.
+- espera: por mensagem (mensagem e chave) ou por tempo (horas).
+- fim: como termina (resultado).
+Condições usam a saída de um passo anterior (<passo>.<campo>) ou um parâmetro (parametros.<nome>), e o valor pode ser outro parâmetro (ex.: valor = parametros.limite_aprovacao). Para "isto OU aquilo" no mesmo caminho, use o campo ou da condição (lista de outras condições); nunca duas ligações entre os mesmos passos.
+
+Como trabalhar:
+- Entenda o que o cliente quer mudar e faça as operações necessárias, poucas e certas. Valores que são regras do cliente (limites, prazos) viram parâmetros.
+- Depois de mudar, confira os problemas que as ferramentas devolvem e corrija os erros antes de responder.
+- Depois de mudar uma regra de caminho, chame simular com um cenário que a teste (ex.: valores {"ler_documento.valor": 4200}) e confira que o caminho passa por onde o cliente quer; se não passar, corrija.
+- Ação irreversível (pagar, enviar, assinar) deve ter aprovação antes quando o cliente pedir controle.
+- Se faltar informação para decidir, pergunte (uma pergunta curta).
+- Responda em português do Brasil, em 1 a 3 frases, dizendo o que mudou no fluxo. Nunca repita a mensagem do cliente."""
 
 
 # Do svc-conhecimento (rpc.conhecimento.*): o que este serviço lê da resposta.
@@ -235,6 +432,7 @@ class Achados(BaseModel):
 
 
 PASSOS = {
+    **PASSOS_DESENHO,
     "buscar_conhecimento": "Consultando o conhecimento",
     "sugerir_processo": "Sugerindo um processo",
     "registrar_processo": "Organizando o processo",
@@ -260,3 +458,50 @@ Chame registrar_processo uma única vez, com um título curto, a área (financei
 a descrição organizada nas palavras do cliente (gatilho, o que acontece, quem participa, quando é exceção) e, se houver \
 na biblioteca (no contexto) um modelo muito parecido, o id dele. Não invente etapas que o cliente não disse. Depois, \
 responda em uma frase o que registrou."""
+
+
+# ── Fluxos de partida (o desenho começa daqui) ───────────────────────────────
+
+C, F, P = Condition, Flow, Step
+FLUXOS: dict[str, Fluxo] = {
+    "contas-a-pagar": Fluxo(
+        gatilho=Trigger(tipo="evento", evento="documento.recebido", descricao="Boleto ou NF chega"),
+        parametros={"limite_aprovacao": 5000},
+        passos=[
+            P(id="ler_documento", tipo="agente", nome="Ler o documento", excecao=True,
+              objetivo="Extrair do boleto ou da nota o fornecedor, o CNPJ, o valor, o vencimento e a linha digitável",
+              saidas=["fornecedor", "cnpj", "valor", "vencimento", "linha_digitavel"],
+              exemplo={"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 1250.0, "vencimento": "2026-10-15"}),
+            P(id="conferir", tipo="acao", nome="Conferir com o pedido", acao="financeiro.conferir_pedido"),
+            P(id="divergente", tipo="decisao", nome="Confere com o pedido?"),
+            P(id="revisar", tipo="tarefa", nome="Resolver divergência", responsavel="staff", pergunta="Seguir com o pagamento?", horas=24),
+            P(id="revisado", tipo="decisao", nome="Seguir?"),
+            P(id="precisa_aprovacao", tipo="decisao", nome="Precisa de aprovação?"),
+            P(id="aprovar", tipo="tarefa", nome="Aprovar o pagamento", responsavel="cliente", pergunta="Aprovar o pagamento?", horas=24),
+            P(id="aprovado", tipo="decisao", nome="Aprovado?"),
+            P(id="classificar", tipo="acao", nome="Classificar no plano de contas", acao="financeiro.classificar"),
+            P(id="agendar", tipo="acao", nome="Agendar o pagamento", acao="financeiro.agendar_pagamento", excecao=True),
+            P(id="aguardar", tipo="espera", nome="Aguardar comprovante", espera="mensagem", mensagem="banco.pago",
+              chave="agendar.pagamento_id", horas=48),
+            P(id="conciliar", tipo="acao", nome="Conciliar", acao="financeiro.conciliar"),
+            P(id="pago", tipo="fim", nome="Pago", resultado="pago"),
+            P(id="recusado", tipo="fim", nome="Recusado", resultado="recusado"),
+        ],
+        ligacoes=[
+            F(de="inicio", para="ler_documento"), F(de="ler_documento", para="conferir"), F(de="conferir", para="divergente"),
+            F(de="divergente", para="revisar", condicao=C(campo="conferir.divergente", operador="verdadeiro")),
+            F(de="divergente", para="precisa_aprovacao"),
+            F(de="revisar", para="revisado"),
+            F(de="revisado", para="precisa_aprovacao", condicao=C(campo="revisar.aprovado", operador="verdadeiro")),
+            F(de="revisado", para="recusado"),
+            F(de="precisa_aprovacao", para="aprovar",
+              condicao=C(campo="ler_documento.valor", operador=">", valor="parametros.limite_aprovacao")),
+            F(de="precisa_aprovacao", para="classificar"),
+            F(de="aprovar", para="aprovado"),
+            F(de="aprovado", para="classificar", condicao=C(campo="aprovar.aprovado", operador="verdadeiro")),
+            F(de="aprovado", para="recusado"),
+            F(de="classificar", para="agendar"), F(de="agendar", para="aguardar"), F(de="aguardar", para="conciliar"),
+            F(de="conciliar", para="pago"),
+        ],
+    ),
+}

@@ -192,11 +192,17 @@ class Runner:
     @asynccontextmanager
     async def worker(
         self, task_queue: str, *, workflows: Sequence[type], service: object, schedules: Sequence[Schedule] = ()
-    ) -> AsyncIterator[Worker]:
-        """Roda o worker no mesmo loop do FastAPI, registrando as activities de @activities, e alinha os agendamentos."""
+    ) -> AsyncIterator[Worker | None]:
+        """Roda o worker no mesmo loop do FastAPI, registrando as activities de @activities, e alinha os agendamentos.
+        Serviço ainda sem activities nem workflows (ex.: um pacote que só declara ações) fica só com o cliente."""
         acts = [getattr(service, n) for n, fn in vars(type(service)).items() if getattr(fn, _MARK, False)]
         if len({s.id for s in schedules}) != len(schedules):
             raise ValueError("schedules: id repetido")
+        if not acts and not workflows:
+            await self.client()
+            await self.sync_schedules(task_queue, schedules)
+            yield None
+            return
         async with Worker(await self.client(), task_queue=task_queue, workflows=workflows, activities=acts) as w:
             await self.sync_schedules(task_queue, schedules)
             yield w

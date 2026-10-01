@@ -5,6 +5,8 @@ base_path: /api/v1/processos
 live:
   - topic: processos                # um processo foi sugerido, aceito, recusado ou descrito
     model: ProcessoMudou
+  - topic: desenho                  # o rascunho mudou, chegou mensagem, publicou, ajustou ou descartou
+    model: DesenhoMudou
 
 endpoints:
   - path: /biblioteca
@@ -65,3 +67,78 @@ endpoints:
     response: Processo
     target_type: http
     target_url: http://svc-processos:8000/processos/recusar
+
+  - path: /catalogo
+    name: catalogo
+    method: GET
+    auth: client_jwt
+    response: CatalogoAcoes
+    target_type: http
+    target_url: http://svc-processos:8000/catalogo
+
+  - path: /desenho/abrir
+    name: abrirDesenho
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/abrir
+
+  - path: /desenho/mensagem
+    name: mensagemDesenho
+    method: POST
+    auth: client_jwt
+    request: MensagemDesenhoIn
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/mensagem
+    stream: true
+    delta: PassoAgente
+    timeout: 120
+
+  - path: /desenho/simular
+    name: simular
+    method: POST
+    auth: client_jwt
+    request: SimulacaoIn
+    response: Simulacao
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/simular
+
+  - path: /desenho/desfazer
+    name: desfazer
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/desfazer
+
+  - path: /desenho/publicar
+    name: publicar
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/publicar
+    timeout: 60
+
+  - path: /desenho/ajustar
+    name: ajustar
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/ajustar
+
+  - path: /desenho/descartar
+    name: descartar
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/descartar

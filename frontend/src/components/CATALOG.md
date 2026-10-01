@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (48)
+## Índice (49)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -31,6 +31,7 @@
 
 **Dados**: registros e números
 
+- [BpmnDiagram](#bpmndiagram): Diagrama BPMN somente leitura (bpmn-js), com zoom e arrasto, o caminho percorrido em destaque e os passos com problema. `xml, label, highlight?, problems?`
 - [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?, sort?, onSort?`
 - [JourneySteps](#journeysteps): Jornada em passos numerados: o que já foi feito, o passo de agora em destaque e os próximos, com o caminho de cada um. `steps`
 - [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items, stacked?`
@@ -381,6 +382,21 @@ Abas que dividem uma tela em partes do mesmo assunto. A aba aberta fica no fragm
 ```
 
 - `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada.
+
+---
+
+## BpmnDiagram
+
+Diagrama BPMN somente leitura (bpmn-js), com zoom e arrasto, o caminho percorrido em destaque e os passos com problema. Fluxo comprido abre legível no começo; o resto se vê arrastando ou com a roda do mouse. _(Dados)_
+
+```tsx
+<BpmnDiagram xml={nome} highlight={["inicio", "ler_documento"]} problems={["conferir"]} label="Fluxo do processo" />
+```
+
+- `xml`: `string`: O BPMN 2.0 com o desenho (BPMN DI), como o backend devolve.
+- `highlight?`: `string[]`: Ids dos elementos percorridos (passos e ligações), pintados com a cor da marca (ex.: o caminho da simulação).
+- `problems?`: `string[]`: Ids dos elementos com problema, contornados em vermelho.
+- `label`: `string`: Nome acessível do diagrama (ex.: "Fluxo do processo Contas a pagar").
 
 ---
 

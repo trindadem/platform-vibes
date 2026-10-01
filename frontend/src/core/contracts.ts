@@ -1036,6 +1036,8 @@ export interface ProcessosProcesso {
   origem: "sugestao" | "cliente";
   status: "sugerido" | "aceito" | "recusado";
   prioridade: "alta" | "media" | "baixa";
+  /** Número da versão publicada (a que roda) */
+  publicada: number | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -1067,6 +1069,8 @@ export interface ProcessosResumo {
   sugeridos: number;
   aceitos: number;
   recusados: number;
+  /** Aceitos com versão publicada (rodando no motor) */
+  publicados: number;
 }
 
 export interface ProcessosEmpty {
@@ -1095,9 +1099,198 @@ export interface ProcessosProcessoRef {
   id: string;
 }
 
+export interface ProcessosCatalogAction {
+  /** <pacote>.<ação> */
+  name: string;
+  service: string;
+  title: string;
+  description: string;
+  risk: "leitura" | "escrita" | "externa" | "irreversivel";
+  connections: string[];
+  /** Campos da saída (o que as condições podem usar) */
+  output_fields: string[];
+  example: Record<string, unknown>;
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown>;
+}
+
+export interface ProcessosCatalogoAcoes {
+  itens: ProcessosCatalogAction[];
+}
+
+export interface ProcessosDesenhoRef {
+  processo: string;
+}
+
+export interface ProcessosAlternative {
+  /** <passo>.<campo> ou parametros.<nome> */
+  campo: string;
+  operador: "=" | "!=" | ">" | ">=" | "<" | "<=" | "verdadeiro" | "falso";
+  /** Valor comparado; parametros.<nome> compara com um parâmetro */
+  valor: string | number | boolean | null;
+}
+
+/** Condição de um caminho que sai de uma decisão: campo, operador e valor (ou parametros.<nome>); com ou, basta uma delas valer (ex.: valor acima do limite ou fornecedor novo). */
+export interface ProcessosCondition {
+  /** <passo>.<campo> ou parametros.<nome> */
+  campo: string;
+  operador: "=" | "!=" | ">" | ">=" | "<" | "<=" | "verdadeiro" | "falso";
+  /** Valor comparado; parametros.<nome> compara com um parâmetro */
+  valor: string | number | boolean | null;
+  /** Outras condições: o caminho vale se qualquer uma valer */
+  ou: ProcessosAlternative[];
+}
+
+export interface ProcessosFlow {
+  de: string;
+  para: string;
+  /** Só saindo de decisão; sem condição é o caminho padrão */
+  condicao: ProcessosCondition | null;
+}
+
+export interface ProcessosFluxo {
+  gatilho: ProcessosTrigger;
+  passos: ProcessosStep[];
+  ligacoes: ProcessosFlow[];
+  parametros: Record<string, string | number | boolean>;
+}
+
+export interface ProcessosMensagemDesenho {
+  id: string;
+  papel: "cliente" | "agente";
+  texto: string;
+  passos: string[];
+  created_at: string | null;
+}
+
+/** O que o Camunda guardou na publicação. */
+export interface ProcessosMotor {
+  /** Id do processo BPMN no motor */
+  processo: string;
+  chave: string;
+  versao: number;
+}
+
+export interface ProcessosProblema {
+  nivel: "erro" | "aviso";
+  passo: string | null;
+  texto: string;
+}
+
+export interface ProcessosStep {
+  /** Identificador curto em snake_case (a saída fica sob ele) */
+  id: string;
+  tipo: "acao" | "agente" | "tarefa" | "decisao" | "espera" | "fim";
+  nome: string;
+  /** acao: nome no catálogo (<pacote>.<ação>) */
+  acao: string | null;
+  /** agente: o que o agente faz neste passo */
+  objetivo: string | null;
+  /** agente: campos que o agente devolve */
+  saidas: string[];
+  /** agente: saída de exemplo para a simulação */
+  exemplo: Record<string, string | number | boolean>;
+  /** tarefa: quem decide */
+  responsavel: "cliente" | "staff" | null;
+  /** tarefa: o que a pessoa decide (a saída é aprovado) */
+  pergunta: string | null;
+  espera: "mensagem" | "tempo" | null;
+  /** espera: mensagem que chega (ex.: banco.pago) */
+  mensagem: string | null;
+  /** espera: campo que identifica a execução */
+  chave: string | null;
+  /** espera tempo: quanto; tarefa e espera de mensagem: prazo */
+  horas: number | null;
+  /** acao e agente: caminho de handoff para o staff */
+  excecao: boolean;
+  /** fim: como termina (ex.: pago, recusado) */
+  resultado: string | null;
+}
+
+export interface ProcessosTrigger {
+  tipo: "evento" | "agenda" | "manual";
+  /** evento: mensagem que inicia */
+  evento: string | null;
+  /** agenda: cron (ex.: 0 8 * * *) */
+  agenda: string | null;
+  descricao: string | null;
+}
+
+export interface ProcessosVersao {
+  id: string;
+  processo: string;
+  numero: number;
+  status: "rascunho" | "revisao" | "publicada" | "arquivada";
+  fluxo: ProcessosFluxo;
+  /** Operações aplicadas neste rascunho */
+  alteracoes: number;
+  pode_desfazer: boolean;
+  motor: ProcessosMotor | null;
+  publicada_em: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProcessosVersaoResumo {
+  numero: number;
+  status: "rascunho" | "revisao" | "publicada" | "arquivada";
+  motor_versao: number | null;
+  publicada_em: string | null;
+}
+
+/** O desenho de um processo: a versão aberta (o rascunho, senão a publicada), o BPMN dela e a conversa. */
+export interface ProcessosDesenho {
+  processo: ProcessosProcesso;
+  versao: ProcessosVersao;
+  versoes: ProcessosVersaoResumo[];
+  /** O BPMN da versão aberta, com o diagrama (o mesmo que vai ao motor) */
+  bpmn: string;
+  problemas: ProcessosProblema[];
+  mensagens: ProcessosMensagemDesenho[];
+  /** A versão traz ação irreversível ou conexão nova */
+  exige_revisao: boolean;
+}
+
+export interface ProcessosMensagemDesenhoIn {
+  processo: string;
+  texto: string;
+}
+
+export interface ProcessosSimulacaoIn {
+  /** <passo>.<campo> → valor */
+  valores?: Record<string, string | number | boolean>;
+  /** Passos que caem na exceção (handoff) */
+  excecoes?: string[];
+  /** Tarefas em que a pessoa diz não */
+  recusas?: string[];
+  processo: string;
+}
+
+export interface ProcessosPassoSimulado {
+  id: string;
+  nome: string;
+  tipo: string;
+  /** O que aconteceu no passo (saída, condição avaliada) */
+  nota: string;
+}
+
+export interface ProcessosSimulacao {
+  /** Ids dos elementos percorridos no BPMN (passos e ligações) */
+  caminho: string[];
+  passos: ProcessosPassoSimulado[];
+  /** Como terminou; vazio se parou antes */
+  fim: string | null;
+  problemas: string[];
+}
+
 export interface ProcessosProcessoMudou {
   id: string;
   action: "sugerido" | "aceito" | "recusado" | "descrito";
+}
+
+export interface ProcessosDesenhoMudou {
+  processo: string;
+  action: "alterado" | "mensagem" | "publicado" | "ajustado" | "descartado";
 }
 
 /** svc-processos · /api/v1/processos */
@@ -1123,6 +1316,30 @@ export const processos = {
   /** POST /api/v1/processos/processos/recusar · http · exige token */
   recusar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
     request<ProcessosProcesso>("POST", "/api/v1/processos/processos/recusar", body, options),
+  /** GET /api/v1/processos/catalogo · http · exige token */
+  catalogo: (options?: RequestOptions) =>
+    request<ProcessosCatalogoAcoes>("GET", "/api/v1/processos/catalogo", undefined, options),
+  /** POST /api/v1/processos/desenho/abrir · http · exige token */
+  abrirDesenho: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/abrir", body, options),
+  /** POST /api/v1/processos/desenho/mensagem · http · em pedaços (options.onDelta) · exige token */
+  mensagemDesenho: (body: ProcessosMensagemDesenhoIn, options?: StreamOptions<ProcessosPassoAgente>) =>
+    stream<ProcessosPassoAgente, ProcessosDesenho>("POST", "/api/v1/processos/desenho/mensagem", body, options),
+  /** POST /api/v1/processos/desenho/simular · http · exige token */
+  simular: (body: ProcessosSimulacaoIn, options?: RequestOptions) =>
+    request<ProcessosSimulacao>("POST", "/api/v1/processos/desenho/simular", body, options),
+  /** POST /api/v1/processos/desenho/desfazer · http · exige token */
+  desfazer: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/desfazer", body, options),
+  /** POST /api/v1/processos/desenho/publicar · http · exige token */
+  publicar: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/publicar", body, options),
+  /** POST /api/v1/processos/desenho/ajustar · http · exige token */
+  ajustar: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/ajustar", body, options),
+  /** POST /api/v1/processos/desenho/descartar · http · exige token */
+  descartar: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/descartar", body, options),
 };
 
 export interface WebhooksEndpoint {
@@ -1280,6 +1497,8 @@ export interface LiveTopics {
   "plans.uso": PlansUsageChanged;
   /** svc-processos · bus.live("processos.processos", ...) */
   "processos.processos": ProcessosProcessoMudou;
+  /** svc-processos · bus.live("processos.desenho", ...) */
+  "processos.desenho": ProcessosDesenhoMudou;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
@@ -1291,7 +1510,7 @@ export const appModules = {
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
-  processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos e aceitos", category: "Sua empresa", core: false },
+  processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados", category: "Sua empresa", core: false },
   webhooks: { title: "Webhooks", description: "Eventos para os sistemas da organização", category: "Integrações", core: true },
 } as const;
 

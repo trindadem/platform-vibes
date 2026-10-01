@@ -6,6 +6,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "bpmn-js/dist/assets/diagram-js.css"; /* BpmnDiagram: o contêiner, o zoom e o arrasto do bpmn-js */
 
 /* Modo escuro do shadcn: classe .dark no <html>, aplicada por main.tsx conforme o sistema. */
 @custom-variant dark (&:is(.dark *));
@@ -145,4 +146,19 @@
   body {
     @apply bg-background font-sans text-foreground antialiased;
   }
+}
+
+/* BpmnDiagram: o caminho percorrido (cor da marca) e os passos com problema (vermelho), por marcadores do bpmn-js. */
+.cv-bpmn .djs-element.cv-percorrido:not(.djs-connection) .djs-visual > :first-child {
+  stroke: var(--primary) !important;
+  stroke-width: 3px !important;
+}
+.cv-bpmn .djs-connection.cv-percorrido .djs-visual > path {
+  stroke: var(--primary) !important;
+  stroke-width: 3px !important;
+}
+.cv-bpmn .djs-element.cv-problema .djs-visual > :first-child {
+  stroke: var(--destructive) !important;
+  stroke-width: 3px !important;
+  stroke-dasharray: 6 4;
 }

@@ -2552,3 +2552,136 @@ def test_kit_recusa_rota_do_manifesto_que_o_main_nao_tem(tmp_path):
         return {}
 
     testing_module._routes_match_manifest(app, "svc-kit", root=tmp_path)  # com a rota, passa
+
+
+# ── Processos: fluxo tipado → BPMN do Camunda 8, ações declaradas e motor (core/processes.py) ─
+
+from xml.etree import ElementTree as _ET  # noqa: E402
+
+from core import processes as processes_module  # noqa: E402
+from core.processes import Action, Condition, Flow, Fluxo, Step, Trigger, feel, to_bpmn  # noqa: E402
+
+_NS = {"bpmn": "http://www.omg.org/spec/BPMN/20100524/MODEL", "zeebe": "http://camunda.org/schema/zeebe/1.0",
+       "bpmndi": "http://www.omg.org/spec/BPMN/20100524/DI"}
+
+
+def _fluxo_pagamento() -> Fluxo:
+    return Fluxo(
+        gatilho=Trigger(tipo="evento", evento="documento.recebido", descricao="Boleto chega"),
+        parametros={"limite": 5000},
+        passos=[
+            Step(id="ler", tipo="agente", nome="Ler", objetivo='Extrair "valor"', saidas=["valor"], excecao=True),
+            Step(id="precisa", tipo="decisao", nome="Precisa aprovar?"),
+            Step(id="aprovar", tipo="tarefa", nome="Aprovar", responsavel="cliente", pergunta="Aprovar?", horas=24),
+            Step(id="pagar", tipo="acao", nome="Pagar", acao="financeiro.agendar_pagamento"),
+            Step(id="aguardar", tipo="espera", nome="Comprovante", espera="mensagem", mensagem="banco.pago", chave="pagar.id"),
+            Step(id="fim", tipo="fim", nome="Pago"),
+        ],
+        ligacoes=[
+            Flow(de="inicio", para="ler"), Flow(de="ler", para="precisa"),
+            Flow(de="precisa", para="aprovar", condicao=Condition(campo="ler.valor", operador=">", valor="parametros.limite")),
+            Flow(de="precisa", para="pagar"), Flow(de="aprovar", para="pagar"), Flow(de="pagar", para="aguardar"),
+            Flow(de="aguardar", para="fim"),
+        ],
+    )
+
+
+def test_fluxo_vira_bpmn_do_camunda_com_extensoes_condicoes_e_desenho():
+    raiz = _ET.fromstring(to_bpmn(_fluxo_pagamento(), process_id="p_acme_pagar", name="Pagar & conferir"))
+    processo = raiz.find("bpmn:process", _NS)
+    assert processo.get("id") == "p_acme_pagar" and processo.get("name") == "Pagar & conferir"
+    inicio = processo.find("bpmn:startEvent", _NS)
+    assert inicio.get("id") == "inicio" and inicio.find("bpmn:messageEventDefinition", _NS) is not None
+    saidas = [(o.get("source"), o.get("target")) for o in inicio.findall(".//zeebe:output", _NS)]
+    assert saidas == [("=5000", "parametros.limite")]  # o parâmetro vai com a versão
+    tarefas = {t.get("id"): t for t in processo.findall("bpmn:serviceTask", _NS)}
+    assert tarefas["pagar"].find(".//zeebe:taskDefinition", _NS).get("type") == "financeiro.agendar_pagamento"
+    assert tarefas["ler"].find(".//zeebe:taskDefinition", _NS).get("type") == "agentes.executar"
+    headers = {h.get("key"): h.get("value") for h in tarefas["ler"].findall(".//zeebe:header", _NS)}
+    assert headers == {"passo": "ler", "objetivo": 'Extrair "valor"', "saidas": "valor"}
+    humanas = {t.get("id"): t for t in processo.findall("bpmn:userTask", _NS)}
+    assert humanas["aprovar"].find(".//zeebe:assignmentDefinition", _NS).get("candidateGroups") == "cliente"
+    assert humanas["ler__excecao"].find(".//zeebe:assignmentDefinition", _NS).get("candidateGroups") == "staff"
+    assert processo.find("bpmn:boundaryEvent", _NS).get("attachedToRef") == "ler"
+    decisao = processo.find("bpmn:exclusiveGateway", _NS)
+    assert decisao.get("default") == "f_precisa_pagar"
+    caminhos = {f.get("id"): f for f in processo.findall("bpmn:sequenceFlow", _NS)}
+    assert caminhos["f_precisa_aprovar"].find("bpmn:conditionExpression", _NS).text == "=ler.valor > parametros.limite"
+    assert caminhos["f_ler__excecao_precisa"].get("targetRef") == "precisa"  # a exceção resolvida segue o fluxo
+    mensagens = {m.get("name"): m for m in raiz.findall("bpmn:message", _NS)}
+    assert mensagens["banco.pago"].find(".//zeebe:subscription", _NS).get("correlationKey") == "=pagar.id"
+    desenhados = {s.get("bpmnElement") for s in raiz.findall(".//bpmndi:BPMNShape", _NS)}
+    assert {"inicio", "ler", "precisa", "aprovar", "pagar", "aguardar", "fim", "ler__excecao", "ler__erro"} <= desenhados
+    assert len(raiz.findall(".//bpmndi:BPMNEdge", _NS)) == len(caminhos)
+
+
+def test_condicao_vira_feel_com_valor_escapado():
+    assert feel(Condition(campo="conferir.divergente", operador="verdadeiro")) == "=conferir.divergente = true"
+    assert feel(Condition(campo="ler.fornecedor", operador="=", valor='Moinho "Sul"')) == '=ler.fornecedor = "Moinho \\"Sul\\""'
+    assert feel(Condition(campo="ler.valor", operador=">=", valor=2000.5)) == "=ler.valor >= 2000.5"
+    assert feel(Condition(campo="ler.valor", operador="<", valor="parametros.x or true")) == '=ler.valor < "parametros.x or true"'
+    with pytest.raises(ValidationError):
+        Condition(campo="ler.valor) or (true", operador="=", valor=1)
+    with pytest.raises(ValidationError):
+        Step(id="Passo-1", tipo="fim", nome="Fim")  # id vira id de elemento BPMN: só snake_case
+
+
+class _Conferencia(BaseModel):
+    divergente: bool
+
+
+class _Documento(BaseModel):
+    valor: float
+
+
+def test_acoes_declaradas_vao_ao_catalogo_com_saida_e_exemplo(monkeypatch):
+    publicados = []
+
+    async def publish(subject, message, msg_id=None):
+        publicados.append((subject, message, msg_id))
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-financeiro")
+    acao = Action("conferir_pedido", "Conferir com o pedido", "Compara o documento com o pedido", _Documento, _Conferencia,
+                  risk="leitura", example=_Conferencia(divergente=False))
+    asyncio.run(processes_module.processes.declare([acao]))
+    subject, catalogo, msg_id = publicados[0]
+    assert subject == "events.processos.catalogo" and msg_id.startswith("acoes-svc-financeiro-")
+    item = catalogo.actions[0]
+    assert (item.name, item.risk, item.output_fields, item.example) == (
+        "financeiro.conferir_pedido", "leitura", ["divergente"], {"divergente": False})
+    with pytest.raises(TypeError):
+        Action("x", "X", "Ação x", _Documento, _Conferencia, risk="leitura", example=_Documento(valor=1))
+    with pytest.raises(ValueError):
+        Action("Pagar-Boleto", "X", "Ação x", _Documento, _Conferencia, risk="leitura", example=_Conferencia(divergente=True))
+
+
+def test_implantar_no_camunda_devolve_a_versao_e_traduz_os_erros(monkeypatch):
+    pedidos = []
+
+    def motor(request):
+        pedidos.append(request)
+        if b"quebrado" in request.content:
+            return httpx.Response(400, json={"title": "INVALID_ARGUMENT", "detail": "Element 'x' has no outgoing flow"})
+        definicao = {"processDefinitionId": "p_acme_pagar", "processDefinitionKey": 2251799813685249, "processDefinitionVersion": 3}
+        return httpx.Response(200, json={"deploymentKey": "1", "deployments": [{"processDefinition": definicao}]})
+
+    async def cenario():
+        motor_falso = processes_module.Camunda()
+        motor_falso._client = httpx.AsyncClient(base_url="http://camunda:8080", transport=httpx.MockTransport(motor))
+        ok = await motor_falso.deploy("<bpmn/>", "p_acme_pagar")
+        with pytest.raises(ServiceError) as recusado:
+            await motor_falso.deploy("<quebrado/>", "p_acme_pagar")
+        await motor_falso.close()
+        return ok, recusado.value
+
+    ok, recusado = asyncio.run(cenario())
+    assert (ok.key, ok.version) == ("2251799813685249", 3) and pedidos[0].url.path == "/v2/deployments"
+    assert b'filename="p_acme_pagar.bpmn"' in pedidos[0].content
+    assert (recusado.code, recusado.status) == ("ERRO_PROCESSOS_BPMN", 422) and "no outgoing flow" in recusado.message
+
+
+def test_condicao_com_alternativas_vira_or_no_feel():
+    condicao = Condition(campo="ler.valor", operador=">", valor="parametros.limite",
+                         ou=[{"campo": "conferir.fornecedor_novo", "operador": "verdadeiro"}])
+    assert feel(condicao) == "=(ler.valor > parametros.limite) or (conferir.fornecedor_novo = true)"

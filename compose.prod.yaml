@@ -107,6 +107,9 @@ services:
   temporal:
     ports: !reset []
 
+  camunda:
+    ports: !reset []
+
   # Só no ambiente local: em produção o e-mail sai pelo SMTP_URL e a observabilidade pelo OTEL_EXPORTER_OTLP_ENDPOINT.
   mailpit:
     profiles: [local]

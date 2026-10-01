@@ -23,7 +23,7 @@ cogniventure/
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
 ├── vendor/                      # Pacotes da casa fora de índice público, como wheel (AgentExo: exovision-agent)
-├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, RustFS, Mailpit, Grafana, gateway e serviços
+├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, Camunda, SurrealDB, RustFS, Mailpit, Grafana, gateway e serviços
 ├── compose.prod.yaml            # Produção num host só, sobre o compose.yaml: HTTPS, frontend, NATS com senha (seção 9)
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
@@ -53,6 +53,7 @@ cogniventure/
 │   ├── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
 │   ├── plans.py                 # Módulos, planos e limites: o que cada organização usa, conferido pelo core (seção 5.17)
 │   ├── resources.py             # Cadastros declarados: CRUD, rotas, contrato e tela saem do schemas.py (seção 5.19)
+│   ├── processes.py             # Processos: ações dos pacotes, fluxo tipado, BPMN e o motor Camunda 8 (seção 5.20)
 │   ├── testing.py               # Kit de testes: o main.py do serviço em memória, pelas rotas (seção 5.5)
 │   └── telemetry.py             # Observabilidade: logs estruturados, trace ponta a ponta, métricas e /health (seção 5.18)
 │
@@ -184,6 +185,8 @@ Cada `services/svc-<service_name>/` contém apenas e unicamente:
 
 Novo passo de negócio = novo método público em `service.py` + uma chamada em `workflows.py`.
 
+Serviço que ainda não tem activities nem workflows (um pacote que só declara ações, seção 5.20) sobe sem worker: `runner.worker` conecta o cliente e sincroniza as agendas, e mais nada.
+
 ### 5.3 Ingress duplo
 
 | Entrada | Caminho | Natureza |
@@ -244,6 +247,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `plans.py` | `Module(título, descrição, category, limits, requires, core, default)`, `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(MODULE)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.enabled(módulo)`, `plans.limits()`, `plans.assign(plano, modules=)` (seção 5.17) |
 | `telemetry.py` | `install_telemetry(app, service, edge, health)`, `telemetry.counter(nome, descrição)`, `telemetry.histogram(nome, descrição)` (seção 5.18) |
 | `resources.py` | `Resource(SERVICE, nome, Campos, título, search, sort, filters, unique, columns, limit, write)`, `Fields`, `Money`, `Email`, `Phone`, `Text`, `resources.mount(app, RESOURCES)`, `resources.list/get/create/update/remove(recurso, ...)` (seção 5.19) |
+| `processes.py` | `Action(nome, título, descrição, Entrada, Saída, risk, example, connections)`, `processes.declare(ACTIONS)`, `Fluxo`, `Step`, `Flow`, `Condition`, `Trigger`, `to_bpmn(fluxo, process_id, name)`, `camunda.deploy(xml, process_id)` (seção 5.20) |
 | `testing.py` | `service_app(cenario)`: o `main.py` em memória, com `app.user(...)`, `app.published`, `app.live`, `app.handlers`, `app.respond(subject, função)` (seção 5.5) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
@@ -363,7 +367,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
 - **Listas:** `db.page` (seção 5.12) filtra a organização sozinho, como `create` e `select`.
-- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`), o de avisos (registro de e-mails e preferências de cada pessoa), o de webhooks (catálogo de eventos) e o de planos (catálogo de limites, planos e o plano de cada organização, no campo `org`).
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`), o de avisos (registro de e-mails e preferências de cada pessoa), o de webhooks (catálogo de eventos), o de processos (catálogo de ações que os pacotes declaram, seção 5.20) e o de planos (catálogo de limites, planos e o plano de cada organização, no campo `org`).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ### 5.10 Tempo real e streaming
@@ -621,6 +625,27 @@ const clientes = useResource(vendas.clientes);          // a tela: lista ao vivo
 - **Regra de negócio:** em `service.py`, com as mesmas operações do core: `await resources.get(CLIENTES, ResourceRef(id=...))`, `resources.update(CLIENTES, CLIENTES.update(id=..., status="inativo"))`, `resources.create(CLIENTES, Cliente(...))`, `resources.list(CLIENTES, CLIENTES.query(status="ativo"))`. Os modelos derivados têm o nome do modelo de campos: `ClienteItem` (o registro), `ClienteUpdate`, `ClienteQuery` e `ClientePage`, acessíveis por `CLIENTES.item`, `.update`, `.query` e `.page`. Ação nova (ex.: `POST /aprovar`) é uma rota comum: modelo de entrada em `schemas.py`, método em `service.py`, rota em `main.py` e no manifesto (`response: ClienteItem`). Para usar um modelo derivado como tipo (retorno do método, `response:` do manifesto), dê nome a ele no `schemas.py`: `ClienteItem = CLIENTES.item`.
 - **Tela:** `useResource` (`core/api.ts`) junta lista e ações; `ResourceList` (catálogo, Receitas) monta a lista com busca, filtros, ordem e páginas, a criação e a edição em painel lateral e a remoção com confirmação, tudo a partir de `meta`. Colunas próprias por `columns=`; ações por linha por `rowActions=`.
 
+### 5.20 Processos (`core/processes.py` e `svc-processos`)
+
+O processo do cliente BPO (briefing.md §5) é um fluxo tipado que o agente de desenho edita numa conversa; o core gera o BPMN e implanta no Camunda 8, que executa. Ninguém escreve BPMN nem FEEL.
+
+```python
+ACTIONS = [Action("conferir_pedido", "Conferir com o pedido", "Compara o documento com o pedido ou o contrato",
+                  Documento, Conferencia, risk="leitura", example=Conferencia(divergente=False))]
+await processes.declare(ACTIONS)                 # main.py do pacote, no lifespan: o catálogo vai ao svc-processos
+
+xml = to_bpmn(fluxo, process_id="p_acme_contas", name="Contas a pagar")   # só o svc-processos gera e implanta
+definicao = await camunda.deploy(xml, "p_acme_contas")                     # → Deployed(process_id, key, version)
+```
+
+- **Ações:** cada pacote (`svc-financeiro`, ...) declara o que oferece: `<serviço>.<nome>`, entrada, saída, risco (`leitura`, `escrita`, `externa`, `irreversivel`), exemplo de saída (conferido contra a saída na declaração; a simulação usa) e conexões que exige. O catálogo vai por `events.processos.catalogo` e o svc-processos guarda numa tabela compartilhada; o agente só usa o que está nele.
+- **Fluxo:** gatilho (evento, agenda, manual) e passos `acao`, `agente` (sempre com exceção para o staff), `tarefa` (pessoa decide: cliente ou staff), `decisao` (caminhos com condição e exatamente um padrão), `espera` (mensagem com chave, ou horas) e `fim`. Cada passo grava a saída sob o próprio id (`ler_documento.valor`); condição compara um campo ou um parâmetro (`parametros.limite_aprovacao`) com um valor ou outro parâmetro, e `ou` junta alternativas num caminho só.
+- **BPMN:** `to_bpmn` gera o XML com as extensões do Camunda (tipo do job `<serviço>.<ação>` ou `agentes.executar`, tarefas de usuário com grupo candidato, erro `handoff` que leva à tarefa do staff, mensagens com chave de correlação, timers) e o desenho (BPMN DI) que a tela mostra. Os parâmetros vão no BPMN, na saída do início: mudar um limite é uma versão nova no motor, e cada execução usa os valores da versão em que começou. Implantar o mesmo XML de novo devolve a mesma versão, então publicar sem mudança é recusado antes.
+- **Versões (svc-processos):** rascunho → publicada → arquivada. Publicar implanta e arquiva a anterior; ajustar uma publicada abre um rascunho novo copiado dela; execuções em andamento terminam na versão em que começaram (é o Camunda). O id no motor é `p_<organização>_<processo>`; a multi-tenancy do Camunda fica desligada no ambiente local.
+- **Agente de desenho:** só mexe no rascunho por operações tipadas (`adicionar_passo`, `alterar_passo`, `remover_passo`, `ligar`, `desligar`, `definir_gatilho`, `definir_parametro`, `simular`); cada uma devolve os problemas do fluxo, e `ligar` recusa na hora o que viraria erro. Se o agente diz que mudou sem chamar operação, ou deixa erros novos, o serviço pede de novo uma vez com o que faltou; se ainda faltar, a resposta diz a verdade. Até 20 alterações se desfazem.
+- **Simulação e validação:** no próprio modelo (sem motor): o caminho percorrido com os exemplos das ações e um cenário (valores, exceções, recusas), e os problemas em `erro` (impede publicar) ou `aviso` (ex.: ação irreversível sem aprovação do cliente antes em todo caminho).
+- **Motor:** o Camunda 8 roda no compose (perfil `processos`), com a API REST v2 só na rede interna (`CAMUNDA_URL`). Em produção o Camunda 8 Self-Managed exige licença Enterprise: decisão antes do primeiro cliente (briefing.md §5.2).
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -661,7 +686,7 @@ export default function Faturas() {
 ```
 
 - **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes`, `ia`, `webhooks` e `plano`, mais o sino de avisos na barra superior (seção 5.15). A tela inicial é o `workspace`: a jornada do cliente (briefing.md §3), que cada módulo de negócio completa.
-- **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
+- **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist, tokens claro/escuro e o CSS de bibliotecas de desenho, como o do bpmn-js, importado nele), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
 ```bash
 cd frontend

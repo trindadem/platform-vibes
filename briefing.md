@@ -94,7 +94,9 @@ execução e não exportamos BPMN: o processo publicado **é** um BPMN implantad
 - **Telas são nossas.** Cliente e staff não usam Operate, Tasklist nem Web Modeler: tudo passa pelas nossas telas,
   pela API REST do Orchestration Cluster. O Operate fica para o time interno depurar.
 - **Organização = tenant do Camunda.** Cada processo é implantado e iniciado com o tenant da organização. O worker lê
-  o tenant do job e age como aquela organização (mesmo isolamento do README §5.9).
+  o tenant do job e age como aquela organização (mesmo isolamento do README §5.9). No ambiente local (N3), a
+  multi-tenancy do Camunda fica desligada e a organização vai no id do processo (`p_<organização>_<processo>`); ligar
+  o tenant entra com a decisão da licença (seção 5.2), já que ela pede identidade (Keycloak ou OIDC) no motor.
 - **Camunda e Temporal têm papéis diferentes.** Camunda é o processo do cliente: o que aparece no diagrama, tem
   versão e tem tarefa humana. Temporal continua sendo a durabilidade interna de um serviço (convite, ingestão de
   documento, entrega de webhook). Uma ação pode usar Temporal por dentro; o diagrama não vê isso.
@@ -102,7 +104,8 @@ execução e não exportamos BPMN: o processo publicado **é** um BPMN implantad
   estado e no armazenamento secundário. O documento, o CPF e o extrato ficam no nosso serviço (SurrealDB e
   armazenamento, isolados por organização); a variável leva `documento_id`, `valor`, `aprovado`.
 - **Python:** os workers usam o SDK oficial (`camunda-orchestration-sdk`, assíncrono, API REST do 8.8+).
-- **Local:** Camunda no `compose.yaml` com armazenamento secundário em banco relacional (sem Elasticsearch).
+- **Local:** Camunda no `compose.yaml` com armazenamento secundário em banco relacional (H2 embutido; sem
+  Elasticsearch).
 
 ### 5.2 Licença: decisão antes de produção
 
@@ -140,30 +143,41 @@ estruturado do que escrevendo código.
 A saída de cada passo fica sob o id dele (`ler_documento.valor`). Como toda ação e todo agente declaram a saída, o
 validador sabe que campos existem e recusa condição que aponta para campo inexistente.
 
+No N3: condição com alternativas (`ou`), para "acima do limite **ou** fornecedor novo" num caminho só; regras do
+cliente (limites, prazos) são parâmetros, gravados no próprio BPMN (na saída do início), então mudar um limite é uma
+versão nova e cada execução usa o valor da versão em que começou. Paralelo e subprocesso ficam para o N7, quando um
+modelo da biblioteca pedir.
+
 ### 5.4 O diálogo que desenha o processo
 
 - **Tela dividida, como no Lovable:** a conversa com o agente de processos de um lado, o diagrama do outro
   (renderizado com bpmn-js a partir do BPMN compilado do rascunho).
-- **O agente edita por operações tipadas**, que são as ferramentas dele:
-  `adicionar_passo`, `ligar`, `remover_passo`, `renomear`, `definir_gatilho`, `definir_condicao`,
-  `definir_excecao`, `definir_parametro`, `simular`.
-- **Cada operação é conferida na hora** e o diagrama muda. Recusa, com o motivo para o agente corrigir:
+- **O agente edita por operações tipadas**, que são as ferramentas dele: `adicionar_passo`, `alterar_passo`
+  (renomear, exceção, responsável), `remover_passo`, `ligar` (com a condição do caminho), `desligar`,
+  `definir_gatilho`, `definir_parametro`, `simular`.
+- **Cada operação é conferida na hora** e o diagrama muda. A operação devolve os problemas do fluxo (`erro` impede
+  publicar, `aviso` não); `ligar` recusa na hora o que viraria erro (condição fora de decisão, segundo caminho de um
+  passo comum). No N3, os problemas conferidos:
   - passo sem saída ou caminho que não chega ao fim;
   - decisão sem caminho padrão;
-  - ação de pacote fora do plano da organização, ou que exige integração não conectada;
+  - ação fora do catálogo; ação que exige integração (aviso até o N4 conectar; plano da organização no N6);
   - passo de agente sem exceção (todo agente tem um caminho de handoff);
   - ação irreversível (pagar, enviar, assinar) sem aprovação antes, quando a política da organização pede.
 - **O agente sabe do que está falando:** consulta o conhecimento da empresa, o catálogo de ações, integrações e
   agentes, e os modelos da biblioteca. Sugere passos ("seu fornecedor manda NF por e-mail; ligo a caixa de entrada?").
-- **Cada operação fica no histórico do rascunho** (desfazer, e saber quem mudou o quê: cliente, staff ou agente).
-- **Simular antes de publicar:** o rascunho é implantado num tenant de simulação da organização, com as ações em modo
-  de simulação (devolvem as saídas de exemplo do catálogo, nada sai para fora). O caminho percorrido aparece no
-  diagrama.
+- **Cada operação fica no histórico do rascunho** (desfazer, até 20; quem mudou o quê entra com o staff no N5).
+- **O agente não pode dizer que mudou sem mudar:** se a resposta afirma uma mudança e nenhuma operação foi aplicada,
+  ou se ficaram erros novos, o serviço pede de novo uma vez com o que faltou; se ainda faltar, a resposta ao cliente
+  diz a verdade. Achado do N3 com o modelo real.
+- **Simular antes de publicar:** no próprio modelo, sem motor: as ações devolvem as saídas de exemplo do catálogo, o
+  cenário muda valores, exceções e recusas, e o caminho percorrido aparece no diagrama. Mais rápido e sem nada no
+  Camunda; o tenant de simulação no motor fica para quando o N4 precisar testar os workers de verdade.
 
 ### 5.5 Versões
 
 - **Rascunho → revisão pelo staff (opcional) → publicada.** A revisão é obrigatória quando a versão traz ação
-  irreversível nova ou integração nova, ou quando o cliente pede.
+  irreversível nova ou integração nova, ou quando o cliente pede. No N3 o serviço já marca a versão que exigiria
+  revisão; o passo de revisão entra com o staff, no N5.
 - **Publicar implanta no Camunda** e grava o número da versão do Camunda na nossa versão.
 - **Ajustar no setup cria um rascunho novo** a partir da publicada. As execuções em andamento terminam na versão em
   que começaram (comportamento nativo do Camunda); as novas usam a última publicada.

@@ -48,7 +48,14 @@ function passos(r: ConhecimentoResumo | null, p: ProcessosResumo | null): Journe
       to: "/processos",
       action: p?.sugeridos ? "Ver sugestões" : aceitos ? "Abrir" : "Descobrir",
     },
-    { title: "Desenho dos processos", description: "Cada processo é desenhado numa conversa, com o fluxo aparecendo ao lado.", status: "later" },
+    {
+      title: "Desenho dos processos",
+      description: "Cada processo aceito é desenhado numa conversa, com o fluxo aparecendo ao lado, e publicado no motor.",
+      status: aceitos === 0 ? "todo" : (p?.publicados ?? 0) > 0 ? "done" : "current",
+      detail: p && aceitos ? `${p.publicados} de ${aceitos} publicados` : undefined,
+      to: "/processos#aceitos",
+      action: "Desenhar",
+    },
     { title: "Acompanhamento", description: "Os processos rodando, o que espera por você e quanto cada um roda sozinho.", status: "later" },
   ];
 }

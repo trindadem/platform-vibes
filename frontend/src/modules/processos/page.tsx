@@ -134,7 +134,12 @@ function Lista({ itens, pode, vazio }: { itens: ProcessosProcesso[]; pode: boole
                       Recusar
                     </Button>
                   )}
-                  {p.status === "aceito" && <Badge>Desenho em breve</Badge>}
+                  {p.status === "aceito" && (
+                    <Button size="sm" to={`/processos/${p.id}`}>
+                      {p.publicada ? "Abrir desenho" : "Desenhar"}
+                    </Button>
+                  )}
+                  {p.publicada && <Badge tone="success">Publicado · versão {p.publicada}</Badge>}
                 </>
               )
             }

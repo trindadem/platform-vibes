@@ -48,7 +48,7 @@ x-service: &service
     STORAGE_CORS_ORIGINS: ${STORAGE_CORS_ORIGINS:-${CORS_ORIGINS:-}}
     # Módulos de negócio instalados (README §9): vazio = todos. O svc-plans só lista estes.
     MODULES: ${MODULES:-}
-  depends_on:
+  depends_on: &service-deps
     nats: { condition: service_healthy }
     surreal-init: { condition: service_completed_successfully }
     temporal: { condition: service_healthy }
@@ -67,6 +67,7 @@ volumes:
   surreal-data:
   temporal-data:
   storage-data:
+  camunda-data:
 
 services:
   traefik:
@@ -181,6 +182,27 @@ services:
       retries: 40
     restart: unless-stopped
 
+  # Motor de processos BPMN (briefing.md §5): Camunda 8, com o armazenamento secundário em H2 dentro do volume. A API
+  # fica só na rede interna (o svc-processos é o único cliente); 127.0.0.1:8082 é para depurar. Licença: livre em
+  # desenvolvimento e teste; produção self-managed exige licença Enterprise (briefing.md §5.2).
+  camunda:
+    image: camunda/camunda:8.10.0
+    profiles: [modules, processos]
+    environment:
+      CAMUNDA_DATA_SECONDARYSTORAGE_TYPE: rdbms
+      CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_URL: jdbc:h2:file:/usr/local/camunda/data/camunda-h2;DB_CLOSE_ON_EXIT=FALSE
+      CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_USERNAME: sa
+      CAMUNDA_SECURITY_AUTHENTICATION_UNPROTECTEDAPI: "true"
+      CAMUNDA_SECURITY_AUTHORIZATIONS_ENABLED: "false"
+      JAVA_TOOL_OPTIONS: -Xmx1g
+    ports: ["127.0.0.1:8082:8080"]
+    volumes: ["camunda-data:/usr/local/camunda/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/v2/topology"]
+      interval: 5s
+      retries: 40
+    restart: unless-stopped
+
   # Armazenamento compatível com S3 (README §5.14). O navegador envia e baixa direto daqui (localhost:9000), sempre
   # por link assinado pelo serviço; em produção, troque pelo S3/R2/B2 (STORAGE_URL e credenciais).
   storage:
@@ -277,5 +299,15 @@ services:
     profiles: [modules, processos]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
     environment:
       <<: *service-env
-      # Modelo dos agentes de descoberta e descrição, como cadastrado no svc-ai (specs/processos.md §3).
+      # Modelo dos agentes de descoberta, descrição e desenho, como cadastrado no svc-ai (specs/processos.md §3).
       PROCESSOS_MODEL: ${PROCESSOS_MODEL:-cv/agente}
+      PROCESSOS_DESENHO_MODEL: ${PROCESSOS_DESENHO_MODEL:-cv/desenho}  # edita o fluxo: pede um modelo mais forte
+      CAMUNDA_URL: http://camunda:8080  # só o svc-processos fala com o motor (core/processes.py)
+    depends_on:
+      <<: *service-deps
+      camunda: { condition: service_healthy }
+
+  svc-financeiro:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: financeiro } }
+    profiles: [modules, financeiro]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
