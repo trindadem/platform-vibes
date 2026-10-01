@@ -256,7 +256,26 @@ export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOpt
   }, [key, version]);
 
   const reload = useCallback(() => setVersion((v) => v + 1), []);
+  useEffect(() => {
+    const reloads = openQueries.get(fn) ?? new Set();
+    reloads.add(reload);
+    openQueries.set(fn, reloads);
+    return () => {
+      reloads.delete(reload);
+      if (!reloads.size) openQueries.delete(fn);
+    };
+  }, [fn, reload]);
   return { ...state, reload };
+}
+
+const openQueries = new Map<unknown, Set<() => void>>();
+
+/**
+ * Busca de novo toda consulta aberta (useQuery, useListQuery, useLiveQuery) feita com esta função de contracts.ts,
+ * em qualquer parte da tela. Uso: useAction(notify.readAll, { onSuccess: () => refresh(notify.unread) }).
+ */
+export function refresh(fn: (...args: never[]) => Promise<unknown>): void {
+  openQueries.get(fn)?.forEach((reload) => reload());
 }
 
 /** Monta a query string de uma rota GET de lista: vazio, null e undefined ficam de fora; lista repete a chave. */

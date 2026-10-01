@@ -56,6 +56,25 @@ endpoints:
     target_type: http
     target_url: http://svc-identity:8000/invite-info
 
+  # Senha esquecida: o link vai por e-mail (README §5.15). A resposta nunca diz se o e-mail tem conta.
+  - path: /password/forgot
+    name: forgotPassword
+    method: POST
+    auth: public
+    request: ForgotInput
+    response: Empty
+    target_type: http
+    target_url: http://svc-identity:8000/password/forgot
+
+  - path: /password/reset
+    name: resetPassword
+    method: POST
+    auth: public
+    request: ResetInput
+    response: Empty
+    target_type: http
+    target_url: http://svc-identity:8000/password/reset
+
   # Com token.
   - path: /me
     method: GET

@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
+from core.notify import CONTACTS_SUBJECT, Contact, Contacts, ContactsRequest  # avisos (README §5.15): contrato do core
 from core.storage import IMAGES, KeepRequest, Upload, UploadRequest  # arquivos (README §5.14): contrato do core
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -23,16 +24,21 @@ TENANTS = "identity_tenants"
 MEMBERSHIPS = "identity_memberships"
 INVITES = "identity_invites"
 SESSIONS = "identity_sessions"
-SHARED_TABLES = [USERS, TENANTS, MEMBERSHIPS, INVITES, SESSIONS]
-UNIQUE = {USERS: ["email"], MEMBERSHIPS: ["user", "tenant"], INVITES: ["code_hash"], SESSIONS: ["token_hash"]}
+RESETS = "identity_resets"
+SHARED_TABLES = [USERS, TENANTS, MEMBERSHIPS, INVITES, SESSIONS, RESETS]
+UNIQUE = {
+    USERS: ["email"], MEMBERSHIPS: ["user", "tenant"], INVITES: ["code_hash"], SESSIONS: ["token_hash"], RESETS: ["code_hash"],
+}
 
 REFRESH_COOKIE = "cv_refresh"
 COOKIE_PATH = "/api/v1/identity"
-PUBLIC_PATHS = ("/signup", "/login", "/refresh", "/logout", "/invite-info")
+PUBLIC_PATHS = ("/signup", "/login", "/refresh", "/logout", "/invite-info", "/password/forgot", "/password/reset")
 MAX_FAILED_LOGINS = 5
 LOCK_MINUTES = 15
 REUSE_GRACE_SECONDS = 30
 INVITE_DAYS = 7
+RESET_MINUTES = 30  # validade do link de redefinir senha
+MAX_RESETS_PER_HOUR = 3  # por pessoa: mais pedidos que isso são ignorados em silêncio
 
 Role = Literal["owner", "admin", "member"]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=80)]
@@ -89,6 +95,16 @@ class TenantInput(_Input):
 
 class InviteInput(_Input):
     role: Literal["admin", "member"] = Field("member", description="Papel de quem aceitar o convite")
+    email: Email | None = Field(None, description="Se informado, o convite também vai por e-mail para este endereço")
+
+
+class ForgotInput(_Input):
+    email: Email = Field(..., description="E-mail da conta")
+
+
+class ResetInput(_Input):
+    code: Code = Field(..., description="Código do link recebido por e-mail")
+    password: Password = Field(..., description="Senha nova (mínimo de 8 caracteres)")
 
 
 class InviteCode(_Input):
@@ -164,6 +180,7 @@ class Invite(BaseModel):
     code: str = Field(..., description="Código para o link de convite (mostrado uma única vez)")
     role: Role
     expires_at: datetime
+    email: str | None = Field(None, description="Para quem o convite foi enviado por e-mail")
 
 
 class InviteInfo(BaseModel):
@@ -208,6 +225,7 @@ class AccessChanged(BaseModel):
 class Cleaned(BaseModel):
     sessions: int
     invites: int
+    resets: int = 0
 
 
 # ── Organização: nome e logo (arquivos, README §5.14) ─────────────────────────

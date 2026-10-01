@@ -31,12 +31,13 @@ export default function Membros() {
   return (
     <Page title="Membros" description={`Quem participa de ${session?.tenant?.name ?? "sua organização"}.`}>
       {gerencia && (
-        <Card title="Convidar" description="Gere um link e envie para a pessoa. Cada link vale por 7 dias e para uma pessoa.">
+        <Card title="Convidar" description="Gere um link para uma pessoa (vale por 7 dias). Com o e-mail, o convite já vai para a caixa dela.">
           <ActionForm
             action={convidar}
             submitLabel="Gerar link"
             initial={{ role: "member" }}
             fields={[
+              { name: "email", label: "E-mail da pessoa", kind: "email", hint: "Opcional: sem ele, copie o link e envie você mesmo.", autoComplete: "off" },
               {
                 name: "role",
                 label: "Papel",
@@ -49,6 +50,7 @@ export default function Membros() {
               },
             ]}
           />
+          {convidar.result?.email && <Alert tone="success">Convite enviado para {convidar.result.email}.</Alert>}
           {convidar.result && <CopyField label="Link do convite" value={inviteLink(convidar.result.code)} hint="Ele só aparece agora: copie antes de sair." />}
         </Card>
       )}

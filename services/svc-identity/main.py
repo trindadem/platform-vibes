@@ -21,6 +21,7 @@ from core.surreal import db
 from core.temporal_runner import runner
 
 from schemas import (
+    CONTACTS_SUBJECT,
     COOKIE_PATH,
     PUBLIC_PATHS,
     REFRESH_COOKIE,
@@ -29,7 +30,9 @@ from schemas import (
     TASK_QUEUE,
     TRIGGER_SUBJECT,
     UNIQUE,
+    ContactsRequest,
     Empty,
+    ForgotInput,
     InviteCode,
     InviteInput,
     JoinRequest,
@@ -37,6 +40,7 @@ from schemas import (
     LoginInput,
     MemberRef,
     RefreshInput,
+    ResetInput,
     Session,
     SignupInput,
     SwitchInput,
@@ -66,6 +70,7 @@ async def lifespan(app: FastAPI):
     ):
         await storage.connected(SERVICE)  # logo da organização (README §5.14)
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
+        await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
         yield
 
 
@@ -127,6 +132,16 @@ async def logout(data: Empty, response: Response, refresh_token: RefreshCookie =
 @app.post("/invite-info", response_model=ResponseEnvelope)
 async def invite_info(data: InviteCode) -> ResponseEnvelope:
     return _ok(await svc.invite_info(data))
+
+
+@app.post("/password/forgot", response_model=ResponseEnvelope)
+async def forgot_password(data: ForgotInput) -> ResponseEnvelope:
+    return _ok(await svc.forgot_password(data))
+
+
+@app.post("/password/reset", response_model=ResponseEnvelope)
+async def reset_password(data: ResetInput) -> ResponseEnvelope:
+    return _ok(await svc.reset_password(data))
 
 
 # ── Com token ───────────────────────────────────────────────────────────────

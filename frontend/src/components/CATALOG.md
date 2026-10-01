@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (42)
+## Índice (43)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -69,8 +69,9 @@
 
 **Aplicação**: moldura e sessão (usados pelo App.tsx, não pelas páginas)
 
-- [AppShell](#appshell): Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, aside?, switcher?`
+- [AppShell](#appshell): Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, aside?, switcher?, actions?`
 - [AuthShell](#authshell): Moldura das telas abertas (entrar, cadastro, convite): marca no topo e conteúdo numa coluna estreita e centralizada. `brand, children`
+- [NotificationBell](#notificationbell): Sino da barra superior com a quantidade de avisos não lidos; leva à lista de avisos. `count, to?`
 - [SessionStatus](#sessionstatus): Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão. `user, onSignOut, detail?`
 - [TenantSwitcher](#tenantswitcher): Seletor da organização ativa no topo do menu lateral, com a opção de criar outra. `tenants, current, onSwitch, onCreate?`
 
@@ -750,6 +751,7 @@ Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a t
 - `nav`: `{ to: string; label: string }[]`: Itens do menu: { to: "/rota", label: "Texto" }.
 - `aside?`: `ReactNode`: Conteúdo no pé do menu lateral (ex.: SessionStatus).
 - `switcher?`: `ReactNode`: Seletor no topo do menu, abaixo da marca (ex.: TenantSwitcher).
+- `actions?`: `ReactNode`: Ações à direita da barra superior (ex.: NotificationBell).
 - `children`: `ReactNode`
 
 ---
@@ -766,6 +768,19 @@ Moldura das telas abertas (entrar, cadastro, convite): marca no topo e conteúdo
 
 - `brand`: `string`: Nome exibido acima do conteúdo.
 - `children`: `ReactNode`
+
+---
+
+## NotificationBell
+
+Sino da barra superior com a quantidade de avisos não lidos; leva à lista de avisos. _(Aplicação)_
+
+```tsx
+<NotificationBell count={3} />
+```
+
+- `count`: `number`: Avisos não lidos; 0 esconde o número.
+- `to?`: `string`: Rota da lista de avisos. Padrão: /notificacoes.
 
 ---
 

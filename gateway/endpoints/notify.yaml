@@ -1,0 +1,56 @@
+# svc-notify · rotas públicas no Gateway. Fonte da verdade: specs/notify.md §2
+service: notify
+base_path: /api/v1/notify
+
+# Eventos ao vivo que o serviço emite (bus.live): viram tipos no frontend (useLive / useLiveQuery).
+live:
+  - topic: nova                     # só para a pessoa avisada
+    model: Notification
+
+endpoints:
+  - path: /items
+    method: GET
+    auth: client_jwt
+    query: NotificationQuery
+    response: NotificationPage
+    target_type: http
+    target_url: http://svc-notify:8000/items
+
+  - path: /unread
+    method: GET
+    auth: client_jwt
+    response: Unread
+    target_type: http
+    target_url: http://svc-notify:8000/unread
+
+  - path: /read
+    method: POST
+    auth: client_jwt
+    request: ReadRequest
+    response: Unread
+    target_type: http
+    target_url: http://svc-notify:8000/read
+
+  - path: /read-all
+    name: readAll
+    method: POST
+    auth: client_jwt
+    response: Unread
+    target_type: http
+    target_url: http://svc-notify:8000/read-all
+
+  - path: /preferences
+    method: GET
+    auth: client_jwt
+    response: Preferences
+    target_type: http
+    target_url: http://svc-notify:8000/preferences
+
+  - path: /preferences
+    name: setPreferences
+    method: POST
+    auth: client_jwt
+    request: Preferences
+    response: Preferences
+    target_type: http
+    target_url: http://svc-notify:8000/preferences

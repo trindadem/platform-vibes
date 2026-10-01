@@ -26,6 +26,8 @@ export interface AppShellProps {
   aside?: ReactNode;
   /** Seletor no topo do menu, abaixo da marca (ex.: TenantSwitcher). */
   switcher?: ReactNode;
+  /** Ações à direita da barra superior (ex.: NotificationBell). */
+  actions?: ReactNode;
   children: ReactNode;
 }
 
@@ -38,7 +40,7 @@ export interface AppShellProps {
  *   <Text>Conteúdo</Text>
  * </AppShell>
  */
-export function AppShell({ brand, nav, aside, switcher, children }: AppShellProps) {
+export function AppShell({ brand, nav, aside, switcher, actions, children }: AppShellProps) {
   const { pathname } = useLocation();
   const current = nav.find((item) => pathname.startsWith(item.to));
   return (
@@ -73,6 +75,7 @@ export function AppShell({ brand, nav, aside, switcher, children }: AppShellProp
           <SidebarTrigger className="-ml-1" aria-label="Abrir ou fechar o menu" />
           <Separator orientation="vertical" className="mx-1 data-[orientation=vertical]:h-4" />
           <span className="truncate text-sm font-medium">{current?.label ?? brand}</span>
+          {actions && <div className="ml-auto flex items-center gap-1">{actions}</div>}
         </header>
         <div className="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6">{children}</div>
       </SidebarInset>

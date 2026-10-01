@@ -12,10 +12,13 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation, useNavigat
 import { AppShell } from "@/components/AppShell";
 import { AuthShell } from "@/components/AuthShell";
 import { EmptyState } from "@/components/EmptyState";
+import { NotificationBell } from "@/components/NotificationBell";
 import { SessionStatus } from "@/components/SessionStatus";
 import { Spinner } from "@/components/Spinner";
 import { TenantSwitcher } from "@/components/TenantSwitcher";
+import { useLiveQuery } from "@/core/api";
 import { logout, switchTenant, useAuthState } from "@/core/auth";
+import { notify } from "@/core/contracts";
 
 const BRAND = "CV-Frame";
 const LOGIN = "/entrar";
@@ -91,6 +94,7 @@ function PrivateShell() {
   }
   return (
     <AppShell
+      actions={session.tenant && <UnreadBell key={session.tenant.id} />}
       brand={BRAND}
       nav={privatePages.map(({ path, meta }) => ({ to: path, label: meta.title }))}
       switcher={
@@ -106,6 +110,12 @@ function PrivateShell() {
       <Outlet />
     </AppShell>
   );
+}
+
+/** Sino com os avisos não lidos da organização ativa: conta de novo a cada aviso ao vivo (notify.nova). */
+function UnreadBell() {
+  const unread = useLiveQuery("notify.nova", notify.unread);
+  return <NotificationBell count={unread.data?.count ?? 0} />;
 }
 
 /** Login e cadastro só fazem sentido sem sessão: quem já entrou segue para ?next= (só rotas internas) ou o início. */

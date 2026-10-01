@@ -17,6 +17,7 @@ from core import security
 from core import storage as storage_module
 from core.envelope import ServiceError
 from core.security import acting_as
+from core.notify import SEND_SUBJECT, ContactsRequest
 from core.storage import KeepRequest, UploadRequest
 
 import service
@@ -26,12 +27,14 @@ from schemas import (
     TENANT_CREATED_SUBJECT,
     UNIQUE,
     Empty,
+    ForgotInput,
     InviteCode,
     InviteInput,
     JoinRequest,
     LoginInput,
     MemberRef,
     RefreshInput,
+    ResetInput,
     SignupInput,
     SwitchRequest,
     TenantRequest,
@@ -59,6 +62,7 @@ def events(monkeypatch):
 
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
+    monkeypatch.setattr(service.bus, "_service", "svc-identity")  # core/notify diz quem pede
     yield published
     _clear()
 
@@ -393,3 +397,89 @@ def test_logo_enviado_trocado_e_removido_so_por_quem_gerencia(events, bucket):
     _error(foreign_key, "ERRO_FILE_NOT_FOUND", 404)
     _error(wrong_type, "ERRO_FILE_TYPE", 422)
     assert removed.logo_url is None and not [k for k in _stored(bucket) if k.startswith("t/")]
+
+
+# ── Avisos e e-mail (README §5.15) ──────────────────────────────────────────
+
+def _notices(events):
+    """Pedidos ao svc-notify publicados pelo core/notify (events.notify.send)."""
+    return [m for subject, m, _ in events if subject == SEND_SUBJECT]
+
+
+def _code_from(notice):
+    return notice.link.partition("codigo=")[2]
+
+
+def test_contatos_so_da_organizacao_de_quem_pergunta(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, ana), name="Bia")
+        caio = await signup(svc, email="caio@x.com", organization="Beta", name="Caio")
+        with as_user(ana):
+            by_id = await svc.contacts(ContactsRequest(users=[bia.auth.user.id, caio.auth.user.id]))
+            owners = await svc.contacts(ContactsRequest(roles=["owner"]))
+        return by_id, owners
+
+    by_id, owners = run(scenario)
+    assert by_id.tenant_name == "Acme"
+    assert [(c.name, c.email) for c in by_id.items] == [("Bia", "bia@x.com")]  # Caio é de outra organização
+    assert [c.email for c in owners.items] == ["ana@acme.com"]
+
+
+def test_convite_por_email_e_aviso_para_quem_convidou(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        with as_user(ana):
+            invite = await svc.create_invite(InviteInput(role="admin", email="Bia@X.com"))
+        sent = _notices(events)[-1]
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=_code_from(sent), name="Bia Souza")
+        return ana, invite, sent, bia
+
+    ana, invite, sent, bia = run(scenario)
+    assert invite.email == "bia@x.com"
+    assert (sent.email, sent.title, sent.action) == ("bia@x.com", "Convite para Acme", "Ver convite")
+    assert "Ana convidou você para participar de Acme como administrador." in sent.body
+    assert sent.link == f"/convite?codigo={invite.code}"
+    joined = _notices(events)[-1]
+    assert (joined.users, joined.title, joined.link) == ([ana.auth.user.id], "Bia Souza entrou na organização", "/membros")
+    assert bia.auth.tenant.roles == ["admin"]
+
+
+def test_esqueci_a_senha_nao_revela_quem_tem_conta_e_limita_pedidos(events):
+    async def scenario(svc):
+        await signup(svc)
+        unknown = await svc.forgot_password(ForgotInput(email="ninguem@x.com"))
+        for _ in range(5):
+            await svc.forgot_password(ForgotInput(email="ANA@acme.com"))
+        return unknown
+
+    unknown = run(scenario)
+    sent = _notices(events)
+    assert unknown.model_dump() == {}  # mesma resposta para quem não tem conta
+    assert len(sent) == 3  # MAX_RESETS_PER_HOUR: o resto é ignorado em silêncio
+    assert {(n.email, n.title, n.action) for n in sent} == {("ana@acme.com", "Redefinir sua senha", "Redefinir senha")}
+    assert all(n.link.startswith("/redefinir-senha?codigo=") for n in sent)
+
+
+def test_redefinir_a_senha_derruba_as_sessoes_e_o_link_vale_uma_vez(events):
+    async def scenario(svc):
+        session = await signup(svc)
+        await svc.forgot_password(ForgotInput(email="ana@acme.com"))
+        code = _code_from(_notices(events)[-1])
+        await svc.reset_password(ResetInput(code=code, password="nova-senha-forte"))
+        with pytest.raises(ServiceError) as reused:
+            await svc.reset_password(ResetInput(code=code, password="outra-senha-forte"))
+        with pytest.raises(ServiceError) as old_session:
+            await svc.refresh(RefreshInput(refresh_token=session.refresh_token))
+        with pytest.raises(ServiceError) as old_password:
+            await svc.login(LoginInput(email="ana@acme.com", password=PASSWORD))
+        relogged = await svc.login(LoginInput(email="ana@acme.com", password="nova-senha-forte"))
+        return reused, old_session, old_password, relogged
+
+    reused, old_session, old_password, relogged = run(scenario)
+    _error(reused, "ERRO_IDENTITY_RESET_INVALID", 404)
+    _error(old_session, "ERRO_IDENTITY_INVALID_SESSION", 401)
+    _error(old_password, "ERRO_IDENTITY_INVALID_CREDENTIALS", 401)
+    assert relogged.auth.user.email == "ana@acme.com"
+    changed = _notices(events)[-1]
+    assert (changed.email, changed.title) == ("ana@acme.com", "Sua senha foi alterada")

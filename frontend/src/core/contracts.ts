@@ -232,6 +232,18 @@ export interface IdentityInviteInfo {
   expires_at: string;
 }
 
+export interface IdentityForgotInput {
+  /** E-mail da conta */
+  email: string;
+}
+
+export interface IdentityResetInput {
+  /** Código do link recebido por e-mail */
+  code: string;
+  /** Senha nova (mínimo de 8 caracteres) */
+  password: string;
+}
+
 export interface IdentityMe {
   user: IdentityUser;
   tenant: string | null;
@@ -251,6 +263,8 @@ export interface IdentityTenantInput {
 export interface IdentityInviteInput {
   /** Papel de quem aceitar o convite */
   role?: "admin" | "member";
+  /** Se informado, o convite também vai por e-mail para este endereço */
+  email?: string | null;
 }
 
 export interface IdentityInvite {
@@ -258,6 +272,8 @@ export interface IdentityInvite {
   code: string;
   role: "owner" | "admin" | "member";
   expires_at: string;
+  /** Para quem o convite foi enviado por e-mail */
+  email: string | null;
 }
 
 export interface IdentityMember {
@@ -335,6 +351,12 @@ export const identity = {
   /** POST /api/v1/identity/invite-info · http · pública */
   inviteInfo: (body: IdentityInviteCode, options?: RequestOptions) =>
     request<IdentityInviteInfo>("POST", "/api/v1/identity/invite-info", body, options),
+  /** POST /api/v1/identity/password/forgot · http · pública */
+  forgotPassword: (body: IdentityForgotInput, options?: RequestOptions) =>
+    request<IdentityEmpty>("POST", "/api/v1/identity/password/forgot", body, options),
+  /** POST /api/v1/identity/password/reset · http · pública */
+  resetPassword: (body: IdentityResetInput, options?: RequestOptions) =>
+    request<IdentityEmpty>("POST", "/api/v1/identity/password/reset", body, options),
   /** GET /api/v1/identity/me · http · exige token */
   me: (options?: RequestOptions) =>
     request<IdentityMe>("GET", "/api/v1/identity/me", undefined, options),
@@ -370,6 +392,76 @@ export const identity = {
     request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo/remove", body, options),
 };
 
+export interface NotifyNotification {
+  id: string;
+  title: string;
+  body: string;
+  link: string | null;
+  action: string | null;
+  /** Serviço que avisou (svc-...) */
+  service: string;
+  read: boolean;
+  created_at: string;
+}
+
+export interface NotifyNotificationPage {
+  items: NotifyNotification[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface NotifyNotificationQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  /** false: só os não lidos */
+  read?: boolean | null;
+}
+
+export interface NotifyUnread {
+  count: number;
+}
+
+export interface NotifyReadRequest {
+  ids: string[];
+}
+
+export interface NotifyPreferences {
+  /** Receber os avisos também por e-mail (os de segurança sempre chegam) */
+  email: boolean;
+}
+
+/** svc-notify · /api/v1/notify */
+export const notify = {
+  /** GET /api/v1/notify/items · http · exige token */
+  items: (query?: NotifyNotificationQuery, options?: RequestOptions) =>
+    request<NotifyNotificationPage>("GET", withQuery("/api/v1/notify/items", query), undefined, options),
+  /** GET /api/v1/notify/unread · http · exige token */
+  unread: (options?: RequestOptions) =>
+    request<NotifyUnread>("GET", "/api/v1/notify/unread", undefined, options),
+  /** POST /api/v1/notify/read · http · exige token */
+  read: (body: NotifyReadRequest, options?: RequestOptions) =>
+    request<NotifyUnread>("POST", "/api/v1/notify/read", body, options),
+  /** POST /api/v1/notify/read-all · http · exige token */
+  readAll: (body: unknown, options?: RequestOptions) =>
+    request<NotifyUnread>("POST", "/api/v1/notify/read-all", body, options),
+  /** GET /api/v1/notify/preferences · http · exige token */
+  preferences: (options?: RequestOptions) =>
+    request<NotifyPreferences>("GET", "/api/v1/notify/preferences", undefined, options),
+  /** POST /api/v1/notify/preferences · http · exige token */
+  setPreferences: (body: NotifyPreferences, options?: RequestOptions) =>
+    request<NotifyPreferences>("POST", "/api/v1/notify/preferences", body, options),
+};
+
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
 export interface LiveTopics {
   /** svc-ai · bus.live("ai.uso", ...) */
@@ -378,4 +470,6 @@ export interface LiveTopics {
   "identity.membros": IdentityMembersChanged;
   /** svc-identity · bus.live("identity.acesso", ...) */
   "identity.acesso": IdentityAccessChanged;
+  /** svc-notify · bus.live("notify.nova", ...) */
+  "notify.nova": NotifyNotification;
 }

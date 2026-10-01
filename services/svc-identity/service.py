@@ -16,15 +16,18 @@ from surrealdb import RecordID
 from core.envelope import ServiceError
 from core.nats_bus import bus
 from core.security import (
+    SYSTEM_PREFIX,
     Principal,
     acting_as,
     current,
+    current_tenant,
     hash_password,
     issue_token,
     new_secret,
     password_needs_rehash,
     verify_password,
 )
+from core.notify import notify
 from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import activities
@@ -38,9 +41,12 @@ from schemas import (
     LOGO_SECONDS,
     LOGO_TYPES,
     MAX_FAILED_LOGINS,
+    MAX_RESETS_PER_HOUR,
     MEMBER_JOINED_SUBJECT,
     MEMBERS_LIVE,
     MEMBERSHIPS,
+    RESETS,
+    RESET_MINUTES,
     REUSE_GRACE_SECONDS,
     SESSIONS,
     TENANT_CREATED_SUBJECT,
@@ -49,7 +55,11 @@ from schemas import (
     AccessChanged,
     AuthResult,
     Cleaned,
+    Contact,
+    Contacts,
+    ContactsRequest,
     Empty,
+    ForgotInput,
     IdentitySettings,
     Invite,
     InviteCode,
@@ -66,6 +76,7 @@ from schemas import (
     MembersChanged,
     Organization,
     RefreshInput,
+    ResetInput,
     Session,
     SignupInput,
     SwitchRequest,
@@ -93,20 +104,22 @@ _SIGNUP_WITH_INVITE = """{
     LET $u = CREATE ONLY identity_users CONTENT $user;
     UPDATE $inv.id SET used_by = $u.id;
     CREATE identity_memberships CONTENT { user: $u.id, tenant: $inv.tenant, roles: [$inv.role] };
-    RETURN { user: $u.id, tenant: $inv.tenant, role: $inv.role };
+    RETURN { user: $u.id, tenant: $inv.tenant, role: $inv.role, inviter: $inv.created_by };
 }"""
 _JOIN = """{
     LET $inv = (UPDATE identity_invites SET used_at = time::now(), used_by = $user
         WHERE code_hash = $code_hash AND used_at = NONE AND expires_at > time::now() RETURN AFTER)[0];
     IF $inv = NONE { RETURN NONE; };
     CREATE identity_memberships CONTENT { user: $user, tenant: $inv.tenant, roles: [$inv.role] };
-    RETURN { user: $user, tenant: $inv.tenant, role: $inv.role };
+    RETURN { user: $user, tenant: $inv.tenant, role: $inv.role, inviter: $inv.created_by };
 }"""
 _CREATE_TENANT = """{
     LET $t = CREATE ONLY identity_tenants CONTENT { name: $name, created_by: $user };
     CREATE identity_memberships CONTENT { user: $user, tenant: $t.id, roles: ['owner'] };
     RETURN $t.id;
 }"""
+
+_ROLE_NAMES = {"owner": "dono", "admin": "administrador", "member": "membro"}
 
 _dummy_hash: str | None = None
 
@@ -134,7 +147,9 @@ class IdentityService:
         if joined is None:
             raise _invite_invalid()
         user_key, tenant_key = _key(joined["user"]), _key(joined["tenant"])
-        await self._announce(user_key, tenant_key, joined["role"], created=data.organization)
+        await self._announce(
+            user_key, tenant_key, joined["role"], created=data.organization, name=data.name, inviter=joined.get("inviter")
+        )
         return await self._issue(user_key, tenant_key)
 
     async def login(self, data: LoginInput) -> Session:
@@ -188,6 +203,59 @@ class IdentityService:
                 await self._revoke_family(rows[0]["family"])
         return Empty()
 
+    async def forgot_password(self, data: ForgotInput) -> Empty:
+        """Manda o link de redefinir senha, se houver conta. A resposta é sempre a mesma: não revela quem tem conta."""
+        rows = await db.query_shared("SELECT id, email FROM identity_users WHERE email = $email", email=data.email)
+        if not rows:
+            return Empty()
+        user = _rid(rows[0]["id"])
+        recent = await db.query_shared(
+            "SELECT count() AS total FROM (SELECT id FROM identity_resets WHERE user = $u AND created_at > $since) GROUP ALL",
+            u=user, since=_now() - timedelta(hours=1),
+        )
+        if recent and recent[0]["total"] >= MAX_RESETS_PER_HOUR:
+            return Empty()  # caixa de alguém sendo inundada: ignora em silêncio
+        code = new_secret(24)
+        await db.create(RESETS, {"code_hash": _hash(code), "user": user, "expires_at": _now() + timedelta(minutes=RESET_MINUTES)})
+        await notify.email(
+            rows[0]["email"],
+            "Redefinir sua senha",
+            "Recebemos um pedido para redefinir a senha da sua conta.\n\n"
+            f"O link vale por {RESET_MINUTES} minutos e só pode ser usado uma vez. "
+            "Se não foi você, ignore este e-mail: a sua senha continua a mesma.",
+            link=f"/redefinir-senha?codigo={code}",
+            action="Redefinir senha",
+            key=f"reset-{_hash(code)[:32]}",
+        )
+        return Empty()
+
+    async def reset_password(self, data: ResetInput) -> Empty:
+        """Troca a senha pelo link do e-mail: o link vale uma vez, todas as sessões caem e a pessoa é avisada."""
+        claimed = await db.query_shared(
+            "UPDATE identity_resets SET used_at = time::now() "
+            "WHERE code_hash = $h AND used_at = NONE AND expires_at > time::now() RETURN AFTER",
+            h=_hash(data.code),
+        )
+        if not claimed:
+            raise ServiceError("ERRO_IDENTITY_RESET_INVALID", "Link inválido, expirado ou já usado. Peça outro.", 404)
+        user = await db.select(str(claimed[0]["user"]))
+        if user is None:
+            raise ServiceError("ERRO_IDENTITY_RESET_INVALID", "Link inválido, expirado ou já usado. Peça outro.", 404)
+        await db.merge(user["id"], {"password_hash": await hash_password(data.password), "failed_logins": 0, "locked_until": None})
+        user_rid = _rid(user["id"])
+        await db.query_shared("UPDATE identity_resets SET used_at = time::now() WHERE user = $u AND used_at = NONE", u=user_rid)
+        await db.query_shared("UPDATE identity_sessions SET revoked = true WHERE user = $u", u=user_rid)
+        await notify.email(
+            user["email"],
+            "Sua senha foi alterada",
+            "A senha da sua conta acabou de ser alterada, e as sessões abertas foram encerradas.\n\n"
+            "Se não foi você, peça um novo link agora e troque a senha.",
+            link="/esqueci-senha",
+            action="Trocar a senha",
+            key=f"changed-{_hash(data.code)[:32]}",
+        )
+        return Empty()
+
     # ── Conta e organizações ────────────────────────────────────────────────
 
     async def me(self, data: Empty) -> Me:
@@ -222,7 +290,8 @@ class IdentityService:
         if joined is None:
             raise _invite_invalid()
         tenant_key = _key(joined["tenant"])
-        await self._announce(who.sub, tenant_key, joined["role"])
+        user = await db.select(f"{USERS}:{who.sub}")
+        await self._announce(who.sub, tenant_key, joined["role"], name=user["name"] if user else None, inviter=joined.get("inviter"))
         return await self._move(who.sub, tenant_key, data.refresh_token)
 
     # ── Convites e membros (organização ativa do token) ─────────────────────
@@ -236,7 +305,20 @@ class IdentityService:
             "role": data.role,
             "expires_at": expires_at,  # quem convidou e quando: carimbos do banco (created_by, created_at)
         })
-        return Invite(code=code, role=data.role, expires_at=expires_at)
+        if data.email is not None:
+            organization = await db.select(f"{TENANTS}:{tenant}")
+            inviter = await db.select(f"{USERS}:{who.sub}")
+            name = organization["name"] if organization else "uma organização"
+            await notify.email(
+                data.email,
+                f"Convite para {name}",
+                f"{inviter['name'] if inviter else 'Alguém'} convidou você para participar de {name} "
+                f"como {_ROLE_NAMES[data.role]}.\n\nO convite vale por {INVITE_DAYS} dias e serve para uma pessoa.",
+                link=f"/convite?codigo={code}",
+                action="Ver convite",
+                key=f"invite-{_hash(code)[:32]}",
+            )
+        return Invite(code=code, role=data.role, expires_at=expires_at, email=data.email)
 
     async def invite_info(self, data: InviteCode) -> InviteInfo:
         rows = await db.query_shared(
@@ -280,6 +362,20 @@ class IdentityService:
         await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
         return await self.list_members(Empty())
 
+    async def contacts(self, data: ContactsRequest) -> Contacts:
+        """rpc.identity.contacts (svc-notify): nome e e-mail de quem é membro da organização de quem pergunta."""
+        tenant = current_tenant()
+        rows = await db.query_shared(
+            "SELECT user.id AS id, user.name AS name, user.email AS email FROM identity_memberships "
+            "WHERE tenant = $t AND (user IN $users OR roles CONTAINSANY $roles)",
+            t=RecordID(TENANTS, tenant), users=[RecordID(USERS, u) for u in data.users], roles=list(data.roles),
+        )
+        organization = await db.select(f"{TENANTS}:{tenant}")
+        return Contacts(
+            tenant_name=organization["name"] if organization else "",
+            items=[Contact(id=_key(row["id"]), name=row["name"], email=row["email"]) for row in rows],
+        )
+
     # ── Organização: nome e logo ────────────────────────────────────────────
 
     async def organization(self, data: Empty) -> Organization:
@@ -322,7 +418,8 @@ class IdentityService:
     async def cleanup(self, data: Empty) -> Cleaned:
         sessions = await db.query_shared("DELETE identity_sessions WHERE expires_at < time::now() RETURN BEFORE")
         invites = await db.query_shared("DELETE identity_invites WHERE expires_at < time::now() RETURN BEFORE")
-        return Cleaned(sessions=len(sessions or []), invites=len(invites or []))
+        resets = await db.query_shared("DELETE identity_resets WHERE expires_at < time::now() RETURN BEFORE")
+        return Cleaned(sessions=len(sessions or []), invites=len(invites or []), resets=len(resets or []))
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -418,8 +515,16 @@ class IdentityService:
             raise _forbidden()
         return who, tenant
 
-    async def _announce(self, user_key: str, tenant_key: str, role: str, created: str | None = None) -> None:
-        """Avisa os outros serviços, em nome do novo membro (o cabeçalho leva a organização)."""
+    async def _announce(
+        self,
+        user_key: str,
+        tenant_key: str,
+        role: str,
+        created: str | None = None,
+        name: str | None = None,
+        inviter: str | None = None,
+    ) -> None:
+        """Avisa os outros serviços e quem convidou, em nome do novo membro (o cabeçalho leva a organização)."""
         with acting_as(Principal(sub=user_key, tenant=tenant_key, roles=frozenset({role}))):
             if created is not None:
                 await bus.publish(TENANT_CREATED_SUBJECT, TenantCreated(tenant=tenant_key, name=created), msg_id=f"tenant-{tenant_key}")
@@ -429,6 +534,15 @@ class IdentityService:
                 msg_id=f"member-{tenant_key}-{user_key}",
             )
             await bus.live(MEMBERS_LIVE, MembersChanged(user=user_key, change="joined"))
+            if inviter and inviter != user_key and name and not inviter.startswith(SYSTEM_PREFIX):  # carimbo de pessoa
+                await notify.user(
+                    inviter,
+                    f"{name} entrou na organização",
+                    f"{name} aceitou o seu convite e agora participa como {_ROLE_NAMES.get(role, role)}.",
+                    link="/membros",
+                    action="Ver membros",
+                    key=f"joined-{tenant_key}-{user_key}",
+                )
 
 
 def _who() -> Principal:

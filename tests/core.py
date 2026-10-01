@@ -1468,3 +1468,64 @@ def test_arquivo_recusado_antes_de_assinar_e_chaves_forjadas(arquivos):
     assert client.get_bucket_cors(Bucket="cv-teste")["CORSRules"][0]["AllowedOrigins"] == ["http://localhost:5173"]
     with pytest.raises(ValidationError):
         UploadRequest(filename="a", content_type="não é tipo", size=1)
+
+
+# ── Avisos: core/notify.py (README §5.15) ────────────────────────────────────
+
+from core import notify as notify_module  # noqa: E402
+from core.notify import SEND_SUBJECT, NotifyRequest, notify  # noqa: E402
+
+
+@pytest.fixture
+def avisos(monkeypatch):
+    """Bus em memória: devolve (subject, pedido, msg_id, quem age) de cada publicação."""
+    sent = []
+
+    async def publish(subject, message, msg_id=None):
+        sent.append((subject, message, msg_id, security.current()))
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-faturas")
+    return sent
+
+
+def test_aviso_vai_para_o_svc_notify_com_quem_age_e_id_estavel(avisos):
+    async def go():
+        with security.acting_as(ACME):
+            await notify.user("bia", "Fatura paga", "A fatura 123 foi paga.", link="/faturas?id=123", key="fatura-123-paga")
+            await notify.user(["bia", "caio", "bia"], "Duas pessoas", send_email=False)
+            await notify.roles("owner", "admin", title="Limite de IA", link="/ia")
+        await notify.email("Pessoa@X.com", "Convite para Acme", link="/convite?codigo=abc", action="Ver convite")
+
+    asyncio.run(go())
+    (s1, r1, id1, who1), (_, r2, id2, _), (_, r3, _, _), (_, r4, id4, who4) = avisos
+    assert (s1, r1.service, r1.users, r1.link, id1) == (SEND_SUBJECT, "svc-faturas", ["bia"], "/faturas?id=123", "notify-svc-faturas-fatura-123-paga")
+    assert who1.tenant == "acme"  # a organização viaja no cabeçalho, nunca no pedido
+    assert (r2.users, r2.send_email) == (["bia", "caio"], False) and id2.startswith("notify-") and id2 != id1
+    assert r3.roles == ["owner", "admin"]
+    assert (r4.email, r4.action, who4) == ("pessoa@x.com", "Ver convite", None)  # e-mail avulso: sem organização
+
+
+def test_aviso_fora_do_trilho_nao_sai(avisos):
+    async def go(call):
+        with security.acting_as(ACME):
+            await call()
+
+    with pytest.raises(ValidationError):  # link para fora vira phishing: só caminho da aplicação
+        asyncio.run(go(lambda: notify.user("bia", "Oi", link="https://outro.site/x")))
+    with pytest.raises(ValidationError):
+        asyncio.run(go(lambda: notify.email("não é e-mail", "Oi")))
+    with pytest.raises(ValueError, match="key"):
+        asyncio.run(go(lambda: notify.user("bia", "Oi", key="tem espaço")))
+    with pytest.raises(ServiceError) as sem_org:  # sem organização não há quem avisar
+        asyncio.run(notify.user("bia", "Oi"))
+    assert sem_org.value.code == "ERRO_TENANT_REQUIRED"
+    with pytest.raises(ValidationError):
+        NotifyRequest(service="svc-x", title="Sem destino")
+    assert avisos == []
+
+
+def test_aviso_exige_bus_conectado(monkeypatch):
+    monkeypatch.setattr(nats_bus.bus, "_service", None)
+    with pytest.raises(RuntimeError, match="bus não conectado"):
+        asyncio.run(notify_module.notify.email("a@b.com", "Oi"))

@@ -21,7 +21,7 @@ cogniventure/
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
-├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, armazenamento (RustFS), gateway e serviços
+├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, RustFS, Mailpit, gateway e serviços
 ├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
@@ -40,7 +40,8 @@ cogniventure/
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
 │   ├── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
 │   ├── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
-│   └── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
+│   ├── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
+│   └── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -219,6 +220,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
 | `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
 | `storage.py` | `storage.connected(service)`, `storage.upload(pedido, accept, max_bytes, folder)`, `storage.keep(key)`, `storage.url(key, ttl, filename, content_type)`, `storage.delete(key)`, `UploadRequest`, `Upload`, `KeepRequest`, `StoredFile`, `IMAGES` (seção 5.14) |
+| `notify.py` | `notify.user(sub, title, body, link, action, send_email, key)`, `notify.roles(*papéis, title=...)`, `notify.email(endereço, title, body, link, action, key)` — o único jeito de avisar alguém (seção 5.15) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -231,7 +233,7 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 - **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. Papéis: `Depends(require("admin"))`.
 - **Identidade vem do token:** quem chama é o `Principal` (usuário, organização ativa e papéis nela; `Depends(principal)` ou `current()`), nunca um campo do payload.
 - **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
-- **Login e sessão:** o `svc-identity` (`specs/identity.md`) é o único emissor de tokens e o único container com `AUTH_PRIVATE_KEY`: cadastro, login, organizações, convites e membros. Token de acesso de 15 min; refresh de 30 dias só no cookie `cv_refresh` (HttpOnly, SameSite=Strict, `Path=/api/v1/identity`, Secure em produção), nunca no corpo, trocado a cada uso; um refresh antigo que reaparece derruba a sessão inteira.
+- **Login e sessão:** o `svc-identity` (`specs/identity.md`) é o único emissor de tokens e o único container com `AUTH_PRIVATE_KEY`: cadastro, login, senha esquecida (link por e-mail de 30 min, uso único, que derruba as sessões), organizações, convites e membros. Token de acesso de 15 min; refresh de 30 dias só no cookie `cv_refresh` (HttpOnly, SameSite=Strict, `Path=/api/v1/identity`, Secure em produção), nunca no corpo, trocado a cada uso; um refresh antigo que reaparece derruba a sessão inteira.
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
 - **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
@@ -255,6 +257,7 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
 | `AI_SECRETS_KEY`, `PLATFORM_TENANT` | Só no `svc-ai`: a chave que criptografa as chaves dos provedores (o `keygen` gera) e a organização dona da plataforma (opcional; seção 5.11) |
+| `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails (seção 5.15) |
 
 Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
@@ -332,7 +335,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
 - **Listas:** `db.page` (seção 5.12) filtra a organização sozinho, como `create` e `select`.
-- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões) e o de IA (provedores e modelos, com o dono no campo `owner`).
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`) e o de avisos (registro de e-mails e preferências de cada pessoa).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ### 5.10 Tempo real e streaming
@@ -455,6 +458,23 @@ await storage.delete(arquivo.key)                                        # 5. ao
 
 Exemplo pronto: o logo da organização no `svc-identity` (`/organization/logo/upload` → envio → `/organization/logo`).
 
+### 5.15 Avisos e e-mail (`core/notify.py` e `svc-notify`)
+
+O serviço avisa pessoas sem falar com servidor de e-mail: chama o core, e o `svc-notify` (`specs/notify.md`), o único com as credenciais SMTP, grava, mostra na tela e envia.
+
+```python
+await notify.user(sub, "Fatura paga", "A fatura 123 foi paga.", link="/faturas?id=123", action="Ver fatura")
+await notify.roles("owner", "admin", title="Limite de IA perto do fim", link="/ia")       # por papel
+await notify.email("pessoa@x.com", "Convite para Acme", "...", link="/convite?codigo=...")  # quem ainda não tem conta
+```
+
+- **Quem recebe:** `notify.user` e `notify.roles` avisam pessoas da organização atual (o `svc-notify` confere com o `svc-identity`, por `rpc.identity.contacts`; quem não é membro é ignorado). Não há como avisar outra organização. `notify.email` é para endereço solto: convite e senha.
+- **Onde chega:** na tela, com o sino da barra superior contando os não lidos ao vivo (`notify.nova`, só para a pessoa) e a tela `notificacoes`; e por e-mail, se a pessoa não desligou na mesma tela (`send_email=False` desliga só para um aviso). `notify.email` sempre sai: é segurança.
+- **Conteúdo:** texto puro (`title` até 120, `body` até 2000; parágrafos separados por linha em branco). O e-mail sai em HTML, com tudo escapado, e em texto puro. `link` é só caminho da aplicação (`/faturas?id=1`): o `svc-notify` monta `APP_URL + link`, então um aviso nunca leva a outro site.
+- **Entrega:** `events.notify.send` é durável (o `svc-notify` fora do ar recebe quando voltar) e cada mensagem vira um workflow: o aviso é gravado uma vez por pessoa, mesmo com reentrega, e cada e-mail tem até 8 tentativas com espera crescente (cerca de 30 min). Servidor de e-mail fora do ar não perde aviso; endereço recusado (5xx) não insiste. Mesma `key=` = mesma intenção: não avisa duas vezes.
+- **Privacidade:** depois de enviado, o conteúdo do e-mail sai do banco (links de senha e de convite não ficam guardados); fica quem, quando e o resultado, por 30 dias. Avisos lidos somem depois de 90 dias.
+- **SMTP:** `SMTP_URL=smtps://usuário:senha@host:465` (TLS direto) ou `smtp://...:587` com STARTTLS, exigido em produção; serve qualquer provedor (SES, Postmark, Resend, Mailgun). No ambiente local, o Mailpit recebe tudo e nada sai para a internet.
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -465,7 +485,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). Uma ação que muda o que outra parte da tela mostra chama `refresh(contrato.funcao)`: toda consulta aberta com essa função busca de novo (ex.: marcar como lido atualiza o sino). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Arquivo: `useUpload(contrato.xUpload, contrato.setX)` + `FileField` (envia ao escolher e mostra o erro no campo); `Picture` exibe a imagem pelo link assinado (seção 5.14). Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };
@@ -492,7 +512,7 @@ export default function Faturas() {
 }
 ```
 
-- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `convite`, `membros`, `organizacoes` e `ia`.
+- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes` e `ia`, mais o sino de avisos na barra superior (seção 5.15).
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
 ```bash
@@ -520,7 +540,7 @@ Pré-requisitos: `uv` (instala o Python e as dependências sozinho), Node e Dock
 
 ```bash
 uv run python -m core.security keygen   # uma vez: cria o .env
-docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal e os serviços
+docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal, RustFS, Mailpit e os serviços
 TOKEN=$(uv run python -m core.security token ana --tenant acme)
 curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" -d '{"payload": {}}'
@@ -536,6 +556,7 @@ O `token` da linha de comando serve para testes rápidos. Conta de verdade: `POS
 | `http://localhost:8233` | Temporal UI: workflows, activities e histórico |
 | `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |
 | `localhost:9000` | Armazenamento de arquivos (RustFS, compatível com S3); o navegador envia e baixa daqui por link assinado |
+| `http://localhost:8025` | Mailpit: todo e-mail que a plataforma envia no ambiente local (convites, senha, avisos) |
 
 Toda porta é publicada só em `127.0.0.1`. O SurrealDB ganha no boot o usuário de banco dos serviços (`surreal-init`); a senha root fica só com ele.
 

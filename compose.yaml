@@ -149,6 +149,17 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # Caixa de e-mail de mentira (README §5.15): o svc-notify entrega aqui e nada sai para a internet. Os e-mails
+  # aparecem em http://localhost:8025. Em produção, SMTP_URL aponta para o provedor de verdade (SES, Postmark...).
+  mailpit:
+    image: axllent/mailpit:v1.31.3
+    ports: ["127.0.0.1:8025:8025"]  # só a tela; o SMTP (1025) fica na rede interna
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+
   # ── Serviços de negócio (acrescentados pelo service.sh) ──────────────────────
 
   svc-identity:
@@ -167,3 +178,14 @@ services:
       # Só o svc-ai abre as chaves dos provedores de IA (README §5.11).
       AI_SECRETS_KEY: ${AI_SECRETS_KEY:?rode uv run python -m core.security keygen}
       PLATFORM_TENANT: ${PLATFORM_TENANT:-}
+
+  svc-notify:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: notify } }
+    environment:
+      <<: *service-env
+      # Só o svc-notify fala com o servidor de e-mail (README §5.15).
+      SMTP_URL: ${SMTP_URL:-smtp://mailpit:1025}
+      MAIL_FROM: ${MAIL_FROM:-CV-Frame <nao-responda@cv-frame.local>}
+      APP_URL: ${APP_URL:-http://localhost:5173}
+      APP_NAME: ${APP_NAME:-CV-Frame}

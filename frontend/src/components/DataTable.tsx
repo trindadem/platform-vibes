@@ -84,7 +84,8 @@ export function DataTable<T>({ columns, rows, rowKey, empty = "Nada por aqui ain
             {columns.map((column) => (
               <div key={column.key} className="flex items-center justify-between gap-4">
                 <span className="text-muted-foreground">{column.header}</span>
-                <span className="min-w-0 truncate text-right font-medium">{cell(row, column)}</span>
+                {/* Valor simples corta com reticências; conteúdo montado (render) quebra a linha para não sumir. */}
+                <span className={`min-w-0 text-right font-medium ${column.render ? "break-words" : "truncate"}`}>{cell(row, column)}</span>
               </div>
             ))}
           </li>
