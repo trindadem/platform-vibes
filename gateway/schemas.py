@@ -29,7 +29,14 @@ _SUBJECT = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
 _MODEL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _OPERATION = re.compile(r"^[a-z][A-Za-z0-9]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_HEADER = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 RESERVED = {"live"}
+# Cabeçalhos que nenhuma rota repassa a mais: sessão, roteamento e os que o gateway já trata (interpreter.py).
+BLOCKED_HEADERS = {
+    "authorization", "content-type", "accept", "x-request-id", "cookie", "host", "content-length",
+    "transfer-encoding", "connection", "upgrade", "forwarded", "x-forwarded-for", "x-forwarded-host",
+    "x-forwarded-proto", "x-real-ip",
+}
 
 
 class Endpoint(BaseModel):
@@ -48,6 +55,7 @@ class Endpoint(BaseModel):
     query: str | None = None
     response: str | None = None
     cookies: bool = False
+    headers: tuple[str, ...] = Field((), max_length=8, description="Cabeçalhos extras repassados (webhook que chega)")
     stream: bool = False
     delta: str | None = None
 
@@ -117,6 +125,11 @@ class Manifest(BaseModel):
                 raise ValueError(f"{where}: query (parâmetros da URL) só em rota HTTP GET")
             if ep.cookies and (ep.target_type != "http" or ep.method != "POST"):
                 raise ValueError(f"{where}: cookies: true só em rota HTTP POST")
+            if ep.headers and (ep.target_type != "http" or ep.method != "POST"):
+                raise ValueError(f"{where}: headers só em rota HTTP POST (ex.: a assinatura de um webhook que chega)")
+            for header in ep.headers:
+                if not _HEADER.match(header) or header in BLOCKED_HEADERS:
+                    raise ValueError(f"{where}: headers: {header!r} não pode ser repassado (minúsculas; nem sessão nem roteamento)")
             if ep.stream and (ep.target_type != "http" or ep.delta is None):
                 raise ValueError(f"{where}: stream: true só em rota HTTP e exige delta: <Modelo> de cada pedaço")
             if ep.delta is not None and not ep.stream:

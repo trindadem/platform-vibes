@@ -19,6 +19,7 @@ from core.security import install_security
 from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import runner
+from core.webhooks import webhooks
 
 from schemas import (
     CONTACTS_SUBJECT,
@@ -30,6 +31,7 @@ from schemas import (
     TASK_QUEUE,
     TRIGGER_SUBJECT,
     UNIQUE,
+    WEBHOOKS,
     ContactsRequest,
     Empty,
     ForgotInput,
@@ -71,6 +73,7 @@ async def lifespan(app: FastAPI):
         await storage.connected(SERVICE)  # logo da organização (README §5.14)
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
+        await webhooks.declare(WEBHOOKS)  # membro-entrou e membro-saiu no catálogo (README §5.16)
         yield
 
 

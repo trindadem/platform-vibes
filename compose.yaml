@@ -189,3 +189,11 @@ services:
       MAIL_FROM: ${MAIL_FROM:-CV-Frame <nao-responda@cv-frame.local>}
       APP_URL: ${APP_URL:-http://localhost:5173}
       APP_NAME: ${APP_NAME:-CV-Frame}
+
+  svc-webhooks:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: webhooks } }
+    environment:
+      <<: *service-env
+      # Só o svc-webhooks abre os segredos de assinatura dos endereços (README §5.16).
+      WEBHOOKS_SECRETS_KEY: ${WEBHOOKS_SECRETS_KEY:?rode uv run python -m core.security keygen}

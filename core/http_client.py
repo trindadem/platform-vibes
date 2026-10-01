@@ -1,7 +1,8 @@
 """HTTP para chamadas EXTERNAS (APIs de terceiros), com as proteções que costumam ser esquecidas.
 
 - Bloqueia SSRF: só https e só hosts com IP público (security.assert_public_url). Nada de
-  169.254.169.254, localhost ou rede interna. http:// exige allow_http=True explícito.
+  169.254.169.254, localhost ou rede interna. http:// exige allow_http=True explícito; rede interna exige
+  allow_private=True e só vale com ENVIRONMENT=development (receptor de teste local).
 - Não segue redirects: um redirect poderia levar para a rede interna depois da checagem.
 - Sempre com timeout (5 s para conectar, 30 s para ler/escrever) e 2 novas tentativas só em falha de conexão.
 - Nunca guarda cookies: o client é um só por processo e atende todas as organizações; cookie recebido numa
@@ -29,10 +30,12 @@ class HttpClient:
         finally:
             await self.close()
 
-    async def request(self, method: str, url: str, *, allow_http: bool = False, **kwargs: Any) -> httpx.Response:
+    async def request(
+        self, method: str, url: str, *, allow_http: bool = False, allow_private: bool = False, **kwargs: Any
+    ) -> httpx.Response:
         if "follow_redirects" in kwargs:
             raise TypeError("http_client não segue redirects (proteção contra SSRF)")
-        await assert_public_url(url, allow_http=allow_http)
+        await assert_public_url(url, allow_http=allow_http, allow_private=allow_private)
         return await self._http().request(method, url, **kwargs)
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:

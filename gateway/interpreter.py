@@ -103,7 +103,7 @@ def mount_live(app: FastAPI) -> None:
 
 def _upstream_request(ep: Endpoint, request: Request, body: bytes) -> tuple[str, dict[str, str]]:
     url = ep.target_url.format_map({k: quote(str(v), safe="") for k, v in request.path_params.items()})
-    allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ())
+    allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ()) + ep.headers  # headers: declarados no manifesto
     headers = {k: v for k, v in request.headers.items() if k in allowed}
     headers.setdefault("x-request-id", uuid.uuid4().hex)
     return url, headers

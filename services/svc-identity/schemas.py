@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings
 
 from core.notify import CONTACTS_SUBJECT, Contact, Contacts, ContactsRequest  # avisos (README §5.15): contrato do core
 from core.storage import IMAGES, KeepRequest, Upload, UploadRequest  # arquivos (README §5.14): contrato do core
+from core.webhooks import WebhookEvent  # webhooks (README §5.16)
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-identity"
@@ -239,3 +240,24 @@ class Organization(BaseModel):
     id: str
     name: str
     logo_url: str | None = Field(None, description="Link assinado da imagem do logo (vale 1 h)")
+
+
+# ── Webhooks: o que este serviço avisa aos sistemas da organização (README §5.16) ─
+
+class MemberJoinedHook(BaseModel):
+    id: str = Field(..., description="Id da pessoa")
+    name: str
+    email: str
+    role: Role = Field(..., description="Papel com que entrou")
+
+
+class MemberLeftHook(BaseModel):
+    id: str = Field(..., description="Id da pessoa")
+    name: str
+    email: str
+
+
+WEBHOOKS = [
+    WebhookEvent("membro-entrou", "Uma pessoa entrou na organização (aceitou um convite).", MemberJoinedHook),
+    WebhookEvent("membro-saiu", "Uma pessoa foi removida da organização.", MemberLeftHook),
+]

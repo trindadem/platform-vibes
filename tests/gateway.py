@@ -106,6 +106,10 @@ def test_manifesto_valido():
         ({"method": "GET", "request": "ExecutionInput"}, "não tem corpo"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "response": "Fatura"}, "remova response"),
         ({"method": "GET", "cookies": True}, "cookies: true só em rota HTTP POST"),
+        ({"method": "GET", "headers": ["stripe-signature"]}, "headers só em rota HTTP POST"),
+        ({"headers": ["Stripe-Signature"]}, "não pode ser repassado"),
+        ({"headers": ["cookie"]}, "não pode ser repassado"),
+        ({"headers": ["x-forwarded-for"]}, "não pode ser repassado"),
         ({"stream": True}, "exige delta"),
         ({"delta": "Pedaco"}, "delta só existe com stream: true"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "stream": True, "delta": "P"}, "stream: true só em rota HTTP"),
@@ -285,6 +289,31 @@ def test_cookie_so_passa_nas_rotas_que_declaram(auth_env, tmp_path):
     assert received == ["cv_refresh=antigo", None]
     assert with_cookies.headers.get_list("set-cookie") == ["cv_refresh=novo; HttpOnly; Path=/api/v1/billing", "outro=1"]
     assert without.headers.get_list("set-cookie") == []
+
+
+def test_cabecalho_extra_so_passa_na_rota_que_declara(auth_env, tmp_path):
+    """Webhook que chega (README §5.16): a assinatura do provedor vem num cabeçalho que só a rota dele recebe."""
+    import interpreter
+    import main
+
+    manifest = {**BILLING, "endpoints": [
+        {**BILLING["endpoints"][0], "path": "/hooks/stripe", "auth": "public",
+         "target_url": "http://svc-billing:8000/hooks/stripe", "headers": ["stripe-signature"]},
+        BILLING["endpoints"][0],
+    ]}
+    (tmp_path / "billing.yaml").write_text(json.dumps(manifest))
+    received = []
+
+    def fake_service(request: httpx.Request) -> httpx.Response:
+        received.append((request.headers.get("stripe-signature"), request.content))
+        return httpx.Response(200, json={"ok": True, "service": "svc-billing", "data": {}})
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(fake_service), cookies=main.no_cookie_jar())
+    client = TestClient(main.create_app(interpreter.load_manifests(tmp_path), upstream), raise_server_exceptions=False)
+    raw = b'{"id": "evt_1",  "type": "invoice.paid"}'  # o corpo chega byte a byte: a assinatura é sobre ele
+    client.post("/api/v1/billing/hooks/stripe", content=raw, headers={"Stripe-Signature": "t=1,v1=abc", "Content-Type": "application/json"})
+    client.post("/api/v1/billing/execute", json={}, headers={**_bearer(), "Stripe-Signature": "t=1,v1=abc"})
+    assert received == [("t=1,v1=abc", raw), (None, b"{}")]
 
 
 def _stream_gateway(tmp_path, reply):

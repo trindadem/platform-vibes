@@ -31,6 +31,7 @@ from core.notify import notify
 from core.storage import storage
 from core.surreal import db
 from core.temporal_runner import activities
+from core.webhooks import webhooks
 
 from schemas import (
     ACCESS_LIVE,
@@ -71,6 +72,8 @@ from schemas import (
     Me,
     Member,
     MemberJoined,
+    MemberJoinedHook,
+    MemberLeftHook,
     MemberList,
     MemberRef,
     MembersChanged,
@@ -148,7 +151,8 @@ class IdentityService:
             raise _invite_invalid()
         user_key, tenant_key = _key(joined["user"]), _key(joined["tenant"])
         await self._announce(
-            user_key, tenant_key, joined["role"], created=data.organization, name=data.name, inviter=joined.get("inviter")
+            user_key, tenant_key, joined["role"], created=data.organization, name=data.name, email=data.email,
+            inviter=joined.get("inviter"),
         )
         return await self._issue(user_key, tenant_key)
 
@@ -291,7 +295,10 @@ class IdentityService:
             raise _invite_invalid()
         tenant_key = _key(joined["tenant"])
         user = await db.select(f"{USERS}:{who.sub}")
-        await self._announce(who.sub, tenant_key, joined["role"], name=user["name"] if user else None, inviter=joined.get("inviter"))
+        await self._announce(
+            who.sub, tenant_key, joined["role"], name=user["name"] if user else None, email=user["email"] if user else None,
+            inviter=joined.get("inviter"),
+        )
         return await self._move(who.sub, tenant_key, data.refresh_token)
 
     # ── Convites e membros (organização ativa do token) ─────────────────────
@@ -353,6 +360,7 @@ class IdentityService:
             )
             if len(owners) <= 1:
                 raise ServiceError("ERRO_IDENTITY_LAST_OWNER", "A organização precisa de pelo menos um dono.", 409)
+        gone = await db.select(f"{USERS}:{data.user}")
         await db.delete(target["id"])
         await db.query_shared(  # perde na hora as sessões nesta organização
             "UPDATE identity_sessions SET revoked = true WHERE user = $u AND tenant = $t",
@@ -360,6 +368,11 @@ class IdentityService:
         )
         await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
         await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
+        if gone is not None:
+            await webhooks.emit(
+                "membro-saiu", MemberLeftHook(id=data.user, name=gone["name"], email=gone["email"]),
+                key=f"saiu-{tenant}-{data.user}-{_key(target['id'])}",
+            )
         return await self.list_members(Empty())
 
     async def contacts(self, data: ContactsRequest) -> Contacts:
@@ -522,6 +535,7 @@ class IdentityService:
         role: str,
         created: str | None = None,
         name: str | None = None,
+        email: str | None = None,
         inviter: str | None = None,
     ) -> None:
         """Avisa os outros serviços e quem convidou, em nome do novo membro (o cabeçalho leva a organização)."""
@@ -534,6 +548,11 @@ class IdentityService:
                 msg_id=f"member-{tenant_key}-{user_key}",
             )
             await bus.live(MEMBERS_LIVE, MembersChanged(user=user_key, change="joined"))
+            if created is None and name and email:  # entrou numa organização que já existia
+                await webhooks.emit(
+                    "membro-entrou", MemberJoinedHook(id=user_key, name=name, email=email, role=role),
+                    key=f"entrou-{tenant_key}-{user_key}",
+                )
             if inviter and inviter != user_key and name and not inviter.startswith(SYSTEM_PREFIX):  # carimbo de pessoa
                 await notify.user(
                     inviter,

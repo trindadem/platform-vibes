@@ -462,6 +462,141 @@ export const notify = {
     request<NotifyPreferences>("POST", "/api/v1/notify/preferences", body, options),
 };
 
+export interface WebhooksEndpoint {
+  id: string;
+  url: string;
+  description: string;
+  /** Eventos inscritos; ["*"] para todos */
+  events: string[];
+  enabled: boolean;
+  /** Entregas seguidas sem sucesso */
+  failures: number;
+  disabled_reason: string | null;
+  created_at: string;
+}
+
+export interface WebhooksEndpointList {
+  items: WebhooksEndpoint[];
+}
+
+export interface WebhooksEndpointInput {
+  /** Endereço que recebe os eventos (https) */
+  url: string;
+  description?: string;
+  /** Eventos, ou ["*"] para todos */
+  events: string[];
+}
+
+export interface WebhooksEndpointSecret {
+  endpoint: WebhooksEndpoint;
+  /** Segredo de assinatura (whsec_...): aparece só agora */
+  secret: string;
+}
+
+export interface WebhooksEndpointUpdate {
+  id: string;
+  url?: string | null;
+  description?: string | null;
+  events?: string[] | null;
+  enabled?: boolean | null;
+}
+
+export interface WebhooksEndpointRef {
+  id: string;
+}
+
+export interface WebhooksDelivery {
+  id: string;
+  endpoint: string;
+  url: string;
+  event: string;
+  status: "pending" | "sent" | "failed" | "skipped";
+  attempts: number;
+  /** Código HTTP da última resposta */
+  response_status: number | null;
+  error: string | null;
+  duration_ms: number | null;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface WebhooksDeliveryPage {
+  items: WebhooksDelivery[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface WebhooksDeliveryQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  endpoint?: string | null;
+  status?: "pending" | "sent" | "failed" | "skipped" | null;
+  event?: string | null;
+}
+
+export interface WebhooksDeliveryRef {
+  id: string;
+}
+
+export interface WebhooksCatalogEvent {
+  /** Nome completo: <serviço>.<evento> */
+  name: string;
+  service: string;
+  description: string;
+  /** JSON Schema do data */
+  payload_schema: Record<string, unknown>;
+}
+
+export interface WebhooksEventList {
+  items: WebhooksCatalogEvent[];
+}
+
+export interface WebhooksDeliveryChanged {
+  id: string;
+  status: "pending" | "sent" | "failed" | "skipped";
+}
+
+/** svc-webhooks · /api/v1/webhooks */
+export const webhooks = {
+  /** GET /api/v1/webhooks/endpoints · http · exige token */
+  endpoints: (options?: RequestOptions) =>
+    request<WebhooksEndpointList>("GET", "/api/v1/webhooks/endpoints", undefined, options),
+  /** POST /api/v1/webhooks/endpoints · http · exige token */
+  createEndpoint: (body: WebhooksEndpointInput, options?: RequestOptions) =>
+    request<WebhooksEndpointSecret>("POST", "/api/v1/webhooks/endpoints", body, options),
+  /** POST /api/v1/webhooks/endpoints/update · http · exige token */
+  updateEndpoint: (body: WebhooksEndpointUpdate, options?: RequestOptions) =>
+    request<WebhooksEndpoint>("POST", "/api/v1/webhooks/endpoints/update", body, options),
+  /** POST /api/v1/webhooks/endpoints/remove · http · exige token */
+  removeEndpoint: (body: WebhooksEndpointRef, options?: RequestOptions) =>
+    request<WebhooksEndpointList>("POST", "/api/v1/webhooks/endpoints/remove", body, options),
+  /** POST /api/v1/webhooks/endpoints/rotate · http · exige token */
+  rotateSecret: (body: WebhooksEndpointRef, options?: RequestOptions) =>
+    request<WebhooksEndpointSecret>("POST", "/api/v1/webhooks/endpoints/rotate", body, options),
+  /** POST /api/v1/webhooks/endpoints/test · http · exige token */
+  testEndpoint: (body: WebhooksEndpointRef, options?: RequestOptions) =>
+    request<WebhooksDelivery>("POST", "/api/v1/webhooks/endpoints/test", body, options),
+  /** GET /api/v1/webhooks/deliveries · http · exige token */
+  deliveries: (query?: WebhooksDeliveryQuery, options?: RequestOptions) =>
+    request<WebhooksDeliveryPage>("GET", withQuery("/api/v1/webhooks/deliveries", query), undefined, options),
+  /** POST /api/v1/webhooks/deliveries/retry · http · exige token */
+  retryDelivery: (body: WebhooksDeliveryRef, options?: RequestOptions) =>
+    request<WebhooksDelivery>("POST", "/api/v1/webhooks/deliveries/retry", body, options),
+  /** GET /api/v1/webhooks/events · http · exige token */
+  events: (options?: RequestOptions) =>
+    request<WebhooksEventList>("GET", "/api/v1/webhooks/events", undefined, options),
+};
+
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
 export interface LiveTopics {
   /** svc-ai · bus.live("ai.uso", ...) */
@@ -472,4 +607,6 @@ export interface LiveTopics {
   "identity.acesso": IdentityAccessChanged;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
+  /** svc-webhooks · bus.live("webhooks.entrega", ...) */
+  "webhooks.entrega": WebhooksDeliveryChanged;
 }

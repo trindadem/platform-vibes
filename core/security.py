@@ -370,12 +370,20 @@ def redact(data: Any) -> Any:
     return data
 
 
-async def assert_public_url(url: str, *, allow_http: bool = False) -> None:
-    """Bloqueia SSRF: só https (ou http, se permitido) para hosts cujos IPs são todos públicos."""
+async def assert_public_url(url: str, *, allow_http: bool = False, allow_private: bool = False) -> None:
+    """Bloqueia SSRF: só https (ou http, se permitido) para hosts cujos IPs são todos públicos.
+
+    allow_private aceita rede interna (um receptor de teste no compose), e só com ENVIRONMENT=development: em produção
+    o pedido é recusado aqui, seja qual for o serviço que o fez.
+    """
     parts = urlsplit(url)
     schemes = {"https", "http"} if allow_http else {"https"}
     if parts.scheme not in schemes or not parts.hostname or parts.username or parts.password:
         raise ServiceError("ERRO_SSRF_BLOCKED", f"URL não permitida (esquemas aceitos: {', '.join(sorted(schemes))}).")
+    if allow_private:
+        if _settings().environment != "development":
+            raise ServiceError("ERRO_SSRF_BLOCKED", "Endereço interno só é aceito em desenvolvimento.")
+        return
     port = parts.port or (443 if parts.scheme == "https" else 80)
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
@@ -419,6 +427,8 @@ STORAGE_ACCESS_KEY={storage_access_key}
 STORAGE_SECRET_KEY={storage_secret_key}
 # IA (README §5.11): chave que criptografa as chaves dos provedores; só o svc-ai a recebe.
 AI_SECRETS_KEY={ai_secrets_key}
+# Webhooks (README §5.16): chave que criptografa os segredos de assinatura dos endereços; só o svc-webhooks a recebe.
+WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
 # Organização dona da plataforma (provedores de IA para todas): o id dela, depois de criada pela tela de cadastro.
 # PLATFORM_TENANT=
 """
@@ -438,6 +448,7 @@ def _keygen(env_file: Path) -> None:
         surreal_password=new_secret(24),
         surreal_root_password=new_secret(24),
         ai_secrets_key=new_secret(32),
+        webhooks_secrets_key=new_secret(32),
         storage_access_key="cv" + new_secret(9).lower().replace("_", "").replace("-", "")[:10],
         storage_secret_key=new_secret(24),
     ))

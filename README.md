@@ -41,7 +41,8 @@ cogniventure/
 │   ├── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
 │   ├── llm.py                   # IA: qualquer API compatível com a da OpenAI, chaves no svc-ai (seção 5.11)
 │   ├── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
-│   └── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
+│   ├── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
+│   └── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
@@ -221,6 +222,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
 | `storage.py` | `storage.connected(service)`, `storage.upload(pedido, accept, max_bytes, folder)`, `storage.keep(key)`, `storage.url(key, ttl, filename, content_type)`, `storage.delete(key)`, `UploadRequest`, `Upload`, `KeepRequest`, `StoredFile`, `IMAGES` (seção 5.14) |
 | `notify.py` | `notify.user(sub, title, body, link, action, send_email, key)`, `notify.roles(*papéis, title=...)`, `notify.email(endereço, title, body, link, action, key)` — o único jeito de avisar alguém (seção 5.15) |
+| `webhooks.py` | `WebhookEvent(nome, descrição, Modelo)`, `webhooks.declare(lista)`, `webhooks.emit(nome, modelo, key)`, `webhooks.verify(segredo, cabeçalhos, corpo)`, `sign`, `new_secret` (seção 5.16) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -237,7 +239,7 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
 - **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
-- **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). NATS em produção com `NATS_CREDS` e permissões por subject.
+- **Rede:** URL externa só por `core.http_client` (bloqueia SSRF e não segue redirects). Rede interna (`allow_private=True`) só com `ENVIRONMENT=development`: em produção o próprio core recusa. NATS em produção com `NATS_CREDS` e permissões por subject.
 - **IA:** chave de provedor só no `svc-ai`, criptografada; o serviço chama modelo só pelo `core/llm.py`, sem ver a chave (seção 5.11).
 - **Respostas:** cabeçalhos de segurança em toda resposta (HSTS e CSP em produção), `cache-control: no-store`, erro 500 sem detalhe interno, CORS só com origens listadas (`*` é recusado).
 - **Segredos e logs:** segredos só no `.env` (fora do Git). Antes de logar dados, `redact(...)`.
@@ -257,9 +259,9 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY` | Orquestração; a API key liga TLS (Temporal Cloud) |
 | `AI_SECRETS_KEY`, `PLATFORM_TENANT` | Só no `svc-ai`: a chave que criptografa as chaves dos provedores (o `keygen` gera) e a organização dona da plataforma (opcional; seção 5.11) |
-| `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails (seção 5.15) |
-
-Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
+| `SMTP_URL`, `MAIL_FROM`, `APP_URL`, `APP_NAME` | Só no `svc-notify`: servidor de e-mail (`smtps://` ou `smtp://` com STARTTLS; sem TLS só em development), remetente, endereço da tela (base dos links) e nome nos e-mails nome nos e-mails (seção 5.15) |
+| `WEBHOOKS_SECRETS_KEY` | Só no `svc-webhooks`: a chave que criptografa os segredos de assinatura dos endereços (o `keygen` gera; seção 5.16) |
+ o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
 ```bash
 uv run python -m core.security keygen
@@ -278,7 +280,7 @@ endpoints:
     name: detalhe                   # opcional: nome da função no frontend (padrão: último trecho fixo do path)
     method: GET                     # GET | POST | PUT | PATCH | DELETE
     auth: client_jwt                # client_jwt | public
-    roles: [financeiro]             # opcional: papéis exigidos no token
+    roles: [financeiro]             # opcional: papéis exigidos no token (todos os listados; "um ou outro" é regra do serviço)
     response: Fatura                # modelo do schemas.py devolvido em data (GET/DELETE não têm request)
     target_type: http               # http | nats
     target_url: http://svc-billing:8000/faturas/{fatura_id}
@@ -313,7 +315,7 @@ live:                               # eventos ao vivo que o serviço emite (bus.
 ```
 
 - **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
-- **HTTP:** repassa corpo, query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`. O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
+- **HTTP:** repassa corpo (byte a byte), query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`; `headers: [stripe-signature]` libera outros numa rota HTTP POST (a assinatura de um webhook que chega, seção 5.16), nunca os de sessão ou roteamento (`cookie`, `host`, `x-forwarded-*`...). O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
 - **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
@@ -335,7 +337,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
 - **Listas:** `db.page` (seção 5.12) filtra a organização sozinho, como `create` e `select`.
-- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`) e o de avisos (registro de e-mails e preferências de cada pessoa).
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões), o de IA (provedores e modelos, com o dono no campo `owner`), o de avisos (registro de e-mails e preferências de cada pessoa) e o de webhooks (catálogo de eventos).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ### 5.10 Tempo real e streaming
@@ -475,6 +477,42 @@ await notify.email("pessoa@x.com", "Convite para Acme", "...", link="/convite?co
 - **Privacidade:** depois de enviado, o conteúdo do e-mail sai do banco (links de senha e de convite não ficam guardados); fica quem, quando e o resultado, por 30 dias. Avisos lidos somem depois de 90 dias.
 - **SMTP:** `SMTP_URL=smtps://usuário:senha@host:465` (TLS direto) ou `smtp://...:587` com STARTTLS, exigido em produção; serve qualquer provedor (SES, Postmark, Resend, Mailgun). No ambiente local, o Mailpit recebe tudo e nada sai para a internet.
 
+### 5.16 Webhooks (`core/webhooks.py` e `svc-webhooks`)
+
+**Saída:** cada organização cadastra endereços e escolhe eventos; a plataforma avisa os sistemas dela quando algo acontece. O serviço só declara e emite; quem chama o endereço é o `svc-webhooks` (`specs/webhooks.md`).
+
+```python
+WEBHOOKS = [WebhookEvent("fatura-paga", "Uma fatura foi paga.", FaturaPaga)]          # schemas.py
+await webhooks.declare(WEBHOOKS)                                                       # main.py, no lifespan (depois do bus)
+await webhooks.emit("fatura-paga", FaturaPaga(id=..., valor=...), key=f"paga-{id}")   # service.py
+```
+
+- **Catálogo:** o evento se chama `<serviço>.<nome>` (`faturas.fatura-paga`) e só o próprio serviço o emite. Emitir evento não declarado é erro. O `declare` publica, no boot, o nome, a descrição e o JSON Schema do modelo: a tela mostra a cada organização o que existe e o formato do `data`. Evento que sai da lista sai do catálogo.
+- **Quem recebe:** só os endereços ativos da organização atual inscritos no evento (ou em todos, `*`). `data` é o modelo declarado, nunca um dict solto: não ponha nele segredo nem dado que a organização não deva ver.
+- **Padrão Standard Webhooks:** POST com `{ "type", "timestamp", "data" }` e os cabeçalhos `webhook-id` (o mesmo em toda tentativa e em todo endereço: quem recebe usa para não processar duas vezes), `webhook-timestamp` e `webhook-signature` (`v1,` + HMAC-SHA256 em base64 de `{id}.{timestamp}.{corpo}`). O segredo (`whsec_...`) é de cada endereço, aparece só ao criar ou trocar e fica criptografado (`WEBHOOKS_SECRETS_KEY`, só no `svc-webhooks`). Qualquer biblioteca do padrão confere do outro lado.
+- **Entrega:** durável (`events.webhooks.emit`) e com até 10 tentativas, de 5 s a 5 h entre elas (cerca de 15 h). 2xx é entregue; `410 Gone` desativa o endereço; o resto (inclusive redirect, que não é seguido, e 15 s sem resposta) tenta de novo. 20 entregas seguidas sem sucesso desativam o endereço e avisam donos e administradores (seção 5.15). O corpo da resposta não é guardado; o registro de cada entrega fica 30 dias. Sem garantia de ordem: o `timestamp` diz quando aconteceu.
+- **Endereço:** `https` público, conferido ao salvar e a cada envio (SSRF, sem redirect). `http` e rede interna só com `ENVIRONMENT=development`, para testar com um receptor local.
+- **Tela `webhooks`** (donos e administradores): Endereços (cadastrar, escolher eventos, testar na hora, ativar, trocar o segredo, remover), Entregas (lista ao vivo, filtros, reenviar com o mesmo id e corpo) e Eventos (catálogo, campos e como conferir a assinatura).
+
+**Entrada:** um sistema de fora (pagamentos, assinatura eletrônica...) avisa um serviço. A rota é pública e libera o cabeçalho da assinatura; o corpo chega ao serviço byte a byte. Se o remetente segue o mesmo padrão (Svix, Resend, Clerk...), o core confere:
+
+```yaml
+  - path: /hooks/pagamentos         # gateway/endpoints/<serviço>.yaml
+    method: POST
+    auth: public
+    headers: [webhook-id, webhook-timestamp, webhook-signature]
+    target_type: http
+    target_url: http://svc-<serviço>:8000/hooks/pagamentos
+```
+
+```python
+@app.post("/hooks/pagamentos")                                   # main.py, com public=("/hooks/pagamentos",)
+async def pagamentos(request: Request) -> ResponseEnvelope:
+    webhooks.verify(settings.segredo_pagamentos, request.headers, await request.body())   # 401 se não bate
+```
+
+Provedor com esquema próprio (`stripe-signature`, `x-hub-signature-256`) se confere com `hmac` e `core.security.same` (comparação em tempo constante). A organização dona do evento vem do conteúdo (a conta no provedor), nunca de um parâmetro da URL.
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -512,7 +550,7 @@ export default function Faturas() {
 }
 ```
 
-- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes` e `ia`, mais o sino de avisos na barra superior (seção 5.15).
+- **Sessão:** `src/core/auth.ts`, sobre o `svc-identity`: `useSession` (pessoa, organização ativa, organizações e papéis) e as ações `login`, `signup`, `logout`, `switchTenant`, `createTenant`, `acceptInvite`, usadas com `useAction`; `hasRoles`/`hasAnyRole` só para exibir. O token de acesso fica só em memória: ao abrir a página a sessão volta pelo cookie de refresh, é renovada sozinha antes de expirar (e num 401) e vale para todas as abas. Quem decide o acesso é o backend. Telas prontas da plataforma: `entrar`, `cadastro`, `esqueci-senha`, `redefinir-senha`, `convite`, `membros`, `organizacoes`, `notificacoes`, `ia` e `webhooks`, mais o sino de avisos na barra superior (seção 5.15).
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
 ```bash

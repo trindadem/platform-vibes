@@ -331,6 +331,17 @@ def test_ip_publico_permitido():
     asyncio.run(security.assert_public_url("http://1.1.1.1", allow_http=True))
 
 
+def test_rede_interna_so_em_desenvolvimento(auth_env, monkeypatch):
+    """allow_private (receptor de teste no compose) é recusado pelo próprio core fora de development."""
+    with pytest.raises(ServiceError, match="só é aceito em desenvolvimento"):
+        asyncio.run(security.assert_public_url("http://receptor:8000/hooks", allow_http=True, allow_private=True))
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    _clear_caches()
+    asyncio.run(security.assert_public_url("http://receptor:8000/hooks", allow_http=True, allow_private=True))
+    with pytest.raises(ServiceError):  # o esquema continua conferido
+        asyncio.run(security.assert_public_url("file:///etc/passwd", allow_http=True, allow_private=True))
+
+
 def test_http_client_nao_segue_redirects():
     with pytest.raises(TypeError, match="redirects"):
         asyncio.run(http.get("https://1.1.1.1", follow_redirects=True))
@@ -1529,3 +1540,98 @@ def test_aviso_exige_bus_conectado(monkeypatch):
     monkeypatch.setattr(nats_bus.bus, "_service", None)
     with pytest.raises(RuntimeError, match="bus não conectado"):
         asyncio.run(notify_module.notify.email("a@b.com", "Oi"))
+
+
+# ── Webhooks: core/webhooks.py (README §5.16) ────────────────────────────────
+
+from core import webhooks as webhooks_module  # noqa: E402
+from core.webhooks import CATALOG_SUBJECT, EMIT_SUBJECT, WebhookEvent, webhooks  # noqa: E402
+
+
+class FaturaPaga(BaseModel):
+    id: str
+    valor: float
+
+
+class Outro(BaseModel):
+    x: int = 1
+
+
+@pytest.fixture
+def ganchos(monkeypatch):
+    """Bus em memória e um serviço que declara um evento; devolve (subject, mensagem, msg_id, quem age)."""
+    sent = []
+
+    async def publish(subject, message, msg_id=None):
+        sent.append((subject, message, msg_id, security.current()))
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-faturas")
+    monkeypatch.setattr(webhooks, "_declared", {})
+    asyncio.run(webhooks.declare([WebhookEvent("paga", "Uma fatura foi paga.", FaturaPaga)]))
+    return sent
+
+
+def test_webhook_declarado_vai_ao_catalogo_e_emite_na_organizacao(ganchos):
+    async def go():
+        with security.acting_as(ACME):
+            await webhooks.emit("paga", FaturaPaga(id="f1", valor=10.5), key="f1-paga")
+
+    asyncio.run(go())
+    (s1, catalog, id1, _), (s2, emitted, id2, who) = ganchos
+    assert (s1, catalog.service, [e.name for e in catalog.events]) == (CATALOG_SUBJECT, "svc-faturas", ["faturas.paga"])
+    assert catalog.events[0].payload_schema["properties"]["valor"]["type"] == "number"  # o cliente vê o formato do data
+    assert id1.startswith("catalog-svc-faturas-")  # réplicas que sobem juntas publicam uma vez só
+    assert (s2, emitted.event, emitted.data, id2, who.tenant) == (
+        EMIT_SUBJECT, "faturas.paga", {"id": "f1", "valor": 10.5}, "webhook-svc-faturas-f1-paga", "acme")
+
+
+def test_webhook_fora_do_trilho_nao_sai(ganchos):
+    ganchos.clear()
+
+    async def go(call):
+        with security.acting_as(ACME):
+            await call()
+
+    with pytest.raises(ValueError, match="não declarado"):
+        asyncio.run(go(lambda: webhooks.emit("estornada", FaturaPaga(id="f1", valor=1))))
+    with pytest.raises(TypeError, match="leva FaturaPaga"):
+        asyncio.run(go(lambda: webhooks.emit("paga", Outro())))
+    with pytest.raises(ServiceError) as sem_org:
+        asyncio.run(webhooks.emit("paga", FaturaPaga(id="f1", valor=1)))
+    assert sem_org.value.code == "ERRO_TENANT_REQUIRED"
+    with pytest.raises(ValueError, match="kebab-case"):
+        WebhookEvent("Fatura_Paga", "Uma fatura foi paga.", FaturaPaga)
+    with pytest.raises(ValueError, match="repetido"):
+        asyncio.run(webhooks.declare([WebhookEvent("paga", "Uma.", FaturaPaga), WebhookEvent("paga", "Outra.", FaturaPaga)]))
+    assert ganchos == []
+
+
+def test_assinatura_segue_o_padrao_e_confere_quem_chega():
+    # Vetor publicado do Standard Webhooks: quem recebe com qualquer biblioteca do padrão confere igual.
+    secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+    body = b'{"test": 2432232314}'
+    assert webhooks.sign(secret, "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, body) == "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="
+    now = int(time.time())
+    good = webhooks.sign(secret, "msg_1", now, body)
+    webhooks.verify(secret, {"webhook-id": "msg_1", "webhook-timestamp": str(now), "webhook-signature": good}, body)
+    webhooks.verify(secret, {"Svix-Id": "msg_1", "Svix-Timestamp": str(now), "Svix-Signature": f"v1,AAAA {good}"}, body)
+    bad_cases = [
+        ({"webhook-id": "msg_1", "webhook-timestamp": str(now), "webhook-signature": good}, body + b" "),  # corpo mexido
+        ({"webhook-id": "msg_2", "webhook-timestamp": str(now), "webhook-signature": good}, body),  # outro id
+        ({"webhook-id": "msg_1", "webhook-timestamp": str(now - 600),
+          "webhook-signature": webhooks.sign(secret, "msg_1", now - 600, body)}, body),  # cópia velha
+        ({"webhook-id": "msg_1", "webhook-timestamp": "x", "webhook-signature": good}, body),
+        ({"webhook-id": "msg_1", "webhook-timestamp": str(now)}, body),
+    ]
+    for headers, raw in bad_cases:
+        with pytest.raises(ServiceError) as exc:
+            webhooks.verify(secret, headers, raw)
+        assert (exc.value.code, exc.value.status) == ("ERRO_WEBHOOK_SIGNATURE", 401)
+    assert webhooks.new_secret().startswith("whsec_") and webhooks.new_secret() != webhooks.new_secret()
+
+
+def test_webhook_exige_bus_conectado(monkeypatch):
+    monkeypatch.setattr(nats_bus.bus, "_service", None)
+    with pytest.raises(RuntimeError, match="bus não conectado"):
+        asyncio.run(webhooks_module.webhooks.declare([]))

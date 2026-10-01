@@ -18,6 +18,7 @@ from core import storage as storage_module
 from core.envelope import ServiceError
 from core.security import acting_as
 from core.notify import SEND_SUBJECT, ContactsRequest
+from core.webhooks import EMIT_SUBJECT
 from core.storage import KeepRequest, UploadRequest
 
 import service
@@ -26,6 +27,7 @@ from schemas import (
     SHARED_TABLES,
     TENANT_CREATED_SUBJECT,
     UNIQUE,
+    WEBHOOKS,
     Empty,
     ForgotInput,
     InviteCode,
@@ -63,6 +65,8 @@ def events(monkeypatch):
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
     monkeypatch.setattr(service.bus, "_service", "svc-identity")  # core/notify diz quem pede
+    asyncio.run(service.webhooks.declare(WEBHOOKS))  # como o boot: eventos no catálogo
+    published.clear()
     yield published
     _clear()
 
@@ -483,3 +487,20 @@ def test_redefinir_a_senha_derruba_as_sessoes_e_o_link_vale_uma_vez(events):
     assert relogged.auth.user.email == "ana@acme.com"
     changed = _notices(events)[-1]
     assert (changed.email, changed.title) == ("ana@acme.com", "Sua senha foi alterada")
+
+
+def test_webhooks_de_entrada_e_saida_de_membros(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, ana), name="Bia")
+        with as_user(ana):
+            await svc.remove_member(MemberRef(user=bia.auth.user.id))
+        return ana, bia
+
+    ana, bia = run(scenario)
+    hooks = [(m.event, m.data, who.tenant) for subject, m, who in events if subject == EMIT_SUBJECT]
+    tenant = ana.auth.tenant.id
+    assert hooks == [  # a Ana criou a organização: não é "entrou" (ninguém teria endereço cadastrado ainda)
+        ("identity.membro-entrou", {"id": bia.auth.user.id, "name": "Bia", "email": "bia@x.com", "role": "member"}, tenant),
+        ("identity.membro-saiu", {"id": bia.auth.user.id, "name": "Bia", "email": "bia@x.com"}, tenant),
+    ]

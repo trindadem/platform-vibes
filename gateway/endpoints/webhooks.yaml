@@ -1,0 +1,87 @@
+# svc-webhooks · rotas públicas no Gateway. Fonte da verdade: specs/webhooks.md §2
+# Todas exigem dono OU administrador: quem confere é o serviço (roles: aqui exigiria os dois papéis ao mesmo tempo).
+service: webhooks
+base_path: /api/v1/webhooks
+
+# Eventos ao vivo que o serviço emite (bus.live): viram tipos no frontend (useLive / useLiveQuery).
+live:
+  - topic: entrega                  # para a organização, a cada mudança de uma entrega
+    model: DeliveryChanged
+
+endpoints:
+  - path: /endpoints
+    method: GET
+    auth: client_jwt
+    response: EndpointList
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints
+
+  - path: /endpoints
+    name: createEndpoint
+    method: POST
+    auth: client_jwt
+    request: EndpointInput
+    response: EndpointSecret
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints
+
+  - path: /endpoints/update
+    name: updateEndpoint
+    method: POST
+    auth: client_jwt
+    request: EndpointUpdate
+    response: Endpoint
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints/update
+
+  - path: /endpoints/remove
+    name: removeEndpoint
+    method: POST
+    auth: client_jwt
+    request: EndpointRef
+    response: EndpointList
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints/remove
+
+  - path: /endpoints/rotate
+    name: rotateSecret
+    method: POST
+    auth: client_jwt
+    request: EndpointRef
+    response: EndpointSecret
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints/rotate
+
+  - path: /endpoints/test
+    name: testEndpoint
+    method: POST
+    auth: client_jwt
+    request: EndpointRef
+    response: Delivery
+    target_type: http
+    target_url: http://svc-webhooks:8000/endpoints/test
+    timeout: 40                     # o teste espera a resposta do endereço (até 15 s)
+
+  - path: /deliveries
+    method: GET
+    auth: client_jwt
+    query: DeliveryQuery
+    response: DeliveryPage
+    target_type: http
+    target_url: http://svc-webhooks:8000/deliveries
+
+  - path: /deliveries/retry
+    name: retryDelivery
+    method: POST
+    auth: client_jwt
+    request: DeliveryRef
+    response: Delivery
+    target_type: http
+    target_url: http://svc-webhooks:8000/deliveries/retry
+
+  - path: /events
+    method: GET
+    auth: client_jwt
+    response: EventList
+    target_type: http
+    target_url: http://svc-webhooks:8000/events
