@@ -22,6 +22,7 @@ cogniventure/
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
 ├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
 ├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, gateway e serviços
+├── .github/workflows/ci.yml     # CI: testes, trilhos, contratos e scaffolder em todo push (seção 7)
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
 │   └── <service_name>.md
@@ -362,6 +363,8 @@ npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + Ty
 5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx com as receitas do CATALOG.md (ResourcePage, QueryTable, ActionForm) e as funções de core/contracts.ts, seguindo o README."*
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
+
+Em todo push, o CI (`.github/workflows/ci.yml`) repete o que roda à mão: testes do core, do gateway e de cada serviço, `contracts.ts` em dia, `npm run check` com o `CATALOG.md` versionado igual ao gerado, e um serviço novo nascendo do `service.sh` e passando nos próprios testes, no contrato, no compose e no frontend. Vermelho no GitHub = algo quebrou o contrato.
 
 ### Ambiente local (`compose.yaml`)
 
