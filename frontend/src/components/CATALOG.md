@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (34)
+## Índice (38)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -21,7 +21,9 @@
 - [Grid](#grid): Grade responsiva para cartões e indicadores: 1 coluna no celular, até 4 em telas largas. `children, cols?`
 - [Page](#page): Estrutura de uma tela: título, descrição, ações e conteúdo com o espaçamento padrão. `title, children, description?, actions?`
 - [Row](#row): Coloca itens lado a lado, com alinhamento e quebra de linha controlados. `children, gap?, align?, justify?, wrap?`
+- [SidePanel](#sidepanel): Painel que desliza da direita sobre a tela, para editar ou criar sem sair dela (ocupa a tela no celular). `open, onClose, title, children, description?`
 - [Stack](#stack): Empilha itens na vertical com espaçamento uniforme. `children, gap?`
+- [Tabs](#tabs): Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (?aba=...). `tabs, param?`
 
 **Dados**: registros e números
 
@@ -34,7 +36,8 @@
 - [Badge](#badge): Etiqueta curta para status, papéis ou categorias. `children, tone?`
 - [Code](#code): Trecho de código, comando ou identificador em fonte monoespaçada. `children, block?`
 - [DateTime](#datetime): Data e hora em pt-BR; a data completa aparece ao passar o mouse. `value, format?`
-- [Money](#money): Valor monetário em pt-BR (R$ 1.234,56), com algarismos alinhados em tabelas. `value, currency?`
+- [Money](#money): Valor monetário em pt-BR (R$ 1.234,56), com algarismos alinhados em tabelas. `value, currency?, digits?`
+- [Quantity](#quantity): Quantidade em pt-BR com separador de milhar (1.234.567) ou curta (1,2 mi), alinhada em tabelas. `value, compact?, unit?`
 - [StatusBadge](#statusbadge): Status como etiqueta colorida, com cor automática para valores comuns (pago, pendente, erro...). `value, tones?, labels?`
 
 **Formulários**: campos e ações
@@ -46,6 +49,7 @@
 - [SelectField](#selectfield): Lista de opções com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, options, placeholder?, hint?, error?, required?`
 - [TextArea](#textarea): Campo de texto de várias linhas com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, rows?, hint?, error?, required?, placeholder?, monospace?`
 - [TextField](#textfield): Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidade. `label, value, onChange, type?, hint?, error?, required?, placeholder?, autoComplete?`
+- [Toggle](#toggle): Interruptor liga/desliga com efeito imediato (ativar um recurso, um modelo, uma notificação). `label, checked, onChange, hideLabel?, hint?, disabled?`
 
 **Feedback**: avisos, carregamento e vazio
 
@@ -232,6 +236,24 @@ Coloca itens lado a lado, com alinhamento e quebra de linha controlados. _(Layou
 
 ---
 
+## SidePanel
+
+Painel que desliza da direita sobre a tela, para editar ou criar sem sair dela (ocupa a tela no celular). _(Layout)_
+
+```tsx
+<SidePanel open={true} onClose={sair} title="Editar fatura" description="As mudanças valem na hora.">
+  <Text>Formulário da fatura.</Text>
+</SidePanel>
+```
+
+- `open`: `boolean`: Aberto ou fechado (estado da página).
+- `onClose`: `() => void`: Chamado ao fechar (X, Esc ou clique fora).
+- `title`: `string`: Título do painel.
+- `description?`: `string`: Linha de ajuda abaixo do título.
+- `children`: `ReactNode`
+
+---
+
 ## Stack
 
 Empilha itens na vertical com espaçamento uniforme. _(Layout)_
@@ -245,6 +267,24 @@ Empilha itens na vertical com espaçamento uniforme. _(Layout)_
 
 - `gap?`: `"sm" | "md" | "lg"`: Espaço entre os itens. Padrão: md.
 - `children`: `ReactNode`
+
+---
+
+## Tabs
+
+Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (?aba=...). _(Layout)_
+
+```tsx
+<Tabs
+  tabs={[
+    { id: "resumo", label: "Resumo", content: <Text>12 faturas emitidas.</Text> },
+    { id: "itens", label: "Itens", content: <Text>Itens da fatura.</Text> },
+  ]}
+/>
+```
+
+- `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. Só o conteúdo da aba aberta fica montado.
+- `param?`: `string`: Parâmetro da URL que guarda a aba aberta (link direto e recarregar mantêm a aba). Padrão: "aba".
 
 ---
 
@@ -352,6 +392,21 @@ Valor monetário em pt-BR (R$ 1.234,56), com algarismos alinhados em tabelas. _(
 
 - `value`: `number | null | undefined`: Valor numérico; null ou undefined vira "—".
 - `currency?`: `"BRL" | "USD" | "EUR"`: Moeda ISO. Padrão: BRL.
+- `digits?`: `number`: Casas decimais máximas, para valores abaixo de um centavo (ex.: custo de IA: 4). Padrão: 2.
+
+---
+
+## Quantity
+
+Quantidade em pt-BR com separador de milhar (1.234.567) ou curta (1,2 mi), alinhada em tabelas. _(Formatação)_
+
+```tsx
+<Quantity value={1234567} compact unit="tokens" />
+```
+
+- `value`: `number | null | undefined`: Quantidade; null ou undefined vira "—".
+- `compact?`: `boolean`: Forma curta para números grandes: 1,2 mil, 3,4 mi. Padrão: false (1.234.567).
+- `unit?`: `string`: Unidade depois do número (ex.: "tokens").
 
 ---
 
@@ -496,6 +551,23 @@ Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidad
 - `required?`: `boolean`
 - `placeholder?`: `string`
 - `autoComplete?`: `string`: Dica para o preenchimento automático do navegador (ex.: "email", "current-password").
+
+---
+
+## Toggle
+
+Interruptor liga/desliga com efeito imediato (ativar um recurso, um modelo, uma notificação). _(Formulários)_
+
+```tsx
+<Toggle label="Ativo" checked={true} onChange={salvar} hint="Desligado, ninguém usa." />
+```
+
+- `label`: `string`: Rótulo (também é o nome acessível).
+- `checked`: `boolean`
+- `onChange`: `(checked: boolean) => void`: Recebe o novo estado (true = ligado).
+- `hideLabel?`: `boolean`: Esconde o rótulo na tela (ex.: dentro de uma tabela); leitores de tela continuam lendo.
+- `hint?`: `string`: Ajuda ao lado do rótulo.
+- `disabled?`: `boolean`
 
 ---
 

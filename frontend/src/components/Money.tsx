@@ -5,6 +5,8 @@ export interface MoneyProps {
   value: number | null | undefined;
   /** Moeda ISO. Padrão: BRL. */
   currency?: "BRL" | "USD" | "EUR";
+  /** Casas decimais máximas, para valores abaixo de um centavo (ex.: custo de IA: 4). Padrão: 2. */
+  digits?: number;
 }
 
 /**
@@ -14,12 +16,13 @@ export interface MoneyProps {
  * @example
  * <Money value={1439.9} />
  */
-export function Money({ value, currency = "BRL" }: MoneyProps) {
+export function Money({ value, currency = "BRL", digits = 2 }: MoneyProps) {
   if (value === null || value === undefined) return <span className="text-muted-foreground">—</span>;
-  let format = FORMATS.get(currency);
+  const key = `${currency}:${digits}`;
+  let format = FORMATS.get(key);
   if (!format) {
-    format = new Intl.NumberFormat("pt-BR", { style: "currency", currency });
-    FORMATS.set(currency, format);
+    format = new Intl.NumberFormat("pt-BR", { style: "currency", currency, minimumFractionDigits: Math.min(2, digits), maximumFractionDigits: digits });
+    FORMATS.set(key, format);
   }
   return <span className="tabular-nums">{format.format(value)}</span>;
 }

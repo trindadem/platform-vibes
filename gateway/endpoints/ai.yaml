@@ -3,6 +3,11 @@
 service: ai
 base_path: /api/v1/ai
 
+# Eventos ao vivo que o serviço emite (bus.live): a tela de uso recarrega sozinha.
+live:
+  - topic: uso
+    model: Recorded
+
 endpoints:
   - path: /providers
     method: GET

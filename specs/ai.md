@@ -17,6 +17,9 @@ organização `PLATFORM_TENANT`).
 - `POST /models` (`ModelInput { provider, model_id, kind }`) → `Model` (cadastro manual, para provedor sem `/models`)
 - `POST /models/update` (`ModelUpdate { id, enabled?, alias?, kind?, price_input?, price_output? }`) → `Model`
 - `GET /usage` → `UsageSummary { month, calls, input_tokens, output_tokens, cost, items }` (mês corrente, UTC)
+- `GET /providers` também diz `manages_platform`: se quem pede administra os provedores da plataforma. Para as
+  outras organizações, o provedor da plataforma vem sem `base_url` e sem `key_hint` (endereço interno e chave).
+- Ao vivo (`bus.live`): `ai.uso` (`Recorded { id, model, service, cost, at }`) para a organização a cada uso gravado.
 - RPC `rpc.ai.resolve` (`ResolveRequest { model, kind }`) → `Resolved { provider, scope, model, base_url, api_key,
   price_input, price_output }`, na organização de quem pede (contratos em `core/llm.py`).
 
@@ -40,3 +43,4 @@ organização `PLATFORM_TENANT`).
 - `ERRO_AI_DISCOVERY_FAILED` (502): o provedor não respondeu ao `/models` (chave errada, fora do ar).
 - Modelo descoberto nasce desativado; quem administra ativa, dá apelido e preço (por milhão de tokens).
 - Custo = tokens × preço do momento da chamada. Sem preço informado, custo zero (tokens continuam contados).
+  Preços e custos em dólar (US$), a moeda em que os provedores cobram.

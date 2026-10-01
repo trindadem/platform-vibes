@@ -1,10 +1,10 @@
 import { type ReactNode, useState } from "react";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { ActionForm, type ActionFormProps } from "./ActionForm";
 import { Button } from "./Button";
 import { Grid } from "./Grid";
 import { Page } from "./Page";
 import { QueryTable, type QueryTableProps } from "./QueryTable";
+import { SidePanel } from "./SidePanel";
 import { Stat } from "./Stat";
 
 export interface ResourcePageProps<T, B> {
@@ -65,17 +65,9 @@ export function ResourcePage<T, B>({ title, description, query, columns, rowKey,
       )}
       <QueryTable query={query} columns={columns} rowKey={rowKey} empty={empty} caption={title} />
       {create && (
-        <Sheet open={open} onOpenChange={setOpen}>
-          <SheetContent className="w-full sm:max-w-md" {...(create.description ? {} : { "aria-describedby": undefined })}>
-            <SheetHeader>
-              <SheetTitle>{create.label}</SheetTitle>
-              {create.description && <SheetDescription>{create.description}</SheetDescription>}
-            </SheetHeader>
-            <div className="px-4">
-              <ActionForm action={create.action} fields={create.fields} submitLabel="Criar" onDone={() => setOpen(false)} />
-            </div>
-          </SheetContent>
-        </Sheet>
+        <SidePanel open={open} onClose={() => setOpen(false)} title={create.label} description={create.description}>
+          <ActionForm action={create.action} fields={create.fields} submitLabel="Criar" onDone={() => setOpen(false)} />
+        </SidePanel>
       )}
     </Page>
   );

@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from surrealdb import AsyncSurreal
 
 from core.envelope import ServiceError
-from core.security import Principal, acting_as, new_secret
+from core.security import Principal, acting_as, current_tenant, new_secret
 
 import service
 from schemas import SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
@@ -24,12 +24,21 @@ BETA = Principal(sub="duda", tenant="beta", roles=frozenset({"admin"}))
 MODELOS = {"object": "list", "data": [{"id": "llama3.2"}, {"id": "nomic-embed-text"}, {"object": "model"}]}
 
 
+AO_VIVO = []
+
+
 @pytest.fixture(autouse=True)
 def ambiente(monkeypatch):
     monkeypatch.setenv("AI_SECRETS_KEY", new_secret(32))
     monkeypatch.setenv("PLATFORM_TENANT", "plat")
     service.settings.cache_clear()
     pedidos = []
+    AO_VIVO.clear()
+
+    async def live(topic, message, user=None):
+        AO_VIVO.append((topic, message, current_tenant()))
+
+    monkeypatch.setattr(service.bus, "live", live)
 
     def provedor(request):
         pedidos.append(request)
@@ -89,6 +98,7 @@ def test_chave_criptografada_presa_ao_registro_e_nunca_devolvida():
 
     prov, row, lista = run(cenario)
     assert (prov.key_hint, prov.scope) == ("…abcd", "organization")
+    assert lista.manages_platform is False
     assert "segredo" not in row["key"] and service._decrypt("acme", "openrouter", row["key"]) == "sk-or-segredo-abcd"
     with pytest.raises(Exception):  # copiada para outro dono/apelido, a chave não abre
         service._decrypt("beta", "openrouter", row["key"])
@@ -138,6 +148,7 @@ def test_descoberta_curadoria_e_resolucao(ambiente):
     async def cenario(svc):
         prov = await _plataforma_com_llama(svc)
         de_novo = await como(PLATAFORMA, lambda: svc.discover_models(ProviderRef(id=prov.id)))
+        assert (await como(PLATAFORMA, lambda: svc.list_providers(Empty()))).manages_platform is True
         resolvido = await como(ACME_MEMBRO, lambda: svc.resolve(ResolveRequest(model="local/rapido", kind="chat")))
         pelo_id = await como(BETA, lambda: svc.resolve(ResolveRequest(model="local/llama3.2", kind="chat")))
         erros = []
@@ -190,6 +201,8 @@ def test_provedor_da_organizacao_tem_prioridade_e_fica_so_nela():
     assert (acme.scope, acme.base_url, acme.api_key.get_secret_value()) == ("organization", "https://1.1.1.1/v1", "sk-acme-1234")
     assert (beta.scope, beta.base_url) == ("platform", "http://ollama:11434/v1")
     assert [(p.slug, p.scope) for p in visao_beta.items] == [("local", "platform")]  # a da Acme não aparece
+    assert visao_beta.manages_platform is False
+    assert (visao_beta.items[0].base_url, visao_beta.items[0].key_hint) == ("", "")  # endereço interno e chave da plataforma
 
 
 def test_remover_provedor_leva_os_modelos_e_apelido_unico_por_provedor():
@@ -199,6 +212,9 @@ def test_remover_provedor_leva_os_modelos_e_apelido_unico_por_provedor():
         outro = next(m for m in modelos.items if m.alias is None)
         with pytest.raises(ServiceError) as exc:
             await como(PLATAFORMA, lambda: svc.update_model(ModelUpdate(id=outro.id, alias="rapido")))
+        rapido = next(m for m in modelos.items if m.alias == "rapido")
+        sem_apelido = await como(PLATAFORMA, lambda: svc.update_model(ModelUpdate(id=rapido.id, alias="")))
+        assert (sem_apelido.alias, sem_apelido.name) == (None, "local/llama3.2")  # vazio remove o apelido
         with pytest.raises(ServiceError) as nao_dono:  # Acme não gerencia o provedor da plataforma
             await como(ACME, lambda: svc.remove_provider(ProviderRef(id=prov.id)))
         await como(PLATAFORMA, lambda: svc.remove_provider(ProviderRef(id=prov.id)))
@@ -226,6 +242,8 @@ def test_uso_e_custo_por_organizacao():
 
     acme, beta, membro = run(cenario)
     assert (acme.calls, acme.input_tokens, acme.cost) == (2, 2_000_000, 4.0)  # 2 × (1 M × 1 + 0,5 M × 2)
+    assert [(t, m.model, m.cost, org) for t, m, org in AO_VIVO] == [  # cada uso avisa só a própria organização
+        ("ai.uso", "local/rapido", 2.0, "acme"), ("ai.uso", "local/rapido", 2.0, "acme"), ("ai.uso", "local/rapido", 2.0, "beta")]
     assert [(i.model, i.service, i.calls) for i in acme.items] == [("local/rapido", "svc-pedidos", 2)]
     assert (beta.calls, beta.items[0].service) == (1, "svc-relatorios")
     _erro(membro, "ERRO_AI_FORBIDDEN")
@@ -246,3 +264,4 @@ def test_reentrega_do_mesmo_evento_nao_conta_duas_vezes():
 
     primeira, reentrega, resumo = run(cenario)
     assert primeira.id == reentrega.id and resumo.calls == 1
+    assert len(AO_VIVO) == 1  # a reentrega não avisa de novo

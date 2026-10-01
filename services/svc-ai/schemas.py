@@ -11,6 +11,7 @@ from core.llm import RESOLVE_SUBJECT, USAGE_SUBJECT, Resolved, ResolveRequest, U
 SERVICE = "svc-ai"
 TASK_QUEUE = "ai-queue"
 TRIGGER_SUBJECT = "events.ai.trigger"
+USAGE_LIVE = "ai.uso"  # ao vivo para a organização a cada uso gravado (README §5.10)
 
 # Tabelas: provedores e modelos são globais (owner = organização ou "platform"); uso é por organização.
 PROVIDERS = "ai_providers"
@@ -61,13 +62,14 @@ class Provider(BaseModel):
     id: str
     name: str
     slug: str
-    base_url: str
-    key_hint: str = Field(..., description="Só os últimos 4 caracteres da chave")
+    base_url: str = Field(..., description="Vazio no provedor da plataforma visto por outra organização")
+    key_hint: str = Field(..., description="Só os últimos 4 caracteres da chave (vazio no provedor da plataforma visto de fora)")
     scope: Scope
 
 
 class ProviderList(BaseModel):
     items: list[Provider]
+    manages_platform: bool = Field(False, description="Quem pede administra os provedores da plataforma")
 
 
 class ModelInput(_Input):
@@ -79,8 +81,8 @@ class ModelInput(_Input):
 class ModelUpdate(_Input):
     id: Id
     enabled: bool | None = None
-    alias: Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[a-z0-9][a-z0-9.-]{0,59}$")] | None = Field(
-        None, description="Nome curto (ex.: claude → openrouter/claude)"
+    alias: Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^([a-z0-9][a-z0-9.-]{0,59})?$")] | None = Field(
+        None, description="Nome curto (ex.: claude → openrouter/claude); vazio remove o apelido"
     )
     kind: Kind | None = None
     price_input: float | None = Field(None, ge=0, description="Preço por milhão de tokens de entrada")
@@ -123,8 +125,10 @@ class UsageSummary(BaseModel):
 
 
 class Recorded(BaseModel):
-    """Interno: uso gravado."""
+    """Uso gravado (também vai ao vivo para a tela da organização)."""
 
     id: str
+    model: str
+    service: str
     cost: float
     at: datetime

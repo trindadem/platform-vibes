@@ -44,6 +44,7 @@ from schemas import (
     Resolved,
     ResolveRequest,
     UsageEvent,
+    USAGE_LIVE,
     UsageItem,
     UsageSummary,
 )
@@ -63,7 +64,8 @@ class AiService:
         rows = await db.query_shared(
             "SELECT * FROM ai_providers WHERE (owner = $org OR owner = $plat) ORDER BY owner, slug", **_visible(who)
         )
-        return ProviderList(items=[_provider_view(row) for row in rows])
+        manages = _manages_platform(who)
+        return ProviderList(items=[_provider_view(row, reveal=manages or row["owner"] != PLATFORM) for row in rows], manages_platform=manages)
 
     async def create_provider(self, data: ProviderInput) -> Provider:
         who = _manager()
@@ -128,6 +130,8 @@ class AiService:
             raise ServiceError("ERRO_AI_MODEL_NOT_FOUND", "Modelo não encontrado.", 404)
         _owner_for(who, "platform" if model["owner"] == PLATFORM else "organization")  # da plataforma: só quem a administra
         changes = data.model_dump(exclude={"id"}, exclude_none=True)
+        if changes.get("alias") == "":
+            changes["alias"] = None  # vazio remove o apelido: o modelo volta a ser chamado pelo id
         if alias := changes.get("alias"):
             taken = await db.query_shared(
                 "SELECT VALUE id FROM ai_models WHERE provider = $p AND alias = $a AND id != $id",
@@ -191,7 +195,10 @@ class AiService:
             if exc.code != "ERRO_RECORD_DUPLICATE":
                 raise
             row = (await db.query("SELECT * FROM ai_usage WHERE tenant = $tenant AND message = $m", m=message))[0]
-        return Recorded(id=row["id"], cost=row["cost"], at=row["at"])
+            return _recorded(row)  # reentrega: já avisado
+        recorded = _recorded(row)
+        await bus.live(USAGE_LIVE, recorded)  # a aba Uso das telas abertas atualiza sozinha
+        return recorded
 
     async def usage_summary(self, data: Empty) -> UsageSummary:
         _manager()
@@ -218,7 +225,7 @@ class AiService:
         provider = await db.select(f"{PROVIDERS}:{provider_id}")
         if provider is None or provider["owner"] not in _owners(who):
             raise ServiceError("ERRO_AI_PROVIDER_NOT_FOUND", "Provedor não encontrado.", 404)
-        if manage and provider["owner"] == PLATFORM and who.tenant != settings().platform_tenant:
+        if manage and provider["owner"] == PLATFORM and not _manages_platform(who):
             raise _forbidden()
         return provider
 
@@ -262,13 +269,19 @@ def _model_record(provider: dict, model_id: str, kind: str, *, enabled: bool) ->
     }
 
 
-def _provider_view(row: dict) -> Provider:
+def _recorded(row: dict) -> Recorded:
+    return Recorded(id=_key(row["id"]), model=row["model"], service=row["service"], cost=row["cost"], at=row["at"])
+
+
+def _provider_view(row: dict, *, reveal: bool = True) -> Provider:
+    """reveal=False (provedor da plataforma visto por outra organização): sem endereço, que pode ser da rede
+    interna, e sem o final da chave."""
     return Provider(
         id=_key(row["id"]),
         name=row["name"],
         slug=row["slug"],
-        base_url=row["base_url"],
-        key_hint=f"…{row['key_hint']}" if row.get("key_hint") else "",
+        base_url=row["base_url"] if reveal else "",
+        key_hint=(f"…{row['key_hint']}" if row.get("key_hint") else "") if reveal else "",
         scope="platform" if row["owner"] == PLATFORM else "organization",
     )
 
@@ -313,9 +326,13 @@ def _visible(who: Principal) -> dict[str, str]:
     return {"org": who.tenant, "plat": PLATFORM if settings().platform_tenant else who.tenant}
 
 
+def _manages_platform(who: Principal) -> bool:
+    return bool(settings().platform_tenant) and who.tenant == settings().platform_tenant
+
+
 def _owner_for(who: Principal, scope: str) -> str:
     if scope == "platform":
-        if not settings().platform_tenant or who.tenant != settings().platform_tenant:
+        if not _manages_platform(who):
             raise _forbidden()
         return PLATFORM
     return who.tenant

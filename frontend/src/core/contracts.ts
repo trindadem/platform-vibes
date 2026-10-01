@@ -23,14 +23,17 @@ export interface AiProvider {
   id: string;
   name: string;
   slug: string;
+  /** Vazio no provedor da plataforma visto por outra organização */
   base_url: string;
-  /** Só os últimos 4 caracteres da chave */
+  /** Só os últimos 4 caracteres da chave (vazio no provedor da plataforma visto de fora) */
   key_hint: string;
   scope: "organization" | "platform";
 }
 
 export interface AiProviderList {
   items: AiProvider[];
+  /** Quem pede administra os provedores da plataforma */
+  manages_platform: boolean;
 }
 
 export interface AiProviderInput {
@@ -78,7 +81,7 @@ export interface AiModelInput {
 export interface AiModelUpdate {
   id: string;
   enabled?: boolean | null;
-  /** Nome curto (ex.: claude → openrouter/claude) */
+  /** Nome curto (ex.: claude → openrouter/claude); vazio remove o apelido */
   alias?: string | null;
   kind?: "chat" | "embedding" | null;
   /** Preço por milhão de tokens de entrada */
@@ -104,6 +107,15 @@ export interface AiUsageSummary {
   output_tokens: number;
   cost: number;
   items: AiUsageItem[];
+}
+
+/** Uso gravado (também vai ao vivo para a tela da organização). */
+export interface AiRecorded {
+  id: string;
+  model: string;
+  service: string;
+  cost: number;
+  at: string;
 }
 
 /** svc-ai · /api/v1/ai */
@@ -291,6 +303,8 @@ export const identity = {
 
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
 export interface LiveTopics {
+  /** svc-ai · bus.live("ai.uso", ...) */
+  "ai.uso": AiRecorded;
   /** svc-identity · bus.live("identity.membros", ...) */
   "identity.membros": IdentityMembersChanged;
   /** svc-identity · bus.live("identity.acesso", ...) */
