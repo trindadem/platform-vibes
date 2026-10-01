@@ -53,7 +53,7 @@ quê** e **por quê**. Decisões ainda abertas estão na seção 14. Exemplos de
 5. **Publicação.** O rascunho é simulado, opcionalmente revisado pelo staff e publicado. Daí em diante roda sozinho.
 6. **Operação.** As execuções acontecem; o que precisa do cliente (uma aprovação) chega para ele; o que é exceção vai
    para o staff.
-7. **Acompanhamento.** O cliente acompanha seus processos como projetos: o que está rodando, o que espera por ele, o
+7. **Workspace.** O cliente acompanha seus processos como projetos: o que está rodando, o que espera por ele, o
    que atrasou, a autonomia de cada um, e a cadeia quando um processo dispara outro.
 8. **Setup.** A qualquer momento o cliente ajusta um processo. Ajustar cria uma versão nova (as execuções em andamento
    terminam na versão delas). De preferência com ajuda humana: o cliente pode chamar o staff para a conversa.
@@ -69,7 +69,7 @@ poucos serviços de plataforma do negócio; o trabalho de cada área de BPO fica
 | Conhecimento (`/conhecimento`) | `svc-conhecimento` | Itens do conhecimento com fonte, busca, correção e remoção; fontes ligadas (site, caixa de entrada). |
 | Processos (`/processos`) | `svc-processos` | Sugestões, processos da organização, desenho com o agente, versões, simulação, publicação. |
 | Setup (`/processos/setup`) | `svc-processos` | Pedidos de ajuste, conversa sobre um rascunho, chamar o staff. |
-| Acompanhamento (`/acompanhamento`) | `svc-processos` | Execuções, tarefas do cliente, prazos, indicadores, cadeia entre processos. |
+| Workspace (`/workspace`) | Todos (a tela compõe) | A casa do cliente: a jornada e o passo atual, processos, execuções, tarefas do cliente, prazos, indicadores, cadeia entre processos. |
 | Agentes (`/agentes`) | `svc-agentes` | Agentes da organização: instrução, modelo, ferramentas, conhecimento, política, avaliação. |
 | Integrações (`/integracoes`) | `svc-integracoes` | Conexões da organização (banco, e-mail, WhatsApp, ERP, servidores MCP) e o catálogo de ações. |
 | Staff (`/staff`) | `svc-staff` | Carteira, fila de handoffs da carteira, revisões pendentes, saúde dos clientes. |
@@ -193,7 +193,7 @@ validador sabe que campos existem e recusa condição que aponta para campo inex
 - **Handoff tem prazo.** Não assumido dentro do prazo, sobe para o responsável pela carteira.
 - **Aprender com o handoff.** Ao resolver, o staff registra o que fez e por quê, e pode marcar "virar regra". A regra
   ou o exemplo entra na especialização do agente daquele passo, depois de passar na avaliação dele (seção 7).
-- **Autonomia por processo** = execuções sem handoff ÷ execuções concluídas, por versão. Aparece no acompanhamento do
+- **Autonomia por processo** = execuções sem handoff ÷ execuções concluídas, por versão. Aparece no workspace do
   cliente e na carteira do staff; é como sabemos se uma versão nova melhorou o processo.
 
 ### 5.8 Gatilhos
@@ -203,7 +203,7 @@ validador sabe que campos existem e recusa condição que aponta para campo inex
   confirmado pelo banco. O serviço que recebe publica a mensagem no Camunda com a chave de correlação.
 - **Manual:** o cliente ou o staff inicia pela tela.
 - **Outro processo:** uma proposta aceita em Vendas inicia a gestão de contratos no Jurídico e o faturamento no
-  Financeiro. O acompanhamento mostra a cadeia como um projeto.
+  Financeiro. O workspace mostra a cadeia como um projeto.
 
 ## 6. Conhecimento
 
@@ -257,7 +257,7 @@ Hoje todo agente da plataforma passa pelo `core/llm.py`, que usa o Agno por baix
 - O SDK é síncrono: roda em thread (`asyncio.to_thread`) dentro do worker.
 - Não tem streaming de texto: no diálogo de processos a tela mostra as operações aplicadas (o diagrama muda). Se o
   texto em pedaços fizer falta, acrescentamos ao SDK.
-- Está em alfa: versão fixada, e a troca começa por um spike no bloco N3 (seção 13). O Agno sai do `core/llm.py`
+- Está em alfa: versão fixada, e a troca começa por um spike no bloco N1 (seção 13). O Agno sai do `core/llm.py`
   quando o spike passar; `ask`, `stream` e `embed` ficam com o cliente OpenAI direto, que o `core/llm.py` já usa.
 
 No console Electron (seção 11) o AgentExo encaixa como está: local, um usuário, SQLite.
@@ -388,24 +388,32 @@ um bloco de plataforma de empacotamento para Kubernetes (proposta):
 
 ## 13. Ordem de construção
 
-Blocos de negócio (N) e de plataforma (P). Cada bloco termina com o critério de pronto validado na stack.
+A ordem segue a jornada do cliente (seção 3). Cada bloco entrega um passo dela, usável no navegador, e alimenta o
+seguinte. Nada roda sem ter passado pelos passos anteriores: o contas a pagar só executa no N4, depois de ter sido
+descoberto no N2 e desenhado no N3.
+
+- **O workspace nasce no N1 e cresce a cada bloco.** É a casa do cliente: mostra a jornada e em que passo ele está,
+  e passa a mostrar os processos e as execuções conforme os blocos chegam. A tela compõe o que cada serviço publica.
+- **A infraestrutura entra quando o passo precisa dela:** o AgentExo no N1 (o briefing já é uma conversa com
+  agente), o Camunda no N3 (desenhar é publicar e simular), workers e integrações no N4.
+- **Cada bloco termina com o critério de pronto validado na stack**, por uma pessoa no navegador.
 
 | Bloco | O que entra | Pronto quando |
 |---|---|---|
-| N1 Motor de processos | Camunda 8 no compose; `svc-processos` (modelo, operações, validação, compilação, publicação, espelho de execuções); `core/processes.py` (workers de ação); `svc-financeiro` com as ações do contas a pagar (simuladas onde não há integração) | Contas a pagar publicado roda ponta a ponta com uma aprovação do cliente e um handoff do staff, e publicar uma versão nova não muda a execução em andamento |
-| N2 Conhecimento e briefing | `svc-conhecimento`; telas de briefing e conhecimento; leitura do site e de documentos | Um cliente faz o briefing e o agente responde citando a fonte |
-| N3 Diálogo de processos | Agente de processos com as operações tipadas; tela dividida com o diagrama; simulação; spike do AgentExo no `core/llm.py` | Um processo da biblioteca é adaptado e publicado só pela conversa |
-| N4 Staff e carteira | `svc-staff`; papel `operador`; fila de handoffs; aprender com o handoff | Um handoff resolvido vira regra e a execução seguinte passa sem handoff |
-| N5 Acompanhamento | Execuções, tarefas do cliente, prazos, autonomia, cadeia entre processos | O cliente vê a cadeia proposta → contrato → faturamento como um projeto |
-| N6 Agentes e integrações | `svc-agentes`; `svc-integracoes` (conexões, credenciais, MCP); catálogo | O cliente cria um agente com uma ferramenta MCP e ele passa na suíte |
-| N7 Pacotes de área | Jurídico, administrativo e vendas: ações e modelos da biblioteca | Os modelos da seção 10 existem e simulam |
-| P1 Cluster | Empacotamento Kubernetes (seção 12) | A plataforma sobe no cluster com um cliente compartilhado e um dedicado |
-| P2 Console | `console/` (seção 11) | Painéis do cluster e dos clientes, e um módulo criado pela IDE chega a deploy aprovado |
+| N1 Briefing e conhecimento | Workspace com a jornada; `svc-conhecimento` (perfil da empresa, conversa guiada, site, documentos, itens com fonte, CRUD, busca); agente de briefing, que é o spike do AgentExo no `core/llm.py` | Uma organização nova faz o briefing conversando, vê e corrige o conhecimento com as fontes, e o workspace marca o passo como feito |
+| N2 Descoberta de processos | `svc-processos` nasce com a biblioteca (os 13 modelos da seção 10, como dados) e os processos da organização; agente que sugere a partir do conhecimento, com o porquê; processo descrito pelo cliente | Depois do briefing de uma empresa de exemplo, o workspace mostra os processos sugeridos com o motivo, e o cliente aceita, recusa ou descreve um novo |
+| N3 Desenho e versões | Modelo tipado, operações e validação (seção 5.3 e 5.4); tela dividida com o diagrama; Camunda 8 no compose; compilação para BPMN; simulação; versões rascunho → revisão → publicada; o `svc-financeiro` nasce declarando as ações do contas a pagar (entrada, saída, risco e exemplo de saída para a simulação) | O contas a pagar aceito no N2 é adaptado só pela conversa, simulado com o caminho no diagrama e publicado no Camunda; ajustar a versão publicada abre um rascunho novo |
+| N4 Execução e acompanhamento | `core/processes.py` (workers); as ações do contas a pagar implementadas; `svc-integracoes` com as conexões que o piloto pede (caixa de entrada; banco simulado até o fornecedor ser escolhido); gatilhos; tarefas do cliente e do staff (papel `operador`); no workspace, execuções, tarefas, prazos e autonomia | Um boleto que chega na caixa de entrada percorre o processo publicado, o cliente aprova no workspace, uma exceção vira handoff resolvido por um operador, e publicar uma versão nova não muda a execução em andamento |
+| N5 Staff, carteira e setup | `svc-staff`; carteira com o papel `operador` automático; fila de handoffs da carteira com prazo e escalonamento; revisão de versões; setup com ajuda humana (o staff entra na conversa de desenho); aprender com o handoff | Um ajuste pedido no setup é feito pelo staff junto com o cliente e publicado; um handoff resolvido vira regra e a execução seguinte passa sem handoff |
+| N6 Agentes e integrações | Área de agentes (instrução, ferramentas do catálogo, MCP, política, suíte); integrações completas (catálogo, credenciais, servidores MCP) | O cliente cria um agente com uma ferramenta MCP, ele passa na suíte e é usado num passo de processo |
+| N7 Pacotes de área | Jurídico, administrativo, vendas e o resto do financeiro: ações e modelos; processos que disparam outros | Os 13 modelos simulam, e a cadeia proposta → contrato → faturamento aparece no workspace como um projeto |
+| P1 Cluster | Empacotamento Kubernetes (seção 12) | A plataforma sobe no cluster com um cliente compartilhado e um dedicado; precisa estar pronto antes do primeiro cliente em produção, junto com a decisão 1 |
+| P2 Console | `console/` (seção 11), depois do P1 | Painéis do cluster e dos clientes, e um módulo criado pela IDE chega a deploy aprovado |
 
-- O antigo bloco 15 (APIs, MCP e medição) entra no N6 (MCP) e nos indicadores do N5. O bloco 14 (experiência) fica
-  depois do N5.
-- O banco de provas passa a medir tarefas do negócio: ações de pacote e "dada a descrição do cliente, o modelo chega
-  ao processo esperado pelas operações tipadas?".
+- O antigo bloco 15 (APIs, MCP e medição) entra no N6 (MCP) e nos indicadores do N4. O bloco 14 (experiência) fica
+  depois do N5, quando a jornada inteira existir.
+- O banco de provas passa a medir tarefas do negócio, a partir do N3: ações de pacote e "dada a descrição do
+  cliente, o modelo chega ao processo esperado pelas operações tipadas?".
 
 ## 14. Decisões abertas
 
@@ -415,7 +423,7 @@ Blocos de negócio (N) e de plataforma (P). Cada bloco termina com o critério d
 3. **Preço e limites do plano:** quantos processos, quantas execuções, se handoff tem cota, e o que acontece acima do
    volume (bloquear ou cobrar).
 4. **Staff como `operador` na organização do cliente** (seção 8): confirmar o modelo.
-5. **AgentExo no lugar do Agno** (seção 7.2): confirmar depois do spike do N3.
+5. **AgentExo no lugar do Agno** (seção 7.2): confirmar depois do spike do N1.
 6. **Fornecedores de integração:** WhatsApp, banco (Open Finance ou API do banco), NFS-e, certidões e tribunais;
    escolhidos pelo cliente piloto.
 7. **Cluster:** armazenamento distribuído e alta disponibilidade do SurrealDB.
