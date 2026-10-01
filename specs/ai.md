@@ -11,9 +11,12 @@ organização `PLATFORM_TENANT`).
 - `GET /providers` → `ProviderList { items: Provider[] }` · `Provider { id, name, slug, base_url, key_hint, scope }`
   (`scope`: `organization` | `platform`; a chave nunca volta, só `…abcd` em `key_hint`)
 - `POST /providers` (`ProviderInput { name, slug, base_url, api_key?, scope }`) → `Provider`
-- `POST /providers/remove` e `POST /providers/discover` (`ProviderRef { id }`) → `ProviderList` / `ModelList`
-- `GET /models` → `ModelList { items: Model[] }` · `Model { id, name, provider, model_id, alias, kind, enabled,
-  price_input, price_output, scope }` (`name` = `<slug>/<alias ou model_id>`, o que se passa ao `llm.*`)
+- `POST /providers/remove` (`ProviderRef { id }`) → `ProviderList`
+- `POST /providers/discover` (`ProviderRef { id }`) → `Discovered { found, added }`
+- `GET /models?q=&enabled=&kind=&sort=&page=&size=` (`ModelQuery`, lista paginada, README §5.12) → `ModelPage`
+  com `Model { id, name, provider, model_id, alias, kind, enabled, price_input, price_output, scope }`
+  (`name` = `<slug>/<alias ou model_id>`, o que se passa ao `llm.*`). Busca por id ou apelido; membro só recebe
+  os liberados.
 - `POST /models` (`ModelInput { provider, model_id, kind }`) → `Model` (cadastro manual, para provedor sem `/models`)
 - `POST /models/update` (`ModelUpdate { id, enabled?, alias?, kind?, price_input?, price_output? }`) → `Model`
 - `GET /usage` → `UsageSummary { month, calls, input_tokens, output_tokens, cost, items }` (mês corrente, UTC)

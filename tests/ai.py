@@ -15,7 +15,7 @@ from core.envelope import ServiceError
 from core.security import Principal, acting_as, current_tenant, new_secret
 
 import service
-from schemas import SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
+from schemas import SEARCH, SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelQuery, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
 
 PLATAFORMA = Principal(sub="ana", tenant="plat", roles=frozenset({"owner"}))
 ACME = Principal(sub="bia", tenant="acme", roles=frozenset({"owner"}))
@@ -55,7 +55,7 @@ def run(cenario):
         await conn.connect()
         await conn.use("cv", "app")
         service.db._conn = conn
-        async with service.db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE):
+        async with service.db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE, search=SEARCH):
             return await cenario(service.AiService())
 
     return asyncio.run(go())
@@ -72,7 +72,9 @@ def como(who, coro):
 async def _plataforma_com_llama(svc):
     async def criar():
         prov = await svc.create_provider(ProviderInput(name="Ollama", slug="local", base_url="http://ollama:11434/v1/", scope="platform"))
-        modelos = await svc.discover_models(ProviderRef(id=prov.id))
+        achados = await svc.discover_models(ProviderRef(id=prov.id))
+        assert (achados.found, achados.added) == (2, 2)
+        modelos = await svc.list_models(ModelQuery())
         llama = next(m for m in modelos.items if m.model_id == "llama3.2")
         await svc.update_model(ModelUpdate(id=llama.id, enabled=True, alias="rapido", price_input=1.0, price_output=2.0))
         return prov
@@ -148,6 +150,8 @@ def test_descoberta_curadoria_e_resolucao(ambiente):
     async def cenario(svc):
         prov = await _plataforma_com_llama(svc)
         de_novo = await como(PLATAFORMA, lambda: svc.discover_models(ProviderRef(id=prov.id)))
+        assert (de_novo.found, de_novo.added) == (2, 0)  # buscar de novo não duplica
+        catalogo = await como(PLATAFORMA, lambda: svc.list_models(ModelQuery()))
         assert (await como(PLATAFORMA, lambda: svc.list_providers(Empty()))).manages_platform is True
         resolvido = await como(ACME_MEMBRO, lambda: svc.resolve(ResolveRequest(model="local/rapido", kind="chat")))
         pelo_id = await como(BETA, lambda: svc.resolve(ResolveRequest(model="local/llama3.2", kind="chat")))
@@ -158,10 +162,10 @@ def test_descoberta_curadoria_e_resolucao(ambiente):
             with pytest.raises(ServiceError) as exc:
                 await como(ACME, lambda: svc.resolve(pedido))
             erros.append(exc.value.code)
-        return de_novo, resolvido, pelo_id, erros
+        return catalogo, resolvido, pelo_id, erros
 
-    de_novo, resolvido, pelo_id, erros = run(cenario)
-    assert sorted((m.model_id, m.kind, m.enabled) for m in de_novo.items) == [("llama3.2", "chat", True), ("nomic-embed-text", "embedding", False)]
+    catalogo, resolvido, pelo_id, erros = run(cenario)
+    assert sorted((m.model_id, m.kind, m.enabled) for m in catalogo.items) == [("llama3.2", "chat", True), ("nomic-embed-text", "embedding", False)]
     assert [r.url.path for r in ambiente] == ["/v1/models", "/v1/models"] and "authorization" not in ambiente[0].headers
     assert (resolvido.model, resolvido.base_url, resolvido.scope, resolvido.price_output) == ("llama3.2", "http://ollama:11434/v1", "platform", 2.0)
     assert pelo_id.model == "llama3.2"
@@ -184,7 +188,7 @@ def test_provedor_da_organizacao_tem_prioridade_e_fica_so_nela():
         visao_beta = await como(BETA, lambda: svc.list_providers(Empty()))
 
         async def ativar_vetores_da_plataforma():
-            modelos = await svc.list_models(Empty())
+            modelos = await svc.list_models(ModelQuery())
             vetores = next(m for m in modelos.items if m.model_id == "nomic-embed-text")
             await svc.update_model(ModelUpdate(id=vetores.id, enabled=True))
 
@@ -208,7 +212,7 @@ def test_provedor_da_organizacao_tem_prioridade_e_fica_so_nela():
 def test_remover_provedor_leva_os_modelos_e_apelido_unico_por_provedor():
     async def cenario(svc):
         prov = await _plataforma_com_llama(svc)
-        modelos = await como(PLATAFORMA, lambda: svc.list_models(Empty()))
+        modelos = await como(PLATAFORMA, lambda: svc.list_models(ModelQuery()))
         outro = next(m for m in modelos.items if m.alias is None)
         with pytest.raises(ServiceError) as exc:
             await como(PLATAFORMA, lambda: svc.update_model(ModelUpdate(id=outro.id, alias="rapido")))
@@ -218,12 +222,32 @@ def test_remover_provedor_leva_os_modelos_e_apelido_unico_por_provedor():
         with pytest.raises(ServiceError) as nao_dono:  # Acme não gerencia o provedor da plataforma
             await como(ACME, lambda: svc.remove_provider(ProviderRef(id=prov.id)))
         await como(PLATAFORMA, lambda: svc.remove_provider(ProviderRef(id=prov.id)))
-        return exc, nao_dono, await como(ACME, lambda: svc.list_models(Empty()))
+        return exc, nao_dono, await como(ACME, lambda: svc.list_models(ModelQuery()))
 
     exc, nao_dono, sobrou = run(cenario)
     _erro(exc, "ERRO_AI_SLUG_TAKEN")
     _erro(nao_dono, "ERRO_AI_FORBIDDEN")
     assert sobrou.items == []
+
+
+def test_lista_de_modelos_paginada_com_busca_filtros_e_membro_so_ve_liberados():
+    async def cenario(svc):
+        await _plataforma_com_llama(svc)
+        admin = lambda q: como(ACME, lambda: svc.list_models(q))  # noqa: E731
+        busca = await admin(ModelQuery(q="nomic"))
+        apelido = await admin(ModelQuery(q="rapi"))
+        vetores = await admin(ModelQuery(kind="embedding"))
+        bloqueados = await admin(ModelQuery(enabled=False))
+        pagina = await admin(ModelQuery(size=1, sort="-model_id"))
+        membro = await como(ACME_MEMBRO, lambda: svc.list_models(ModelQuery(enabled=False)))  # pede os bloqueados
+        return busca, apelido, vetores, bloqueados, pagina, membro
+
+    busca, apelido, vetores, bloqueados, pagina, membro = run(cenario)
+    assert [m.model_id for m in busca.items] == ["nomic-embed-text"]
+    assert [m.name for m in apelido.items] == ["local/rapido"]  # achado pelo apelido
+    assert [m.model_id for m in vetores.items] == [m.model_id for m in bloqueados.items] == ["nomic-embed-text"]
+    assert ([m.model_id for m in pagina.items], pagina.total, pagina.pages) == (["nomic-embed-text"], 2, 2)
+    assert [m.model_id for m in membro.items] == ["llama3.2"]  # o serviço ignora o pedido: membro só vê liberados
 
 
 # ── Uso e custo ─────────────────────────────────────────────────────────────

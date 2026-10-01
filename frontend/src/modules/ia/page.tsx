@@ -8,28 +8,26 @@ import { Code } from "@/components/Code";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { DataTable } from "@/components/DataTable";
 import { Grid } from "@/components/Grid";
+import { ListView } from "@/components/ListView";
 import { Money } from "@/components/Money";
 import { Page } from "@/components/Page";
 import { Quantity } from "@/components/Quantity";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
-import { SelectField } from "@/components/SelectField";
 import { SidePanel } from "@/components/SidePanel";
 import { Stat } from "@/components/Stat";
 import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
-import { TextField } from "@/components/TextField";
 import { TextLink } from "@/components/TextLink";
 import { Toggle } from "@/components/Toggle";
-import { type QueryState, useAction, useLiveQuery, useQuery } from "@/core/api";
+import { type ListState, type QueryState, useAction, useListQuery, useLiveQuery, useQuery } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
-import { type AiModel, type AiModelList, type AiProviderList, type AiUsageSummary, ai } from "@/core/contracts";
+import { type AiModel, type AiProviderList, type AiUsageSummary, ai } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "IA", order: 4 };
 
 const ORIGEM = { organization: "Sua organização", platform: "Plataforma" };
 const TIPO = { chat: "Conversa", embedding: "Vetores" };
-const LIMITE = 100; // linhas por vez na lista de modelos (um provedor como o OpenRouter lista centenas)
 
 /** "2026-10" → "outubro de 2026" (o mês do resumo é em UTC). */
 const mesPorExtenso = (mes: string) => new Date(`${mes}-15T12:00:00Z`).toLocaleDateString("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -39,27 +37,25 @@ export default function Ia() {
   return hasAnyRole(session, "owner", "admin") ? <Gestao /> : <Disponiveis />;
 }
 
-/** Membros: só veem os modelos liberados, com o nome que os serviços usam. */
+/** Membros: só veem os modelos liberados (o serviço garante), com o nome que os serviços usam. */
 function Disponiveis() {
-  const modelos = useQuery(ai.models);
+  const modelos = useListQuery(ai.models);
   return (
     <Page title="IA" description="Modelos que os serviços da sua organização podem usar.">
       <Alert>Só donos e administradores cadastram provedores e liberam modelos.</Alert>
-      <QueryView query={modelos}>
-        {(lista) => (
-          <DataTable
-            rows={lista.items.filter((m) => m.enabled)}
-            rowKey={(m) => m.id}
-            caption="Modelos liberados"
-            empty="Nenhum modelo liberado ainda."
-            columns={[
-              { key: "name", header: "Nome", render: (m) => <Code>{m.name}</Code> },
-              { key: "kind", header: "Tipo", render: (m) => <Badge>{TIPO[m.kind]}</Badge> },
-              { key: "scope", header: "Origem", render: (m) => ORIGEM[m.scope] },
-            ]}
-          />
-        )}
-      </QueryView>
+      <ListView
+        list={modelos}
+        rowKey={(m) => m.id}
+        search="claude, gpt, llama…"
+        caption="Modelos liberados"
+        empty="Nenhum modelo liberado ainda."
+        noun="modelos"
+        columns={[
+          { key: "name", header: "Nome", sort: "model_id", render: (m) => <Code>{m.name}</Code> },
+          { key: "kind", header: "Tipo", render: (m) => <Badge>{TIPO[m.kind]}</Badge> },
+          { key: "scope", header: "Origem", render: (m) => ORIGEM[m.scope] },
+        ]}
+      />
     </Page>
   );
 }
@@ -68,7 +64,7 @@ function Disponiveis() {
 function Gestao() {
   const uso = useLiveQuery("ai.uso", ai.usage); // cada chamada de IA da organização atualiza a aba sozinha
   const provedores = useQuery(ai.providers);
-  const modelos = useQuery(ai.models);
+  const modelos = useListQuery(ai.models); // página, busca e filtros ficam na URL (?q=claude&enabled=true); a aba, no #
   return (
     <Page title="IA" description="Provedores compatíveis com a API da OpenAI, modelos liberados e o uso do mês.">
       <Tabs
@@ -116,9 +112,7 @@ function Uso({ uso }: { uso: QueryState<AiUsageSummary> }) {
   );
 }
 
-function Modelos({ modelos, provedores }: { modelos: QueryState<AiModelList>; provedores: QueryState<AiProviderList> }) {
-  const [busca, setBusca] = useState("");
-  const [filtro, setFiltro] = useState("todos");
+function Modelos({ modelos, provedores }: { modelos: ListState<AiModel>; provedores: QueryState<AiProviderList> }) {
   const [editando, setEditando] = useState<AiModel | null>(null);
   const [cadastrando, setCadastrando] = useState(false);
   const gerePlataforma = provedores.data?.manages_platform ?? false;
@@ -135,98 +129,79 @@ function Modelos({ modelos, provedores }: { modelos: QueryState<AiModelList>; pr
 
   return (
     <>
-      <Row justify="between" align="end">
-        <Row align="end">
-          <TextField label="Buscar" type="search" value={busca} onChange={setBusca} placeholder="claude, gpt, llama…" />
-          <SelectField
-            label="Mostrar"
-            value={filtro}
-            onChange={setFiltro}
-            options={[
-              { value: "todos", label: "Todos" },
-              { value: "ativos", label: "Liberados" },
-              { value: "desativados", label: "Não liberados" },
-            ]}
-          />
-        </Row>
-        <Button variant="secondary" onClick={() => setCadastrando(true)} disabled={meusProvedores.length === 0}>
-          Cadastrar à mão
-        </Button>
-      </Row>
       {alternar.error && <Alert tone="danger">{alternar.error.message}</Alert>}
-      <QueryView query={modelos}>
-        {(lista) => {
-          const termo = busca.trim().toLowerCase();
-          // Ordem do servidor (provedor, id): ligar ou desligar um modelo não muda a linha de lugar.
-          const achados = lista.items.filter(
-            (m) =>
-              (filtro === "todos" || m.enabled === (filtro === "ativos")) &&
-              (!termo || m.name.toLowerCase().includes(termo) || m.model_id.toLowerCase().includes(termo)),
-          );
-          return (
-            <>
-              <DataTable
-                rows={achados.slice(0, LIMITE)}
-                rowKey={(m) => m.id}
-                caption="Modelos"
-                empty={
-                  lista.items.length === 0
-                    ? "Nenhum modelo ainda. Cadastre um provedor e use Buscar modelos."
-                    : filtro === "ativos" && !termo
-                      ? "Nenhum modelo liberado. Em Mostrar, escolha Não liberados para ativar."
-                      : "Nenhum modelo encontrado."
-                }
-                columns={[
-                  { key: "name", header: "Nome nos serviços", render: (m) => <Code>{m.name}</Code> },
-                  { key: "kind", header: "Tipo", render: (m) => <Badge>{TIPO[m.kind]}</Badge> },
-                  { key: "scope", header: "Origem", render: (m) => <Badge tone={m.scope === "platform" ? "accent" : "neutral"}>{ORIGEM[m.scope]}</Badge> },
-                  {
-                    key: "price",
-                    header: "US$ / 1 mi tokens",
-                    render: (m) => (
-                      <Row gap="sm">
-                        <Money value={m.price_input} currency="USD" digits={4} />
-                        <Text tone="muted" size="sm">
-                          ·
-                        </Text>
-                        <Money value={m.price_output} currency="USD" digits={4} />
-                      </Row>
-                    ),
-                  },
-                  {
-                    key: "enabled",
-                    header: "Liberado",
-                    render: (m) => (
-                      <Toggle
-                        label={`Liberar ${m.name}`}
-                        hideLabel
-                        checked={m.enabled}
-                        disabled={!editavel(m) || alternar.running}
-                        onChange={(ligado) => void alternar.run({ id: m.id, enabled: ligado })}
-                      />
-                    ),
-                  },
-                  {
-                    key: "acoes",
-                    header: "",
-                    render: (m) =>
-                      editavel(m) ? (
-                        <Button variant="ghost" size="sm" onClick={() => setEditando(m)}>
-                          Editar
-                        </Button>
-                      ) : null,
-                  },
-                ]}
-              />
-              {achados.length > LIMITE && (
+      <ListView
+        list={modelos}
+        rowKey={(m) => m.id}
+        search="claude, gpt, llama…"
+        caption="Modelos"
+        noun="modelos"
+        empty="Nenhum modelo ainda. Cadastre um provedor e use Buscar modelos."
+        filters={[
+          {
+            name: "enabled",
+            label: "Mostrar",
+            options: [
+              { value: "true", label: "Liberados" },
+              { value: "false", label: "Não liberados" },
+            ],
+          },
+          {
+            name: "kind",
+            label: "Tipo",
+            options: [
+              { value: "chat", label: TIPO.chat },
+              { value: "embedding", label: TIPO.embedding },
+            ],
+          },
+        ]}
+        actions={
+          <Button variant="secondary" onClick={() => setCadastrando(true)} disabled={meusProvedores.length === 0}>
+            Cadastrar à mão
+          </Button>
+        }
+        columns={[
+          { key: "name", header: "Nome nos serviços", sort: "model_id", render: (m) => <Code>{m.name}</Code> },
+          { key: "kind", header: "Tipo", render: (m) => <Badge>{TIPO[m.kind]}</Badge> },
+          { key: "scope", header: "Origem", render: (m) => <Badge tone={m.scope === "platform" ? "accent" : "neutral"}>{ORIGEM[m.scope]}</Badge> },
+          {
+            key: "price",
+            header: "US$ / 1 mi tokens",
+            render: (m) => (
+              <Row gap="sm">
+                <Money value={m.price_input} currency="USD" digits={4} />
                 <Text tone="muted" size="sm">
-                  Mostrando {LIMITE} de {achados.length}. Refine a busca para ver os outros.
+                  ·
                 </Text>
-              )}
-            </>
-          );
-        }}
-      </QueryView>
+                <Money value={m.price_output} currency="USD" digits={4} />
+              </Row>
+            ),
+          },
+          {
+            key: "enabled",
+            header: "Liberado",
+            render: (m) => (
+              <Toggle
+                label={`Liberar ${m.name}`}
+                hideLabel
+                checked={m.enabled}
+                disabled={!editavel(m) || alternar.running}
+                onChange={(ligado) => void alternar.run({ id: m.id, enabled: ligado })}
+              />
+            ),
+          },
+          {
+            key: "acoes",
+            header: "",
+            render: (m) =>
+              editavel(m) ? (
+                <Button variant="ghost" size="sm" onClick={() => setEditando(m)}>
+                  Editar
+                </Button>
+              ) : null,
+          },
+        ]}
+      />
 
       <SidePanel
         open={editando !== null}
@@ -302,7 +277,7 @@ function Modelos({ modelos, provedores }: { modelos: QueryState<AiModelList>; pr
   );
 }
 
-function Provedores({ provedores, modelos }: { provedores: QueryState<AiProviderList>; modelos: QueryState<AiModelList> }) {
+function Provedores({ provedores, modelos }: { provedores: QueryState<AiProviderList>; modelos: ListState<AiModel> }) {
   const [criando, setCriando] = useState(false);
   const criar = useAction(ai.createProvider, { onSuccess: provedores.reload });
   const buscar = useAction(ai.discoverModels, { onSuccess: modelos.reload });
@@ -313,7 +288,6 @@ function Provedores({ provedores, modelos }: { provedores: QueryState<AiProvider
     },
   });
   const gerePlataforma = provedores.data?.manages_platform ?? false;
-  const novos = buscar.result?.items.filter((m) => !m.enabled).length ?? 0;
 
   return (
     <>
@@ -325,8 +299,11 @@ function Provedores({ provedores, modelos }: { provedores: QueryState<AiProvider
         <Alert title="Sua organização administra a plataforma">Provedores com origem Plataforma valem para todas as organizações.</Alert>
       )}
       {buscar.result && (
-        <Alert tone="success" title="Modelos atualizados">
-          {novos} {novos === 1 ? "modelo aguarda" : "modelos aguardam"} liberação. Veja em <TextLink to="/ia?aba=modelos">Modelos</TextLink>.
+        <Alert tone="success" title={`O provedor listou ${buscar.result.found} ${buscar.result.found === 1 ? "modelo" : "modelos"}`}>
+          {buscar.result.added === 0
+            ? "Nenhum modelo novo desde a última busca."
+            : `${buscar.result.added} ${buscar.result.added === 1 ? "novo aguarda" : "novos aguardam"} liberação.`}{" "}
+          Veja em <TextLink to="/ia?enabled=false#modelos">Modelos</TextLink>.
         </Alert>
       )}
       {buscar.error && <Alert tone="danger">{buscar.error.message}</Alert>}

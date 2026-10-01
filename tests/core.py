@@ -7,6 +7,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import ClassVar, Literal
 
 import httpx
 import jwt
@@ -14,8 +15,8 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
-from surrealdb import RecordID
+from pydantic import BaseModel, ValidationError
+from surrealdb import AsyncSurreal, RecordID
 from surrealdb.errors import InternalError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
@@ -1059,3 +1060,108 @@ def test_ia_trilhos_de_nome_organizacao_e_rede(ia):
     with pytest.raises(ServiceError) as exc:
         asyncio.run(llm.ask("byok/modelo", "oi"))
     assert exc.value.code == "ERRO_SSRF_BLOCKED"
+
+
+# ── Listas: db.page no SurrealDB embutido, com a SurrealQL de verdade (README §5.12) ─
+
+class FaturaQuery(surreal.ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("cliente", "valor")
+    default_sort: ClassVar[str | None] = "-valor"
+    status: Literal["aberta", "paga"] | None = None
+    valor_from: float | None = None
+    valor_to: float | None = None
+    cliente: list[str] | None = None
+
+
+class Fatura(BaseModel):
+    id: str
+    cliente: str
+    valor: float
+
+
+class FaturaPage(surreal.Page[Fatura]):
+    pass
+
+
+FATURAS = [
+    ("acme", "Padaria Aurora", "pão francês e café", 150, "aberta"),
+    ("acme", "João da Silva", "consultoria fiscal", 900, "paga"),
+    ("acme", "Mercado Bom Preço", "cestas básicas", 40, "aberta"),
+    ("acme", "Aurora Tecidos", "tecidos finos", 300, "paga"),
+    ("beta", "Padaria Beta", "segredo da beta", 999, "aberta"),
+]
+
+
+def _paginas(*queries, table="faturas", **page_kwargs):
+    """Grava FATURAS no SurrealDB embutido e devolve os clientes de cada página pedida, como a Acme."""
+
+    async def run():
+        d = surreal.Database()
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        d._conn = conn
+        async with d.connected(tables=["faturas", "notas"], shared=["modelos"], search={"faturas": ["cliente", "descricao"]}):
+            for tenant, cliente, descricao, valor, status in FATURAS:
+                with security.acting_as(Principal(sub="x", tenant=tenant)):
+                    await d.create("faturas", {"cliente": cliente, "descricao": descricao, "valor": valor, "status": status})
+            with security.acting_as(ACME):
+                return [await d.page(table, q, FaturaPage, **page_kwargs) for q in queries]
+
+    return asyncio.run(run())
+
+
+def _clientes(page):
+    return [f.cliente for f in page.items]
+
+
+def test_lista_pagina_com_ordem_padrao_total_e_so_da_organizacao():
+    um, dois, tres = _paginas(FaturaQuery(size=2), FaturaQuery(size=2, page=2), FaturaQuery(size=2, page=3))
+    assert _clientes(um) == ["João da Silva", "Aurora Tecidos"]  # default_sort -valor; a Beta não aparece
+    assert _clientes(dois) == ["Padaria Aurora", "Mercado Bom Preço"]
+    assert (um.total, um.pages, um.page, um.size) == (4, 2, 1, 2)
+    assert (tres.items, tres.total) == ([], 4)  # página depois da última: vazia, com o total certo
+
+
+def test_lista_filtra_por_igualdade_intervalo_e_lista_e_ordena_pelo_pedido():
+    abertas, faixa, escolhidos, por_nome = _paginas(
+        FaturaQuery(status="aberta"),
+        FaturaQuery(valor_from=100, valor_to=500),
+        FaturaQuery(cliente=["Mercado Bom Preço", "Padaria Beta"]),
+        FaturaQuery(sort="cliente"),
+    )
+    assert _clientes(abertas) == ["Padaria Aurora", "Mercado Bom Preço"]
+    assert _clientes(faixa) == ["Aurora Tecidos", "Padaria Aurora"]
+    assert _clientes(escolhidos) == ["Mercado Bom Preço"]  # a da Beta não vaza nem pedindo pelo nome
+    assert _clientes(por_nome) == ["Aurora Tecidos", "João da Silva", "Mercado Bom Preço", "Padaria Aurora"]
+
+
+def test_lista_busca_por_inicio_de_palavra_sem_acento_em_varios_campos():
+    pad, joao, aurora, cafe, nada, ordenada = _paginas(
+        FaturaQuery(q="pad"), FaturaQuery(q="joao"), FaturaQuery(q="AURORA"), FaturaQuery(q="cafe"),
+        FaturaQuery(q="xyz"), FaturaQuery(q="aurora", sort="-valor"),
+    )
+    assert _clientes(pad) == ["Padaria Aurora"]  # a Padaria Beta é de outra organização
+    assert _clientes(joao) == ["João da Silva"]
+    assert sorted(_clientes(aurora)) == ["Aurora Tecidos", "Padaria Aurora"] and aurora.total == 2
+    assert _clientes(cafe) == ["Padaria Aurora"]  # achada pela descrição
+    assert (nada.items, nada.total, nada.pages) == ([], 0, 0)
+    assert _clientes(ordenada) == ["Aurora Tecidos", "Padaria Aurora"]
+
+
+def test_lista_recusa_o_que_esta_fora_do_trilho():
+    with pytest.raises(ServiceError) as exc:  # notas não declarou busca
+        _paginas(FaturaQuery(q="x"), table="notas")
+    assert (exc.value.code, exc.value.status) == ("ERRO_SEARCH_UNAVAILABLE", 422)
+    with pytest.raises(ValueError, match="tabela global"):
+        _paginas(FaturaQuery(), table="modelos")
+    with pytest.raises(ValueError, match="reservados"):
+        _paginas(FaturaQuery(), tenant="beta")
+    with pytest.raises(ValidationError):
+        FaturaQuery(sort="descricao")  # não está em sortable
+    with pytest.raises(ValidationError):
+        FaturaQuery(size=101)
+    assert FaturaQuery.model_validate({"page": "2", "aba": "modelos"}).page == 2  # parâmetro alheio da URL é ignorado
+    with pytest.raises(TypeError, match="sortable"):
+        class Ruim(surreal.ListQuery):
+            default_sort: ClassVar[str | None] = "-valor"

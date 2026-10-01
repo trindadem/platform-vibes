@@ -67,8 +67,10 @@ render "$STAGE/spec.md" <<'EOF'
 TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio esperado.
 
 ## 2. Contrato de Entrada e Saída
-- Request (schemas.ExecutionInput): { payload: {...} }
+- Request (schemas.ExecutionInput): { title: str, payload: {...} }
 - Response (schemas.ExecutionResult, dentro do envelope): { task_id: str, status: str, data: {...} }
+- GET /records?q=&sort=&page=&size= (schemas.RecordQuery) → RecordPage { items: Record[], total, page, size,
+  pages }: lista paginada da organização, com busca por palavras no title (README §5.12).
 - Quem chama e a organização vêm do token (core.security.current_tenant()), nunca do corpo.
 
 ## 3. Fluxo de Execução
@@ -84,9 +86,11 @@ EOF
 
 render "$STAGE/svc/schemas.py" <<'EOF'
 """svc-__NAME__ · contratos (DTOs, enums, constantes). Fonte da verdade: specs/__NAME__.md §2"""
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-__NAME__"
@@ -95,11 +99,13 @@ TRIGGER_SUBJECT = "events.__NAME__.trigger"
 PROCESSED_SUBJECT = "events.__NAME__.processed"
 PROCESSED_LIVE = "__NAME__.processado"  # ao vivo para a organização (README §5.10)
 TABLE = "__SNAKE___records"
+SEARCH = {TABLE: ["title"]}  # campos com busca por palavras (db.page com q, README §5.12)
 
 
 class ExecutionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
 
+    title: str = Field("", max_length=200, description="Título curto: aparece na lista e entra na busca")
     payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
 
 
@@ -107,6 +113,22 @@ class ExecutionResult(BaseModel):
     task_id: str
     status: str
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class Record(BaseModel):
+    id: str
+    title: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecordQuery(ListQuery):
+    """GET /records: página, ordem e busca vêm da URL. Filtros novos entram como campos (README §5.12)."""
+
+    sortable: ClassVar[tuple[str, ...]] = ("title",)
+
+
+class RecordPage(Page[Record]):
+    pass
 EOF
 
 render "$STAGE/svc/service.py" <<'EOF'
@@ -120,11 +142,14 @@ from core.nats_bus import bus
 from core.surreal import db
 from core.temporal_runner import activities
 
-from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult
+from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult, RecordPage, RecordQuery
 
 
 @activities("__NAME__")
 class __PASCAL__Service:
+    async def list_records(self, data: RecordQuery) -> RecordPage:
+        return await db.page(TABLE, data, RecordPage)  # só da organização atual, com busca, ordem e páginas
+
     async def process_task(self, data: ExecutionInput) -> ExecutionResult:
         record = await db.create(TABLE, data.model_dump())
         result = ExecutionResult(task_id=str(record["id"]), status="SUCCESS", data=record)
@@ -165,13 +190,15 @@ render "$STAGE/svc/main.py" <<'EOF'
 """svc-__NAME__ · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/__NAME__.md
 
 HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
+HTTP GET /records   → lista paginada da organização (busca, ordem e páginas pela URL).
 NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona, durável e idempotente).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-__NAME__ main:app --port 8100 --env-file .env
 """
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
@@ -179,7 +206,7 @@ from core.security import install_security
 from core.surreal import db
 from core.temporal_runner import runner
 
-from schemas import SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput
+from schemas import SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
 from service import __PASCAL__Service
 from workflows import __PASCAL__Workflow
 
@@ -195,7 +222,7 @@ async def on_trigger(data: ExecutionInput) -> None:
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=[TABLE]),
+        db.connected(tables=[TABLE], search=SEARCH),
         runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
@@ -210,6 +237,11 @@ install_security(app, service=SERVICE)  # rota pública só se o spec §2 declar
 @app.post("/execute", response_model=ResponseEnvelope)
 async def execute(data: ExecutionInput) -> ResponseEnvelope:
     return ResponseEnvelope.success(data=await svc.process_task(data), service=SERVICE)
+
+
+@app.get("/records", response_model=ResponseEnvelope)
+async def records(data: Annotated[RecordQuery, Query()]) -> ResponseEnvelope:
+    return ResponseEnvelope.success(data=await svc.list_records(data), service=SERVICE)
 EOF
 
 render "$STAGE/endpoint.yaml" <<'EOF'
@@ -238,10 +270,20 @@ endpoints:
     request: ExecutionInput
     target_type: nats
     nats_subject: events.__NAME__.trigger
+
+  - path: /records
+    method: GET
+    auth: client_jwt
+    query: RecordQuery             # parâmetros da URL tipados: página, ordem, busca e filtros (README §5.12)
+    response: RecordPage
+    target_type: http
+    target_url: http://svc-__NAME__:8000/records
 EOF
 
 render "$STAGE/test.py" <<'EOF'
 """svc-__NAME__ · testes sem infraestrutura. Fonte da verdade: specs/__NAME__.md §2 e §4
+
+SurrealDB embutido em memória (mem://), com as tabelas e índices do boot e a SurrealQL de verdade; o NATS vira dublê.
 
 Rodar (da raiz): PYTHONPATH=services/svc-__NAME__ uv run python -m pytest tests/__NAME__.py
 """
@@ -249,20 +291,21 @@ import asyncio
 
 import pytest
 from pydantic import ValidationError
+from surrealdb import AsyncSurreal
 
-from core.security import Principal, acting_as, current_tenant
+from core.security import Principal, acting_as
 
 import service
-from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, ExecutionInput, ExecutionResult
+from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, SEARCH, TABLE, ExecutionInput, ExecutionResult, RecordQuery
+
+ACME = Principal(sub="u1", tenant="acme")
+BETA = Principal(sub="u2", tenant="beta")
 
 
 @pytest.fixture
 def published(monkeypatch):
-    """Troca SurrealDB e NATS por dublês em memória e roda o teste em nome de uma organização."""
+    """Troca o NATS por um dublê em memória e devolve o que foi publicado."""
     events = []
-
-    async def create(table, data):
-        return {"id": f"{table}:1", "tenant": current_tenant(), **data}  # como o core.surreal faz
 
     async def publish(subject, message, msg_id=None):
         events.append((subject, message))
@@ -270,18 +313,55 @@ def published(monkeypatch):
     async def live(topic, message, user=None):
         events.append((topic, message))
 
-    monkeypatch.setattr(service.db, "create", create)
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
-    with acting_as(Principal(sub="u1", tenant="t1")):
-        yield events
+    return events
+
+
+def run(cenario):
+    """Roda o cenário com o SurrealDB embutido, já com as tabelas e índices do boot."""
+
+    async def go():
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        service.db._conn = conn
+        async with service.db.connected(tables=[TABLE], search=SEARCH):
+            return await cenario(service.__PASCAL__Service())
+
+    return asyncio.run(go())
+
+
+def como(who, call):
+    """Executa call() em nome de quem (a organização vem do contexto, como numa requisição)."""
+
+    async def go():
+        with acting_as(who):
+            return await call()
+
+    return go()
 
 
 def test_process_task(published):
-    result = asyncio.run(service.__PASCAL__Service().process_task(ExecutionInput(payload={"x": 1})))
+    result = run(lambda svc: como(ACME, lambda: svc.process_task(ExecutionInput(title="Primeira", payload={"x": 1}))))
     assert isinstance(result, ExecutionResult) and result.status == "SUCCESS"
-    assert result.data["tenant"] == "t1"
+    assert result.data["tenant"] == "acme" and result.data["payload"] == {"x": 1}
     assert [subject for subject, _ in published] == [PROCESSED_SUBJECT, PROCESSED_LIVE]
+
+
+def test_lista_paginada_com_busca_e_so_da_organizacao(published):
+    async def cenario(svc):
+        for who, title in ((ACME, "Pedido da Padaria"), (ACME, "Orçamento João"), (ACME, "Pedido urgente"), (BETA, "Pedido da Beta")):
+            await como(who, lambda: svc.process_task(ExecutionInput(title=title)))
+        primeira = await como(ACME, lambda: svc.list_records(RecordQuery(size=2, sort="title")))
+        pedidos = await como(ACME, lambda: svc.list_records(RecordQuery(q="pedido")))
+        joao = await como(ACME, lambda: svc.list_records(RecordQuery(q="joao")))
+        return primeira, pedidos, joao
+
+    primeira, pedidos, joao = run(cenario)
+    assert ([r.title for r in primeira.items], primeira.total, primeira.pages) == (["Orçamento João", "Pedido da Padaria"], 3, 2)
+    assert sorted(r.title for r in pedidos.items) == ["Pedido da Padaria", "Pedido urgente"]  # o da Beta não aparece
+    assert [r.title for r in joao.items] == ["Orçamento João"]  # sem acento, pelo início da palavra
 
 
 def test_organizacao_nao_vem_do_corpo():
@@ -292,6 +372,11 @@ def test_organizacao_nao_vem_do_corpo():
 def test_campo_nao_declarado_e_rejeitado():
     with pytest.raises(ValidationError):
         ExecutionInput.model_validate({"payload": {}, "is_admin": True})
+
+
+def test_lista_so_ordena_pelos_campos_declarados():
+    with pytest.raises(ValidationError):
+        RecordQuery(sort="payload")
 EOF
 
 # O compose.yaml novo também nasce na área temporária: a troca é um rename, nunca um arquivo pela metade.

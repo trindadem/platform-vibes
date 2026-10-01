@@ -12,6 +12,10 @@ Trilhos:
 - Login sempre como usuário do banco (DEFINE USER ... ON DATABASE), nunca root: menor privilégio.
 - Resultados voltam como tipos simples: "tabela:id" em vez de RecordID; select de um registro → dict | None.
 - Valor repetido em índice unique → ServiceError 409 ERRO_RECORD_DUPLICATE (sem ecoar o valor).
+- Listas (README §5.12): db.page(TABELA, query, ModeloPage) devolve uma página filtrada, ordenada e com busca por
+  palavras, sempre na organização atual. A query é um ListQuery (page, size, sort, q) cuja subclasse declara os
+  filtros como campos: x → igualdade, x_from/x_to → intervalo, list[...] → um dos valores. Só ordena pelos campos
+  de `sortable`; só busca nos campos declarados em db.connected(search={"tabela": ["campo"]}).
 
 Variáveis: SURREAL_URL (padrão ws://localhost:8000) e, obrigatórias e sem padrão,
 SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER, SURREAL_PASSWORD.
@@ -20,9 +24,9 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
-from typing import Any, LiteralString
+from typing import Any, ClassVar, Generic, LiteralString, TypeVar
 
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from surrealdb import AsyncSurreal, ConnectionUnavailableError, RecordID, ServerError, Table
 
@@ -33,6 +37,83 @@ TENANT = "tenant"
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TENANT_PARAM = re.compile(r"\$tenant\b")
 _DUPLICATE = re.compile(r"index `[a-z0-9_]+?__(?P<fields>[a-z0-9_]+)__unique` already contains")
+_VERSION = re.compile(r"(\d+)\.\d+")
+# Busca por palavras: início de palavra, sem diferença de maiúscula nem de acento ("pad" acha "Padaria", "joao" acha "João").
+ANALYZER = "cv_busca"
+_ANALYZER_DEF = f"DEFINE ANALYZER IF NOT EXISTS {ANALYZER} TOKENIZERS blank,class,punct FILTERS lowercase,ascii,edgengram(1,20)"
+T = TypeVar("T")
+P = TypeVar("P", bound=BaseModel)
+
+
+class ListQuery(BaseModel):
+    """Parâmetros de uma lista, vindos da URL (README §5.12). A subclasse declara os filtros como campos opcionais:
+
+        class FaturaQuery(ListQuery):
+            sortable: ClassVar[tuple[str, ...]] = ("cliente", "valor", "criada_em")
+            default_sort: ClassVar[str | None] = "-criada_em"
+            status: Literal["aberta", "paga"] | None = None     # status = $status
+            valor_from: float | None = None                     # valor >= $valor_from
+            cliente: list[str] | None = None                    # cliente IN $cliente
+
+    Parâmetro desconhecido na URL é ignorado (extra="ignore"): a lista só lê o que declarou.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    sortable: ClassVar[tuple[str, ...]] = ()
+    default_sort: ClassVar[str | None] = None
+
+    page: int = Field(1, ge=1, le=10_000, description="Página, a partir de 1")
+    size: int = Field(20, ge=1, le=100, description="Itens por página (até 100)")
+    sort: str | None = Field(None, max_length=64, description='Ordem: "campo" (crescente) ou "-campo" (decrescente)')
+    q: str | None = Field(None, max_length=200, description="Busca por palavras (início de palavra, sem acento)")
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        for name in [*cls.filter_names(), *cls.sortable, (cls.default_sort or "x").lstrip("-")]:
+            if not _IDENT.match(name):
+                raise TypeError(f"{cls.__name__}: {name!r} não é um nome de campo válido (snake_case)")
+        if cls.default_sort and cls.default_sort.lstrip("-") not in cls.sortable:
+            raise TypeError(f"{cls.__name__}: default_sort {cls.default_sort!r} precisa estar em sortable")
+
+    @classmethod
+    def filter_names(cls) -> list[str]:
+        return [name for name in cls.model_fields if name not in ListQuery.model_fields]
+
+    @field_validator("sort")
+    @classmethod
+    def _sortable(cls, value: str | None) -> str | None:
+        if value is not None and value.lstrip("-") not in cls.sortable:
+            raise ValueError(f"Ordenação não permitida. Use: {', '.join(cls.sortable) or 'nenhuma'} (com - na frente para decrescente).")
+        return value
+
+    @field_validator("q")
+    @classmethod
+    def _blank_is_none(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema: Any, handler: Any) -> dict[str, Any]:
+        """No contrato (contracts.ts), sort vira a lista exata das ordens permitidas: "cliente" | "-cliente" | ..."""
+        schema = handler.resolve_ref_schema(handler(core_schema))
+        if cls.sortable and "sort" in schema.get("properties", {}):
+            options = [option for name in cls.sortable for option in (name, f"-{name}")]
+            schema["properties"]["sort"] = {**schema["properties"]["sort"], "anyOf": [{"enum": options}, {"type": "null"}]}
+        return schema
+
+    def filters(self) -> dict[str, Any]:
+        """Filtros preenchidos (campo da subclasse com valor), na ordem da declaração."""
+        return {name: value for name in self.filter_names() if (value := getattr(self, name)) not in (None, [])}
+
+
+class Page(BaseModel, Generic[T]):
+    """Uma página de lista. No schemas.py: class FaturaPage(Page[Fatura]): pass."""
+
+    items: list[T]
+    total: int = Field(..., description="Itens que atendem ao filtro, somando todas as páginas")
+    page: int
+    size: int
+    pages: int = Field(..., description="Total de páginas (0 quando não há itens)")
 
 
 class SurrealSettings(BaseSettings):
@@ -51,6 +132,7 @@ class Database:
         self._lock = asyncio.Lock()
         self._tenant_tables: frozenset[str] = frozenset()
         self._shared_tables: frozenset[str] = frozenset()
+        self._search: dict[str, tuple[str, ...]] = {}
 
     @asynccontextmanager
     async def connected(
@@ -59,12 +141,14 @@ class Database:
         *,
         shared: Iterable[str] = (),
         unique: Mapping[str, Iterable[str]] | None = None,
+        search: Mapping[str, Iterable[str]] | None = None,
     ) -> AsyncIterator["Database"]:
         """Conecta no boot (falha cedo se faltar credencial) e garante tabelas, campo tenant e índices.
 
         tables: por organização (ganham o campo tenant, READONLY e indexado). shared: globais.
         unique: {"tabela": ["campo", ...]}; em tabela por organização o tenant entra no índice sozinho
-        (o mesmo e-mail pode existir em duas organizações). Idempotente. O SurrealDB 3 recusa SELECT em
+        (o mesmo e-mail pode existir em duas organizações). search: {"tabela": ["campo", ...]} cria o índice de busca
+        por palavras de cada campo (db.page com q). Idempotente. O SurrealDB 3 recusa SELECT em
         tabela que nunca recebeu registro; declarar no boot faz a primeira listagem devolver [] em vez de erro.
         """
         per_tenant, globals_ = [_ident(t) for t in tables], [_ident(t) for t in shared]
@@ -73,6 +157,9 @@ class Database:
         indexes = {_ident(t): [_ident(f) for f in fields] for t, fields in (unique or {}).items()}
         if unknown := set(indexes) - set(per_tenant) - set(globals_):
             raise ValueError(f"unique cita tabela não declarada em tables/shared: {sorted(unknown)}")
+        searches = {_ident(t): tuple(_ident(f) for f in fields) for t, fields in (search or {}).items()}
+        if unknown := set(searches) - set(per_tenant) - set(globals_):
+            raise ValueError(f"search cita tabela não declarada em tables/shared: {sorted(unknown)}")
         # Nomes validados por _ident (só a-z, 0-9, _): seguros fora de parâmetro, que DEFINE não aceita.
         statements = [f"DEFINE TABLE IF NOT EXISTS {t} SCHEMALESS" for t in per_tenant + globals_]
         for t in per_tenant:
@@ -86,9 +173,21 @@ class Database:
                 f"DEFINE INDEX IF NOT EXISTS {t}__{'__'.join(fields)}__unique ON TABLE {t} FIELDS {', '.join(columns)} UNIQUE"
             )
         await self._connection()
+        if searches:
+            # O mesmo índice tem nomes diferentes: FULLTEXT no SurrealDB 3 (servidor), SEARCH no 2.x (o motor embutido
+            # do SDK, usado nos testes). A busca se comporta igual nos dois.
+            major = _VERSION.search(str(await self._call("version")) or "")
+            keyword = "SEARCH" if major and int(major.group(1)) < 3 else "FULLTEXT"
+            statements.append(_ANALYZER_DEF)
+            for t, fields in searches.items():
+                statements += [
+                    f"DEFINE INDEX IF NOT EXISTS {t}__busca__{f} ON TABLE {t} FIELDS {f} {keyword} ANALYZER {ANALYZER} BM25"
+                    for f in fields
+                ]
         for statement in statements:
             await self._call("query", statement, None)
         self._tenant_tables, self._shared_tables = frozenset(per_tenant), frozenset(globals_)
+        self._search = searches
         try:
             yield self
         finally:
@@ -116,6 +215,65 @@ class Database:
         if not self._shared_tables:
             raise RuntimeError("db.query_shared exige tabelas globais declaradas: db.connected(shared=[...]) (README §5.9)")
         return await self._call("query", sql, params or None)
+
+    async def page(
+        self,
+        table: str,
+        query: ListQuery,
+        model: type[P],
+        *,
+        where: LiteralString = "",
+        select: LiteralString = "*",
+        **params: Any,
+    ) -> P:
+        """Uma página da lista: filtros da query, busca (q), ordem e total, na organização atual.
+
+        Tabela por organização: o filtro de tenant entra sozinho. Tabela global: where= é obrigatório e diz quem
+        enxerga o quê (ex.: where="owner = $org", org=...). select acrescenta campos calculados (ex.: "*, provider.slug
+        AS slug"); a ordem só aceita campos presentes na seleção, por isso o * fica.
+        """
+        name = self._declared(_ident(table))
+        if TENANT in params or any(key.startswith("f_") for key in params) or {"q", "size", "start"} & set(params):
+            raise ValueError("parâmetros reservados em db.page: tenant, q, size, start e f_*")
+        conditions: list[str] = []
+        values: dict[str, Any] = dict(params)
+        if name in self._tenant_tables:
+            conditions.append(f"{TENANT} = $tenant")
+            values[TENANT] = current_tenant()
+        elif not where:
+            raise ValueError(f"tabela global {name!r}: diga em where= quem enxerga o quê (README §5.12)")
+        if where:
+            conditions.append(f"({where})")
+        for field, value in query.filters().items():
+            column, operator = _filter(field, value)
+            conditions.append(f"{column} {operator} $f_{field}")  # nomes validados no ListQuery; valor sempre parâmetro
+            values[f"f_{field}"] = value
+        score = ""
+        if query.q:
+            fields = self._search.get(name)
+            if not fields:
+                raise ServiceError("ERRO_SEARCH_UNAVAILABLE", "Esta lista não tem busca por texto.", status=422)
+            conditions.append("(" + " OR ".join(f"{f} @{i}@ $q" for i, f in enumerate(fields)) + ")")
+            score = ", (" + " + ".join(f"search::score({i})" for i in range(len(fields))) + ") AS _score"
+            values["q"] = query.q
+        condition = " AND ".join(conditions)
+        rows = await self._call(
+            "query",
+            f"SELECT {select}{score} FROM {name} WHERE {condition} ORDER BY {_order(query, bool(score))} LIMIT $size START $start",
+            {**values, "size": query.size, "start": (query.page - 1) * query.size},
+        )
+        # Conta a partir da subconsulta: o motor 2.x (embutido) soma os índices em vez de cruzá-los num count() direto.
+        counted = await self._call(
+            "query", f"SELECT count() AS total FROM (SELECT id FROM {name} WHERE {condition}) GROUP ALL", values
+        )
+        total = counted[0]["total"] if counted else 0
+        return model.model_validate({
+            "items": [{k: v for k, v in row.items() if k != "_score"} for row in rows],
+            "total": total,
+            "page": query.page,
+            "size": query.size,
+            "pages": -(-total // query.size),
+        })
 
     async def create(self, table: str, data: dict[str, Any]) -> dict[str, Any]:
         name = self._declared(_ident(table))
@@ -211,6 +369,23 @@ def _record(record_id: str) -> RecordID:
     if not sep or not key:
         raise ValueError(f"id de registro inválido: {record_id!r} (formato: tabela:id)")
     return RecordID(_ident(table), key)
+
+
+def _filter(field: str, value: Any) -> tuple[str, str]:
+    """Convenção dos filtros do ListQuery: x → x =, x_from → x >=, x_to → x <=, lista → x IN."""
+    if field.endswith("_from"):
+        return field.removesuffix("_from"), ">="
+    if field.endswith("_to"):
+        return field.removesuffix("_to"), "<="
+    return field, "IN" if isinstance(value, list) else "="
+
+
+def _order(query: ListQuery, by_score: bool) -> str:
+    """sort pedido > relevância da busca > default_sort > id. O id desempata: a mesma página volta igual."""
+    sort = query.sort or (None if by_score else type(query).default_sort)
+    if sort:
+        return f"{sort.lstrip('-')} {'DESC' if sort.startswith('-') else 'ASC'}, id ASC"
+    return "_score DESC, id ASC" if by_score else "id ASC"
 
 
 def _without_tenant(data: dict[str, Any]) -> dict[str, Any]:

@@ -7,8 +7,9 @@ e TRIGGER_SUBJECT → AiWorkflow (busca de modelos em segundo plano).
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-ai main:app --port 8100 --env-file .env
 """
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
@@ -22,11 +23,13 @@ from schemas import (
     SHARED_TABLES,
     TASK_QUEUE,
     TENANT_TABLES,
+    SEARCH,
     TRIGGER_SUBJECT,
     UNIQUE,
     USAGE_SUBJECT,
     Empty,
     ModelInput,
+    ModelQuery,
     ModelUpdate,
     ProviderInput,
     ProviderRef,
@@ -53,7 +56,7 @@ async def lifespan(app: FastAPI):
     settings()  # sem AI_SECRETS_KEY válida o serviço não sobe
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE),
+        db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE, search=SEARCH),
         runner.worker(TASK_QUEUE, workflows=[AiWorkflow], service=svc),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ProviderRef)
@@ -92,8 +95,8 @@ async def discover_models(data: ProviderRef) -> ResponseEnvelope:
 
 
 @app.get("/models", response_model=ResponseEnvelope)
-async def models() -> ResponseEnvelope:
-    return _ok(await svc.list_models(Empty()))
+async def models(data: Annotated[ModelQuery, Query()]) -> ResponseEnvelope:
+    return _ok(await svc.list_models(data))
 
 
 @app.post("/models", response_model=ResponseEnvelope)

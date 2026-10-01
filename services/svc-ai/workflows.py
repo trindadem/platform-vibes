@@ -9,7 +9,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from schemas import ModelList, ProviderRef
+    from schemas import Discovered, ProviderRef
     from service import AiService
 
 
@@ -18,7 +18,7 @@ class AiWorkflow:
     """Busca os modelos de um provedor em segundo plano. Disparada por events.ai.trigger."""
 
     @workflow.run
-    async def run(self, data: ProviderRef) -> ModelList:
+    async def run(self, data: ProviderRef) -> Discovered:
         return await workflow.execute_activity_method(
             AiService.discover_models,
             data,

@@ -49,6 +49,11 @@ _VALIDATION_MESSAGES = {
     "literal_error": "Valor não permitido (aceitos: {expected}).",
     "enum": "Valor não permitido (aceitos: {expected}).",
     "json_invalid": "JSON inválido.",
+    "value_error": "{error}",  # validador próprio: só a mensagem dele, sem o "Value error," do Pydantic
+    "datetime_parsing": "Data e hora inválidas (use AAAA-MM-DDTHH:MM).",
+    "datetime_from_date_parsing": "Data inválida (use AAAA-MM-DD).",
+    "date_parsing": "Data inválida (use AAAA-MM-DD).",
+    "date_from_datetime_parsing": "Data inválida (use AAAA-MM-DD).",
 }
 
 

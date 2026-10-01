@@ -39,7 +39,7 @@ endpoints:
     method: POST
     auth: client_jwt
     request: ProviderRef
-    response: ModelList
+    response: Discovered
     target_type: http
     target_url: http://svc-ai:8000/providers/discover
     timeout: 30
@@ -47,7 +47,8 @@ endpoints:
   - path: /models
     method: GET
     auth: client_jwt
-    response: ModelList
+    query: ModelQuery
+    response: ModelPage
     target_type: http
     target_url: http://svc-ai:8000/models
 

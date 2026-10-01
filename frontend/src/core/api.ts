@@ -12,6 +12,11 @@
  *   const criar   = useAction(loja.criar, { onSuccess: faturas.reload });
  * e entregam o estado aos componentes de receita (QueryTable, QueryView, ActionForm, ResourcePage).
  *
+ * Listas paginadas (README §5.12): a rota GET com query: tem página, ordem, busca e filtros na URL da tela.
+ *   const faturas = useListQuery(loja.listar);                    // ?page=2&q=padaria&status=paga
+ *   const faturas = useListQuery(loja.listar, { live: "loja.criada" });  // e recarrega ao vivo
+ * e entregam o estado ao ListView (busca, filtros, ordenação no cabeçalho e páginas).
+ *
  * Tempo real (README §5.10):
  *   const resposta = useStream(assistente.responder);             // rota stream: pedaços tipados + resultado
  *   const lista = useLiveQuery("pedidos.criado", pedidos.listar);  // recarrega quando o evento chega
@@ -19,6 +24,7 @@
  * Uma conexão ao vivo por aba (GET /api/v1/live), aberta no primeiro uso e reaberta sozinha.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router";
 import type { LiveTopics } from "./contracts"; // só tipo: não cria ciclo de import em tempo de execução
 
 export interface ApiErrorDetail {
@@ -251,6 +257,75 @@ export function useQuery<T, A extends unknown[]>(fn: (...args: [...A, RequestOpt
 
   const reload = useCallback(() => setVersion((v) => v + 1), []);
   return { ...state, reload };
+}
+
+/** Monta a query string de uma rota GET de lista: vazio, null e undefined ficam de fora; lista repete a chave. */
+export function withQuery(path: string, query?: object): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value === undefined || value === null || value === "") continue;
+    for (const item of Array.isArray(value) ? value : [value]) search.append(key, String(item));
+  }
+  const text = search.toString();
+  return text ? `${path}?${text}` : path;
+}
+
+/** Uma página de lista, como o Page[T] do backend devolve (core/surreal.py). */
+export interface ListPage<T> {
+  items: T[];
+  total: number;
+  page: number;
+  size: number;
+  pages: number;
+}
+
+/** Estado de useListQuery: o que o ListView recebe. */
+export interface ListState<T> extends QueryState<ListPage<T>> {
+  /** Parâmetros atuais da lista, como estão na URL (texto): page, size, sort, q e os filtros. */
+  params: Record<string, string>;
+  /** Muda parâmetros (vazio, null ou undefined remove). Mudança que não seja de página volta para a página 1. */
+  set: (changes: Record<string, string | number | null | undefined>) => void;
+}
+
+/**
+ * Receita de lista paginada: os parâmetros vivem na URL da tela (voltar, recarregar e compartilhar o link mantêm
+ * página, busca e filtros) e vão para a rota como estão; o serviço ignora o que não declarou. Com live, recarrega
+ * quando o tópico chega e quando a conexão ao vivo volta. Uso: useListQuery(loja.listar).
+ */
+export function useListQuery<Q extends object, T>(
+  fn: (query?: Q, options?: RequestOptions) => Promise<ListPage<T>>,
+  options: { live?: keyof LiveTopics } = {},
+): ListState<T> {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const params = Object.fromEntries(new URLSearchParams(location.search));
+  const query = useQuery(fn, params as Q); // a busca depende do texto dos parâmetros: objeto novo não refaz a requisição
+  const { reload } = query;
+  useEffect(() => {
+    if (!options.live) return;
+    const stopEvents = onLive(options.live, () => reload());
+    const stopReconnects = onLiveReconnect(reload);
+    return () => {
+      stopEvents();
+      stopReconnects();
+    };
+  }, [options.live, reload]);
+  const latest = useRef({ location, navigate });
+  latest.current = { location, navigate };
+  // Identidade estável: quem depende de set num efeito (ex.: a busca com espera do ListView) não entra em laço.
+  // Muda só a parte ?...: caminho e fragmento (#aba das Tabs) ficam como estão.
+  const set = useCallback((changes: Record<string, string | number | null | undefined>) => {
+    const { location: current, navigate: go } = latest.current;
+    const next = new URLSearchParams(current.search);
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined || value === null || value === "") next.delete(key);
+      else next.set(key, String(value));
+    }
+    if (!("page" in changes)) next.delete("page");
+    const search = next.toString();
+    go({ pathname: current.pathname, search: search ? `?${search}` : "", hash: current.hash }, { replace: true });
+  }, []);
+  return { ...query, params, set };
 }
 
 /** Estado de uma ação: o que ActionForm e ResourcePage recebem. */

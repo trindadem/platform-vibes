@@ -12,6 +12,7 @@ import functools
 import os
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -21,7 +22,7 @@ from core.envelope import ServiceError
 from core.http_client import http, no_cookie_jar
 from core.nats_bus import bus
 from core.security import Principal, assert_public_url, current
-from core.surreal import db
+from core.surreal import Page, db
 from core.temporal_runner import activities
 
 from schemas import (
@@ -31,10 +32,12 @@ from schemas import (
     PROVIDERS,
     USAGE,
     AiSettings,
+    Discovered,
     Empty,
     Model,
     ModelInput,
-    ModelList,
+    ModelPage,
+    ModelQuery,
     ModelUpdate,
     Provider,
     ProviderInput,
@@ -100,16 +103,17 @@ class AiService:
 
     # ── Catálogo de modelos ─────────────────────────────────────────────────
 
-    async def discover_models(self, data: ProviderRef) -> ModelList:
+    async def discover_models(self, data: ProviderRef) -> Discovered:
         """Busca GET {base_url}/models e grava os novos ids desativados (quem administra ativa)."""
         who = _manager()
         provider = await self._provider(who, data.id, manage=True)
         ids = await _fetch_model_ids(provider)
         known = set(await db.query_shared("SELECT VALUE model_id FROM ai_models WHERE provider = $p", p=_rid(provider["id"])))
-        for model_id in sorted(set(ids) - known):
+        new = sorted(set(ids) - known)
+        for model_id in new:
             kind = "embedding" if "embed" in model_id.lower() else "chat"
             await db.create(MODELS, _model_record(provider, model_id, kind, enabled=False))
-        return await self.list_models(Empty())
+        return Discovered(found=len(set(ids)), added=len(new))
 
     async def add_model(self, data: ModelInput) -> Model:
         """Cadastro manual (provedor sem /models): já nasce ativo."""
@@ -142,14 +146,16 @@ class AiService:
         row = await db.merge(model["id"], changes) if changes else model
         return await self._model_view(row)
 
-    async def list_models(self, data: Empty) -> ModelList:
-        """Modelos visíveis para a organização: os dela e os da plataforma."""
+    async def list_models(self, data: ModelQuery) -> ModelPage:
+        """Modelos visíveis para a organização (os dela e os da plataforma), uma página por vez.
+        Membro só recebe os liberados: os outros são assunto de quem administra."""
         who = _member()
-        rows = await db.query_shared(
-            "SELECT *, provider.slug AS slug FROM ai_models WHERE (owner = $org OR owner = $plat) ORDER BY slug, model_id",
-            **_visible(who),
+        if not MANAGERS & who.roles:
+            data = data.model_copy(update={"enabled": True})
+        rows = await db.page(
+            MODELS, data, Page[dict[str, Any]], where="(owner = $org OR owner = $plat)", select="*, provider.slug AS slug", **_visible(who)
         )
-        return ModelList(items=[_model_view(row) for row in rows])
+        return ModelPage(**rows.model_dump(exclude={"items"}), items=[_model_view(row) for row in rows.items])
 
     # ── Uso dos serviços (core/llm.py) ──────────────────────────────────────
 

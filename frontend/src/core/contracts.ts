@@ -1,6 +1,6 @@
 // Gerado por gateway/contracts.py a partir de gateway/endpoints/*.yaml e services/*/schemas.py. Não edite:
 // depois de mudar um manifesto ou um schemas.py, rode (da raiz) `uv run python gateway/contracts.py`.
-import { request, type RequestOptions } from "./api";
+import { request, withQuery, type RequestOptions } from "./api";
 
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */
 export interface Dispatched {
@@ -53,6 +53,13 @@ export interface AiProviderRef {
   id: string;
 }
 
+export interface AiDiscovered {
+  /** Modelos que o provedor listou */
+  found: number;
+  /** Novos no catálogo (nascem não liberados) */
+  added: number;
+}
+
 export interface AiModel {
   id: string;
   /** O que se passa ao llm.*: <provedor>/<apelido ou id> */
@@ -67,8 +74,29 @@ export interface AiModel {
   scope: "organization" | "platform";
 }
 
-export interface AiModelList {
+export interface AiModelPage {
   items: AiModel[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** Lista de modelos: busca por id ou apelido, filtros de liberado e tipo. Membro só recebe os liberados. */
+export interface AiModelQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "model_id" | "-model_id" | "alias" | "-alias" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  /** Só liberados (true) ou só não liberados (false) */
+  enabled?: boolean | null;
+  kind?: "chat" | "embedding" | null;
 }
 
 export interface AiModelInput {
@@ -131,10 +159,10 @@ export const ai = {
     request<AiProviderList>("POST", "/api/v1/ai/providers/remove", body, options),
   /** POST /api/v1/ai/providers/discover · http · exige token */
   discoverModels: (body: AiProviderRef, options?: RequestOptions) =>
-    request<AiModelList>("POST", "/api/v1/ai/providers/discover", body, options),
+    request<AiDiscovered>("POST", "/api/v1/ai/providers/discover", body, options),
   /** GET /api/v1/ai/models · http · exige token */
-  models: (options?: RequestOptions) =>
-    request<AiModelList>("GET", "/api/v1/ai/models", undefined, options),
+  models: (query?: AiModelQuery, options?: RequestOptions) =>
+    request<AiModelPage>("GET", withQuery("/api/v1/ai/models", query), undefined, options),
   /** POST /api/v1/ai/models · http · exige token */
   addModel: (body: AiModelInput, options?: RequestOptions) =>
     request<AiModel>("POST", "/api/v1/ai/models", body, options),

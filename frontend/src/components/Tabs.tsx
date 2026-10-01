@@ -1,16 +1,15 @@
 import type { ReactNode } from "react";
-import { useSearchParams } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { Tabs as TabsRoot, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export interface TabsProps {
-  /** Abas na ordem: { id, label, content }. Só o conteúdo da aba aberta fica montado. */
+  /** Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada. */
   tabs: { id: string; label: string; content: ReactNode }[];
-  /** Parâmetro da URL que guarda a aba aberta (link direto e recarregar mantêm a aba). Padrão: "aba". */
-  param?: string;
 }
 
 /**
- * Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (?aba=...).
+ * Abas que dividem uma tela em partes do mesmo assunto. A aba aberta fica no fragmento da URL (/tela#modelos):
+ * link direto e recarregar mantêm a aba, e os parâmetros de lista (?q=, ?page=) ficam só para as listas.
  *
  * @category Layout
  * @example
@@ -21,19 +20,12 @@ export interface TabsProps {
  *   ]}
  * />
  */
-export function Tabs({ tabs, param = "aba" }: TabsProps) {
-  const [search, setSearch] = useSearchParams();
-  const requested = search.get(param);
-  const current = tabs.some((tab) => tab.id === requested) ? requested! : tabs[0]?.id;
-  const open = (id: string) =>
-    setSearch(
-      (previous) => {
-        const next = new URLSearchParams(previous);
-        next.set(param, id);
-        return next;
-      },
-      { replace: true },
-    );
+export function Tabs({ tabs }: TabsProps) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const requested = decodeURIComponent(location.hash.slice(1));
+  const current = tabs.some((tab) => tab.id === requested) ? requested : tabs[0]?.id;
+  const open = (id: string) => navigate({ pathname: location.pathname, search: location.search, hash: id }, { replace: true });
 
   return (
     <TabsRoot value={current} onValueChange={open} className="gap-4">

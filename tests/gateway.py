@@ -110,6 +110,8 @@ def test_manifesto_valido():
         ({"delta": "Pedaco"}, "delta só existe com stream: true"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "stream": True, "delta": "P"}, "stream: true só em rota HTTP"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "cookies": True}, "cookies: true só"),
+        ({"query": "FaturaQuery"}, "query (parâmetros da URL) só em rota HTTP GET"),
+        ({"method": "GET", "request": None, "query": "fatura_query"}, "PascalCase"),
     ],
 )
 def test_manifesto_fora_do_trilho_e_recusado(override, erro):
@@ -375,8 +377,9 @@ def test_timeout_do_servico_vira_504(auth_env, tmp_path, monkeypatch):
 
 LOJA_SCHEMAS = """
 from enum import Enum
-from typing import Literal
+from typing import ClassVar, Literal
 from pydantic import BaseModel, Field
+from core.surreal import ListQuery, Page
 
 class Status(str, Enum):
     ABERTA = "aberta"
@@ -397,6 +400,13 @@ class Fatura(BaseModel):
     id: str
     status: Status
     itens: list[Item]
+
+class FaturaQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("cliente", "valor")
+    status: Status | None = None
+
+class FaturaPage(Page[Fatura]):
+    pass
 """
 
 LOJA = {
@@ -409,6 +419,8 @@ LOJA = {
          "response": "Fatura", "target_type": "http", "target_url": "http://svc-loja:8000/faturas/{fatura_id}"},
         {"path": "/faturas/emitir", "method": "POST", "auth": "client_jwt", "request": "FaturaIn",
          "target_type": "nats", "nats_subject": "events.loja.emitir"},
+        {"path": "/faturas", "name": "listar", "method": "GET", "auth": "client_jwt", "query": "FaturaQuery",
+         "response": "FaturaPage", "target_type": "http", "target_url": "http://svc-loja:8000/faturas"},
     ],
 }
 
@@ -452,6 +464,18 @@ def test_contrato_gera_uma_funcao_tipada_por_rota(loja_dirs):
     assert "exige token com papéis financeiro" in ts
     assert "  emitir: (body: LojaFaturaIn, options?: RequestOptions) =>" in ts  # name derivado do path
     assert '    request<Dispatched>("POST", "/api/v1/loja/faturas/emitir", body, options),' in ts
+
+
+def test_contrato_de_lista_tipa_os_parametros_da_url_e_a_pagina(loja_dirs):
+    import contracts
+
+    ts = contracts.generate(*loja_dirs)
+    assert "import { request, withQuery, type RequestOptions } from \"./api\";" in ts
+    assert "  listar: (query?: LojaFaturaQuery, options?: RequestOptions) =>" in ts
+    assert '    request<LojaFaturaPage>("GET", withQuery("/api/v1/loja/faturas", query), undefined, options),' in ts
+    assert '  sort?: "cliente" | "-cliente" | "valor" | "-valor" | null;' in ts  # só as ordens permitidas
+    assert "  status?: LojaStatus | null;" in ts and "  page?: number;" in ts
+    assert "export interface LojaFaturaPage {\n  items: LojaFatura[];" in ts
 
 
 def test_contrato_com_modelo_inexistente_e_erro(loja_dirs):

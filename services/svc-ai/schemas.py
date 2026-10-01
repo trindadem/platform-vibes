@@ -1,11 +1,12 @@
 """svc-ai · contratos (DTOs, enums, constantes). Fonte da verdade: specs/ai.md §2"""
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings
 
 from core.llm import RESOLVE_SUBJECT, USAGE_SUBJECT, Resolved, ResolveRequest, UsageEvent  # contrato com core/llm.py
+from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-ai"
@@ -20,6 +21,7 @@ USAGE = "ai_usage"
 SHARED_TABLES = [PROVIDERS, MODELS]
 TENANT_TABLES = [USAGE]
 UNIQUE = {PROVIDERS: ["owner", "slug"], MODELS: ["owner", "provider", "model_id"], USAGE: ["message"]}
+SEARCH = {MODELS: ["model_id", "alias"]}  # busca por palavras na lista de modelos (README §5.12)
 PLATFORM = "platform"
 MANAGERS = frozenset({"owner", "admin"})
 
@@ -102,8 +104,22 @@ class Model(BaseModel):
     scope: Scope
 
 
-class ModelList(BaseModel):
-    items: list[Model]
+class ModelQuery(ListQuery):
+    """Lista de modelos: busca por id ou apelido, filtros de liberado e tipo. Membro só recebe os liberados."""
+
+    sortable: ClassVar[tuple[str, ...]] = ("model_id", "alias")
+    default_sort: ClassVar[str | None] = "model_id"
+    enabled: bool | None = Field(None, description="Só liberados (true) ou só não liberados (false)")
+    kind: Kind | None = None
+
+
+class ModelPage(Page[Model]):
+    pass
+
+
+class Discovered(BaseModel):
+    found: int = Field(..., description="Modelos que o provedor listou")
+    added: int = Field(..., description="Novos no catálogo (nascem não liberados)")
 
 
 class UsageItem(BaseModel):

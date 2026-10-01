@@ -4,13 +4,14 @@
 > Como usar: leia o índice, escolha as peças (receitas primeiro) e copie o exemplo da seção de cada uma.
 > Dados vêm de `useQuery`/`useAction` com as funções de `src/core/contracts.ts`. Faltou peça? Crie
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
-> Os exemplos usam dados fictícios (`faturas`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
+> Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (38)
+## Índice (40)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
 - [ActionForm](#actionform): Receita de formulário: campos a partir de uma lista, envio pela ação, erro do servidor no campo certo. `action, fields, submitLabel?, successMessage?, initial?, onDone?`
+- [ListView](#listview): Receita de lista paginada no servidor: busca por texto, filtros, ordenação no cabeçalho, páginas e todos os estados. `list, columns, rowKey, search?, filters?, empty?, noun?, caption?, actions?`
 - [QueryTable](#querytable): Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito. `query, columns, rowKey, empty?, caption?`
 - [QueryView](#queryview): Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados. `query, children, empty?`
 - [ResourcePage](#resourcepage): Receita de tela de cadastro: título, indicadores, lista com todos os estados e criação em painel lateral. `title, query, columns, rowKey, description?, empty?, stats?, create?`
@@ -23,12 +24,13 @@
 - [Row](#row): Coloca itens lado a lado, com alinhamento e quebra de linha controlados. `children, gap?, align?, justify?, wrap?`
 - [SidePanel](#sidepanel): Painel que desliza da direita sobre a tela, para editar ou criar sem sair dela (ocupa a tela no celular). `open, onClose, title, children, description?`
 - [Stack](#stack): Empilha itens na vertical com espaçamento uniforme. `children, gap?`
-- [Tabs](#tabs): Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (?aba=...). `tabs, param?`
+- [Tabs](#tabs): Abas que dividem uma tela em partes do mesmo assunto. `tabs`
 
 **Dados**: registros e números
 
-- [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?`
+- [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?, sort?, onSort?`
 - [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items`
+- [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
 
 **Formatação**: dinheiro, datas, status e códigos
@@ -95,6 +97,36 @@ Receita de formulário: campos a partir de uma lista, envio pela ação, erro do
 - `successMessage?`: `string`: Mensagem exibida após sucesso (o formulário é limpo).
 - `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo.
 - `onDone?`: `() => void`: Chamado após sucesso (ex.: fechar o painel).
+
+---
+
+## ListView
+
+Receita de lista paginada no servidor: busca por texto, filtros, ordenação no cabeçalho, páginas e todos os estados. Os parâmetros ficam na URL: voltar, recarregar e compartilhar o link mantêm o que a pessoa escolheu. _(Receitas)_
+
+```tsx
+<ListView
+  list={lista}
+  rowKey={(f) => f.id}
+  search="cliente"
+  filters={[{ name: "status", label: "Status", options: [{ value: "aberta", label: "Aberta" }, { value: "paga", label: "Paga" }] }]}
+  columns={[
+    { key: "cliente", header: "Cliente", sort: "cliente" },
+    { key: "valor", header: "Valor", sort: "valor", render: (f) => <Money value={f.valor} /> },
+  ]}
+  noun="faturas"
+/>
+```
+
+- `list`: `{ data: { items: T[]; total: number; page: number; size: number; pages: number } | null; loading: boolean; error: { message: string } | null; reload: () => void; params: Record<string, string>; set: (changes: Record<string, string | number | null | undefined>) => void; }`: Estado de useListQuery(...) (src/core/api.ts): página carregada e parâmetros da URL.
+- `columns`: `DataTableProps<T>["columns"]`: Colunas como em DataTable; sort é o campo que ordena a coluna (precisa estar no sortable do backend).
+- `rowKey`: `(row: T) => string`: Identificador estável de cada linha (ex.: f => f.id).
+- `search?`: `string`: Liga a busca por texto e mostra este exemplo no campo (ex.: "cliente ou descrição").
+- `filters?`: `{ name: string; label: string; options: { value: string; label: string }[] }[]`: Filtros de escolha única: name é o parâmetro da lista no backend (ex.: status).
+- `empty?`: `string`: Título quando ainda não há nenhum item. Padrão: "Nada por aqui ainda."
+- `noun?`: `string`: Nome dos itens no plural, para o rodapé (ex.: "faturas"). Padrão: "itens".
+- `caption?`: `string`: Legenda acessível da tabela.
+- `actions?`: `ReactNode`: Ações ao lado da busca (ex.: botão de criar).
 
 ---
 
@@ -272,7 +304,7 @@ Empilha itens na vertical com espaçamento uniforme. _(Layout)_
 
 ## Tabs
 
-Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (?aba=...). _(Layout)_
+Abas que dividem uma tela em partes do mesmo assunto. A aba aberta fica no fragmento da URL (/tela#modelos): link direto e recarregar mantêm a aba, e os parâmetros de lista (?q=, ?page=) ficam só para as listas. _(Layout)_
 
 ```tsx
 <Tabs
@@ -283,14 +315,13 @@ Abas que dividem uma tela em partes do mesmo assunto; a aba aberta fica na URL (
 />
 ```
 
-- `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. Só o conteúdo da aba aberta fica montado.
-- `param?`: `string`: Parâmetro da URL que guarda a aba aberta (link direto e recarregar mantêm a aba). Padrão: "aba".
+- `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada.
 
 ---
 
 ## DataTable
 
-Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rótulo e valor. _(Dados)_
+Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rótulo e valor. Com onSort, as colunas que têm sort viram botões de ordenação no cabeçalho. _(Dados)_
 
 ```tsx
 <DataTable
@@ -303,11 +334,13 @@ Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rót
 />
 ```
 
-- `columns`: `{ key: string; header: string; render?: (row: T) => ReactNode }[]`: Colunas: header é o título; render formata a célula (padrão: String(row[key])).
+- `columns`: `{ key: string; header: string; render?: (row: T) => ReactNode; sort?: string }[]`: Colunas: header é o título; render formata a célula (padrão: String(row[key])); sort é o campo que ordena a coluna.
 - `rows`: `T[]`
 - `rowKey`: `(row: T) => string`: Identificador estável de cada linha (ex.: row => row.id).
 - `empty?`: `ReactNode`: Exibido quando não há linhas. Padrão: "Nada por aqui ainda."
 - `caption?`: `string`: Legenda acessível que descreve a tabela.
+- `sort?`: `string | null`: Ordem atual: "campo" (crescente) ou "-campo" (decrescente).
+- `onSort?`: `(sort: string | null) => void`: Clique no título de uma coluna com sort: crescente → decrescente → ordem padrão (null).
 
 ---
 
@@ -325,6 +358,23 @@ Lista de pares rótulo/valor para detalhes de um registro. _(Dados)_
 ```
 
 - `items`: `{ label: string; value: ReactNode }[]`: Pares rótulo/valor, na ordem de exibição.
+
+---
+
+## Pagination
+
+Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. _(Dados)_
+
+```tsx
+<Pagination page={2} pages={7} total={134} size={20} onPage={salvar} noun="faturas" />
+```
+
+- `page`: `number`: Página atual, a partir de 1.
+- `pages`: `number`: Total de páginas (0 quando não há itens).
+- `total`: `number`: Itens que atendem ao filtro, somando todas as páginas.
+- `size`: `number`: Itens por página.
+- `onPage`: `(page: number) => void`: Vai para a página pedida.
+- `noun?`: `string`: Nome dos itens no plural, para o texto (ex.: "faturas"). Padrão: "itens".
 
 ---
 

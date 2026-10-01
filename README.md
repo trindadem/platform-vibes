@@ -111,8 +111,8 @@ O código vive somente em `service.sh` (este README não o duplica). O script:
 
 - valida o nome (seção 2) e aborta sem tocar em nada se o serviço ou a rota já existirem;
 - cria `specs/<service_name>.md` com o template de 4 tópicos — **ou preserva o spec, se já existir** (spec-first);
-- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker);
-- cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py`, e registra o serviço no fim do `compose.yaml`;
+- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker) e uma lista paginada com busca (`GET /records`, seção 5.12);
+- cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py` (no SurrealDB embutido), e registra o serviço no fim do `compose.yaml`;
 - gera tudo numa área temporária, verifica a sintaxe e só então publica (tudo ou nada).
 
 Arquivo de serviço criado à mão, fora do `service.sh`, é violação de contrato.
@@ -196,7 +196,7 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
 - **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), copia apenas `core/` e a pasta do app e roda sem root.
-- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB vira dublê ou roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), executando a SurrealQL de verdade:
+- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), com as tabelas e os índices do boot, executando a SurrealQL de verdade. O motor embutido é o 2.x e o servidor é o 3.x: o core cuida das diferenças conhecidas (seção 5.12).
 
   ```bash
   PYTHONPATH=services/svc-<service_name> uv run python -m pytest tests/<service_name>.py
@@ -214,7 +214,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)`, `bus.live(tópico, model, user=None)`, `bus.live_feed(principal)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
-| `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
+| `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...}, search={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.page(TABLE, query, ModeloPage)`, `db.create`, `db.select`, `db.merge`, `db.delete`, `ListQuery`, `Page` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
 | `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
 
@@ -285,6 +285,14 @@ endpoints:
     request: FaturaIn               # modelo do schemas.py esperado no corpo; NATS responde { message_id }
     target_type: nats
     nats_subject: events.billing.trigger
+  - path: /faturas
+    name: listar
+    method: GET
+    auth: client_jwt
+    query: FaturaQuery              # parâmetros da URL tipados (lista paginada, seção 5.12); só em GET
+    response: FaturaPage
+    target_type: http
+    target_url: http://svc-billing:8000/faturas
   - path: /resumo
     method: POST
     auth: client_jwt
@@ -300,7 +308,7 @@ live:                               # eventos ao vivo que o serviço emite (bus.
 ```
 
 - **Trilhos do manifesto:** `target_url` só aponta para `http://svc-<service>:8000/` e `nats_subject` só para `events.<service>.*`, ou seja, nunca para outro serviço ou para fora. O nome do arquivo é igual ao `service`. Rota pública não tem `roles` nem parâmetros no caminho. Campo desconhecido é erro.
-- **HTTP:** repassa corpo, query e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`. O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
+- **HTTP:** repassa corpo, query string e só os cabeçalhos `authorization`, `content-type`, `accept` e `x-request-id`. O serviço verifica o token de novo. Parâmetros de caminho são codificados (`../` não atravessa). Serviço fora do ar → 502; lento → 504.
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
 - **Limites:** corpo acima de 1 MiB → 413, no gateway (que lê o corpo em pedaços). O Traefik não usa o middleware `buffering`, que seguraria a resposta inteira e quebraria o streaming. Rate limit por IP no Traefik (50 req/s, rajada de 100). O nome de serviço `live` é reservado: `/api/v1/live` é do gateway.
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
@@ -321,6 +329,7 @@ Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode per
   ```
 
 - **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
+- **Listas:** `db.page` (seção 5.12) filtra a organização sozinho, como `create` e `select`.
 - **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só os serviços de plataforma as usam: o de identidade (usuários, organizações, sessões) e o de IA (provedores e modelos, com o dono no campo `owner`).
 - **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
@@ -367,6 +376,33 @@ agente  = await llm.agent("openrouter/claude", tools=[...])              # Agent
       "WHERE tenant = $tenant ORDER BY nota DESC LIMIT 5", q=q)
   ```
 
+### 5.12 Listas e busca (`db.page`)
+
+Toda lista que pode crescer é paginada no servidor, com filtros, ordem e busca por palavras declarados no `schemas.py`. Uma linha no service:
+
+```python
+class FaturaQuery(ListQuery):                      # schemas.py: parâmetros da URL (page, size, sort, q + filtros)
+    sortable: ClassVar[tuple[str, ...]] = ("cliente", "valor")
+    default_sort: ClassVar[str | None] = "-valor"
+    status: Literal["aberta", "paga"] | None = None     # status = $status
+    valor_from: float | None = None                     # valor >= $valor_from (e valor_to: <=)
+    cliente: list[str] | None = None                    # cliente IN $cliente
+
+class FaturaPage(Page[Fatura]):                    # { items, total, page, size, pages }
+    pass
+
+async def listar(self, data: FaturaQuery) -> FaturaPage:     # service.py
+    return await db.page(FATURAS, data, FaturaPage)
+```
+
+- **Rota:** `async def listar(data: Annotated[FaturaQuery, Query()])` no `main.py` e `query: FaturaQuery` no manifesto (seção 5.8). No `contracts.ts`, `loja.listar(query?)` com os parâmetros tipados; `sort` aceita só `"cliente" | "-cliente" | "valor" | "-valor"`.
+- **Trilhos:** página de até 100 itens; ordem só pelos campos de `sortable` (outro → 422 no campo `sort`); `default_sort` precisa estar em `sortable`; nomes de filtro e de ordem são validados ao importar. Parâmetro desconhecido na URL é ignorado. Valores sempre como parâmetros, nunca no texto da SurrealQL.
+- **Organização:** tabela por organização ganha o filtro de `tenant` sozinha. Tabela global exige `where=` dizendo quem enxerga o quê (ex.: `where="owner = $org", org=...`); `select=` acrescenta campos calculados.
+- **Busca (`q`):** por início de palavra, sem diferença de maiúscula nem de acento ("pad" acha "Padaria", "joao" acha "João"); com várias palavras, todas precisam aparecer. Os campos são declarados no boot, `db.connected(..., search={"faturas": ["cliente", "descricao"]})`; sem eles, `q` → 422 `ERRO_SEARCH_UNAVAILABLE`. Sem `sort`, a busca ordena pela relevância.
+- **Ordem estável:** `sort` > relevância > `default_sort` > id, sempre com o id desempatando: a mesma página volta igual.
+- **Motores:** o índice de busca se chama `FULLTEXT` no SurrealDB 3 e `SEARCH` no 2.x embutido dos testes; o core escolhe pela versão. O total é contado a partir da subconsulta, porque o motor 2.x soma índices num `count()` direto.
+- **Tela:** `useListQuery(loja.listar)` + `ListView` (seção 6). Página, busca, filtros e ordem ficam na URL da tela.
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -377,7 +413,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
 - **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Página chama serviço só pelas funções geradas em `src/core/contracts.ts`, através dos hooks `useQuery` (ler) e `useAction` (escrever); importar `request` numa página é erro. Rota, corpo e resposta são tipados; nunca se digita caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
-- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica na URL, `?aba=`), e edição sem sair da tela usa `SidePanel`. Peça avulsa só quando a receita não serve.
+- **Receitas antes de peças:** o hook busca, o componente apresenta. `QueryView` e `QueryTable` cuidam de carregamento, erro com "Tentar de novo", vazio e dados; `ActionForm` monta o formulário a partir de uma lista de campos (conferidos contra o contrato) e mostra o erro do servidor no campo certo; `ResourcePage` é a tela de cadastro inteira (indicadores, lista e criação em painel lateral). Tempo real: `useLiveQuery` no lugar de `useQuery` para a lista se atualizar sozinha, e `useStream` para resposta em pedaços (seção 5.10). `Money` (com `digits` para frações de centavo), `Quantity`, `DateTime` e `StatusBadge` formatam em pt-BR. Tela com várias partes usa `Tabs` (a aba aberta fica no fragmento da URL, `#modelos`), e edição sem sair da tela usa `SidePanel`. Lista que pode crescer usa `useListQuery` + `ListView` (seção 5.12): busca com espera de 300 ms, filtros, ordenação no cabeçalho (seletor no celular), páginas e os estados de carregando, erro e vazio, com tudo na URL (`?q=&status=&sort=&page=`); `QueryTable` e `ResourcePage` ficam para listas curtas. Peça avulsa só quando a receita não serve.
 
 ```tsx
 export const meta: PageMeta = { title: "Faturas", order: 3 };

@@ -12,6 +12,8 @@ Trilhos (manifesto fora deles impede o boot do gateway):
 - Campo desconhecido é erro (um typo não vira configuração silenciosa).
 - request/response nomeiam modelos do schemas.py do serviço; gateway/contracts.py confere que existem e gera
   o cliente tipado do frontend. name é o nome da função gerada (padrão: último trecho fixo do path).
+- query (só em GET) nomeia o modelo dos parâmetros da URL, em geral um ListQuery (lista paginada, README §5.12):
+  vira o argumento tipado query? da função gerada. O gateway repassa a query string como veio; o serviço valida.
 """
 import re
 import string
@@ -43,6 +45,7 @@ class Endpoint(BaseModel):
     nats_subject: str | None = None
     timeout: float = Field(30, gt=0, le=120)
     request: str | None = None
+    query: str | None = None
     response: str | None = None
     cookies: bool = False
     stream: bool = False
@@ -105,11 +108,13 @@ class Manifest(BaseModel):
             if ep.operation() in operations:
                 raise ValueError(f"{where}: outra rota já gera a função {ep.operation()!r}; defina name: diferente")
             operations.add(ep.operation())
-            for field, model in (("request", ep.request), ("response", ep.response), ("delta", ep.delta)):
+            for field, model in (("request", ep.request), ("query", ep.query), ("response", ep.response), ("delta", ep.delta)):
                 if model is not None and not _MODEL.match(model):
                     raise ValueError(f"{where}: {field} deve ser o nome de um modelo do schemas.py (PascalCase)")
             if ep.request is not None and ep.method in ("GET", "DELETE"):
                 raise ValueError(f"{where}: {ep.method} não tem corpo; remova request")
+            if ep.query is not None and (ep.method != "GET" or ep.target_type != "http"):
+                raise ValueError(f"{where}: query (parâmetros da URL) só em rota HTTP GET")
             if ep.cookies and (ep.target_type != "http" or ep.method != "POST"):
                 raise ValueError(f"{where}: cookies: true só em rota HTTP POST")
             if ep.stream and (ep.target_type != "http" or ep.delta is None):

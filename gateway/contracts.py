@@ -3,6 +3,7 @@
 Junta os manifestos (gateway/endpoints/*.yaml: rota, método, request/response) com os modelos Pydantic de
 services/svc-<nome>/schemas.py e escreve tipos TypeScript e uma função por rota. O frontend nunca adivinha
 caminho nem campo: se errar, o TypeScript acusa. Modelo citado no manifesto e ausente no schemas.py é erro.
+Rota com query: (GET de lista) recebe os parâmetros da URL tipados em query?, montados por withQuery (api.ts).
 Rota stream: true vira função com options.onDelta (pedaços tipados) que resolve com o resultado final; os tópicos
 live: viram a interface LiveTopics, que dá o tipo de cada evento em useLive/useLiveQuery (README §5.10).
 
@@ -59,9 +60,16 @@ def generate(endpoints_dir: Path = ENDPOINTS_DIR, services_dir: Path = SERVICES_
         section, service_topics = _service_section(manifest, services_dir)
         sections.append(section)
         topics += service_topics
-    streams = any(ep.stream for manifest in load_manifests(endpoints_dir) for ep in manifest.endpoints)
-    imports = "request, stream, type RequestOptions, type StreamOptions" if streams else "request, type RequestOptions"
-    sections[0] = HEADER.replace("__IMPORTS__", imports)
+    endpoints = [ep for manifest in load_manifests(endpoints_dir) for ep in manifest.endpoints]
+    imports = ["request"]
+    if any(ep.stream for ep in endpoints):
+        imports.append("stream")
+    if any(ep.query for ep in endpoints):
+        imports.append("withQuery")
+    imports.append("type RequestOptions")
+    if any(ep.stream for ep in endpoints):
+        imports.append("type StreamOptions")
+    sections[0] = HEADER.replace("__IMPORTS__", ", ".join(imports))
     lines = "".join(f"  /** {doc} */\n  {json.dumps(name)}: {ts};\n" for name, ts, doc in topics)
     sections.append(
         "/** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */\n"
@@ -82,7 +90,8 @@ def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[
             _declare(module, ep.response, prefix, types, where, response=True) if ep.response else "unknown"
         )
         delta = _declare(module, ep.delta, prefix, types, where, response=True) if ep.delta else None
-        functions.append(_function(manifest, ep, body, result, delta))
+        query = _declare(module, ep.query, prefix, types, where, response=False) if ep.query else None
+        functions.append(_function(manifest, ep, body, result, delta, query))
     topics = [
         (f"{manifest.service}.{t.topic}", _declare(module, t.model, prefix, types, f"{manifest.service}: live {t.topic}", response=True),
          f"svc-{manifest.service} · bus.live(\"{manifest.service}.{t.topic}\", ...)")
@@ -92,7 +101,7 @@ def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[
     return "\n".join([*types.values(), client]), topics
 
 
-def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: str | None = None) -> str:
+def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: str | None = None, query: str | None = None) -> str:
     url = manifest.base_path + ep.path
     params = ep.params()
     path = f'"{url}"'
@@ -101,6 +110,9 @@ def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: s
     args = []
     if params:
         args.append("params: { " + "; ".join(f"{p}: string" for p in params) + " }")
+    if query:
+        args.append(f"query?: {query}")
+        path = f"withQuery({path}, query)"
     has_body = ep.method in ("POST", "PUT", "PATCH")
     if has_body:
         args.append(f"body: {body}")
