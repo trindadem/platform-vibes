@@ -8,7 +8,7 @@ export interface CodeProps {
 /** Trecho de código, comando ou identificador em fonte monoespaçada. */
 export function Code({ children, block = false }: CodeProps) {
   if (block) {
-    return <pre className="overflow-x-auto rounded-control border border-line bg-surface p-3 font-mono text-sm break-all whitespace-pre-wrap">{children}</pre>;
+    return <pre className="overflow-x-auto rounded-lg border bg-muted/50 px-4 py-3 font-mono text-xs break-all whitespace-pre-wrap">{children}</pre>;
   }
-  return <code className="rounded bg-line/60 px-1.5 py-0.5 font-mono text-[0.9em]">{children}</code>;
+  return <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[0.85em]">{children}</code>;
 }

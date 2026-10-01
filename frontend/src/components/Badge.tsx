@@ -1,12 +1,13 @@
 import type { ReactNode } from "react";
+import { Badge as UiBadge } from "@/components/ui/badge";
 
 const TONE = {
-  neutral: "bg-line/60 text-ink",
-  accent: "bg-accent/10 text-accent",
-  success: "bg-success/10 text-success",
-  warning: "bg-warning/15 text-warning",
-  danger: "bg-danger/10 text-danger",
-};
+  neutral: { variant: "secondary", className: "" },
+  accent: { variant: "default", className: "" },
+  success: { variant: "outline", className: "border-transparent bg-success/10 text-success" },
+  warning: { variant: "outline", className: "border-transparent bg-warning/15 text-warning" },
+  danger: { variant: "destructive", className: "" },
+} as const;
 
 export interface BadgeProps {
   /** Cor semântica. Padrão: neutral. */
@@ -16,5 +17,10 @@ export interface BadgeProps {
 
 /** Etiqueta curta para status, papéis ou categorias. */
 export function Badge({ tone = "neutral", children }: BadgeProps) {
-  return <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${TONE[tone]}`}>{children}</span>;
+  const { variant, className } = TONE[tone];
+  return (
+    <UiBadge variant={variant} className={className}>
+      {children}
+    </UiBadge>
+  );
 }

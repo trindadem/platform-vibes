@@ -4,6 +4,8 @@
  *
  * - src/modules/<modulo>/page.tsx: só compõe. Sem tag HTML, sem className/style; exporta default e meta.
  * - src/components/<Nome>.tsx: exporta <Nome> com JSDoc e <Nome>Props; não importa core/, modules/ nem App.
+ * - src/components/ui/<nome>.tsx: primitivos do shadcn/ui (npx shadcn add <nome>), código de origem preservado.
+ *   Só componentes do catálogo os usam; página nunca importa de ui/.
  * - Requisição só em src/core/api.ts; .css só src/core/theme.css, importado por main.tsx.
  * - Módulo não importa outro módulo. Arquivo fora da topologia é erro.
  *
@@ -28,7 +30,7 @@ export default defineConfig({
 
 // ── Trilhos ──────────────────────────────────────────────────────────────────
 
-type Kind = "component" | "module" | "core" | "root";
+type Kind = "component" | "ui" | "module" | "core" | "root";
 type Node = { type: string; start: number; end: number; [key: string]: any };
 type Comment = { type: string; value: string; start: number; end: number };
 interface Violation {
@@ -38,6 +40,7 @@ interface Violation {
 
 const COMPONENT_FILE = /^[A-Z][A-Za-z0-9]*\.tsx$/;
 const MODULE_DIR = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+const UI_FILE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*\.tsx?$/;
 const CORE_FILES = new Set(["api.ts", "auth.ts", "theme.css"]);
 const ROOT_FILES = new Set(["App.tsx", "main.tsx"]);
 const NETWORK = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]);
@@ -84,6 +87,7 @@ function scan(): Violation[] {
       ROOT_FILES.has(r) ||
       (parts[0] === "core" && parts.length === 2 && CORE_FILES.has(parts[1]!)) ||
       (parts[0] === "components" && parts.length === 2 && (COMPONENT_FILE.test(parts[1]!) || parts[1] === "CATALOG.md")) ||
+      (parts[0] === "components" && parts[1] === "ui" && parts.length === 3 && UI_FILE.test(parts[2]!)) ||
       (parts[0] === "modules" && parts.length === 3 && MODULE_DIR.test(parts[1]!) && parts[2] === "page.tsx");
     if (!ok) {
       violations.push({ file: r, message: "arquivo fora da topologia (README §1): componente em src/components/<Nome>.tsx, tela em src/modules/<modulo>/page.tsx" });
@@ -133,6 +137,12 @@ function checkImport(spec: string, file: string, r: string, kind: Kind, fail: (m
   }
   if (target === null) return;
   const [area, name] = t.split("/");
+  if (kind === "module" && area === "components" && name === "ui") {
+    fail(`importa ${spec}: página usa o catálogo (src/components/<Nome>.tsx), não os primitivos do shadcn em ui/`);
+  }
+  if (kind === "ui" && (area !== "components" || name !== "ui")) {
+    fail(`importa ${spec}: primitivo de ui/ só depende de pacotes e de outros primitivos de ui/`);
+  }
   if (kind === "module" && area === "modules" && name !== r.split("/")[1]) {
     fail(`importa ${spec}: um módulo não importa outro módulo (domínios isolados)`);
   }
@@ -235,6 +245,7 @@ function isTypeDecl(node: Node | undefined): boolean {
 
 function kindOf(r: string): Kind | null {
   const area = r.split("/")[0];
+  if (r.startsWith("components/ui/")) return "ui";
   if (area === "components") return "component";
   if (area === "modules") return "module";
   if (area === "core") return "core";

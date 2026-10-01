@@ -1,4 +1,6 @@
 import { useId } from "react";
+import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
+import { Textarea } from "@/components/ui/textarea";
 
 export interface TextAreaProps {
   /** Rótulo visível (também é o nome acessível). */
@@ -23,12 +25,12 @@ export function TextArea({ label, value, onChange, rows = 4, hint, error, requir
   const id = useId();
   const help = error ? `${id}-erro` : hint ? `${id}-ajuda` : undefined;
   return (
-    <div className="flex flex-col gap-1.5">
-      <label htmlFor={id} className="text-sm font-medium">
+    <Field data-invalid={error ? true : undefined}>
+      <FieldLabel htmlFor={id}>
         {label}
-        {required && <span className="text-danger"> *</span>}
-      </label>
-      <textarea
+        {required && <span className="text-destructive">*</span>}
+      </FieldLabel>
+      <Textarea
         id={id}
         rows={rows}
         value={value}
@@ -38,13 +40,9 @@ export function TextArea({ label, value, onChange, rows = 4, hint, error, requir
         spellCheck={!monospace}
         aria-invalid={error ? true : undefined}
         aria-describedby={help}
-        className={`rounded-control border bg-panel px-3 py-2 text-sm outline-accent placeholder:text-muted focus-visible:outline-2 ${monospace ? "font-mono break-all" : ""} ${error ? "border-danger" : "border-line"}`}
+        className={monospace ? "font-mono text-xs break-all" : undefined}
       />
-      {error ? (
-        <p id={help} className="text-sm text-danger">{error}</p>
-      ) : (
-        hint && <p id={help} className="text-sm text-muted">{hint}</p>
-      )}
-    </div>
+      {error ? <FieldError id={help}>{error}</FieldError> : hint && <FieldDescription id={help}>{hint}</FieldDescription>}
+    </Field>
   );
 }

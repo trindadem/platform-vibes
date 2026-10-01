@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
-const TONE = { default: "text-ink", muted: "text-muted", danger: "text-danger", success: "text-success" };
-const SIZE = { sm: "text-sm", md: "text-base" };
+const TONE = { default: "text-foreground", muted: "text-muted-foreground", danger: "text-destructive", success: "text-success" };
+const SIZE = { sm: "text-sm leading-6", md: "text-base leading-7" };
 
 export interface TextProps {
   /** Cor semântica. Padrão: default. */
@@ -13,5 +13,5 @@ export interface TextProps {
 
 /** Parágrafo de texto com tom e tamanho padronizados. */
 export function Text({ tone = "default", size = "md", children }: TextProps) {
-  return <p className={`${TONE[tone]} ${SIZE[size]} leading-relaxed`}>{children}</p>;
+  return <p className={`${TONE[tone]} ${SIZE[size]}`}>{children}</p>;
 }

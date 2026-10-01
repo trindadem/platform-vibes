@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
-const TONE = { default: "text-ink", success: "text-success", danger: "text-danger" };
+const TONE = { default: "", success: "text-success", danger: "text-destructive" };
 
 export interface StatProps {
   /** O que o número mede. */
@@ -16,10 +17,12 @@ export interface StatProps {
 /** Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid. */
 export function Stat({ label, value, hint, tone = "default" }: StatProps) {
   return (
-    <div className="flex flex-col gap-1 rounded-card border border-line bg-panel p-5">
-      <span className="text-sm text-muted">{label}</span>
-      <span className={`text-2xl font-semibold tabular-nums ${TONE[tone]}`}>{value}</span>
-      {hint && <span className="text-xs text-muted">{hint}</span>}
-    </div>
+    <Card className="@container/card">
+      <CardHeader>
+        <CardDescription>{label}</CardDescription>
+        <CardTitle className={`font-heading text-2xl font-semibold tabular-nums @[250px]/card:text-3xl ${TONE[tone]}`}>{value}</CardTitle>
+      </CardHeader>
+      {hint && <CardContent className="text-sm text-muted-foreground">{hint}</CardContent>}
+    </Card>
   );
 }

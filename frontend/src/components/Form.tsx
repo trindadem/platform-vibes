@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { FieldGroup } from "@/components/ui/field";
 
 export interface FormProps {
   /** Chamado no envio (Enter ou Button type="submit"); o recarregamento da página já é evitado. */
@@ -8,18 +9,17 @@ export interface FormProps {
   children: ReactNode;
 }
 
-/** Formulário com campos empilhados e envio sem recarregar a página. */
+/** Formulário com campos espaçados de forma uniforme e envio sem recarregar a página. */
 export function Form({ onSubmit, busy = false, children }: FormProps) {
   return (
     <form
       aria-busy={busy}
-      className="flex flex-col gap-4"
       onSubmit={(event) => {
         event.preventDefault();
         void onSubmit();
       }}
     >
-      {children}
+      <FieldGroup>{children}</FieldGroup>
     </form>
   );
 }

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { CardContent, CardDescription, CardFooter, CardHeader, CardTitle, Card as UiCard } from "@/components/ui/card";
 
 export interface CardProps {
   /** Título do cartão. */
@@ -10,18 +11,18 @@ export interface CardProps {
   children?: ReactNode;
 }
 
-/** Superfície elevada que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais. */
+/** Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais. */
 export function Card({ title, description, footer, children }: CardProps) {
   return (
-    <section className="flex flex-col gap-4 rounded-card border border-line bg-panel p-5 shadow-sm">
+    <UiCard>
       {(title || description) && (
-        <header className="flex flex-col gap-1">
-          {title && <h2 className="text-base font-semibold">{title}</h2>}
-          {description && <p className="text-sm text-muted">{description}</p>}
-        </header>
+        <CardHeader>
+          {title && <CardTitle>{title}</CardTitle>}
+          {description && <CardDescription>{description}</CardDescription>}
+        </CardHeader>
       )}
-      {children}
-      {footer && <footer className="flex flex-wrap gap-2 border-t border-line pt-4">{footer}</footer>}
-    </section>
+      {children && <CardContent className="flex flex-col gap-4">{children}</CardContent>}
+      {footer && <CardFooter className="flex flex-wrap gap-2">{footer}</CardFooter>}
+    </UiCard>
   );
 }

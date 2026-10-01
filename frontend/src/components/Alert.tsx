@@ -1,11 +1,9 @@
+import { CircleAlertIcon, CircleCheckIcon, InfoIcon, TriangleAlertIcon } from "lucide-react";
 import type { ReactNode } from "react";
+import { AlertDescription, AlertTitle, Alert as UiAlert } from "@/components/ui/alert";
 
-const TONE = {
-  info: "border-info/30 bg-info/10 text-info",
-  success: "border-success/30 bg-success/10 text-success",
-  warning: "border-warning/30 bg-warning/10 text-warning",
-  danger: "border-danger/30 bg-danger/10 text-danger",
-};
+const ICON = { info: InfoIcon, success: CircleCheckIcon, warning: TriangleAlertIcon, danger: CircleAlertIcon };
+const ICON_TONE = { info: "text-info", success: "text-success", warning: "text-warning", danger: "" };
 
 export interface AlertProps {
   /** Gravidade. danger é anunciado imediatamente por leitores de tela. Padrão: info. */
@@ -15,12 +13,14 @@ export interface AlertProps {
   children?: ReactNode;
 }
 
-/** Mensagem de destaque para resultado, aviso ou erro. */
+/** Mensagem de destaque para resultado, aviso ou erro, com ícone conforme a gravidade. */
 export function Alert({ tone = "info", title, children }: AlertProps) {
+  const Icon = ICON[tone];
   return (
-    <div role={tone === "danger" ? "alert" : "status"} className={`flex flex-col gap-1 rounded-control border px-4 py-3 text-sm ${TONE[tone]}`}>
-      {title && <strong className="font-semibold">{title}</strong>}
-      {children && <div className="text-ink">{children}</div>}
-    </div>
+    <UiAlert variant={tone === "danger" ? "destructive" : "default"} role={tone === "danger" ? "alert" : "status"}>
+      <Icon className={ICON_TONE[tone]} />
+      {title && <AlertTitle>{title}</AlertTitle>}
+      {children && <AlertDescription>{children}</AlertDescription>}
+    </UiAlert>
   );
 }

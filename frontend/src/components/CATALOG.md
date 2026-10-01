@@ -7,7 +7,7 @@
 
 ## Alert
 
-Mensagem de destaque para resultado, aviso ou erro.
+Mensagem de destaque para resultado, aviso ou erro, com ícone conforme a gravidade.
 
 - `tone?`: `"info" | "success" | "warning" | "danger"` — Gravidade. danger é anunciado imediatamente por leitores de tela. Padrão: info.
 - `title?`: `string` — Resumo em negrito.
@@ -15,11 +15,11 @@ Mensagem de destaque para resultado, aviso ou erro.
 
 ## AppShell
 
-Moldura da aplicação: topo com marca, menu de navegação e área de conteúdo centralizada.
+Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado.
 
-- `brand`: `string` — Nome exibido no topo.
+- `brand`: `string` — Nome exibido no topo do menu lateral.
 - `nav`: `{ to: string; label: string }[]` — Itens do menu: { to: "/rota", label: "Texto" }.
-- `aside?`: `ReactNode` — Conteúdo à direita do topo (ex.: SessionStatus).
+- `aside?`: `ReactNode` — Conteúdo no pé do menu lateral (ex.: SessionStatus).
 - `children`: `ReactNode`
 
 ## Badge
@@ -43,7 +43,7 @@ Botão de ação com variantes, tamanhos e estado de carregamento.
 
 ## Card
 
-Superfície elevada que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais.
+Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais.
 
 - `title?`: `string` — Título do cartão.
 - `description?`: `string` — Uma linha abaixo do título.
@@ -59,7 +59,7 @@ Trecho de código, comando ou identificador em fonte monoespaçada.
 
 ## DataTable
 
-Tabela de dados tipada, com colunas declarativas e estado vazio. Rola na horizontal em telas estreitas.
+Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rótulo e valor.
 
 - `columns`: `{ key: string; header: string; render?: (row: T) => ReactNode }[]` — Colunas: header é o título; render formata a célula (padrão: String(row[key])).
 - `rows`: `T[]`
@@ -77,7 +77,7 @@ Espaço reservado para lista vazia, página inexistente ou recurso indisponível
 
 ## Form
 
-Formulário com campos empilhados e envio sem recarregar a página.
+Formulário com campos espaçados de forma uniforme e envio sem recarregar a página.
 
 - `onSubmit`: `() => void | Promise<void>` — Chamado no envio (Enter ou Button type="submit"); o recarregamento da página já é evitado.
 - `busy?`: `boolean` — Marca o formulário como ocupado para tecnologias assistivas.
@@ -124,14 +124,14 @@ Coloca itens lado a lado, com alinhamento e quebra de linha controlados.
 
 ## SessionStatus
 
-Estado da sessão no topo: usuário e botão de sair, ou aviso de que não há sessão.
+Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão.
 
 - `user`: `string | null` — Usuário da sessão; null quando não há sessão.
 - `onSignOut`: `() => void` — Encerra a sessão.
 
 ## Spinner
 
-Indicador de carregamento acessível.
+Indicador de carregamento acessível, com texto.
 
 - `label?`: `string` — Texto para leitores de tela e exibido ao lado. Padrão: "Carregando".
 

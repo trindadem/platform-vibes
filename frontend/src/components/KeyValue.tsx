@@ -8,11 +8,11 @@ export interface KeyValueProps {
 /** Lista de pares rótulo/valor para detalhes de um registro. */
 export function KeyValue({ items }: KeyValueProps) {
   return (
-    <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-[max-content_1fr]">
+    <dl className="grid grid-cols-1 gap-x-8 gap-y-3 text-sm sm:grid-cols-[max-content_1fr]">
       {items.map((item) => (
         <div key={item.label} className="contents">
-          <dt className="text-sm text-muted">{item.label}</dt>
-          <dd className="text-sm break-all">{item.value}</dd>
+          <dt className="text-muted-foreground">{item.label}</dt>
+          <dd className="font-medium break-all">{item.value}</dd>
         </div>
       ))}
     </dl>

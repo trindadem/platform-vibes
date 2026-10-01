@@ -1,42 +1,87 @@
 import type { ReactNode } from "react";
-import { NavLink } from "react-router";
+import { NavLink, useLocation } from "react-router";
+import { Separator } from "@/components/ui/separator";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarHeader,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarTrigger,
+  useSidebar,
+} from "@/components/ui/sidebar";
 
 export interface AppShellProps {
-  /** Nome exibido no topo. */
+  /** Nome exibido no topo do menu lateral. */
   brand: string;
   /** Itens do menu: { to: "/rota", label: "Texto" }. */
   nav: { to: string; label: string }[];
-  /** Conteúdo à direita do topo (ex.: SessionStatus). */
+  /** Conteúdo no pé do menu lateral (ex.: SessionStatus). */
   aside?: ReactNode;
   children: ReactNode;
 }
 
-/** Moldura da aplicação: topo com marca, menu de navegação e área de conteúdo centralizada. */
+/** Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. */
 export function AppShell({ brand, nav, aside, children }: AppShellProps) {
+  const { pathname } = useLocation();
+  const current = nav.find((item) => pathname.startsWith(item.to));
   return (
-    <div className="min-h-dvh bg-surface font-sans text-ink">
-      <header className="border-b border-line bg-panel">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
-          <span className="font-semibold tracking-tight">{brand}</span>
-          <nav aria-label="Principal" className="flex flex-1 flex-wrap gap-1">
-            {nav.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                className={({ isActive }) =>
-                  `rounded-control px-3 py-1.5 text-sm outline-accent focus-visible:outline-2 ${
-                    isActive ? "bg-accent/10 font-medium text-accent" : "text-muted hover:bg-line/60 hover:text-ink"
-                  }`
-                }
-              >
-                {item.label}
-              </NavLink>
-            ))}
-          </nav>
-          {aside}
-        </div>
-      </header>
-      <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
-    </div>
+    <SidebarProvider>
+      <Sidebar variant="inset">
+        <SidebarHeader>
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <SidebarMenuButton size="lg" asChild>
+                <NavLink to="/">
+                  <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-xs font-semibold text-primary-foreground">
+                    {brand.slice(0, 2).toUpperCase()}
+                  </span>
+                  <span className="truncate font-semibold">{brand}</span>
+                </NavLink>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarHeader>
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <NavItems nav={nav} pathname={pathname} />
+            </SidebarGroupContent>
+          </SidebarGroup>
+        </SidebarContent>
+        {aside && <SidebarFooter>{aside}</SidebarFooter>}
+      </Sidebar>
+      <SidebarInset>
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4 lg:px-6">
+          <SidebarTrigger className="-ml-1" aria-label="Abrir ou fechar o menu" />
+          <Separator orientation="vertical" className="mx-1 data-[orientation=vertical]:h-4" />
+          <span className="truncate text-sm font-medium">{current?.label ?? brand}</span>
+        </header>
+        <div className="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6">{children}</div>
+      </SidebarInset>
+    </SidebarProvider>
+  );
+}
+
+function NavItems({ nav, pathname }: { nav: AppShellProps["nav"]; pathname: string }) {
+  const { setOpenMobile } = useSidebar();
+  return (
+    <SidebarMenu>
+      {nav.map((item) => (
+        <SidebarMenuItem key={item.to}>
+          <SidebarMenuButton asChild isActive={pathname.startsWith(item.to)}>
+            <NavLink to={item.to} onClick={() => setOpenMobile(false)}>
+              {item.label}
+            </NavLink>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ))}
+    </SidebarMenu>
   );
 }
