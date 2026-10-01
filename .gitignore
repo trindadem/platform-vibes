@@ -1,0 +1,15 @@
+# Artefatos gerados por ferramentas (README §1): nunca versionados.
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+node_modules/
+dist/
+.scaffold.*/
+
+# Segredos: configuração local nunca entra no histórico.
+.env
+.env.*
+
+# Sistema operacional.
+.DS_Store
