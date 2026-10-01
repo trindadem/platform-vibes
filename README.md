@@ -16,6 +16,7 @@
 ```text
 cogniventure/
 ├── README.md                    # Esta especificação
+├── briefing.md                  # Camada de negócios da Cogniventure BPO: o quê e por quê (processos, áreas, ordem)
 ├── LICENSE                      # MIT: uso livre, mantendo o aviso de copyright
 ├── sprint.md                    # Log de bloqueios e revisões de contrato (seção 8)
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
