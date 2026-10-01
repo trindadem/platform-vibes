@@ -124,6 +124,26 @@ class Principal(BaseModel, frozen=True):
     def has(self, *roles: str) -> bool:
         return set(roles) <= self.roles
 
+    @property
+    def is_system(self) -> bool:
+        """Tarefa da própria plataforma (agendamento, migração), não uma pessoa: veja system()."""
+        return self.sub.startswith(SYSTEM_PREFIX)
+
+
+SYSTEM_PREFIX = "system:"
+
+
+def system(service: str, tenant: str | None = None) -> Principal:
+    """Quem age numa tarefa da plataforma (agendamento, migração), nunca vindo de token.
+
+        for org in await db.tenants(TABELA):
+            with acting_as(system(SERVICE, org)):
+                await db.query("DELETE faturas WHERE tenant = $tenant AND vence_em < $limite", limite=...)
+
+    Os carimbos de autoria gravam "system:<serviço>". Token nenhum chega com esse sub: issue_token o recusa.
+    """
+    return Principal(sub=f"{SYSTEM_PREFIX}{service}", tenant=tenant, roles=frozenset({"system"}))
+
 
 _current: contextvars.ContextVar[Principal | None] = contextvars.ContextVar("cv_principal", default=None)
 
@@ -156,6 +176,8 @@ def issue_token(
     sub: str, *, tenant: str | None = None, roles: Iterable[str] = (), ttl_seconds: int | None = None
 ) -> str:
     """Emite um JWT EdDSA. Só funciona onde AUTH_PRIVATE_KEY existe (o serviço que faz login)."""
+    if sub.startswith(SYSTEM_PREFIX):
+        raise ValueError(f"sub {sub!r} é reservado às tarefas da plataforma (security.system)")
     s = _settings()
     private, _ = _own_keys() if not s.auth_jwks_url else (None, None)
     if private is None:
@@ -201,6 +223,8 @@ def verify_token(token: str) -> Principal:
     tenant = claims.get(s.auth_tenant_claim)
     if tenant is not None and not isinstance(tenant, str):
         raise ServiceError("ERRO_AUTH_INVALID_TOKEN", "Token inválido ou expirado.", status=401)
+    if str(claims["sub"]).startswith(SYSTEM_PREFIX):  # identidade das tarefas da plataforma nunca vem de fora
+        raise ServiceError("ERRO_AUTH_INVALID_TOKEN", "Token inválido.", status=401)
     return Principal(sub=str(claims["sub"]), tenant=tenant or None, roles=frozenset(roles), expires_at=int(claims["exp"]))
 
 

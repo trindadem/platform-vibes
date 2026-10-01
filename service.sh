@@ -78,6 +78,7 @@ TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio
 2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult) e, ao vivo para a tela da
    organização, __NAME__.processado (bus.live)
 3. Temporal — __PASCAL__Workflow → activity __NAME__.process_task (timeout 5 min, 3 tentativas)
+4. Ciclo de vida (README §5.13) — agendamentos (workflows.SCHEDULES) e migrações (service.MIGRATIONS): nenhum ainda.
 
 ## 4. Casos de Borda e Erros Mapeados
 - ERRO___UPPER___INVALID_PAYLOAD: payload inconsistente (HTTP 422).
@@ -86,6 +87,7 @@ EOF
 
 render "$STAGE/svc/schemas.py" <<'EOF'
 """svc-__NAME__ · contratos (DTOs, enums, constantes). Fonte da verdade: specs/__NAME__.md §2"""
+from datetime import datetime
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -119,12 +121,15 @@ class Record(BaseModel):
     id: str
     title: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None  # carimbos do banco (README §5.13)
+    created_by: str | None = None
 
 
 class RecordQuery(ListQuery):
     """GET /records: página, ordem e busca vêm da URL. Filtros novos entram como campos (README §5.12)."""
 
-    sortable: ClassVar[tuple[str, ...]] = ("title",)
+    sortable: ClassVar[tuple[str, ...]] = ("title", "created_at")
+    default_sort: ClassVar[str | None] = "-created_at"  # mais novos primeiro
 
 
 class RecordPage(Page[Record]):
@@ -139,10 +144,14 @@ de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "__NAME
 Helpers começam com _ e nunca viram activities.
 """
 from core.nats_bus import bus
-from core.surreal import db
+from core.surreal import Migration, db
 from core.temporal_runner import activities
 
 from schemas import PROCESSED_LIVE, PROCESSED_SUBJECT, TABLE, ExecutionInput, ExecutionResult, RecordPage, RecordQuery
+
+# Mudanças de dados versionadas, rodadas uma vez por banco no boot (README §5.13). Nunca edite uma já publicada:
+#   Migration(1, "título padrão nos registros antigos", sql="UPDATE __SNAKE___records SET title = '' WHERE title = NONE")
+MIGRATIONS: list[Migration] = []
 
 
 @activities("__NAME__")
@@ -170,6 +179,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from core.temporal_runner import Schedule
     from schemas import ExecutionInput, ExecutionResult
     from service import __PASCAL__Service
 
@@ -184,6 +194,11 @@ class __PASCAL__Workflow:
             start_to_close_timeout=timedelta(minutes=5),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+
+
+# Tarefas recorrentes (README §5.13): o runner as cria, atualiza e remove no Temporal a cada boot. Exemplo:
+#   Schedule("resumo-diario", "0 6 * * *", ResumoWorkflow.run, Empty(), timezone="America/Sao_Paulo")
+SCHEDULES: list[Schedule] = []
 EOF
 
 render "$STAGE/svc/main.py" <<'EOF'
@@ -207,8 +222,8 @@ from core.surreal import db
 from core.temporal_runner import runner
 
 from schemas import SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
-from service import __PASCAL__Service
-from workflows import __PASCAL__Workflow
+from service import MIGRATIONS, __PASCAL__Service
+from workflows import SCHEDULES, __PASCAL__Workflow
 
 svc = __PASCAL__Service()
 
@@ -222,8 +237,8 @@ async def on_trigger(data: ExecutionInput) -> None:
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=[TABLE], search=SEARCH),
-        runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc),
+        db.connected(tables=[TABLE], search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
+        runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
         yield
@@ -360,6 +375,7 @@ def test_lista_paginada_com_busca_e_so_da_organizacao(published):
 
     primeira, pedidos, joao = run(cenario)
     assert ([r.title for r in primeira.items], primeira.total, primeira.pages) == (["Orçamento João", "Pedido da Padaria"], 3, 2)
+    assert primeira.items[0].created_by == "u1" and primeira.items[0].created_at is not None  # carimbos do banco
     assert sorted(r.title for r in pedidos.items) == ["Pedido da Padaria", "Pedido urgente"]  # o da Beta não aparece
     assert [r.title for r in joao.items] == ["Orçamento João"]  # sem acento, pelo início da palavra
 

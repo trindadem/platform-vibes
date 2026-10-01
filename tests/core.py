@@ -511,9 +511,13 @@ class _FakeSurreal:
     def __init__(self, select=None, query=None, error=None):
         self.calls, self._select, self._query, self._error = [], select, query, error
 
-    async def query(self, sql, vars=None):
+    async def query_raw(self, sql, vars=None):
+        if sql.startswith("CREATE type::table($tb)"):  # o db.create grava por consulta (carimbos com $cv_actor)
+            if self._error:
+                raise self._error
+            return {"result": [{"status": "OK", "result": [{"id": RecordID(vars["tb"], "f1"), **vars["data"]}]}]}
         self.calls.append((sql, vars))
-        return self._query
+        return {"result": [{"status": "OK", "result": self._query}]}
 
     async def create(self, table, data):
         if self._error:
@@ -533,13 +537,13 @@ class _FakeSurreal:
         pass
 
 
-def _with_db(fn, conn=None, *, who=ACME, tables=("faturas",), shared=(), unique=None):
+def _with_db(fn, conn=None, *, who=ACME, tables=("faturas",), shared=(), unique=None, **boot):
     conn = conn or _FakeSurreal()
 
     async def run():
         d = surreal.Database()
         d._conn = conn
-        async with d.connected(tables=tables, shared=shared, unique=unique):
+        async with d.connected(tables=tables, shared=shared, unique=unique, **boot):
             with security.acting_as(who):
                 return await fn(d)
 
@@ -601,7 +605,7 @@ def test_query_precisa_citar_tenant_e_o_recebe_do_contexto():
     with pytest.raises(ValueError, match="não passe tenant="):
         _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant", tenant="beta"))
     _, conn = _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant AND v > $v", v=1))
-    assert conn.calls[-1] == ("SELECT * FROM faturas WHERE tenant = $tenant AND v > $v", {"v": 1, "tenant": "acme"})
+    assert conn.calls[-1] == ("SELECT * FROM faturas WHERE tenant = $tenant AND v > $v", {"v": 1, "tenant": "acme", "cv_actor": "ana"})
 
 
 def test_registro_de_outra_organizacao_nao_existe():
@@ -624,7 +628,7 @@ def test_query_shared_so_para_quem_declarou_tabelas_globais():
     with pytest.raises(RuntimeError, match="shared=\\[...\\]"):
         _with_db(lambda d: d.query_shared("SELECT * FROM contas"))
     _, conn = _with_db(lambda d: d.query_shared("SELECT * FROM contas WHERE email = $e", e="a@x"), shared=("contas",))
-    assert conn.calls[-1] == ("SELECT * FROM contas WHERE email = $e", {"e": "a@x"})
+    assert conn.calls[-1] == ("SELECT * FROM contas WHERE email = $e", {"e": "a@x", "cv_actor": "ana"})
 
 
 def test_valor_repetido_vira_409_sem_ecoar_o_valor():
@@ -1165,3 +1169,227 @@ def test_lista_recusa_o_que_esta_fora_do_trilho():
     with pytest.raises(TypeError, match="sortable"):
         class Ruim(surreal.ListQuery):
             default_sort: ClassVar[str | None] = "-valor"
+
+
+# ── Ciclo de vida: carimbos, tarefas da plataforma e migrações (README §5.13) ─
+
+def _banco(cenario, **boot):
+    """SurrealDB embutido com as tabelas do boot; devolve o que o cenário devolver."""
+
+    async def run():
+        d = surreal.Database()
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        d._conn = conn
+        async with d.connected(**{"tables": ["notas"], **boot}):
+            return await cenario(d)
+
+    return asyncio.run(run())
+
+
+def test_carimbos_de_quem_criou_e_alterou_e_quando():
+    async def cenario(d):
+        with security.acting_as(ACME):
+            nota = await d.create("notas", {"texto": "a"})
+        await asyncio.sleep(0.01)
+        with security.acting_as(Principal(sub="bia", tenant="acme")):
+            alterada = await d.merge(nota["id"], {"texto": "b"})
+            crua = await d.query("UPDATE notas SET texto = 'c' WHERE tenant = $tenant RETURN AFTER")
+        with security.acting_as(security.system("svc-notas", "acme")):
+            sistema = await d.query("UPDATE notas SET texto = 'd' WHERE tenant = $tenant RETURN AFTER")
+        return nota, alterada, crua[0], sistema[0]
+
+    nota, alterada, crua, sistema = _banco(cenario)
+    assert (nota["created_by"], nota["updated_by"]) == ("ana", "ana") and nota["created_at"] is not None
+    assert (alterada["created_by"], alterada["updated_by"]) == ("ana", "bia")  # quem criou não muda
+    assert alterada["created_at"] == nota["created_at"] and alterada["updated_at"] > nota["updated_at"]
+    assert crua["updated_by"] == "bia"  # vale também para a SurrealQL crua do serviço
+    assert sistema["updated_by"] == "system:svc-notas"
+
+
+def test_carimbo_nunca_e_gravado_a_mao_nem_trocado():
+    with pytest.raises(ValueError, match="carimba"):
+        _with_db(lambda d: d.create("faturas", {"valor": 1, "created_at": "2020-01-01"}))
+    with pytest.raises(ValueError, match="carimba"):
+        _with_db(lambda d: d.merge("faturas:1", {"updated_by": "outro"}))
+    with pytest.raises(ValueError, match="cv_actor"):
+        _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant", cv_actor="outro"))
+
+    async def troca(d):
+        with security.acting_as(ACME):
+            nota = await d.create("notas", {"texto": "a"})
+            await d.query("UPDATE $rid SET created_by = 'intruso' WHERE tenant = $tenant", rid=RecordID("notas", nota["id"].split(":")[1]))
+
+    with pytest.raises(Exception, match="created_by"):  # o próprio banco recusa (READONLY)
+        _banco(troca)
+
+
+def test_tarefa_da_plataforma_lista_organizacoes_e_pessoa_nao():
+    async def cenario(d):
+        for org in ("beta", "acme", "acme"):
+            with security.acting_as(Principal(sub="x", tenant=org)):
+                await d.create("notas", {"texto": org})
+        sem_ninguem = await d.tenants("notas")
+        with security.acting_as(security.system("svc-notas")):
+            como_sistema = await d.tenants("notas")
+        with security.acting_as(ACME), pytest.raises(PermissionError):
+            await d.tenants("notas")
+        return sem_ninguem, como_sistema
+
+    assert _banco(cenario) == (["acme", "beta"], ["acme", "beta"])
+    with pytest.raises(ValueError, match="reservado"):
+        security.issue_token("system:svc-notas")
+
+
+def _migracoes(*levas):
+    """Sobe o banco uma vez por leva de migrações (como boots sucessivos) e devolve as notas e o registro."""
+
+    async def run():
+        d = surreal.Database()
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        resultados = []
+        for leva in levas:
+            d._conn = conn
+            try:
+                async with d.connected(tables=["notas"], migrations=leva, service="svc-notas"):
+                    pass
+                resultados.append("ok")
+            except RuntimeError as exc:
+                resultados.append(str(exc))
+            d._conn = conn
+        registro = await conn.query("SELECT version, status, error FROM cv_migrations ORDER BY version")
+        notas = await conn.query("SELECT texto, created_by FROM notas ORDER BY texto")
+        return resultados, registro, notas
+
+    return asyncio.run(run())
+
+
+def test_migracoes_rodam_uma_vez_em_ordem_e_param_o_boot_quando_falham():
+    chamadas = []
+
+    async def via_python():
+        chamadas.append(security.current().sub)
+
+    async def quebra():
+        raise RuntimeError("bug")
+
+    um = surreal.Migration(1, "cria nota", sql="CREATE notas SET texto = 'm1', tenant = 'acme'")
+    dois = surreal.Migration(2, "via python", run=via_python)
+    tres_quebrada = surreal.Migration(3, "quebra", run=quebra)
+    tres_corrigida = surreal.Migration(3, "corrigida", sql="UPDATE notas SET texto = 'm3' WHERE texto = 'm1'")
+    resultados, registro, notas = _migracoes([um, dois], [um, dois], [um, dois, tres_quebrada], [um, dois, tres_corrigida])
+    assert resultados[:2] == ["ok", "ok"] and "#3 (quebra) falhou" in resultados[2] and resultados[3] == "ok"
+    assert chamadas == ["system:svc-notas"]  # a #2 rodou uma vez só, como tarefa da plataforma
+    assert [(r["version"], r["status"]) for r in registro] == [(1, "done"), (2, "done"), (3, "done")]
+    assert [(n["texto"], n["created_by"]) for n in notas] == [("m3", "system:svc-notas")]  # #1 uma vez; a #3 corrigida rodou
+
+
+@pytest.mark.parametrize(
+    ("migracoes", "service", "erro"),
+    [
+        ([surreal.Migration(2, "x", sql="RETURN 1")], "svc-notas", "1, 2, 3"),
+        ([surreal.Migration(1, "x", sql="RETURN 1"), surreal.Migration(1, "y", sql="RETURN 1")], "svc-notas", "1, 2, 3"),
+        ([surreal.Migration(1, "x")], "svc-notas", "sql= ou run="),
+        ([surreal.Migration(1, "x", sql="RETURN 1")], None, "service=SERVICE"),
+    ],
+)
+def test_migracoes_fora_do_trilho_impedem_o_boot(migracoes, service, erro):
+    with pytest.raises(ValueError, match=erro):
+        _with_db(lambda d: asyncio.sleep(0), migrations=migracoes, service=service)
+
+
+# ── Agendamentos (core/temporal_runner.py, README §5.13) ────────────────────
+
+from temporalio import workflow as _workflow  # noqa: E402
+from temporalio.client import ScheduleAlreadyRunningError, ScheduleOverlapPolicy  # noqa: E402
+
+
+@_workflow.defn
+class _Limpeza:
+    @_workflow.run
+    async def run(self) -> None:
+        pass
+
+
+class _FakeSchedules:
+    """Temporal falso: guarda os agendamentos por id e registra criar, atualizar e remover."""
+
+    def __init__(self, existing):
+        self.existing, self.calls = set(existing), []
+
+    async def list_schedules(self):
+        async def listed():
+            for schedule_id in sorted(self.existing):
+                yield SimpleNamespace(id=schedule_id)
+
+        return listed()
+
+    async def create_schedule(self, schedule_id, schedule):
+        if schedule_id in self.existing:
+            raise ScheduleAlreadyRunningError()
+        self.existing.add(schedule_id)
+        self.calls.append(("criar", schedule_id, list(schedule.spec.cron_expressions), schedule.spec.time_zone_name, schedule.policy.overlap))
+
+    def get_schedule_handle(self, schedule_id):
+        fake = self
+
+        class Handle:
+            async def update(self, updater):
+                fake.calls.append(("atualizar", schedule_id, list(updater(None).schedule.spec.cron_expressions)))
+
+            async def delete(self):
+                fake.existing.discard(schedule_id)
+                fake.calls.append(("remover", schedule_id))
+
+        return Handle()
+
+
+def test_agendamentos_declarados_sao_criados_atualizados_e_removidos():
+    fake = _FakeSchedules({"fila/antigo", "fila/limpeza", "outra-fila/dela"})
+    runner = temporal_runner.Runner()
+    runner._client = fake
+    declarados = [
+        temporal_runner.Schedule("limpeza", "0 4 * * *", _Limpeza.run),
+        temporal_runner.Schedule("relatorio", "0 8 * * 1", _Limpeza.run, timezone="America/Sao_Paulo"),
+    ]
+    asyncio.run(runner.sync_schedules("fila", declarados))
+    asyncio.run(runner.sync_schedules("fila", declarados))  # segundo boot: só atualiza
+    assert fake.calls == [
+        ("atualizar", "fila/limpeza", ["0 4 * * *"]),
+        ("criar", "fila/relatorio", ["0 8 * * 1"], "America/Sao_Paulo", ScheduleOverlapPolicy.SKIP),
+        ("remover", "fila/antigo"),  # saiu da lista do serviço
+        ("atualizar", "fila/limpeza", ["0 4 * * *"]),
+        ("atualizar", "fila/relatorio", ["0 8 * * 1"]),
+    ]
+    assert "outra-fila/dela" in fake.existing  # o de outro serviço não é tocado
+
+
+@pytest.mark.parametrize(("args", "erro"), [(("Limpeza", "0 4 * * *"), "kebab-case"), (("limpeza", "0 4 * *"), "5 campos")])
+def test_agendamento_fora_do_trilho(args, erro):
+    with pytest.raises(ValueError, match=erro):
+        temporal_runner.Schedule(*args, _Limpeza.run)
+
+
+def test_erro_em_qualquer_comando_da_consulta_chega_ao_servico():
+    """O SDK só conferia o primeiro comando: no SurrealDB 3, num BEGIN; X; COMMIT o erro de X passava em silêncio."""
+
+    async def cenario(d):
+        with security.acting_as(ACME):
+            await d.create("notas", {"texto": "a"})
+            with pytest.raises(Exception, match="falha de propósito"):
+                await d.query("UPDATE notas SET texto = 'b' WHERE tenant = $tenant; THROW 'falha de propósito'")
+            with pytest.raises(Exception, match="falha de propósito"):
+                await d.query("BEGIN TRANSACTION; UPDATE notas SET texto = 'c' WHERE tenant = $tenant; THROW 'falha de propósito'; COMMIT TRANSACTION;")
+            return await d.query("SELECT VALUE texto FROM notas WHERE tenant = $tenant")
+
+    assert _banco(cenario) == ["b"]  # sem transação o UPDATE valeu; com transação, nada mudou
+
+
+def test_migracao_que_falha_em_comando_seguinte_nao_fica_como_feita():
+    quebra = surreal.Migration(1, "quebra no segundo comando", sql="UPDATE notas SET x = 1; THROW 'falha de propósito'")
+    resultados, registro, _ = _migracoes([quebra])
+    assert "#1 (quebra no segundo comando) falhou" in resultados[0]
+    assert [(r["version"], r["status"]) for r in registro] == [(1, "failed")]

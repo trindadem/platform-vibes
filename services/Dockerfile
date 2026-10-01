@@ -12,7 +12,9 @@ ENV UV_PYTHON_DOWNLOADS=never \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 # --locked: lock defasado em relação ao pyproject.toml derruba o build (rode uv lock e versione).
-RUN uv sync --locked --no-dev --no-install-project --no-cache
+# --compile-bytecode: os .pyc já vão na imagem. Sem eles, cada container recompila FastAPI, Pydantic, Temporal e Agno
+# ao subir (~13 s por processo; minutos com vários serviços subindo juntos).
+RUN uv sync --locked --no-dev --no-install-project --no-cache --compile-bytecode
 
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -25,6 +27,7 @@ ARG SERVICE
 ARG APP_DIR=services/svc-${SERVICE}
 COPY core/ core/
 COPY ${APP_DIR}/ ./
+RUN python -m compileall -q core .
 
 RUN useradd --create-home --uid 10001 app
 USER app

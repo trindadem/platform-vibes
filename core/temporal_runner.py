@@ -9,32 +9,78 @@ Quem age viaja junto (README §5.9): start_workflow grava o Principal do context
 workflow o repassa a cada activity e a activity roda dentro de acting_as(...). O serviço não escreve nada:
 current_tenant() funciona na activity como funcionou na requisição ou no evento que a disparou.
 
+Agendamentos (README §5.13): runner.worker(..., schedules=[Schedule("limpeza", "0 4 * * *", Workflow.run, arg)]) cria,
+atualiza e remove os agendamentos do Temporal no boot, conforme a lista (id <task_queue>/<id>). Execução sobreposta é
+pulada e, se o Temporal ficar fora do ar, só a última execução perdida (até 10 min) é recuperada. Activity sem
+pessoa por trás (agendamento, migração) roda como system("svc-<serviço>").
+
 Variáveis: TEMPORAL_ADDRESS (padrão localhost:7233), TEMPORAL_NAMESPACE (padrão default),
 TEMPORAL_API_KEY (Temporal Cloud; liga TLS).
 """
 import functools
 import inspect
+import logging
+import re
 import typing
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from temporalio import activity, client, worker
+from temporalio import client as client_module
 from temporalio.api.common.v1 import Payload
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import (
+    Client,
+    ScheduleActionStartWorkflow,
+    ScheduleAlreadyRunningError,
+    ScheduleOverlapPolicy,
+    SchedulePolicy,
+    ScheduleSpec,
+    ScheduleUpdate,
+    WorkflowHandle,
+)
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
 from core.envelope import ServiceError
-from core.security import Principal, acting_as, current
+from core.security import Principal, acting_as, current, system
 
 _MARK = "__cv_activity__"
 _PRINCIPAL_HEADER = "cv-principal"
+_SCHEDULE_ID = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+_NO_ARG = object()
+log = logging.getLogger("core.temporal_runner")
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """Tarefa recorrente declarada no serviço (workflows.py), mantida no Temporal pelo runner a cada boot.
+
+        SCHEDULES = [Schedule("limpeza", "0 4 * * *", LimpezaWorkflow.run, Empty())]   # todo dia às 4h (UTC)
+
+    cron com 5 campos: minuto, hora, dia do mês, mês, dia da semana. timezone: nome IANA (ex.: America/Sao_Paulo).
+    Sem pessoa por trás: as activities rodam como system("svc-<serviço>"); para tabelas por organização, use
+    db.tenants(TABELA) e acting_as(system(SERVICE, org)).
+    """
+
+    id: str
+    cron: str
+    workflow: Callable[..., Any]
+    arg: Any = _NO_ARG
+    timezone: str = "UTC"
+
+    def __post_init__(self) -> None:
+        if not _SCHEDULE_ID.match(self.id):
+            raise ValueError(f"Schedule {self.id!r}: id em kebab-case (ex.: limpeza-diaria)")
+        if len(self.cron.split()) != 5:
+            raise ValueError(f"Schedule {self.id!r}: cron com 5 campos (minuto hora dia mês dia-da-semana), veio {self.cron!r}")
 
 
 class TemporalSettings(BaseSettings):
@@ -83,11 +129,42 @@ class Runner:
         return self._client
 
     @asynccontextmanager
-    async def worker(self, task_queue: str, *, workflows: Sequence[type], service: object) -> AsyncIterator[Worker]:
-        """Roda o worker no mesmo loop do FastAPI, registrando as activities de @activities."""
+    async def worker(
+        self, task_queue: str, *, workflows: Sequence[type], service: object, schedules: Sequence[Schedule] = ()
+    ) -> AsyncIterator[Worker]:
+        """Roda o worker no mesmo loop do FastAPI, registrando as activities de @activities, e alinha os agendamentos."""
         acts = [getattr(service, n) for n, fn in vars(type(service)).items() if getattr(fn, _MARK, False)]
+        if len({s.id for s in schedules}) != len(schedules):
+            raise ValueError("schedules: id repetido")
         async with Worker(await self.client(), task_queue=task_queue, workflows=workflows, activities=acts) as w:
+            await self.sync_schedules(task_queue, schedules)
             yield w
+
+    async def sync_schedules(self, task_queue: str, schedules: Sequence[Schedule]) -> None:
+        """Deixa no Temporal exatamente os agendamentos declarados para esta fila: cria, atualiza e remove."""
+        client = await self.client()
+        prefix = f"{task_queue}/"
+        existing = {listed.id async for listed in await client.list_schedules() if listed.id.startswith(prefix)}
+        for declared in schedules:
+            schedule_id = prefix + declared.id
+            args = [] if declared.arg is _NO_ARG else [declared.arg]
+            definition = client_module.Schedule(
+                action=ScheduleActionStartWorkflow(declared.workflow, args=args, id=schedule_id, task_queue=task_queue),
+                spec=ScheduleSpec(cron_expressions=[declared.cron], time_zone_name=declared.timezone),
+                policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP, catchup_window=timedelta(minutes=10)),
+            )
+            handle = client.get_schedule_handle(schedule_id)
+            if schedule_id not in existing:
+                try:
+                    await client.create_schedule(schedule_id, definition)
+                    log.info("agendamento %s criado (%s, %s)", schedule_id, declared.cron, declared.timezone)
+                    continue
+                except ScheduleAlreadyRunningError:  # outra réplica criou primeiro (ou a listagem ainda não o via)
+                    pass
+            await handle.update(lambda _input, definition=definition: ScheduleUpdate(schedule=definition))
+        for stale in existing - {prefix + d.id for d in schedules}:
+            await client.get_schedule_handle(stale).delete()
+            log.info("agendamento %s removido (saiu da lista do serviço)", stale)
 
     async def start_workflow(
         self, run: Callable[..., Any], arg: Any, *, task_queue: str, id: str | None = None
@@ -138,7 +215,10 @@ class _ClientOutbound(client.OutboundInterceptor):
 
 class _ActivityInbound(worker.ActivityInboundInterceptor):
     async def execute_activity(self, input: worker.ExecuteActivityInput) -> Any:
-        with acting_as(_decode(input.headers.get(_PRINCIPAL_HEADER))):
+        who = _decode(input.headers.get(_PRINCIPAL_HEADER))
+        if who is None:  # sem pessoa por trás (agendamento): age a própria plataforma, como "system:svc-<serviço>"
+            who = system("svc-" + activity.info().activity_type.split(".")[0])
+        with acting_as(who):
             return await super().execute_activity(input)
 
 

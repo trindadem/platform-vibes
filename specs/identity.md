@@ -30,7 +30,8 @@ cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em
    `revoked`). Cadastro, convite e criação de organização gravam num bloco atômico.
 2. NATS: `events.identity.tenant-created` `{ tenant, name }` e `events.identity.member-joined` `{ tenant, user, roles }`,
    publicados em nome do novo membro. `events.identity.trigger` inicia a limpeza.
-3. Temporal: `IdentityWorkflow` → activity `identity.cleanup` (apaga sessões e convites vencidos; timeout 5 min,
+3. Temporal: `IdentityWorkflow` → activity `identity.cleanup` (apaga sessões e convites vencidos), todo dia às 4h
+   UTC pelo agendamento `identity-queue/limpeza` (workflows.SCHEDULES) ou pelo trigger; (timeout 5 min,
    3 tentativas).
 
 ## 4. Casos de Borda e Erros Mapeados

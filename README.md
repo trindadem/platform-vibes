@@ -111,7 +111,7 @@ O código vive somente em `service.sh` (este README não o duplica). O script:
 
 - valida o nome (seção 2) e aborta sem tocar em nada se o serviço ou a rota já existirem;
 - cria `specs/<service_name>.md` com o template de 4 tópicos — **ou preserva o spec, se já existir** (spec-first);
-- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker) e uma lista paginada com busca (`GET /records`, seção 5.12);
+- cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker), uma lista paginada com busca (`GET /records`, seção 5.12) e as listas vazias `SCHEDULES` e `MIGRATIONS` já ligadas (seção 5.13);
 - cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py` (no SurrealDB embutido), e registra o serviço no fim do `compose.yaml`;
 - gera tudo numa área temporária, verifica a sintaxe e só então publica (tudo ou nada).
 
@@ -195,7 +195,7 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Gateway declarativo:** zero rotas de negócio no código do Gateway. Toda rota pública vive em `gateway/endpoints/<service_name>.yaml` (seção 5.8). Rotas nascem com `auth: client_jwt`; `auth: public` só quando o spec §2 declarar.
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
-- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), copia apenas `core/` e a pasta do app e roda sem root.
+- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), já com o bytecode compilado (o container sobe sem recompilar as bibliotecas), copia apenas `core/` e a pasta do app e roda sem root.
 - **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), com as tabelas e os índices do boot, executando a SurrealQL de verdade. O motor embutido é o 2.x e o servidor é o 3.x: o core cuida das diferenças conhecidas (seção 5.12).
 
   ```bash
@@ -211,16 +211,16 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | Arquivo | Expõe |
 |---|---|
 | `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)`, `stream_response(gerador, service, final=Modelo)` |
-| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
+| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `system(service, tenant)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)`, `bus.live(tópico, model, user=None)`, `bus.live_feed(principal)` |
-| `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
-| `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...}, search={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.page(TABLE, query, ModeloPage)`, `db.create`, `db.select`, `db.merge`, `db.delete`, `ListQuery`, `Page` |
+| `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service, schedules)`, `runner.start_workflow(run, arg, task_queue, id)`, `Schedule` |
+| `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...}, search={...}, migrations=[...], service=SERVICE)`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.page(TABLE, query, ModeloPage)`, `db.create`, `db.select`, `db.merge`, `db.delete`, `db.tenants(TABLE)`, `ListQuery`, `Page`, `Migration` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
 | `llm.py` | `llm.ask(modelo, prompt, instructions, output, tools, images)`, `llm.stream(...)`, `llm.embed(modelo, textos)`, `llm.agent(...)`, `Image` — o único jeito de chamar IA (seção 5.11) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
-Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio modelo ("Mínimo de 2 caracteres.", "Deve ser maior que 0."), e cada detalhe aponta o campo em `loc`. As tabelas declaradas em `db.connected(...)` são garantidas no boot (no SurrealDB 3, consultar tabela inexistente é erro; assim a primeira listagem devolve `[]`); tabela não declarada é erro. Valor repetido num índice `unique` sai como 409 `ERRO_RECORD_DUPLICATE`, sem ecoar o valor.
+Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio modelo ("Mínimo de 2 caracteres.", "Deve ser maior que 0."), e cada detalhe aponta o campo em `loc`. As tabelas declaradas em `db.connected(...)` são garantidas no boot (no SurrealDB 3, consultar tabela inexistente é erro; assim a primeira listagem devolve `[]`); tabela não declarada é erro. Valor repetido num índice `unique` sai como 409 `ERRO_RECORD_DUPLICATE`, sem ecoar o valor. Consulta com vários comandos devolve o resultado do primeiro, mas o core confere todos: o erro de qualquer um chega ao serviço (o SDK só conferia o primeiro).
 
 ### 5.7 Segurança (`core/security.py`)
 
@@ -403,6 +403,34 @@ async def listar(self, data: FaturaQuery) -> FaturaPage:     # service.py
 - **Motores:** o índice de busca se chama `FULLTEXT` no SurrealDB 3 e `SEARCH` no 2.x embutido dos testes; o core escolhe pela versão. O total é contado a partir da subconsulta, porque o motor 2.x soma índices num `count()` direto.
 - **Tela:** `useListQuery(loja.listar)` + `ListView` (seção 6). Página, busca, filtros e ordem ficam na URL da tela.
 
+### 5.13 Ciclo de vida dos dados
+
+**Carimbos.** Toda tabela declarada ganha `created_at`, `created_by`, `updated_at` e `updated_by`, preenchidos pelo próprio banco, inclusive na SurrealQL crua do serviço. `created_*` entra uma vez e o banco recusa trocá-lo depois; `updated_*` muda a cada gravação. Quem age vai como `$cv_actor` em toda consulta do core: o `sub` da pessoa, ou `system:svc-<serviço>` nas tarefas da plataforma. Gravar um carimbo à mão é erro. Para listar do mais novo ao mais velho: `default_sort = "-created_at"` (o template já nasce assim).
+
+**Tarefas recorrentes.** Declaradas no `workflows.py` e mantidas no Temporal pelo runner a cada boot: o que entrou na lista é criado, o que mudou é atualizado, o que saiu é removido (id `<task_queue>/<id>`). Execução sobreposta é pulada; com o Temporal fora do ar, só a última execução perdida (até 10 min) é recuperada.
+
+```python
+SCHEDULES = [Schedule("limpeza", "0 4 * * *", LimpezaWorkflow.run, Empty())]           # workflows.py: todo dia às 4h UTC
+runner.worker(TASK_QUEUE, workflows=[LimpezaWorkflow], service=svc, schedules=SCHEDULES)  # main.py
+```
+
+Sem pessoa por trás, a activity roda como `system("svc-<serviço>")`. Para trabalhar em tabela por organização, percorra as organizações que têm dados: `for org in await db.tenants(TABELA): with acting_as(system(SERVICE, org)): ...`. Só tarefas da plataforma listam organizações; uma pessoa nunca. Token nenhum carrega um `sub` começando com `system:`.
+
+**Migrações.** Mudanças de dados versionadas no `service.py`, rodadas no boot, em ordem e uma vez por banco:
+
+```python
+MIGRATIONS = [
+    Migration(1, "status padrão nas faturas antigas", sql="UPDATE faturas SET status = 'aberta' WHERE status = NONE"),
+    Migration(2, "recalcula totais", run=_recalcula_totais),     # função async sem argumentos
+]
+db.connected(tables=[TABLE], migrations=MIGRATIONS, service=SERVICE)   # main.py
+```
+
+- Versões 1, 2, 3… sem buracos. Nunca edite uma migração publicada: crie a próxima.
+- A SQL roda numa transação e **sem filtro de organização**: é a mudança dos dados de todas, revisada no PR. A função roda como `system(<serviço>)`.
+- O registro fica em `cv_migrations`. Uma réplica roda e as outras esperam. Se falhar, o serviço não sobe, e a próxima subida tenta de novo depois da correção. Se ficar mais de 10 min "em andamento" (a réplica caiu), outra assume.
+- Índice `unique` que mudou de campos é um índice novo, criado no boot; o antigo sai por migração (`REMOVE INDEX ...`).
+
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
@@ -494,7 +522,7 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 - importar código de outro serviço;
 - implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
 - abrir uma rota (`public=`) que o spec não declara pública;
-- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (identidade e IA), ou organização vinda do corpo;
+- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora dos serviços de plataforma (identidade e IA), ou organização vinda do corpo (a única exceção são as migrações versionadas, seção 5.13);
 - chamar provedor de IA, montar cliente `openai` ou Agno, ou guardar chave de provedor fora de `core/llm.py` e do `svc-ai`;
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;

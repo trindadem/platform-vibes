@@ -74,8 +74,8 @@ settings = IdentitySettings()
 # Blocos atômicos: um erro no meio (ex.: e-mail repetido) desfaz tudo; RETURN NONE sai antes de gravar.
 _SIGNUP_WITH_ORGANIZATION = """{
     LET $u = CREATE ONLY identity_users CONTENT $user;
-    LET $t = CREATE ONLY identity_tenants CONTENT { name: $organization, created_by: $u.id, created_at: time::now() };
-    CREATE identity_memberships CONTENT { user: $u.id, tenant: $t.id, roles: ['owner'], created_at: time::now() };
+    LET $t = CREATE ONLY identity_tenants CONTENT { name: $organization, created_by: $u.id };
+    CREATE identity_memberships CONTENT { user: $u.id, tenant: $t.id, roles: ['owner'] };
     RETURN { user: $u.id, tenant: $t.id, role: 'owner' };
 }"""
 _SIGNUP_WITH_INVITE = """{
@@ -84,19 +84,19 @@ _SIGNUP_WITH_INVITE = """{
     IF $inv = NONE { RETURN NONE; };
     LET $u = CREATE ONLY identity_users CONTENT $user;
     UPDATE $inv.id SET used_by = $u.id;
-    CREATE identity_memberships CONTENT { user: $u.id, tenant: $inv.tenant, roles: [$inv.role], created_at: time::now() };
+    CREATE identity_memberships CONTENT { user: $u.id, tenant: $inv.tenant, roles: [$inv.role] };
     RETURN { user: $u.id, tenant: $inv.tenant, role: $inv.role };
 }"""
 _JOIN = """{
     LET $inv = (UPDATE identity_invites SET used_at = time::now(), used_by = $user
         WHERE code_hash = $code_hash AND used_at = NONE AND expires_at > time::now() RETURN AFTER)[0];
     IF $inv = NONE { RETURN NONE; };
-    CREATE identity_memberships CONTENT { user: $user, tenant: $inv.tenant, roles: [$inv.role], created_at: time::now() };
+    CREATE identity_memberships CONTENT { user: $user, tenant: $inv.tenant, roles: [$inv.role] };
     RETURN { user: $user, tenant: $inv.tenant, role: $inv.role };
 }"""
 _CREATE_TENANT = """{
-    LET $t = CREATE ONLY identity_tenants CONTENT { name: $name, created_by: $user, created_at: time::now() };
-    CREATE identity_memberships CONTENT { user: $user, tenant: $t.id, roles: ['owner'], created_at: time::now() };
+    LET $t = CREATE ONLY identity_tenants CONTENT { name: $name, created_by: $user };
+    CREATE identity_memberships CONTENT { user: $user, tenant: $t.id, roles: ['owner'] };
     RETURN $t.id;
 }"""
 
@@ -113,7 +113,6 @@ class IdentityService:
             "name": data.name,
             "password_hash": await hash_password(data.password),
             "failed_logins": 0,
-            "created_at": _now(),
         }
         try:
             if data.organization is not None:
@@ -227,9 +226,7 @@ class IdentityService:
             "code_hash": _hash(code),
             "tenant": RecordID(TENANTS, tenant),
             "role": data.role,
-            "created_by": RecordID(USERS, who.sub),
-            "created_at": _now(),
-            "expires_at": expires_at,
+            "expires_at": expires_at,  # quem convidou e quando: carimbos do banco (created_by, created_at)
         })
         return Invite(code=code, role=data.role, expires_at=expires_at)
 
@@ -301,7 +298,6 @@ class IdentityService:
             "user": RecordID(USERS, user_key),
             "tenant": RecordID(TENANTS, active.id) if active else None,
             "revoked": False,
-            "created_at": now,
             "expires_at": now + timedelta(days=settings.refresh_days),
         })
         if active and user.get("last_tenant") != active.id:

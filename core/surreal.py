@@ -12,6 +12,11 @@ Trilhos:
 - Login sempre como usuário do banco (DEFINE USER ... ON DATABASE), nunca root: menor privilégio.
 - Resultados voltam como tipos simples: "tabela:id" em vez de RecordID; select de um registro → dict | None.
 - Valor repetido em índice unique → ServiceError 409 ERRO_RECORD_DUPLICATE (sem ecoar o valor).
+- Carimbos (README §5.13): toda tabela declarada ganha created_at, created_by, updated_at e updated_by, que o próprio
+  banco preenche (inclusive na SurrealQL crua): created_* uma vez e imutáveis, updated_* a cada gravação. Quem age
+  entra como $cv_actor em toda consulta do core (o sub do Principal; None sem ninguém). Gravar um carimbo à mão é erro.
+- Migrações (README §5.13): db.connected(..., service=SERVICE, migrations=[Migration(1, "...", sql="...")]) roda as
+  pendentes no boot, em ordem, uma vez por banco (registro em cv_migrations, com trava entre réplicas).
 - Listas (README §5.12): db.page(TABELA, query, ModeloPage) devolve uma página filtrada, ordenada e com busca por
   palavras, sempre na organização atual. A query é um ListQuery (page, size, sort, q) cuja subclasse declara os
   filtros como campos: x → igualdade, x_from/x_to → intervalo, list[...] → um dos valores. Só ordena pelos campos
@@ -21,23 +26,40 @@ Variáveis: SURREAL_URL (padrão ws://localhost:8000) e, obrigatórias e sem pad
 SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER, SURREAL_PASSWORD.
 """
 import asyncio
+import logging
 import re
-from collections.abc import AsyncIterator, Iterable, Mapping
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, LiteralString, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from surrealdb import AsyncSurreal, ConnectionUnavailableError, RecordID, ServerError, Table
+from surrealdb.errors import parse_query_error
 
 from core.envelope import ServiceError
-from core.security import current_tenant
+from core.security import acting_as, current, current_tenant, system
 
 TENANT = "tenant"
+ACTOR = "cv_actor"  # parâmetro de toda consulta do core: quem age (carimbos created_by/updated_by)
+STAMPS = ("created_at", "created_by", "updated_at", "updated_by")
+MIGRATIONS = "cv_migrations"
+_STAMP_FIELDS = (
+    # created_* uma vez (o banco recusa trocar depois); updated_* recalculados a cada gravação.
+    "DEFINE FIELD IF NOT EXISTS created_at ON TABLE {t} TYPE option<datetime> DEFAULT time::now() READONLY",
+    "DEFINE FIELD IF NOT EXISTS created_by ON TABLE {t} DEFAULT $cv_actor READONLY",
+    "DEFINE FIELD IF NOT EXISTS updated_at ON TABLE {t} TYPE option<datetime> VALUE time::now()",
+    "DEFINE FIELD IF NOT EXISTS updated_by ON TABLE {t} VALUE $cv_actor",
+)
+_STALE_MIGRATION_SECONDS = 600  # migração "em andamento" há mais que isso: a réplica que a rodava caiu
+log = logging.getLogger("core.surreal")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TENANT_PARAM = re.compile(r"\$tenant\b")
 _DUPLICATE = re.compile(r"index `[a-z0-9_]+?__(?P<fields>[a-z0-9_]+)__unique` already contains")
 _VERSION = re.compile(r"(\d+)\.\d+")
+_CASCADE = re.compile(r"not executed due to a failed transaction|Cannot COMMIT")
 # Busca por palavras: início de palavra, sem diferença de maiúscula nem de acento ("pad" acha "Padaria", "joao" acha "João").
 ANALYZER = "cv_busca"
 _ANALYZER_DEF = f"DEFINE ANALYZER IF NOT EXISTS {ANALYZER} TOKENIZERS blank,class,punct FILTERS lowercase,ascii,edgengram(1,20)"
@@ -106,6 +128,23 @@ class ListQuery(BaseModel):
         return {name: value for name in self.filter_names() if (value := getattr(self, name)) not in (None, [])}
 
 
+@dataclass(frozen=True)
+class Migration:
+    """Mudança de dados versionada, rodada uma vez por banco no boot (README §5.13).
+
+        Migration(1, "status padrão nas faturas antigas", sql="UPDATE faturas SET status = 'aberta' WHERE status = NONE")
+        Migration(2, "recalcula totais", run=_recalcula_totais)   # função async sem argumentos, em service.py
+
+    A SQL roda numa transação e SEM filtro de organização: é a mudança de dados de todas, revisada no PR. A função
+    roda como system(<serviço>). Versões crescentes a partir de 1; nunca edite uma migração já publicada, crie outra.
+    """
+
+    version: int
+    description: str
+    sql: LiteralString | None = None
+    run: Callable[[], Awaitable[None]] | None = None
+
+
 class Page(BaseModel, Generic[T]):
     """Uma página de lista. No schemas.py: class FaturaPage(Page[Fatura]): pass."""
 
@@ -142,13 +181,16 @@ class Database:
         shared: Iterable[str] = (),
         unique: Mapping[str, Iterable[str]] | None = None,
         search: Mapping[str, Iterable[str]] | None = None,
+        migrations: Sequence[Migration] = (),
+        service: str | None = None,
     ) -> AsyncIterator["Database"]:
         """Conecta no boot (falha cedo se faltar credencial) e garante tabelas, campo tenant e índices.
 
         tables: por organização (ganham o campo tenant, READONLY e indexado). shared: globais.
         unique: {"tabela": ["campo", ...]}; em tabela por organização o tenant entra no índice sozinho
         (o mesmo e-mail pode existir em duas organizações). search: {"tabela": ["campo", ...]} cria o índice de busca
-        por palavras de cada campo (db.page com q). Idempotente. O SurrealDB 3 recusa SELECT em
+        por palavras de cada campo (db.page com q). migrations (com service=SERVICE) roda as mudanças de dados pendentes,
+        em ordem. Idempotente. O SurrealDB 3 recusa SELECT em
         tabela que nunca recebeu registro; declarar no boot faz a primeira listagem devolver [] em vez de erro.
         """
         per_tenant, globals_ = [_ident(t) for t in tables], [_ident(t) for t in shared]
@@ -160,8 +202,10 @@ class Database:
         searches = {_ident(t): tuple(_ident(f) for f in fields) for t, fields in (search or {}).items()}
         if unknown := set(searches) - set(per_tenant) - set(globals_):
             raise ValueError(f"search cita tabela não declarada em tables/shared: {sorted(unknown)}")
+        _check_migrations(migrations, service)
         # Nomes validados por _ident (só a-z, 0-9, _): seguros fora de parâmetro, que DEFINE não aceita.
         statements = [f"DEFINE TABLE IF NOT EXISTS {t} SCHEMALESS" for t in per_tenant + globals_]
+        statements += [field.format(t=t) for t in per_tenant + globals_ for field in _STAMP_FIELDS]
         for t in per_tenant:
             statements += [
                 f"DEFINE FIELD IF NOT EXISTS {TENANT} ON TABLE {t} TYPE string READONLY",
@@ -188,6 +232,8 @@ class Database:
             await self._call("query", statement, None)
         self._tenant_tables, self._shared_tables = frozenset(per_tenant), frozenset(globals_)
         self._search = searches
+        if migrations:
+            await self._migrate(service or "", migrations)
         try:
             yield self
         finally:
@@ -203,6 +249,7 @@ class Database:
         """Resultado do primeiro statement, sempre na organização atual: $tenant entra sozinho e a SQL precisa citá-lo."""
         if TENANT in params:
             raise ValueError("não passe tenant=: $tenant vem do contexto (core.security.current_tenant)")
+        _no_actor(params)
         if not _TENANT_PARAM.search(sql):
             raise ValueError(
                 "query sem $tenant: filtre a organização (ex.: WHERE tenant = $tenant). "
@@ -214,6 +261,7 @@ class Database:
         """Query sem filtro de organização, para tabelas globais. Só existe para quem declarou shared=[...]."""
         if not self._shared_tables:
             raise RuntimeError("db.query_shared exige tabelas globais declaradas: db.connected(shared=[...]) (README §5.9)")
+        _no_actor(params)
         return await self._call("query", sql, params or None)
 
     async def page(
@@ -233,8 +281,8 @@ class Database:
         AS slug"); a ordem só aceita campos presentes na seleção, por isso o * fica.
         """
         name = self._declared(_ident(table))
-        if TENANT in params or any(key.startswith("f_") for key in params) or {"q", "size", "start"} & set(params):
-            raise ValueError("parâmetros reservados em db.page: tenant, q, size, start e f_*")
+        if TENANT in params or ACTOR in params or any(key.startswith("f_") for key in params) or {"q", "size", "start"} & set(params):
+            raise ValueError("parâmetros reservados em db.page: tenant, cv_actor, q, size, start e f_*")
         conditions: list[str] = []
         values: dict[str, Any] = dict(params)
         if name in self._tenant_tables:
@@ -277,9 +325,30 @@ class Database:
 
     async def create(self, table: str, data: dict[str, Any]) -> dict[str, Any]:
         name = self._declared(_ident(table))
+        _without_stamps(data)
         if name in self._tenant_tables:
             data = {**_without_tenant(data), TENANT: current_tenant()}
-        return await self._call("create", Table(name), data)
+        # Por consulta (e não pelo create do SDK): os carimbos precisam de $cv_actor.
+        rows = await self._call("query", "CREATE type::table($tb) CONTENT $data RETURN AFTER", {"tb": name, "data": data})
+        return rows[0]
+
+    async def tenants(self, table: str) -> list[str]:
+        """Organizações com registros na tabela, para tarefas da plataforma (agendamentos, migrações):
+
+            for org in await db.tenants(FATURAS):
+                with acting_as(system(SERVICE, org)):
+                    ...
+
+        Só fora de uma requisição ou como system(): uma pessoa nunca lista as organizações dos outros.
+        """
+        who = current()
+        if who is not None and not who.is_system:
+            raise PermissionError("db.tenants é só para tarefas da plataforma (acting_as(system(SERVICE)))")
+        name = self._declared(_ident(table))
+        if name not in self._tenant_tables:
+            raise ValueError(f"{name!r} não é tabela por organização")
+        rows = await self._call("query", f"SELECT {TENANT} FROM {name} GROUP BY {TENANT}", None)
+        return sorted(row[TENANT] for row in rows or [] if row.get(TENANT))
 
     async def select(self, record_id: str) -> dict[str, Any] | None:
         rid = _record(record_id)
@@ -293,12 +362,14 @@ class Database:
     async def merge(self, record_id: str, data: dict[str, Any]) -> dict[str, Any]:
         rid = _record(record_id)
         tenant = self._tenant_of(rid)
+        _without_stamps(data)
         if tenant is None:
-            return await self._call("merge", rid, data)
-        rows = await self._call(
-            "query", "UPDATE $rid MERGE $data WHERE tenant = $tenant RETURN AFTER",
-            {"rid": rid, "data": _without_tenant(data), TENANT: tenant},
-        )
+            rows = await self._call("query", "UPDATE $rid MERGE $data RETURN AFTER", {"rid": rid, "data": data})
+        else:
+            rows = await self._call(
+                "query", "UPDATE $rid MERGE $data WHERE tenant = $tenant RETURN AFTER",
+                {"rid": rid, "data": _without_tenant(data), TENANT: tenant},
+            )
         if not rows:
             raise ServiceError("ERRO_RECORD_NOT_FOUND", "Registro não encontrado.", status=404)
         return rows[0]
@@ -310,6 +381,59 @@ class Database:
             await self._call("delete", rid)
         else:
             await self._call("query", "DELETE $rid WHERE tenant = $tenant", {"rid": rid, TENANT: tenant})
+
+    async def _migrate(self, service: str, migrations: Sequence[Migration]) -> None:
+        """Roda as migrações pendentes em ordem. Uma réplica por vez: quem cria o registro primeiro roda; as outras
+        esperam. Falhou: o boot para (o registro fica failed e a próxima subida tenta de novo)."""
+        await self._call("query", f"DEFINE TABLE IF NOT EXISTS {MIGRATIONS} SCHEMALESS", None)
+        for m in migrations:
+            rid = RecordID(MIGRATIONS, f"{service}-{m.version:04d}")
+            if not await self._claim(rid, service, m):
+                continue
+            log.info("migração %s #%d: %s", service, m.version, m.description)
+            try:
+                with acting_as(system(service)):
+                    if m.sql is not None:
+                        await self._call("query", f"BEGIN TRANSACTION; {m.sql}; COMMIT TRANSACTION;", None)
+                    else:
+                        await m.run()  # type: ignore[misc]
+            except Exception as exc:
+                await self._call("query", "UPDATE $rid SET status = 'failed', error = $e", {"rid": rid, "e": type(exc).__name__})
+                raise RuntimeError(f"migração {service} #{m.version} ({m.description}) falhou: o serviço não sobe") from exc
+            await self._call("query", "UPDATE $rid SET status = 'done', finished_at = time::now()", {"rid": rid})
+
+    async def _claim(self, rid: RecordID, service: str, m: Migration) -> bool:
+        """True se esta réplica deve rodar a migração; False se já está feita. Espera quem estiver rodando."""
+        deadline = time.monotonic() + _STALE_MIGRATION_SECONDS
+        while True:
+            rows = await self._call("query", "SELECT * FROM $rid", {"rid": rid})
+            row = rows[0] if rows else None
+            if row is None:
+                try:
+                    await self._call(
+                        "query",
+                        "CREATE $rid SET service = $s, version = $v, description = $d, status = 'running', started_at = time::now()",
+                        {"rid": rid, "s": service, "v": m.version, "d": m.description},
+                    )
+                    return True
+                except ServerError as exc:
+                    if "already exists" not in str(exc):
+                        raise
+                    continue  # outra réplica criou primeiro: volta e confere o estado
+            if row["status"] == "done":
+                return False
+            # failed (tenta de novo) ou running abandonada (réplica caiu): reivindica só se ninguém fez isso antes
+            taken = await self._call(
+                "query",
+                "UPDATE $rid SET status = 'running', started_at = time::now(), error = NONE "
+                "WHERE status = 'failed' OR (status = 'running' AND started_at < time::now() - 10m) RETURN AFTER",
+                {"rid": rid},
+            )
+            if taken:
+                return True
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"migração {service} #{m.version} está em andamento há mais de 10 min (confira {rid})")
+            await asyncio.sleep(1)
 
     def _declared(self, table: str) -> str:
         if table not in self._tenant_tables and table not in self._shared_tables:
@@ -340,10 +464,15 @@ class Database:
             return self._conn
 
     async def _call(self, method: str, *args: Any) -> Any:
+        if method == "query":  # quem age vai em toda consulta: o banco carimba created_by/updated_by com ele
+            who = current()
+            args = (args[0], {**(args[1] or {}), ACTOR: who.sub if who else None}, *args[2:])
         # Conexão caiu (restart do banco, rede): reconecta uma vez e repete.
         for attempt in (1, 2):
             conn = await self._connection()
             try:
+                if method == "query":
+                    return _plain(await _query(conn, *args))
                 return _plain(await getattr(conn, method)(*args))
             except (ConnectionUnavailableError, ConnectionError):
                 if attempt == 2:
@@ -371,6 +500,18 @@ def _record(record_id: str) -> RecordID:
     return RecordID(_ident(table), key)
 
 
+async def _query(conn: Any, sql: str, params: dict[str, Any] | None) -> Any:
+    """Resultado do primeiro comando, conferindo TODOS. O SDK só confere o primeiro: num BEGIN ...; X; COMMIT do
+    SurrealDB 3, o BEGIN sai OK e o erro de X passava em silêncio (achado na migração que falhou e ficou "done")."""
+    results = (await conn.query_raw(sql, params)).get("result") or []
+    if errors := [statement for statement in results if statement.get("status") == "ERR"]:
+        # Numa transação, os outros comandos falham por tabela ("not executed due to a failed transaction",
+        # "Cannot COMMIT"): a causa é o comando que falhou por conta própria.
+        cause = next((e for e in errors if not _CASCADE.search(str(e.get("result")))), errors[0])
+        raise parse_query_error(cause)
+    return results[0].get("result") if results else None
+
+
 def _filter(field: str, value: Any) -> tuple[str, str]:
     """Convenção dos filtros do ListQuery: x → x =, x_from → x >=, x_to → x <=, lista → x IN."""
     if field.endswith("_from"):
@@ -389,9 +530,35 @@ def _order(query: ListQuery, by_score: bool) -> str:
 
 
 def _without_tenant(data: dict[str, Any]) -> dict[str, Any]:
+    """Tabela por organização: o tenant vem do contexto, nunca dos dados."""
     if TENANT in data:
         raise ValueError("não grave 'tenant' à mão: ele vem do contexto (core.security.current_tenant)")
     return data
+
+
+def _without_stamps(data: dict[str, Any]) -> None:
+    """Qualquer tabela: os carimbos são do banco."""
+    if stamped := sorted(set(STAMPS) & set(data)):
+        raise ValueError(f"não grave {', '.join(stamped)} à mão: o banco carimba quem e quando (README §5.13)")
+
+
+def _no_actor(params: Mapping[str, Any]) -> None:
+    if ACTOR in params:
+        raise ValueError("não passe cv_actor=: quem age vem do contexto (core.security.current)")
+
+
+def _check_migrations(migrations: Sequence[Migration], service: str | None) -> None:
+    if not migrations:
+        return
+    if not service:
+        raise ValueError("migrations exige service=SERVICE (o registro de cada migração é por serviço)")
+    versions = [m.version for m in migrations]
+    if versions != list(range(1, len(versions) + 1)):
+        raise ValueError(f"migrations: versões precisam ser 1, 2, 3... em ordem e sem buracos (veio {versions})")
+    for m in migrations:
+        if (m.sql is None) == (m.run is None):
+            raise ValueError(f"migração #{m.version}: informe sql= ou run= (só um dos dois)")
+
 
 
 def _plain(value: Any) -> Any:

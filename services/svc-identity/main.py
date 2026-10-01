@@ -43,7 +43,7 @@ from schemas import (
     TenantRequest,
 )
 from service import IdentityService, settings
-from workflows import IdentityWorkflow
+from workflows import SCHEDULES, IdentityWorkflow
 
 svc = IdentityService()
 RefreshCookie = Annotated[str | None, Cookie(alias=REFRESH_COOKIE)]
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(shared=SHARED_TABLES, unique=UNIQUE),
-        runner.worker(TASK_QUEUE, workflows=[IdentityWorkflow], service=svc),
+        runner.worker(TASK_QUEUE, workflows=[IdentityWorkflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         yield

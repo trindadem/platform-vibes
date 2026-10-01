@@ -83,8 +83,6 @@ class AiService:
             "base_url": base_url,
             "key": _encrypt(owner, data.slug, data.api_key),
             "key_hint": data.api_key[-4:] if data.api_key else "",
-            "created_by": who.sub,
-            "created_at": _now(),
         }
         try:
             row = await db.create(PROVIDERS, record)
@@ -271,7 +269,6 @@ def _model_record(provider: dict, model_id: str, kind: str, *, enabled: bool) ->
         "enabled": enabled,
         "price_input": 0.0,
         "price_output": 0.0,
-        "created_at": _now(),
     }
 
 
