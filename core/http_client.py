@@ -5,6 +5,8 @@
   allow_private=True e só vale com ENVIRONMENT=development (receptor de teste local).
 - Não segue redirects: um redirect poderia levar para a rede interna depois da checagem.
 - Sempre com timeout (5 s para conectar, 30 s para ler/escrever) e 2 novas tentativas só em falha de conexão.
+- max_bytes= para o corpo no meio da leitura quando passa do tamanho (ex.: ler o site de alguém): 422
+  ERRO_HTTP_TOO_LARGE, sem guardar o resto na memória.
 - Nunca guarda cookies: o client é um só por processo e atende todas as organizações; cookie recebido numa
   chamada não volta na próxima (quem precisa de cookie o passa explicitamente na chamada).
 Serviços internos não usam este client: serviços conversam por NATS ou pelo Gateway.
@@ -16,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from core.envelope import ServiceError
 from core.security import assert_public_url
 
 
@@ -31,12 +34,27 @@ class HttpClient:
             await self.close()
 
     async def request(
-        self, method: str, url: str, *, allow_http: bool = False, allow_private: bool = False, **kwargs: Any
+        self,
+        method: str,
+        url: str,
+        *,
+        allow_http: bool = False,
+        allow_private: bool = False,
+        max_bytes: int | None = None,
+        **kwargs: Any,
     ) -> httpx.Response:
         if "follow_redirects" in kwargs:
             raise TypeError("http_client não segue redirects (proteção contra SSRF)")
         await assert_public_url(url, allow_http=allow_http, allow_private=allow_private)
-        return await self._http().request(method, url, **kwargs)
+        if max_bytes is None:
+            return await self._http().request(method, url, **kwargs)
+        async with self._http().stream(method, url, **kwargs) as response:
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise ServiceError("ERRO_HTTP_TOO_LARGE", "A resposta passou do tamanho permitido.", status=422)
+        return httpx.Response(response.status_code, headers=response.headers, content=bytes(body), request=response.request)
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)

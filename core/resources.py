@@ -358,10 +358,13 @@ def _label(name: str, info: FieldInfo) -> str:
 
 
 def _options(info: FieldInfo) -> list[dict[str, str]]:
+    """Opções da escolha. Rótulo: o de json_schema_extra={"labels": {"politica": "Política"}}, senão o próprio valor."""
     values = _choices(info.annotation) or []
     if values == [True, False]:
         return [{"value": "true", "label": "Sim"}, {"value": "false", "label": "Não"}]
-    return [{"value": str(v), "label": str(v).replace("_", " ").capitalize()} for v in values]
+    extra = info.json_schema_extra if isinstance(info.json_schema_extra, dict) else {}
+    labels = extra.get("labels") if isinstance(extra.get("labels"), dict) else {}
+    return [{"value": str(v), "label": str(labels.get(str(v)) or str(v).replace("_", " ").capitalize())} for v in values]
 
 
 def _field_meta(name: str, info: FieldInfo) -> dict[str, Any]:

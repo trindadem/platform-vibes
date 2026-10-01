@@ -1,0 +1,115 @@
+# svc-conhecimento · rotas públicas no Gateway. Fonte da verdade: specs/conhecimento.md §2
+service: conhecimento
+base_path: /api/v1/conhecimento
+
+# Itens da base de conhecimento (core/resources.py, README §5.19): 5 rotas e o aviso ao vivo conhecimento.itens.
+resources: [itens]
+
+live:
+  - topic: briefing                 # perfil ou conversa mudou
+    model: BriefingMudou
+  - topic: leituras                 # leitura de site ou documento mudou de estado
+    model: LeituraMudou
+
+endpoints:
+  - path: /briefing
+    method: GET
+    auth: client_jwt
+    response: Briefing
+    target_type: http
+    target_url: http://svc-conhecimento:8000/briefing
+
+  - path: /briefing/mensagem
+    method: POST
+    auth: client_jwt
+    stream: true                    # os passos do agente em pedaços; o briefing atualizado no fim
+    request: MensagemIn
+    delta: Passo
+    response: Briefing
+    target_type: http
+    target_url: http://svc-conhecimento:8000/briefing/mensagem
+    timeout: 120
+
+  - path: /briefing/perfil
+    name: salvarPerfil
+    method: POST
+    auth: client_jwt
+    request: Perfil
+    response: Briefing
+    target_type: http
+    target_url: http://svc-conhecimento:8000/briefing/perfil
+
+  - path: /briefing/concluir
+    method: POST
+    auth: client_jwt
+    request: Empty
+    response: Briefing
+    target_type: http
+    target_url: http://svc-conhecimento:8000/briefing/concluir
+
+  - path: /briefing/reabrir
+    method: POST
+    auth: client_jwt
+    request: Empty
+    response: Briefing
+    target_type: http
+    target_url: http://svc-conhecimento:8000/briefing/reabrir
+
+  - path: /busca
+    method: GET
+    auth: client_jwt
+    query: BuscaQuery
+    response: Achados
+    target_type: http
+    target_url: http://svc-conhecimento:8000/busca
+
+  - path: /resumo
+    method: GET
+    auth: client_jwt
+    response: Resumo
+    target_type: http
+    target_url: http://svc-conhecimento:8000/resumo
+
+  - path: /site
+    name: lerSite
+    method: POST
+    auth: client_jwt
+    request: SiteIn
+    response: Leitura
+    target_type: http
+    target_url: http://svc-conhecimento:8000/site
+
+  - path: /documentos/upload
+    name: documentoUpload
+    method: POST
+    auth: client_jwt
+    request: UploadRequest
+    response: Upload
+    target_type: http
+    target_url: http://svc-conhecimento:8000/documentos/upload
+
+  - path: /documentos
+    name: lerDocumento
+    method: POST
+    auth: client_jwt
+    request: KeepRequest
+    response: Leitura
+    target_type: http
+    target_url: http://svc-conhecimento:8000/documentos
+
+  - path: /leituras
+    method: GET
+    auth: client_jwt
+    query: LeituraQuery
+    response: LeituraPage
+    target_type: http
+    target_url: http://svc-conhecimento:8000/leituras
+
+  - path: /leituras/remove
+    name: removerLeitura
+    method: POST
+    auth: client_jwt
+    request: LeituraRef
+    response: LeituraMudou
+    target_type: http
+    target_url: http://svc-conhecimento:8000/leituras/remove

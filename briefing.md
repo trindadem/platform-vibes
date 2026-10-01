@@ -257,8 +257,12 @@ Hoje todo agente da plataforma passa pelo `core/llm.py`, que usa o Agno por baix
 - O SDK é síncrono: roda em thread (`asyncio.to_thread`) dentro do worker.
 - Não tem streaming de texto: no diálogo de processos a tela mostra as operações aplicadas (o diagrama muda). Se o
   texto em pedaços fizer falta, acrescentamos ao SDK.
-- Está em alfa: versão fixada, e a troca começa por um spike no bloco N1 (seção 13). O Agno sai do `core/llm.py`
-  quando o spike passar; `ask`, `stream` e `embed` ficam com o cliente OpenAI direto, que o `core/llm.py` já usa.
+- Está em alfa: versão fixada (wheel em `vendor/`).
+
+**Spike do N1: passou.** O agente de briefing roda no AgentExo pelo `llm.run_agent` (README §5.11), contra o Qwen3
+Next 80B no Bedrock pela API compatível: cinco mensagens de um cliente preencheram os seis tópicos do perfil, com
+plano conferido e uso registrado a cada volta, e erro de ferramenta voltando ao modelo para ele corrigir. Falta tirar
+o Agno de `ask`, `stream` e `agent` (passam ao cliente OpenAI direto, que o `core/llm.py` já usa, e ao `run_agent`).
 
 No console Electron (seção 11) o AgentExo encaixa como está: local, um usuário, SQLite.
 
@@ -423,7 +427,7 @@ descoberto no N2 e desenhado no N3.
 3. **Preço e limites do plano:** quantos processos, quantas execuções, se handoff tem cota, e o que acontece acima do
    volume (bloquear ou cobrar).
 4. **Staff como `operador` na organização do cliente** (seção 8): confirmar o modelo.
-5. **AgentExo no lugar do Agno** (seção 7.2): confirmar depois do spike do N1.
+5. **AgentExo no lugar do Agno** (seção 7.2): o spike do N1 passou; falta decidir quando tirar o Agno de vez.
 6. **Fornecedores de integração:** WhatsApp, banco (Open Finance ou API do banco), NFS-e, certidões e tribunais;
    escolhidos pelo cliente piloto.
 7. **Cluster:** armazenamento distribuído e alta disponibilidade do SurrealDB.

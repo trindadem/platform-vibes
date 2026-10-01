@@ -261,3 +261,12 @@ services:
       <<: *service-env
       # Quem administra a plataforma gerencia os planos (README §5.17); a mesma organização do svc-ai.
       PLATFORM_TENANT: ${PLATFORM_TENANT:-}
+
+  svc-conhecimento:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: conhecimento } }
+    profiles: [modules, conhecimento]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      # Modelo do agente de briefing, como cadastrado no svc-ai (specs/conhecimento.md §3).
+      CONHECIMENTO_MODEL: ${CONHECIMENTO_MODEL:-cv/agente}

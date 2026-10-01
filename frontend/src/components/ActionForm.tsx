@@ -37,7 +37,7 @@ export interface ActionFormProps<B> {
   submitLabel?: string;
   /** Mensagem exibida após sucesso (o formulário é limpo). */
   successMessage?: string;
-  /** Valores iniciais por campo. */
+  /** Valores iniciais por campo (edição). Campo opcional que tinha valor e foi esvaziado vai como null: apaga. */
   initial?: Partial<Record<keyof B & string, string>>;
   /** Chamado após sucesso (ex.: fechar o painel). */
   onDone?: () => void;
@@ -82,10 +82,13 @@ export function ActionForm<B>({ action, fields, submitLabel = "Salvar", successM
   const submit = async () => {
     setDone(false);
     setEdited(new Set());
-    const body: Record<string, string | number | boolean> = {};
+    const body: Record<string, string | number | boolean | null> = {};
     for (const field of fields) {
       const raw = values[field.name] ?? "";
-      if (raw === "" && !field.required) continue;
+      if (raw === "" && !field.required) {
+        if (initial?.[field.name]) body[field.name] = null; // tinha valor e foi apagado: vai null, e o backend apaga
+        continue;
+      }
       body[field.name] = field.kind === "number" ? Number(raw.replace(",", ".")) : field.kind === "boolean" ? raw === "true" : raw;
     }
     const result = await action.run(body as B);

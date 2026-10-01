@@ -348,6 +348,21 @@ def test_http_client_nao_segue_redirects():
         asyncio.run(http.get("https://1.1.1.1", follow_redirects=True))
 
 
+def test_http_client_para_de_ler_o_corpo_acima_de_max_bytes():
+    async def chamadas():
+        client = HttpClient()
+        client._http()._transport = httpx.MockTransport(lambda request: httpx.Response(200, text="x" * 3000))
+        cabe = await client.get("https://1.1.1.1/pagina", max_bytes=5000)
+        with pytest.raises(ServiceError) as exc:
+            await client.get("https://1.1.1.1/pagina", max_bytes=1000)
+        await client.close()
+        return cabe, exc.value
+
+    cabe, erro = asyncio.run(chamadas())
+    assert (cabe.status_code, len(cabe.text)) == (200, 3000)
+    assert (erro.code, erro.status) == ("ERRO_HTTP_TOO_LARGE", 422)
+
+
 # ── Utilidades ──────────────────────────────────────────────────────────────
 
 def test_http_client_nunca_reenvia_cookie():
@@ -1100,6 +1115,125 @@ def test_ia_para_antes_do_provedor_quando_o_plano_do_mes_acabou(ia):
     assert (sent, usage, resolutions) == ([], [], [])  # nem resolve o modelo nem chama o provedor
 
 
+# ── Agentes: llm.run_agent no laço do AgentExo, com o mesmo provedor falso (README §5.11) ─
+
+def test_agente_chama_a_ferramenta_no_loop_em_nome_de_quem_age_e_registra_cada_volta(ia):
+    llm, sent, usage, resolutions, state = ia
+    vistos, passos = [], []
+
+    async def buscar_cliente(nome: str) -> str:
+        """Busca um cliente da organização pelo nome."""
+        vistos.append((nome, security.current_tenant()))
+        return f"cliente {nome} encontrado"
+
+    async def cenario():
+        return await llm.run_agent("local/rapido", "ache a Acme", instructions="Use as ferramentas.",
+                                   tools=[buscar_cliente], context="Conversa até aqui: nada.", on_step=passos.append)
+
+    feito = asyncio.run(cenario())
+    assert feito.text == "Ferramenta disse: cliente Acme encontrado"
+    assert (feito.turns, feito.tool_calls, feito.input_tokens, feito.output_tokens) == (2, 1, 32, 11)
+    assert vistos == [("Acme", "acme")]  # a ferramenta roda no loop do serviço, como a organização de quem pediu
+    assert [(p.tool, p.status) for p in passos] == [("buscar_cliente", "running"), ("buscar_cliente", "done")]
+    assert [(e.model, e.service, e.input_tokens, e.output_tokens) for _, e in usage] == [
+        ("local/rapido", "svc-pedidos", 20, 5), ("local/rapido", "svc-pedidos", 12, 6)]  # uma por volta
+    assert sent[0]["tools"][0]["function"]["name"] == "buscar_cliente"
+    assert sent[0]["tools"][0]["function"]["description"] == "Busca um cliente da organização pelo nome."
+    assert "Conversa até aqui: nada." in json.dumps(sent[0]["messages"], ensure_ascii=False)  # o contexto entra antes da tarefa
+    assert state["auth"] == ["Bearer sk-segredo-abcd"] * 2 and len(resolutions) == 1
+
+
+def test_agente_recebe_de_volta_o_erro_de_validacao_e_o_erro_de_negocio_para_corrigir(ia):
+    llm, sent, _, _, _ = ia
+    chamadas, passos = [], []
+
+    async def reservar(nome: str, quantidade: int) -> str:
+        """Reserva uma quantidade para um cliente."""
+        chamadas.append((nome, quantidade))
+        return "reservado"
+
+    feito = asyncio.run(llm.run_agent("local/rapido", "reserve", instructions="x", tools=[reservar], on_step=passos.append))
+    assert chamadas == [] and "argumentos inválidos: quantidade" in feito.text
+    assert passos[-1].status == "failed"
+
+    async def bloquear(nome: str) -> str:
+        """Bloqueia um cliente."""
+        raise ServiceError("ERRO_PEDIDOS_BLOQUEIO", "Cliente com pedido aberto não pode ser bloqueado.", status=409)
+
+    feito = asyncio.run(llm.run_agent("local/rapido", "bloqueie", instructions="x", tools=[bloquear]))
+    assert feito.text == "Ferramenta disse: ERRO_PEDIDOS_BLOQUEIO: Cliente com pedido aberto não pode ser bloqueado."
+
+    async def quebrar(nome: str) -> str:
+        """Quebra."""
+        raise RuntimeError("segredo interno")
+
+    feito = asyncio.run(llm.run_agent("local/rapido", "quebre", instructions="x", tools=[quebrar]))
+    assert "falha interna" in feito.text and "segredo" not in feito.text
+
+
+def test_agente_sobe_o_erro_do_provedor_e_do_plano_sem_ecoar_a_mensagem(ia):
+    from core.plans import LimitState, plans
+
+    llm, sent, usage, resolutions, state = ia
+    state["handler"] = lambda request: httpx.Response(401, json={"error": {"message": "chave sk-segredo-abcd inválida"}})
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(llm.run_agent("local/rapido", "oi", instructions="x"))
+    assert exc.value.code == "ERRO_AI_PROVIDER_AUTH" and "sk-" not in exc.value.message and usage == []
+
+    sent.clear()
+    plans.clear()  # os limites do mês ficam guardados por instantes no processo
+    tokens = dict(name="ai.tokens", service="svc-ai", description="Tokens de IA no mês", default=None, monthly=True)
+    state["plano"] = [LimitState(**tokens, limit=10, used=10)]
+    with pytest.raises(ServiceError) as exc:
+        asyncio.run(llm.run_agent("local/rapido", "oi", instructions="x"))
+    assert exc.value.code == "ERRO_PLAN_LIMIT" and sent == []
+
+
+def test_ferramenta_de_agente_precisa_de_docstring_e_tipos_e_o_schema_sai_sem_referencias(ia):
+    llm, sent, _, _, _ = ia
+
+    async def sem_doc(nome: str) -> str:
+        return nome
+
+    async def sem_tipo(nome) -> str:  # noqa: ANN001
+        """Sem tipo."""
+        return nome
+
+    for ferramenta in (sem_doc, sem_tipo):
+        with pytest.raises(TypeError):
+            asyncio.run(llm.run_agent("local/rapido", "oi", instructions="x", tools=[ferramenta]))
+
+    class Endereco(BaseModel):
+        title: str  # um campo chamado title não some do schema
+        cidade: str
+
+    async def cadastrar(nome: str, endereco: Endereco, vip: bool = False) -> str:
+        """Cadastra um cliente."""
+        return "ok"
+
+    asyncio.run(llm.run_agent("local/rapido", "cadastre", instructions="x", tools=[cadastrar]))
+    schema = sent[0]["tools"][0]["function"]["parameters"]
+    assert "$defs" not in json.dumps(schema) and "$ref" not in json.dumps(schema)
+    assert schema["properties"]["endereco"]["properties"].keys() == {"title", "cidade"}
+    assert schema["required"] == ["nome", "endereco"]
+
+    class Contato(BaseModel):
+        nome: str
+        telefone: str | None = None
+
+    recebidos = []
+
+    async def anotar(contato: Contato) -> str:
+        """Anota um contato."""
+        recebidos.append(contato)
+        return "anotado"
+
+    sent.clear()
+    asyncio.run(llm.run_agent("local/rapido", "anote", instructions="x", tools=[anotar]))
+    assert sent[0]["tools"][0]["function"]["parameters"]["properties"].keys() == {"nome", "telefone"}  # campos achatados
+    assert recebidos == [Contato(nome="Acme")]  # a função recebe o modelo validado
+
+
 # ── Listas: db.page no SurrealDB embutido, com a SurrealQL de verdade (README §5.12) ─
 
 class FaturaQuery(surreal.ListQuery):
@@ -1478,6 +1612,22 @@ def test_arquivo_envio_assinado_guardado_e_baixado_so_pela_organizacao(arquivos)
             asyncio.run(s.keep(upload.key))
         asyncio.run(s.delete(guardado.key))
     assert client.list_objects_v2(Bucket="cv-teste").get("KeyCount") == 0
+
+
+def test_arquivo_guardado_e_lido_pelo_servico_com_teto_de_tamanho(arquivos):
+    s, client = arquivos
+    with security.acting_as(ACME):
+        upload = asyncio.run(s.upload(UploadRequest(filename="contrato.txt", content_type="text/plain", size=11),
+                                      accept=("text/",), max_bytes=100))
+        _envia(client, upload, b"ola contrato")
+        guardado = asyncio.run(s.keep(upload.key))
+        assert asyncio.run(s.read(guardado.key, max_bytes=100)) == b"ola contrato"
+        with pytest.raises(ServiceError) as exc:
+            asyncio.run(s.read(guardado.key, max_bytes=5))
+        assert exc.value.code == "ERRO_FILE_TOO_LARGE"
+    with security.acting_as(Principal(sub="bia", tenant="beta")), pytest.raises(ServiceError) as exc:
+        asyncio.run(s.read(guardado.key, max_bytes=100))
+    assert exc.value.code == "ERRO_FILE_NOT_FOUND"  # de outra organização: não existe
 
 
 def test_arquivo_recusado_antes_de_assinar_e_chaves_forjadas(arquivos):
@@ -2203,6 +2353,14 @@ def test_recurso_deriva_tabela_modelos_e_a_descricao_da_tela():
         ClienteCampos(nome="Ana", tenant="outra")  # campo não declarado
     with pytest.raises(ValidationError):
         CLIENTES.query(sort="email")  # só ordena pelo que declarou
+
+
+def test_recurso_com_rotulos_de_escolha_com_acento():
+    class Item(Fields):
+        tipo: Literal["politica", "outro"] = _Field("outro", title="Tipo", json_schema_extra={"labels": {"politica": "Política"}})
+
+    meta = Resource("svc-vendas", "itens", Item, "Itens", filters=("tipo",)).meta()
+    assert meta["filters"][0]["options"] == [{"value": "politica", "label": "Política"}, {"value": "outro", "label": "Outro"}]
 
 
 def test_recurso_com_declaracao_errada_nao_nasce():

@@ -6,11 +6,12 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (45)
+## Índice (48)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
 - [ActionForm](#actionform): Receita de formulário: campos a partir de uma lista, envio pela ação, erro do servidor no campo certo. `action, fields, submitLabel?, successMessage?, initial?, onDone?`
+- [ChatThread](#chatthread): Receita de conversa com um agente: mensagens em balões, passos do agente enquanto responde, erro e campo de envio. `messages, onSend, sending?, progress?, error?, assistant?, placeholder?, disabled?`
 - [ListView](#listview): Receita de lista paginada no servidor: busca por texto, filtros, ordenação no cabeçalho, páginas e todos os estados. `list, columns, rowKey, search?, filters?, empty?, noun?, caption?, actions?`
 - [QueryTable](#querytable): Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito. `query, columns, rowKey, empty?, caption?`
 - [QueryView](#queryview): Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados. `query, children, empty?`
@@ -20,6 +21,7 @@
 **Layout**: estrutura da tela
 
 - [Card](#card): Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé opcionais. `title?, description?, footer?, children?`
+- [Columns](#columns): Duas colunas: o principal e uma lateral fixa (ex.: conversa e o perfil sendo preenchido); no celular, uma abaixo da outra. `children, aside, asideWidth?`
 - [Grid](#grid): Grade responsiva para cartões e indicadores: 1 coluna no celular, até 4 em telas largas. `children, cols?`
 - [Page](#page): Estrutura de uma tela: título, descrição, ações e conteúdo com o espaçamento padrão. `title, children, description?, actions?`
 - [Row](#row): Coloca itens lado a lado, com alinhamento e quebra de linha controlados. `children, gap?, align?, justify?, wrap?`
@@ -30,7 +32,8 @@
 **Dados**: registros e números
 
 - [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?, sort?, onSort?`
-- [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items`
+- [JourneySteps](#journeysteps): Jornada em passos numerados: o que já foi feito, o passo de agora em destaque e os próximos, com o caminho de cada um. `steps`
+- [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items, stacked?`
 - [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
 - [Picture](#picture): Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). `src, alt, size?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
@@ -100,8 +103,33 @@ Receita de formulário: campos a partir de uma lista, envio pela ação, erro do
 - `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "boolean" | "color" | "tel" | "date" | "datetime"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; boolean vira true/false (Sim/Não); color dá #rrggbb; date e datetime dão a data no formato ISO.
 - `submitLabel?`: `string`: Texto do botão de envio. Padrão: "Salvar".
 - `successMessage?`: `string`: Mensagem exibida após sucesso (o formulário é limpo).
-- `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo.
+- `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo (edição). Campo opcional que tinha valor e foi esvaziado vai como null: apaga.
 - `onDone?`: `() => void`: Chamado após sucesso (ex.: fechar o painel).
+
+---
+
+## ChatThread
+
+Receita de conversa com um agente: mensagens em balões, passos do agente enquanto responde, erro e campo de envio. _(Receitas)_
+
+```tsx
+<ChatThread
+  messages={[{ id: "1", role: "assistant", text: "Olá! O que a sua empresa faz?" }, { id: "2", role: "user", text: "Somos uma padaria." }]}
+  onSend={(texto) => setNome(texto)}
+  sending={false}
+  progress={[{ label: "Anotando no perfil", status: "done" }]}
+  assistant="Agente de briefing"
+/>
+```
+
+- `messages`: `ChatMessage[]`: Mensagens na ordem, a mais antiga primeiro.
+- `onSend`: `(text: string) => void`: Envia o texto digitado (Enter envia; Shift+Enter quebra a linha).
+- `sending?`: `boolean`: Resposta em andamento: trava o envio e mostra os passos.
+- `progress?`: `ChatProgress[]`: Passos da resposta em andamento, na ordem em que chegaram.
+- `error?`: `string | null`: Erro da última resposta.
+- `assistant?`: `string`: Nome de quem responde, para leitores de tela e para o indicador de resposta (ex.: "Agente de briefing").
+- `placeholder?`: `string`: Texto de exemplo no campo.
+- `disabled?`: `boolean`: Desliga o campo (ex.: para quem só pode ler).
 
 ---
 
@@ -236,6 +264,22 @@ Superfície que agrupa conteúdo relacionado, com título, descrição e rodapé
 
 ---
 
+## Columns
+
+Duas colunas: o principal e uma lateral fixa (ex.: conversa e o perfil sendo preenchido); no celular, uma abaixo da outra. _(Layout)_
+
+```tsx
+<Columns aside={<Card title="Perfil"><Text>Segmento: padaria</Text></Card>}>
+  <Text>Conteúdo principal.</Text>
+</Columns>
+```
+
+- `children`: `ReactNode`: Conteúdo principal, à esquerda (ocupa o espaço que sobra).
+- `aside`: `ReactNode`: Coluna lateral, à direita em telas largas; abaixo do principal no celular.
+- `asideWidth?`: `"sm" | "md" | "lg"`: Largura da coluna lateral. Padrão: md.
+
+---
+
 ## Grid
 
 Grade responsiva para cartões e indicadores: 1 coluna no celular, até 4 em telas largas. _(Layout)_
@@ -365,6 +409,24 @@ Tabela de dados tipada. Em espaço estreito, cada linha vira um cartão com rót
 
 ---
 
+## JourneySteps
+
+Jornada em passos numerados: o que já foi feito, o passo de agora em destaque e os próximos, com o caminho de cada um. _(Dados)_
+
+```tsx
+<JourneySteps
+  steps={[
+    { title: "Briefing", description: "Conte como a empresa funciona.", status: "done", detail: "6 de 6 tópicos", to: "/briefing" },
+    { title: "Conhecimento", description: "Site e documentos.", status: "current", to: "/conhecimento", action: "Enviar documentos" },
+    { title: "Processos", description: "O que vamos executar.", status: "later" },
+  ]}
+/>
+```
+
+- `steps`: `JourneyStep[]`: Passos na ordem da jornada.
+
+---
+
 ## KeyValue
 
 Lista de pares rótulo/valor para detalhes de um registro. _(Dados)_
@@ -379,6 +441,7 @@ Lista de pares rótulo/valor para detalhes de um registro. _(Dados)_
 ```
 
 - `items`: `{ label: string; value: ReactNode }[]`: Pares rótulo/valor, na ordem de exibição.
+- `stacked?`: `boolean`: Rótulo acima do valor, para colunas estreitas (ex.: a lateral de Columns). Padrão: lado a lado em telas largas.
 
 ---
 

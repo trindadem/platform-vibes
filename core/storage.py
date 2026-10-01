@@ -7,6 +7,7 @@ O arquivo nunca passa pelos serviços nem pelo gateway: o navegador envia direto
     arquivo = await storage.keep(KeepRequest.key)                             # 3. confirma: sai da área temporária
     await db.merge(registro, {"logo": arquivo.key})                           #    e o serviço guarda a chave
     link = storage.url(arquivo.key)                                           # 4. download/visualização (5 min)
+    conteudo = await storage.read(arquivo.key, max_bytes=10_000_000)          #    o serviço lê (ex.: extrair texto)
     await storage.delete(arquivo.key)                                         # 5. ao apagar o registro
 
 Trilhos:
@@ -200,6 +201,22 @@ class Storage:
         if content_type and not inline:
             params["ResponseContentType"] = "application/octet-stream"  # nada que o navegador interprete
         return self._signer.generate_presigned_url("get_object", Params=params, ExpiresIn=max(1, min(ttl, 7 * 86400)))
+
+    async def read(self, key: str, *, max_bytes: int) -> bytes:
+        """Conteúdo de um arquivo guardado da organização atual, para o serviço processar (extrair texto, conferir).
+        Maior que max_bytes → 422 ERRO_FILE_TOO_LARGE, sem baixar."""
+        s = self._ready()
+        self._own(key)
+        try:
+            head = await asyncio.to_thread(self._client.head_object, Bucket=s.bucket, Key=key)
+            if head["ContentLength"] > max_bytes:
+                raise ServiceError("ERRO_FILE_TOO_LARGE", f"Arquivo maior que o permitido ({_human(max_bytes)}).", status=422)
+            body = (await asyncio.to_thread(self._client.get_object, Bucket=s.bucket, Key=key))["Body"]
+            return await asyncio.to_thread(body.read, max_bytes + 1)
+        except ClientError as exc:
+            if _missing(exc):
+                raise _not_found() from None
+            raise
 
     async def delete(self, key: str) -> None:
         """Apaga um arquivo guardado da organização atual (não existir não é erro)."""

@@ -11,6 +11,7 @@ ENV UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
+COPY vendor/ vendor/
 # --locked: lock defasado em relação ao pyproject.toml derruba o build (rode uv lock e versione).
 # --compile-bytecode: os .pyc já vão na imagem. Sem eles, cada container recompila FastAPI, Pydantic, Temporal e Agno
 # ao subir (~13 s por processo; minutos com vários serviços subindo juntos).

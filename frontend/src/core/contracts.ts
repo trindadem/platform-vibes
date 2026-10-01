@@ -1,6 +1,6 @@
 // Gerado por gateway/contracts.py a partir de gateway/endpoints/*.yaml e services/*/schemas.py. Não edite:
 // depois de mudar um manifesto ou um schemas.py, rode (da raiz) `uv run python gateway/contracts.py`.
-import { request, withQuery, type RequestOptions } from "./api";
+import { request, stream, withQuery, type RequestOptions, type ResourceMeta, type StreamOptions } from "./api";
 
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */
 export interface Dispatched {
@@ -192,6 +192,310 @@ export const ai = {
   /** GET /api/v1/ai/usage · http · exige token */
   usage: (options?: RequestOptions) =>
     request<AiUsageSummary>("GET", "/api/v1/ai/usage", undefined, options),
+};
+
+export interface ConhecimentoMensagem {
+  id: string;
+  papel: "cliente" | "agente";
+  texto: string;
+  /** O que o agente fez para responder */
+  passos: string[];
+  created_at: string | null;
+}
+
+/** O perfil da empresa. Todo campo é opcional: o briefing vai preenchendo; vazio apaga. */
+export interface ConhecimentoPerfil {
+  atividade: string | null;
+  /** Ex.: padaria, clínica, indústria de embalagens */
+  segmento: string | null;
+  porte: "mei" | "micro" | "pequena" | "media" | "grande" | null;
+  cidade: string | null;
+  uf: string | null;
+  site: string | null;
+  produtos: string | null;
+  clientes: string | null;
+  canais_venda: string | null;
+  bancos: string | null;
+  /** Boleto, Pix, cartão, prazo... */
+  recebimentos: string | null;
+  pagamentos: string | null;
+  /** Escritório contábil ou interna */
+  contabilidade: string | null;
+  regime_tributario: "mei" | "simples" | "presumido" | "real" | "nao_sei" | null;
+  sistemas: string | null;
+  /** NF, boletos, contratos */
+  documentos: string | null;
+  colaboradores: number | null;
+  equipe: string | null;
+  dores: string | null;
+  objetivos: string | null;
+}
+
+export interface ConhecimentoTopico {
+  id: string;
+  titulo: string;
+  status: "feito" | "em_andamento" | "a_fazer";
+  /** Rótulos do que falta para o tópico ficar feito */
+  faltam: string[];
+}
+
+export interface ConhecimentoBriefing {
+  perfil: ConhecimentoPerfil;
+  topicos: ConhecimentoTopico[];
+  mensagens: ConhecimentoMensagem[];
+  concluido_em: string | null;
+  pode_concluir: boolean;
+}
+
+export interface ConhecimentoMensagemIn {
+  /** O que a pessoa escreveu */
+  texto: string;
+}
+
+/** Um passo do agente enquanto responde (pedaço do stream). */
+export interface ConhecimentoPasso {
+  ferramenta: string;
+  texto: string;
+  status: "running" | "done" | "failed";
+}
+
+export interface ConhecimentoEmpty {
+}
+
+export interface ConhecimentoAchado {
+  id: string;
+  titulo: string;
+  trecho: string;
+  fonte: "briefing" | "site" | "documento" | "manual";
+  origem: string | null;
+  nota: number;
+}
+
+export interface ConhecimentoAchados {
+  itens: ConhecimentoAchado[];
+}
+
+export interface ConhecimentoBuscaQuery {
+  /** Palavras da busca, em qualquer ordem */
+  q: string;
+}
+
+/** O passo de briefing e conhecimento da jornada, para o workspace. */
+export interface ConhecimentoResumo {
+  topicos_feitos: number;
+  topicos_total: number;
+  concluido_em: string | null;
+  itens: number;
+  /** Itens por fonte (briefing, site, documento, manual) */
+  por_fonte: Record<string, number>;
+  leituras_lendo: number;
+}
+
+export interface ConhecimentoSiteIn {
+  /** Endereço do site (com ou sem https://) */
+  url: string;
+}
+
+export interface ConhecimentoLeitura {
+  id: string;
+  tipo: "site" | "documento";
+  /** Endereço do site ou nome do arquivo */
+  origem: string;
+  status: "lendo" | "pronta" | "falhou";
+  paginas: number;
+  itens: number;
+  erro: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** O que a tela diz antes de enviar: nome, tipo e tamanho do arquivo (o envio só vale para esse tamanho e tipo). */
+export interface ConhecimentoUploadRequest {
+  filename: string;
+  content_type: string;
+  /** Tamanho em bytes */
+  size: number;
+}
+
+/** Link de envio: a tela faz PUT do arquivo em url com estes cabeçalhos e depois confirma a key no serviço. */
+export interface ConhecimentoUpload {
+  key: string;
+  url: string;
+  /** Cabeçalhos que o PUT precisa levar exatamente assim */
+  headers: Record<string, string>;
+  expires_at: string;
+}
+
+export interface ConhecimentoKeepRequest {
+  /** A key devolvida em Upload */
+  key: string;
+}
+
+export interface ConhecimentoLeituraPage {
+  items: ConhecimentoLeitura[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface ConhecimentoLeituraQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "origem" | "-origem" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  tipo?: "site" | "documento" | null;
+  status?: "lendo" | "pronta" | "falhou" | null;
+}
+
+export interface ConhecimentoLeituraRef {
+  id: string;
+}
+
+export interface ConhecimentoLeituraMudou {
+  id: string;
+  status: "lendo" | "pronta" | "falhou" | "removida";
+}
+
+export interface ConhecimentoBriefingMudou {
+  action: "mensagem" | "perfil" | "concluido" | "reaberto";
+}
+
+/** Um item da base de conhecimento: um assunto, com a fonte de onde veio. */
+export interface ConhecimentoConhecimento {
+  titulo: string;
+  conteudo: string;
+  tipo?: "empresa" | "produto" | "cliente" | "fornecedor" | "processo" | "politica" | "contato" | "outro";
+  /** De onde veio: briefing, site, documento ou manual */
+  fonte?: "briefing" | "site" | "documento" | "manual";
+  /** Endereço ou arquivo de onde veio */
+  origem?: string | null;
+  /** Ex.: tabela de preços ou contrato com vencimento */
+  validade?: string | null;
+}
+
+/** Conhecimento: só os campos que mudam. */
+export interface ConhecimentoConhecimentoUpdate {
+  /** Id do registro */
+  id: string;
+  titulo?: string | null;
+  conteudo?: string | null;
+  tipo?: "empresa" | "produto" | "cliente" | "fornecedor" | "processo" | "politica" | "contato" | "outro" | null;
+  /** De onde veio: briefing, site, documento ou manual */
+  fonte?: "briefing" | "site" | "documento" | "manual" | null;
+  /** Endereço ou arquivo de onde veio */
+  origem?: string | null;
+  /** Ex.: tabela de preços ou contrato com vencimento */
+  validade?: string | null;
+}
+
+/** Conhecimento: página, busca, filtros e ordem pela URL. */
+export interface ConhecimentoConhecimentoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "titulo" | "-titulo" | "validade" | "-validade" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  tipo?: "empresa" | "produto" | "cliente" | "fornecedor" | "processo" | "politica" | "contato" | "outro" | null;
+  fonte?: "briefing" | "site" | "documento" | "manual" | null;
+}
+
+/** Conhecimento: um registro. */
+export interface ConhecimentoConhecimentoItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  titulo: string;
+  conteudo: string;
+  tipo: "empresa" | "produto" | "cliente" | "fornecedor" | "processo" | "politica" | "contato" | "outro";
+  /** De onde veio: briefing, site, documento ou manual */
+  fonte: "briefing" | "site" | "documento" | "manual";
+  /** Endereço ou arquivo de onde veio */
+  origem: string | null;
+  /** Ex.: tabela de preços ou contrato com vencimento */
+  validade: string | null;
+}
+
+export interface ConhecimentoConhecimentoPage {
+  items: ConhecimentoConhecimentoItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** svc-conhecimento · /api/v1/conhecimento */
+export const conhecimento = {
+  /** GET /api/v1/conhecimento/briefing · http · exige token */
+  briefing: (options?: RequestOptions) =>
+    request<ConhecimentoBriefing>("GET", "/api/v1/conhecimento/briefing", undefined, options),
+  /** POST /api/v1/conhecimento/briefing/mensagem · http · em pedaços (options.onDelta) · exige token */
+  mensagem: (body: ConhecimentoMensagemIn, options?: StreamOptions<ConhecimentoPasso>) =>
+    stream<ConhecimentoPasso, ConhecimentoBriefing>("POST", "/api/v1/conhecimento/briefing/mensagem", body, options),
+  /** POST /api/v1/conhecimento/briefing/perfil · http · exige token */
+  salvarPerfil: (body: ConhecimentoPerfil, options?: RequestOptions) =>
+    request<ConhecimentoBriefing>("POST", "/api/v1/conhecimento/briefing/perfil", body, options),
+  /** POST /api/v1/conhecimento/briefing/concluir · http · exige token */
+  concluir: (body: ConhecimentoEmpty, options?: RequestOptions) =>
+    request<ConhecimentoBriefing>("POST", "/api/v1/conhecimento/briefing/concluir", body, options),
+  /** POST /api/v1/conhecimento/briefing/reabrir · http · exige token */
+  reabrir: (body: ConhecimentoEmpty, options?: RequestOptions) =>
+    request<ConhecimentoBriefing>("POST", "/api/v1/conhecimento/briefing/reabrir", body, options),
+  /** GET /api/v1/conhecimento/busca · http · exige token */
+  busca: (query?: ConhecimentoBuscaQuery, options?: RequestOptions) =>
+    request<ConhecimentoAchados>("GET", withQuery("/api/v1/conhecimento/busca", query), undefined, options),
+  /** GET /api/v1/conhecimento/resumo · http · exige token */
+  resumo: (options?: RequestOptions) =>
+    request<ConhecimentoResumo>("GET", "/api/v1/conhecimento/resumo", undefined, options),
+  /** POST /api/v1/conhecimento/site · http · exige token */
+  lerSite: (body: ConhecimentoSiteIn, options?: RequestOptions) =>
+    request<ConhecimentoLeitura>("POST", "/api/v1/conhecimento/site", body, options),
+  /** POST /api/v1/conhecimento/documentos/upload · http · exige token */
+  documentoUpload: (body: ConhecimentoUploadRequest, options?: RequestOptions) =>
+    request<ConhecimentoUpload>("POST", "/api/v1/conhecimento/documentos/upload", body, options),
+  /** POST /api/v1/conhecimento/documentos · http · exige token */
+  lerDocumento: (body: ConhecimentoKeepRequest, options?: RequestOptions) =>
+    request<ConhecimentoLeitura>("POST", "/api/v1/conhecimento/documentos", body, options),
+  /** GET /api/v1/conhecimento/leituras · http · exige token */
+  leituras: (query?: ConhecimentoLeituraQuery, options?: RequestOptions) =>
+    request<ConhecimentoLeituraPage>("GET", withQuery("/api/v1/conhecimento/leituras", query), undefined, options),
+  /** POST /api/v1/conhecimento/leituras/remove · http · exige token */
+  removerLeitura: (body: ConhecimentoLeituraRef, options?: RequestOptions) =>
+    request<ConhecimentoLeituraMudou>("POST", "/api/v1/conhecimento/leituras/remove", body, options),
+  /** Cadastro Conhecimento (core/resources.py) · /api/v1/conhecimento/itens · exige token */
+  itens: {
+    /** GET /api/v1/conhecimento/itens · página, busca, filtros e ordem */
+    list: (query?: ConhecimentoConhecimentoQuery, options?: RequestOptions) =>
+      request<ConhecimentoConhecimentoPage>("GET", withQuery("/api/v1/conhecimento/itens", query), undefined, options),
+    /** GET /api/v1/conhecimento/itens/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<ConhecimentoConhecimentoItem>("GET", withQuery("/api/v1/conhecimento/itens/item", query), undefined, options),
+    /** POST /api/v1/conhecimento/itens */
+    create: (body: ConhecimentoConhecimento, options?: RequestOptions) =>
+      request<ConhecimentoConhecimentoItem>("POST", "/api/v1/conhecimento/itens", body, options),
+    /** POST /api/v1/conhecimento/itens/update · só os campos que vierem mudam */
+    update: (body: ConhecimentoConhecimentoUpdate, options?: RequestOptions) =>
+      request<ConhecimentoConhecimentoItem>("POST", "/api/v1/conhecimento/itens/update", body, options),
+    /** POST /api/v1/conhecimento/itens/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/conhecimento/itens/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Conhecimento", "live": "conhecimento.itens", "fields": [{"name": "titulo", "label": "Título", "kind": "text", "required": true}, {"name": "conteudo", "label": "Conteúdo", "kind": "textarea", "required": true}, {"name": "tipo", "label": "Tipo", "kind": "select", "required": false, "options": [{"value": "empresa", "label": "Empresa"}, {"value": "produto", "label": "Produto ou serviço"}, {"value": "cliente", "label": "Cliente"}, {"value": "fornecedor", "label": "Fornecedor"}, {"value": "processo", "label": "Processo"}, {"value": "politica", "label": "Política ou regra"}, {"value": "contato", "label": "Contato"}, {"value": "outro", "label": "Outro"}]}, {"name": "fonte", "label": "Fonte", "kind": "select", "required": false, "options": [{"value": "briefing", "label": "Briefing"}, {"value": "site", "label": "Site"}, {"value": "documento", "label": "Documento"}, {"value": "manual", "label": "Manual"}], "hint": "De onde veio: briefing, site, documento ou manual"}, {"name": "origem", "label": "Origem", "kind": "text", "required": false, "hint": "Endereço ou arquivo de onde veio"}, {"name": "validade", "label": "Vale até", "kind": "date", "required": false, "hint": "Ex.: tabela de preços ou contrato com vencimento"}], "columns": [{"key": "titulo", "header": "Título", "kind": "text", "sort": "titulo"}, {"key": "tipo", "header": "Tipo", "kind": "select"}, {"key": "fonte", "header": "Fonte", "kind": "select"}, {"key": "origem", "header": "Origem", "kind": "text"}, {"key": "validade", "header": "Vale até", "kind": "date", "sort": "validade"}], "filters": [{"name": "tipo", "label": "Tipo", "options": [{"value": "empresa", "label": "Empresa"}, {"value": "produto", "label": "Produto ou serviço"}, {"value": "cliente", "label": "Cliente"}, {"value": "fornecedor", "label": "Fornecedor"}, {"value": "processo", "label": "Processo"}, {"value": "politica", "label": "Política ou regra"}, {"value": "contato", "label": "Contato"}, {"value": "outro", "label": "Outro"}]}, {"name": "fonte", "label": "Fonte", "options": [{"value": "briefing", "label": "Briefing"}, {"value": "site", "label": "Site"}, {"value": "documento", "label": "Documento"}, {"value": "manual", "label": "Manual"}]}], "search": "título, conteúdo"} satisfies ResourceMeta,
+  },
 };
 
 export interface IdentitySignupInput {
@@ -839,6 +1143,12 @@ export const webhooks = {
 export interface LiveTopics {
   /** svc-ai · bus.live("ai.uso", ...) */
   "ai.uso": AiRecorded;
+  /** svc-conhecimento · bus.live("conhecimento.briefing", ...) */
+  "conhecimento.briefing": ConhecimentoBriefingMudou;
+  /** svc-conhecimento · bus.live("conhecimento.leituras", ...) */
+  "conhecimento.leituras": ConhecimentoLeituraMudou;
+  /** svc-conhecimento · cadastro itens (core/resources.py) */
+  "conhecimento.itens": ResourceChanged;
   /** svc-identity · bus.live("identity.membros", ...) */
   "identity.membros": IdentityMembersChanged;
   /** svc-identity · bus.live("identity.acesso", ...) */
@@ -854,6 +1164,7 @@ export interface LiveTopics {
 /** Módulos (o MODULE de cada services/svc-<nome>/schemas.py): o meta.module das telas e os grupos do menu. */
 export const appModules = {
   ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
+  conhecimento: { title: "Conhecimento", description: "Briefing da empresa e a base de conhecimento que os agentes consultam", category: "Sua empresa", core: false },
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
