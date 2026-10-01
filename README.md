@@ -42,6 +42,7 @@ cogniventure/
 │   ├── endpoints/               # 1 manifesto YAML declarativo por serviço
 │   │   └── <service_name>.yaml
 │   ├── interpreter.py           # Lê os YAML, monta as rotas e despacha (HTTP ou NATS)
+│   ├── contracts.py             # Gera frontend/src/core/contracts.ts (cliente tipado da API)
 │   ├── schemas.py               # Schemas de rota e contratos de payload
 │   └── main.py                  # Entrypoint FastAPI
 │
@@ -67,7 +68,7 @@ cogniventure/
         ├── modules/             # Domínios de negócio isolados
         │   └── <module_name>/
         │       └── page.tsx     # A tela: vira a rota /<module_name> e o item do menu
-        ├── core/                # 1 arquivo por recurso: api.ts, auth.ts, theme.css
+        ├── core/                # 1 arquivo por recurso: api.ts, auth.ts, contracts.ts (gerado), theme.css
         ├── App.tsx              # Router plano, montado a partir de src/modules
         └── main.tsx             # Entrypoint DOM
 ```
@@ -258,15 +259,18 @@ service: billing
 base_path: /api/v1/billing          # sempre /api/v1/<service>
 endpoints:
   - path: /faturas/{fatura_id}
+    name: detalhe                   # opcional: nome da função no frontend (padrão: último trecho fixo do path)
     method: GET                     # GET | POST | PUT | PATCH | DELETE
     auth: client_jwt                # client_jwt | public
     roles: [financeiro]             # opcional: papéis exigidos no token
+    response: Fatura                # modelo do schemas.py devolvido em data (GET/DELETE não têm request)
     target_type: http               # http | nats
     target_url: http://svc-billing:8000/faturas/{fatura_id}
     timeout: 30                     # segundos, até 120
   - path: /trigger
     method: POST                    # NATS só aceita POST
     auth: client_jwt
+    request: FaturaIn               # modelo do schemas.py esperado no corpo; NATS responde { message_id }
     target_type: nats
     nats_subject: events.billing.trigger
 ```
@@ -277,6 +281,7 @@ endpoints:
 - **Limites:** corpo acima de 1 MiB → 413 (no Traefik e no gateway). Rate limit por IP no Traefik (50 req/s, rajada de 100).
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
+- **Contratos tipados:** `python gateway/contracts.py` junta manifestos e `schemas.py` e gera `frontend/src/core/contracts.ts`: tipos TypeScript (com as descrições dos campos) e uma função por rota, como `billing.execute(body)` e `loja.detalhe({ fatura_id })`. Modelo citado e inexistente é erro. Arquivo desatualizado falha em `tests/gateway.py` (e em `--check`). Rode sempre que mudar um manifesto ou um `schemas.py`.
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -287,7 +292,7 @@ Telas nascem da composição de componentes existentes; a IA não inventa estrut
 - **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default), documentada com `/** ... */`, e `<Nome>Props` com cada prop documentada. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código (nome, descrição, props, tipos). Ler o catálogo antes de criar uma tela; nunca editá-lo à mão.
-- **Consumo isolado:** toda requisição passa por `src/core/api.ts` (`useApi`, `api.get`, `api.post`…), sempre para o gateway. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
+- **Consumo isolado:** toda requisição passa por `src/core/api.ts`, sempre para o gateway. Chamadas a serviços usam o cliente gerado em `src/core/contracts.ts` (`import { billing } from "@/core/contracts"`): rota, corpo e resposta tipados; nunca digitar caminho à mão. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
 - **Sessão:** `src/core/auth.ts` (`useSession`, `signIn`, `signOut`, `hasRoles`). O conteúdo do token serve só para exibição; quem decide o acesso é o backend.
 - **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos do shadcn (`bg-background`, `text-foreground`, `bg-card`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-destructive`) e os extras `text-success`, `text-warning`, `text-info`. O único `.css` é `src/core/theme.css` (Tailwind, base do shadcn/ui, fonte Geist e tokens claro/escuro), importado por `main.tsx`. A cor da marca é o token `--primary`.
 
@@ -303,7 +308,7 @@ npm run check    # tipos (TypeScript) + build com os trilhos; regenera o CATALOG
 1. `./service.sh <service_name>`
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
-4. Rodar `tests/<service_name>.py` (seção 5.5).
+4. Rodar `tests/<service_name>.py` (seção 5.5) e `python gateway/contracts.py` (atualiza os tipos do frontend).
 5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx compondo componentes do CATALOG.md, seguindo o README."*
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.

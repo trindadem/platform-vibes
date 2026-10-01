@@ -100,6 +100,10 @@ def test_manifesto_valido():
         ({"auth": "public", "roles": ["admin"]}, "rota pública"),
         ({"path": "/../admin"}, "path inválido"),
         ({"tiemout": 5}, "Extra inputs"),
+        ({"request": "execution_input"}, "PascalCase"),
+        ({"name": "Executar"}, "camelCase"),
+        ({"method": "GET", "request": "ExecutionInput"}, "não tem corpo"),
+        ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "response": "Fatura"}, "remova response"),
     ],
 )
 def test_manifesto_fora_do_trilho_e_recusado(override, erro):
@@ -237,3 +241,113 @@ def test_timeout_do_servico_vira_504(auth_env, tmp_path, monkeypatch):
     app = main.create_app(interpreter.load_manifests(tmp_path), httpx.AsyncClient(transport=httpx.MockTransport(slow)))
     r = TestClient(app).post("/api/v1/billing/execute", json={}, headers=_bearer())
     assert (r.status_code, r.json()["error"]["code"]) == (504, "ERRO_GATEWAY_TIMEOUT")
+
+
+# ── Contratos tipados (gateway/contracts.py) ────────────────────────────────
+
+LOJA_SCHEMAS = """
+from enum import Enum
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class Status(str, Enum):
+    ABERTA = "aberta"
+    PAGA = "paga"
+
+class Item(BaseModel):
+    \"\"\"Item da fatura.\"\"\"
+    sku: str
+    quantidade: int = Field(1, ge=1, description="Unidades compradas")
+
+class FaturaIn(BaseModel):
+    cliente: str
+    itens: list[Item]
+    cupom: str | None = None
+    moeda: Literal["BRL", "USD"] = "BRL"
+
+class Fatura(BaseModel):
+    id: str
+    status: Status
+    itens: list[Item]
+"""
+
+LOJA = {
+    "service": "loja",
+    "base_path": "/api/v1/loja",
+    "endpoints": [
+        {"path": "/faturas", "name": "criar", "method": "POST", "auth": "client_jwt", "request": "FaturaIn",
+         "response": "Fatura", "target_type": "http", "target_url": "http://svc-loja:8000/faturas"},
+        {"path": "/faturas/{fatura_id}", "name": "detalhe", "method": "GET", "auth": "client_jwt", "roles": ["financeiro"],
+         "response": "Fatura", "target_type": "http", "target_url": "http://svc-loja:8000/faturas/{fatura_id}"},
+        {"path": "/faturas/emitir", "method": "POST", "auth": "client_jwt", "request": "FaturaIn",
+         "target_type": "nats", "nats_subject": "events.loja.emitir"},
+    ],
+}
+
+
+@pytest.fixture
+def loja_dirs(tmp_path):
+    endpoints, services = tmp_path / "endpoints", tmp_path / "services"
+    (services / "svc-loja").mkdir(parents=True)
+    endpoints.mkdir()
+    (services / "svc-loja" / "schemas.py").write_text(LOJA_SCHEMAS)
+    (endpoints / "loja.yaml").write_text(json.dumps(LOJA))
+    return endpoints, services
+
+
+def test_contrato_versionado_esta_em_dia():
+    import contracts
+
+    assert contracts.OUTPUT.read_text(encoding="utf-8") == contracts.generate(), "rode: python gateway/contracts.py"
+
+
+def test_contrato_gera_tipos_a_partir_do_pydantic(loja_dirs):
+    import contracts
+
+    ts = contracts.generate(*loja_dirs)
+    assert 'export type LojaStatus = "aberta" | "paga";' in ts
+    assert "/** Item da fatura. */\nexport interface LojaItem {" in ts
+    assert "  /** Unidades compradas */\n  quantidade?: number;" in ts  # padrão → opcional na entrada
+    assert "  cupom?: string | null;" in ts
+    assert '  moeda?: "BRL" | "USD";' in ts
+    assert "  itens: LojaItem[];" in ts
+
+
+def test_contrato_gera_uma_funcao_tipada_por_rota(loja_dirs):
+    import contracts
+
+    ts = contracts.generate(*loja_dirs)
+    assert "  criar: (body: LojaFaturaIn, options?: RequestOptions) =>" in ts
+    assert '    request<LojaFatura>("POST", "/api/v1/loja/faturas", body, options),' in ts
+    assert "  detalhe: (params: { fatura_id: string }, options?: RequestOptions) =>" in ts
+    assert "`/api/v1/loja/faturas/${encodeURIComponent(params.fatura_id)}`" in ts
+    assert "exige token com papéis financeiro" in ts
+    assert "  emitir: (body: LojaFaturaIn, options?: RequestOptions) =>" in ts  # name derivado do path
+    assert '    request<Dispatched>("POST", "/api/v1/loja/faturas/emitir", body, options),' in ts
+
+
+def test_contrato_com_modelo_inexistente_e_erro(loja_dirs):
+    import contracts
+
+    endpoints, services = loja_dirs
+    broken = {**LOJA, "endpoints": [{**LOJA["endpoints"][0], "request": "FaturaInn"}]}
+    (endpoints / "loja.yaml").write_text(json.dumps(broken))
+    with pytest.raises(RuntimeError, match="cita FaturaInn"):
+        contracts.generate(endpoints, services)
+
+
+def test_contrato_sem_schemas_do_servico_e_erro(loja_dirs):
+    import contracts
+
+    endpoints, services = loja_dirs
+    (services / "svc-loja" / "schemas.py").unlink()
+    with pytest.raises(RuntimeError, match="não tem"):
+        contracts.generate(endpoints, services)
+
+
+def test_duas_rotas_com_o_mesmo_nome_de_funcao_sao_recusadas():
+    from schemas import Manifest
+
+    duplicated = {**BILLING, "endpoints": [BILLING["endpoints"][0], {**BILLING["endpoints"][0], "path": "/v2/execute"}]}
+    with pytest.raises(ValidationError, match="defina name"):
+        Manifest.model_validate(duplicated)

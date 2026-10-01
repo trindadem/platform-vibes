@@ -9,16 +9,13 @@ import { Stack } from "@/components/Stack";
 import { Stat } from "@/components/Stat";
 import { Text } from "@/components/Text";
 import { useApi } from "@/core/api";
+import type { GatewayHealth } from "@/core/contracts";
 import { useSession } from "@/core/auth";
 
 export const meta: PageMeta = { title: "Início", order: 1 };
 
-interface Health {
-  routes: number;
-}
-
 export default function Inicio() {
-  const health = useApi<Health>("/health");
+  const health = useApi<GatewayHealth>("/health");
   const session = useSession();
   const online = health.data !== null;
 
@@ -56,8 +53,8 @@ export default function Inicio() {
             página nunca usa tags HTML nem classes.
           </Text>
           <Text>
-            3. Dados vêm de <Code>{"useApi"}</Code> e <Code>{"api.post"}</Code> (<Code>{"src/core/api.ts"}</Code>), sempre pelo
-            gateway.
+            3. Dados vêm do cliente tipado gerado do backend (<Code>{"src/core/contracts.ts"}</Code>), por exemplo{" "}
+            <Code>{"billing.execute({ ... })"}</Code>: rota e campos errados não compilam.
           </Text>
         </Stack>
       </Card>

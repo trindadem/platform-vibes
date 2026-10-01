@@ -41,7 +41,7 @@ interface Violation {
 const COMPONENT_FILE = /^[A-Z][A-Za-z0-9]*\.tsx$/;
 const MODULE_DIR = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const UI_FILE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*\.tsx?$/;
-const CORE_FILES = new Set(["api.ts", "auth.ts", "theme.css"]);
+const CORE_FILES = new Set(["api.ts", "auth.ts", "contracts.ts", "theme.css"]);
 const ROOT_FILES = new Set(["App.tsx", "main.tsx"]);
 const NETWORK = new Set(["fetch", "XMLHttpRequest", "WebSocket", "EventSource"]);
 const HEADER = "Trilhos do frontend violados (README §6):";

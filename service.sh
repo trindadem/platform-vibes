@@ -218,6 +218,8 @@ endpoints:
   - path: /execute
     method: POST
     auth: client_jwt
+    request: ExecutionInput        # modelos de schemas.py: viram os tipos do frontend (gateway/contracts.py)
+    response: ExecutionResult
     target_type: http
     target_url: http://svc-__NAME__:8000/execute
     timeout: 30
@@ -225,6 +227,7 @@ endpoints:
   - path: /trigger
     method: POST
     auth: client_jwt
+    request: ExecutionInput
     target_type: nats
     nats_subject: events.__NAME__.trigger
 EOF
@@ -331,4 +334,5 @@ cat <<EOF
 Próximo passo: preencha ${SPEC_FILE} e peça à IA:
   "Implemente specs/${NAME}.md em ${SVC_DIR}/ seguindo o README."
 Testes: PYTHONPATH=${SVC_DIR} python -m pytest ${TEST_FILE}
+Contratos do frontend: python gateway/contracts.py
 EOF
