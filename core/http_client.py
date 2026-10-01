@@ -4,10 +4,13 @@
   169.254.169.254, localhost ou rede interna. http:// exige allow_http=True explícito.
 - Não segue redirects: um redirect poderia levar para a rede interna depois da checagem.
 - Sempre com timeout (5 s para conectar, 30 s para ler/escrever) e 2 novas tentativas só em falha de conexão.
+- Nunca guarda cookies: o client é um só por processo e atende todas as organizações; cookie recebido numa
+  chamada não volta na próxima (quem precisa de cookie o passa explicitamente na chamada).
 Serviços internos não usam este client: serviços conversam por NATS ou pelo Gateway.
 """
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 
 import httpx
@@ -50,8 +53,14 @@ class HttpClient:
                 follow_redirects=False,
                 transport=httpx.AsyncHTTPTransport(retries=2),
                 headers={"User-Agent": "cv-frame"},
+                cookies=no_cookie_jar(),
             )
         return self._client
+
+
+def no_cookie_jar() -> CookieJar:
+    """Pote de cookies que recusa tudo: o Set-Cookie continua visível na resposta, mas nunca é reenviado."""
+    return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
 
 
 http = HttpClient()

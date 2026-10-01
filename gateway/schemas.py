@@ -4,6 +4,8 @@ Trilhos (manifesto fora deles impede o boot do gateway):
 - Cada manifesto só aponta para o próprio serviço: target_url = http://svc-<service>:8000/...,
   nats_subject = events.<service>.<ação>. Nunca para outro serviço nem para fora.
 - NATS só aceita POST. Rota pública não tem papéis nem parâmetros no caminho.
+- cookies: true (só HTTP e POST) é a única forma de um cookie passar pelo gateway: a rota recebe o Cookie do
+  navegador e devolve o Set-Cookie do serviço. As demais nunca veem cookie (sessão de login, README §5.8).
 - Campo desconhecido é erro (um typo não vira configuração silenciosa).
 - request/response nomeiam modelos do schemas.py do serviço; gateway/contracts.py confere que existem e gera
   o cliente tipado do frontend. name é o nome da função gerada (padrão: último trecho fixo do path).
@@ -37,6 +39,7 @@ class Endpoint(BaseModel):
     timeout: float = Field(30, gt=0, le=120)
     request: str | None = None
     response: str | None = None
+    cookies: bool = False
 
     def params(self) -> list[str]:
         """Parâmetros do caminho, na ordem em que aparecem."""
@@ -82,6 +85,8 @@ class Manifest(BaseModel):
                     raise ValueError(f"{where}: {field} deve ser o nome de um modelo do schemas.py (PascalCase)")
             if ep.request is not None and ep.method in ("GET", "DELETE"):
                 raise ValueError(f"{where}: {ep.method} não tem corpo; remova request")
+            if ep.cookies and (ep.target_type != "http" or ep.method != "POST"):
+                raise ValueError(f"{where}: cookies: true só em rota HTTP POST")
             if ep.auth == "public" and (ep.roles or ep.params()):
                 raise ValueError(f"{where}: rota pública não tem roles nem parâmetros no caminho")
             if ep.target_type == "http":

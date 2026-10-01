@@ -81,7 +81,7 @@ class Database:
                 f"DEFINE INDEX IF NOT EXISTS {t}__{TENANT} ON TABLE {t} FIELDS {TENANT}",
             ]
         for t, fields in indexes.items():
-            columns = ([TENANT] if t in per_tenant else []) + [f for f in fields if f != TENANT]
+            columns = [TENANT, *(f for f in fields if f != TENANT)] if t in per_tenant else fields
             statements.append(
                 f"DEFINE INDEX IF NOT EXISTS {t}__{'__'.join(fields)}__unique ON TABLE {t} FIELDS {', '.join(columns)} UNIQUE"
             )

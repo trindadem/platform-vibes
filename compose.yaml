@@ -15,7 +15,7 @@ x-service: &service
   build: &service-build
     context: .
     dockerfile: services/Dockerfile
-  environment:
+  environment: &service-env
     <<: *auth-env
     SURREAL_URL: ws://surrealdb:8000
     SURREAL_NAMESPACE: ${SURREAL_NAMESPACE:?rode uv run python -m core.security keygen}
@@ -124,3 +124,11 @@ services:
     restart: unless-stopped
 
   # ── Serviços de negócio (acrescentados pelo service.sh) ──────────────────────
+
+  svc-identity:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: identity } }
+    environment:
+      <<: *service-env
+      # Só o serviço de identidade emite tokens: é o único container com a chave privada (README §5.7).
+      AUTH_PRIVATE_KEY: ${AUTH_PRIVATE_KEY:?rode uv run python -m core.security keygen}

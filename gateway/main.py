@@ -9,6 +9,7 @@ import httpx
 from fastapi import FastAPI
 
 from core.envelope import ResponseEnvelope, install_envelope
+from core.http_client import no_cookie_jar
 from core.nats_bus import bus
 from core.security import install_security
 
@@ -36,5 +37,6 @@ def create_app(manifests: list[Manifest], upstream: httpx.AsyncClient) -> FastAP
     return app
 
 
-# O upstream só fala com os serviços declarados nos manifestos (validados em schemas.py).
-app = create_app(load_manifests(), httpx.AsyncClient(follow_redirects=False))
+# O upstream só fala com os serviços declarados nos manifestos (validados em schemas.py) e nunca guarda cookie:
+# um Set-Cookie devolvido a um usuário não pode voltar na requisição de outro.
+app = create_app(load_manifests(), httpx.AsyncClient(follow_redirects=False, cookies=no_cookie_jar()))

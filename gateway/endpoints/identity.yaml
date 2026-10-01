@@ -1,0 +1,112 @@
+# svc-identity · rotas públicas no Gateway. Fonte da verdade: specs/identity.md §2
+# cookies: true → só estas rotas recebem o cookie cv_refresh e devolvem Set-Cookie (README §5.8).
+service: identity
+base_path: /api/v1/identity
+
+endpoints:
+  # Públicas: as mesmas de PUBLIC_PATHS no install_security do serviço.
+  - path: /signup
+    method: POST
+    auth: public
+    cookies: true
+    request: SignupInput
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/signup
+
+  - path: /login
+    method: POST
+    auth: public
+    cookies: true
+    request: LoginInput
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/login
+
+  - path: /refresh
+    method: POST
+    auth: public
+    cookies: true
+    request: Empty
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/refresh
+
+  - path: /logout
+    method: POST
+    auth: public
+    cookies: true
+    request: Empty
+    response: Empty
+    target_type: http
+    target_url: http://svc-identity:8000/logout
+
+  - path: /invite-info
+    method: POST
+    auth: public
+    request: InviteCode
+    response: InviteInfo
+    target_type: http
+    target_url: http://svc-identity:8000/invite-info
+
+  # Com token.
+  - path: /me
+    method: GET
+    auth: client_jwt
+    response: Me
+    target_type: http
+    target_url: http://svc-identity:8000/me
+
+  - path: /switch
+    name: switchTenant
+    method: POST
+    auth: client_jwt
+    cookies: true
+    request: SwitchInput
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/switch
+
+  - path: /tenants
+    name: createTenant
+    method: POST
+    auth: client_jwt
+    cookies: true
+    request: TenantInput
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/tenants
+
+  - path: /join
+    method: POST
+    auth: client_jwt
+    cookies: true
+    request: InviteCode
+    response: AuthResult
+    target_type: http
+    target_url: http://svc-identity:8000/join
+
+  - path: /invites
+    name: createInvite
+    method: POST
+    auth: client_jwt
+    request: InviteInput
+    response: Invite
+    target_type: http
+    target_url: http://svc-identity:8000/invites
+
+  - path: /members
+    method: GET
+    auth: client_jwt
+    response: MemberList
+    target_type: http
+    target_url: http://svc-identity:8000/members
+
+  - path: /members/remove
+    name: removeMember
+    method: POST
+    auth: client_jwt
+    request: MemberRef
+    response: MemberList
+    target_type: http
+    target_url: http://svc-identity:8000/members/remove

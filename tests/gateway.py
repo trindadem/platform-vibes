@@ -104,6 +104,8 @@ def test_manifesto_valido():
         ({"name": "Executar"}, "camelCase"),
         ({"method": "GET", "request": "ExecutionInput"}, "não tem corpo"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "response": "Fatura"}, "remova response"),
+        ({"method": "GET", "cookies": True}, "cookies: true só em rota HTTP POST"),
+        ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "cookies": True}, "cookies: true só"),
     ],
 )
 def test_manifesto_fora_do_trilho_e_recusado(override, erro):
@@ -234,6 +236,32 @@ def test_evento_e_publicado_em_nome_de_quem_chamou(gateway, monkeypatch):
     monkeypatch.setattr(bus, "publish", publish)
     client.post("/api/v1/billing/trigger", json={}, headers=_bearer("ana", roles=["ops"], tenant="acme"))
     assert actors == [security.Principal(sub="ana", tenant="acme", roles=frozenset({"ops"}))]
+
+
+def test_cookie_so_passa_nas_rotas_que_declaram(auth_env, tmp_path):
+    import interpreter
+    import main
+
+    manifest = {**BILLING, "endpoints": [
+        {**BILLING["endpoints"][0], "path": "/sessao", "target_url": "http://svc-billing:8000/sessao", "cookies": True},
+        BILLING["endpoints"][0],
+    ]}
+    (tmp_path / "billing.yaml").write_text(json.dumps(manifest))
+    received = []
+
+    def fake_service(request: httpx.Request) -> httpx.Response:
+        received.append(request.headers.get("cookie"))
+        headers = [("set-cookie", "cv_refresh=novo; HttpOnly; Path=/api/v1/billing"), ("set-cookie", "outro=1")]
+        return httpx.Response(200, json={"ok": True, "service": "svc-billing", "data": {}}, headers=headers)
+
+    upstream = httpx.AsyncClient(transport=httpx.MockTransport(fake_service), cookies=main.no_cookie_jar())
+    client = TestClient(main.create_app(interpreter.load_manifests(tmp_path), upstream), raise_server_exceptions=False)
+    headers = {**_bearer(), "Cookie": "cv_refresh=antigo"}
+    with_cookies = client.post("/api/v1/billing/sessao", json={}, headers=headers)
+    without = client.post("/api/v1/billing/execute", json={}, headers=headers)
+    assert received == ["cv_refresh=antigo", None]
+    assert with_cookies.headers.get_list("set-cookie") == ["cv_refresh=novo; HttpOnly; Path=/api/v1/billing", "outro=1"]
+    assert without.headers.get_list("set-cookie") == []
 
 
 @pytest.mark.parametrize("body", [b"[1, 2]", b"nao-e-json", b'"texto"'])

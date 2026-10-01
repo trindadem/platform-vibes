@@ -93,6 +93,8 @@ def _function(manifest: Manifest, ep: Endpoint, body: str, result: str) -> str:
         else "http"
     )
     access = "pública" if ep.auth == "public" else "exige token" + (f" com papéis {', '.join(ep.roles)}" if ep.roles else "")
+    if ep.cookies:
+        access += " · sessão em cookie"
     return (
         f"  /** {ep.method} {url} · {target} · {access} */\n"
         f"  {_key(ep.operation())}: ({', '.join(args)}) =>\n"

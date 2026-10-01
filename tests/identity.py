@@ -1,0 +1,320 @@
+"""svc-identity · testes sem infraestrutura. Fonte da verdade: specs/identity.md §2 e §4
+
+O SurrealDB roda embutido em memória (mem://, do próprio SDK): a SurrealQL do serviço é executada de verdade,
+com os mesmos índices únicos do boot. O NATS vira uma lista em memória.
+
+Rodar (da raiz): PYTHONPATH=services/svc-identity uv run python -m pytest tests/identity.py
+"""
+import asyncio
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ValidationError
+from surrealdb import AsyncSurreal
+
+from core import security
+from core.envelope import ServiceError
+from core.security import acting_as
+
+import service
+from schemas import (
+    MEMBER_JOINED_SUBJECT,
+    SHARED_TABLES,
+    TENANT_CREATED_SUBJECT,
+    UNIQUE,
+    Empty,
+    InviteCode,
+    InviteInput,
+    JoinRequest,
+    LoginInput,
+    MemberRef,
+    RefreshInput,
+    SignupInput,
+    SwitchRequest,
+    TenantRequest,
+)
+
+PASSWORD = "senha-forte-1"
+
+
+@pytest.fixture
+def events(monkeypatch):
+    """Chaves EdDSA de teste e NATS em memória: devolve (subject, mensagem, quem publicou)."""
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("AUTH_ISSUER", "https://auth.cv.test")
+    monkeypatch.setenv("AUTH_AUDIENCE", "cv-api")
+    monkeypatch.setenv("AUTH_PRIVATE_KEY", security._b64e(key.private_bytes_raw()))
+    monkeypatch.setenv("AUTH_PUBLIC_KEY", security._b64e(key.public_key().public_bytes_raw()))
+    _clear()
+    published = []
+
+    async def publish(subject, message, msg_id=None):
+        published.append((subject, message, security.current()))
+
+    monkeypatch.setattr(service.bus, "publish", publish)
+    yield published
+    _clear()
+
+
+def _clear():
+    security._settings.cache_clear()
+    security._own_keys.cache_clear()
+
+
+def run(scenario):
+    """Roda o cenário num SurrealDB novo em memória, com as tabelas e índices do boot do serviço."""
+
+    async def go():
+        conn = AsyncSurreal("mem://")
+        await conn.connect()
+        await conn.use("cv", "app")
+        service.db._conn = conn
+        async with service.db.connected(shared=SHARED_TABLES, unique=UNIQUE):
+            return await scenario(service.IdentityService())
+
+    return asyncio.run(go())
+
+
+def as_user(session):
+    """Age com o token de acesso emitido (como o core faz ao receber a requisição)."""
+    return acting_as(security.verify_token(session.auth.access_token))
+
+
+def signup(svc, email="ana@acme.com", organization="Acme", invite=None, name="Ana"):
+    return svc.signup(SignupInput(name=name, email=email, password=PASSWORD, organization=organization, invite=invite))
+
+
+async def _code(svc, owner, role="member"):
+    with as_user(owner):
+        return (await svc.create_invite(InviteInput(role=role))).code
+
+
+def _error(exc_info, code, status):
+    assert (exc_info.value.code, exc_info.value.status) == (code, status)
+
+
+# ── Cadastro e login ────────────────────────────────────────────────────────
+
+def test_cadastro_cria_conta_organizacao_dono_e_sessao(events):
+    async def scenario(svc):
+        session = await signup(svc, email="  Ana@ACME.com ")
+        rows = await service.db.query_shared("SELECT email, password_hash FROM identity_users")
+        sessions = await service.db.query_shared("SELECT token_hash FROM identity_sessions")
+        return session, rows, sessions
+
+    session, users, sessions = run(scenario)
+    auth = session.auth
+    assert auth.user.email == "ana@acme.com" and auth.tenant.name == "Acme" and auth.tenant.roles == ["owner"]
+    claims = security.verify_token(auth.access_token)
+    assert (claims.sub, claims.tenant, claims.roles) == (auth.user.id, auth.tenant.id, frozenset({"owner"}))
+    assert users[0]["password_hash"].startswith("$argon2id$")  # senha nunca em claro
+    assert sessions[0]["token_hash"] != session.refresh_token  # refresh guardado só como hash
+    assert [(subject, who.tenant) for subject, _, who in events] == [
+        (TENANT_CREATED_SUBJECT, auth.tenant.id),
+        (MEMBER_JOINED_SUBJECT, auth.tenant.id),
+    ]
+
+
+def test_email_repetido_nao_cria_nada(events):
+    async def scenario(svc):
+        await signup(svc)
+        with pytest.raises(ServiceError) as exc:
+            await signup(svc, email="ANA@acme.com", organization="Outra")
+        return exc, await service.db.query_shared("SELECT VALUE name FROM identity_tenants")
+
+    exc, tenants = run(scenario)
+    _error(exc, "ERRO_IDENTITY_EMAIL_TAKEN", 409)
+    assert tenants == ["Acme"]  # bloco atômico: a organização "Outra" não ficou pela metade
+
+
+def test_cadastro_exige_organizacao_ou_convite():
+    for extra in ({}, {"organization": "Acme", "invite": "c" * 32}):
+        with pytest.raises(ValidationError) as exc:
+            SignupInput(name="Ana", email="a@x.com", password=PASSWORD, **extra)
+        assert exc.value.errors()[0]["type"] == "one_way_in"
+    with pytest.raises(ValidationError):
+        SignupInput(name="Ana", email="a@x.com", password=PASSWORD, organization="Acme", roles=["owner"])
+
+
+def test_login_tem_mensagem_unica_para_email_ou_senha_errados(events):
+    async def scenario(svc):
+        await signup(svc)
+        ok = await svc.login(LoginInput(email="ANA@acme.com", password=PASSWORD))
+        errors = []
+        for email, password in (("ana@acme.com", "errada-123"), ("ninguem@acme.com", PASSWORD)):
+            with pytest.raises(ServiceError) as exc:
+                await svc.login(LoginInput(email=email, password=password))
+            errors.append((exc.value.code, exc.value.message))
+        return ok, errors
+
+    ok, errors = run(scenario)
+    assert ok.auth.tenant.name == "Acme"
+    assert errors[0] == errors[1] == ("ERRO_IDENTITY_INVALID_CREDENTIALS", "E-mail ou senha inválidos.")
+
+
+def test_cinco_erros_bloqueiam_o_login(events):
+    async def scenario(svc):
+        await signup(svc)
+        for _ in range(5):
+            with pytest.raises(ServiceError):
+                await svc.login(LoginInput(email="ana@acme.com", password="errada-123"))
+        with pytest.raises(ServiceError) as exc:
+            await svc.login(LoginInput(email="ana@acme.com", password=PASSWORD))  # nem a senha certa entra
+        return exc
+
+    _error(run(scenario), "ERRO_IDENTITY_LOCKED", 429)
+
+
+# ── Sessão: refresh girando e reuso ─────────────────────────────────────────
+
+def test_refresh_gira_e_o_antigo_nao_vale_mais(events):
+    async def scenario(svc):
+        first = await signup(svc)
+        second = await svc.refresh(RefreshInput(refresh_token=first.refresh_token))
+        with pytest.raises(ServiceError) as reuse:  # dentro dos 30 s: corrida entre abas, não revoga
+            await svc.refresh(RefreshInput(refresh_token=first.refresh_token))
+        third = await svc.refresh(RefreshInput(refresh_token=second.refresh_token))
+        return first, second, third, reuse
+
+    first, second, third, reuse = run(scenario)
+    assert len({first.refresh_token, second.refresh_token, third.refresh_token}) == 3
+    assert third.auth.tenant.id == first.auth.tenant.id
+    _error(reuse, "ERRO_IDENTITY_INVALID_SESSION", 401)
+
+
+def test_refresh_antigo_reaparecendo_depois_revoga_a_sessao_inteira(events):
+    async def scenario(svc):
+        first = await signup(svc)
+        second = await svc.refresh(RefreshInput(refresh_token=first.refresh_token))
+        await service.db.query_shared("UPDATE identity_sessions SET rotated_at = time::now() - 1m WHERE rotated_at != NONE")
+        with pytest.raises(ServiceError):
+            await svc.refresh(RefreshInput(refresh_token=first.refresh_token))  # cópia roubada
+        with pytest.raises(ServiceError) as exc:
+            await svc.refresh(RefreshInput(refresh_token=second.refresh_token))  # o legítimo também cai
+        return exc
+
+    _error(run(scenario), "ERRO_IDENTITY_INVALID_SESSION", 401)
+
+
+def test_logout_encerra_a_sessao(events):
+    async def scenario(svc):
+        session = await signup(svc)
+        await svc.logout(RefreshInput(refresh_token=session.refresh_token))
+        await svc.logout(RefreshInput(refresh_token=None))  # sem cookie: nada a fazer, sem erro
+        with pytest.raises(ServiceError) as exc:
+            await svc.refresh(RefreshInput(refresh_token=session.refresh_token))
+        return exc
+
+    _error(run(scenario), "ERRO_IDENTITY_INVALID_SESSION", 401)
+
+
+# ── Convites, várias organizações e membros ─────────────────────────────────
+
+def test_convite_leva_um_novo_usuario_para_a_organizacao(events):
+    async def scenario(svc):
+        owner = await signup(svc)
+        code = await _code(svc, owner)
+        info = await svc.invite_info(InviteCode(code=code))
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=code, name="Bia")
+        with pytest.raises(ServiceError) as reuse:
+            await signup(svc, email="caio@x.com", organization=None, invite=code, name="Caio")
+        users = await service.db.query_shared("SELECT VALUE email FROM identity_users")
+        return owner, info, bia, reuse, users
+
+    owner, info, bia, reuse, users = run(scenario)
+    assert (info.tenant_name, info.role) == ("Acme", "member")
+    assert (bia.auth.tenant.id, bia.auth.tenant.roles) == (owner.auth.tenant.id, ["member"])
+    _error(reuse, "ERRO_IDENTITY_INVITE_INVALID", 404)
+    assert sorted(users) == ["ana@acme.com", "bia@x.com"]  # convite usado não cria o Caio
+
+
+def test_membro_comum_nao_convida(events):
+    async def scenario(svc):
+        owner = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, owner))
+        with as_user(bia), pytest.raises(ServiceError) as exc:
+            await svc.create_invite(InviteInput())
+        return exc
+
+    _error(run(scenario), "ERRO_IDENTITY_FORBIDDEN", 403)
+
+
+def test_usuario_em_varias_organizacoes(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@beta.com", organization="Beta", name="Bia")
+        code = await _code(svc, ana, role="admin")
+        with as_user(bia):
+            joined = await svc.join(JoinRequest(code=code, refresh_token=bia.refresh_token))
+        with as_user(joined), pytest.raises(ServiceError) as again:
+            await svc.join(JoinRequest(code=await _code(svc, ana)))
+        with as_user(joined):
+            back = await svc.switch_tenant(SwitchRequest(tenant=bia.auth.tenant.id, refresh_token=joined.refresh_token))
+            with pytest.raises(ServiceError) as stranger:
+                await svc.switch_tenant(SwitchRequest(tenant="naoexiste"))
+            me = await svc.me(Empty())
+        login = await svc.login(LoginInput(email="bia@beta.com", password=PASSWORD))
+        return ana, bia, joined, again, back, stranger, me, login
+
+    ana, bia, joined, again, back, stranger, me, login = run(scenario)
+    assert (joined.auth.tenant.id, joined.auth.tenant.roles) == (ana.auth.tenant.id, ["admin"])
+    assert [t.name for t in joined.auth.tenants] == ["Beta", "Acme"]
+    _error(again, "ERRO_IDENTITY_ALREADY_MEMBER", 409)
+    assert back.auth.tenant.name == "Beta" and security.verify_token(back.auth.access_token).tenant == bia.auth.tenant.id
+    _error(stranger, "ERRO_IDENTITY_NOT_MEMBER", 403)
+    assert me.tenant == ana.auth.tenant.id and len(me.tenants) == 2
+    assert login.auth.tenant.name == "Beta"  # login volta para a última organização usada
+
+
+def test_nova_organizacao_e_troca_de_sessao(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        with as_user(ana):
+            nova = await svc.create_tenant(TenantRequest(name="Nova", refresh_token=ana.refresh_token))
+        renewed = await svc.refresh(RefreshInput(refresh_token=nova.refresh_token))
+        with pytest.raises(ServiceError) as old:  # o refresh da organização anterior foi substituído
+            await svc.refresh(RefreshInput(refresh_token=ana.refresh_token))
+        return nova, renewed, old
+
+    nova, renewed, old = run(scenario)
+    assert (nova.auth.tenant.name, nova.auth.tenant.roles) == ("Nova", ["owner"])
+    assert renewed.auth.tenant.name == "Nova"
+    _error(old, "ERRO_IDENTITY_INVALID_SESSION", 401)
+
+
+def test_remocao_de_membros(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, ana), name="Bia")
+        with as_user(bia), pytest.raises(ServiceError) as forbidden:
+            await svc.remove_member(MemberRef(user=ana.auth.user.id))
+        with as_user(ana):
+            before = await svc.list_members(Empty())
+            after = await svc.remove_member(MemberRef(user=bia.auth.user.id))
+            with pytest.raises(ServiceError) as last_owner:
+                await svc.remove_member(MemberRef(user=ana.auth.user.id))
+        with pytest.raises(ServiceError) as gone:  # a sessão da Bia nesta organização caiu na hora
+            await svc.refresh(RefreshInput(refresh_token=bia.refresh_token))
+        with as_user(bia), pytest.raises(ServiceError) as not_member:  # token ainda válido, mas o banco confere
+            await svc.list_members(Empty())
+        return before, after, forbidden, last_owner, gone, not_member
+
+    before, after, forbidden, last_owner, gone, not_member = run(scenario)
+    assert [(m.name, m.roles) for m in before.items] == [("Ana", ["owner"]), ("Bia", ["member"])]
+    assert [m.name for m in after.items] == ["Ana"]
+    _error(forbidden, "ERRO_IDENTITY_FORBIDDEN", 403)
+    _error(last_owner, "ERRO_IDENTITY_LAST_OWNER", 409)
+    _error(gone, "ERRO_IDENTITY_INVALID_SESSION", 401)
+    _error(not_member, "ERRO_IDENTITY_NOT_MEMBER", 403)
+
+
+def test_limpeza_apaga_sessoes_e_convites_vencidos(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        await _code(svc, ana)
+        await service.db.query_shared("UPDATE identity_sessions SET expires_at = time::now() - 1d")
+        await service.db.query_shared("UPDATE identity_invites SET expires_at = time::now() - 1d")
+        return await svc.cleanup(Empty())
+
+    cleaned = run(scenario)
+    assert (cleaned.sessions, cleaned.invites) == (1, 1)

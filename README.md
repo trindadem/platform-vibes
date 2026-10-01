@@ -193,7 +193,7 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
 - **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
 - **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), copia apenas `core/` e a pasta do app e roda sem root.
-- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura (SurrealDB e NATS viram dublês):
+- **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura: o NATS vira dublê e o SurrealDB vira dublê ou roda embutido em memória (`AsyncSurreal("mem://")`, do próprio SDK), executando a SurrealQL de verdade:
 
   ```bash
   PYTHONPATH=services/svc-<service_name> uv run python -m pytest tests/<service_name>.py
@@ -212,7 +212,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
 | `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
-| `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas |
+| `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas; nunca guarda cookie entre chamadas |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
@@ -225,6 +225,7 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 - **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. Papéis: `Depends(require("admin"))`.
 - **Identidade vem do token:** quem chama é o `Principal` (usuário, organização ativa e papéis nela; `Depends(principal)` ou `current()`), nunca um campo do payload.
 - **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
+- **Login e sessão:** o `svc-identity` (`specs/identity.md`) é o único emissor de tokens e o único container com `AUTH_PRIVATE_KEY`: cadastro, login, organizações, convites e membros. Token de acesso de 15 min; refresh de 30 dias só no cookie `cv_refresh` (HttpOnly, SameSite=Strict, `Path=/api/v1/identity`, Secure em produção), nunca no corpo, trocado a cada uso; um refresh antigo que reaparece derruba a sessão inteira.
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
 - **Banco:** só `core.surreal`, com parâmetros (`$nome`) e nunca f-string; login como usuário do banco, nunca root.
@@ -271,6 +272,7 @@ endpoints:
     target_type: http               # http | nats
     target_url: http://svc-billing:8000/faturas/{fatura_id}
     timeout: 30                     # segundos, até 120
+    cookies: false                  # opcional: true só em rota de sessão (HTTP POST)
   - path: /trigger
     method: POST                    # NATS só aceita POST
     auth: client_jwt
@@ -284,6 +286,7 @@ endpoints:
 - **NATS:** o corpo precisa ser um objeto JSON; a resposta é `202` com o `message_id`. O cabeçalho `Idempotency-Key` faz a mesma requisição repetida virar a mesma mensagem e o mesmo workflow, com a chave isolada por usuário.
 - **Limites:** corpo acima de 1 MiB → 413 (no Traefik e no gateway). Rate limit por IP no Traefik (50 req/s, rajada de 100).
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
+- **Cookies:** só rotas com `cookies: true` recebem o `Cookie` do navegador e devolvem o `Set-Cookie` do serviço; nas outras, cookie nunca passa. O gateway não guarda cookie entre requisições.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
 - **Contratos tipados:** `uv run python gateway/contracts.py` junta manifestos e `schemas.py` e gera `frontend/src/core/contracts.ts`: tipos TypeScript (com as descrições dos campos) e uma função por rota, como `billing.execute(body)` e `loja.detalhe({ fatura_id })`. Modelo citado e inexistente é erro. Arquivo desatualizado falha em `tests/gateway.py` (e em `--check`). Rode sempre que mudar um manifesto ou um `schemas.py`.
 
@@ -372,6 +375,8 @@ curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bea
      -H "Content-Type: application/json" -d '{"payload": {}}'
 docker compose down                     # para tudo (com -v, apaga também os dados)
 ```
+
+O `token` da linha de comando serve para testes rápidos. Conta de verdade: `POST /api/v1/identity/signup` com `{ name, email, password, organization }` cria a pessoa e a organização e devolve o token de acesso (o refresh vai no cookie).
 
 | Endereço | O quê |
 |---|---|

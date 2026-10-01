@@ -2,6 +2,7 @@
 
 Nenhuma rota de negócio é escrita aqui: cada rota nasce de gateway/endpoints/<service_name>.yaml.
 - HTTP: repassa corpo, query e cabeçalhos permitidos ao serviço; o token segue junto e o serviço verifica de novo.
+  Cookie só nas rotas com cookies: true, que também devolvem o Set-Cookie do serviço; nas outras, nunca passa.
 - NATS: publica o corpo (objeto JSON) e responde 202 com o message_id. Quem chamou viaja no cabeçalho da mensagem
   (core.nats_bus). O cabeçalho Idempotency-Key faz a mesma requisição repetida virar a mesma mensagem (e o mesmo
   workflow); a chave é isolada por organização e usuário.
@@ -70,7 +71,8 @@ def _forward(ep: Endpoint, upstream: httpx.AsyncClient):
     async def forward(request: Request) -> Response:
         body = await _read_body(request)
         url = ep.target_url.format_map({k: quote(str(v), safe="") for k, v in request.path_params.items()})
-        headers = {k: v for k, v in request.headers.items() if k in FORWARDED_HEADERS}
+        allowed = FORWARDED_HEADERS + (("cookie",) if ep.cookies else ())
+        headers = {k: v for k, v in request.headers.items() if k in allowed}
         headers.setdefault("x-request-id", uuid.uuid4().hex)
         try:
             reply = await upstream.request(
@@ -85,7 +87,11 @@ def _forward(ep: Endpoint, upstream: httpx.AsyncClient):
             raise ServiceError("ERRO_GATEWAY_TIMEOUT", "O serviço não respondeu a tempo.", status=504) from None
         except httpx.TransportError:
             raise ServiceError("ERRO_GATEWAY_UNAVAILABLE", "Serviço indisponível.", status=502) from None
-        return Response(reply.content, status_code=reply.status_code, media_type=reply.headers.get("content-type"))
+        response = Response(reply.content, status_code=reply.status_code, media_type=reply.headers.get("content-type"))
+        if ep.cookies:
+            for cookie in reply.headers.get_list("set-cookie"):
+                response.headers.append("set-cookie", cookie)
+        return response
 
     return forward
 

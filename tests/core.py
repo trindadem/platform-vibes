@@ -6,6 +6,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -19,7 +20,7 @@ from temporalio.testing import ActivityEnvironment
 
 from core import envelope, nats_bus, security, surreal, temporal_runner
 from core.envelope import ServiceError
-from core.http_client import http
+from core.http_client import HttpClient, http
 from core.security import Principal, principal, require
 
 
@@ -324,6 +325,23 @@ def test_http_client_nao_segue_redirects():
 
 # ── Utilidades ──────────────────────────────────────────────────────────────
 
+def test_http_client_nunca_reenvia_cookie():
+    def servico(request):
+        return httpx.Response(200, headers={"set-cookie": "sessao=de-outra-organizacao"}, json={"cookie": request.headers.get("cookie")})
+
+    async def duas_chamadas():
+        client = HttpClient()._http()
+        client._transport = httpx.MockTransport(servico)
+        primeira = await client.get("https://api.exemplo.com/a")
+        segunda = await client.get("https://api.exemplo.com/b")
+        await client.aclose()
+        return primeira, segunda
+
+    primeira, segunda = asyncio.run(duas_chamadas())
+    assert primeira.headers["set-cookie"] == "sessao=de-outra-organizacao"
+    assert segunda.json()["cookie"] is None
+
+
 def test_redact_mascara_campos_sensiveis():
     data = {"user": "ana", "password": "x", "auth": {"Authorization": "Bearer y", "api_key": "z"}, "itens": [{"token": "t"}]}
     assert security.redact(data) == {
@@ -522,6 +540,11 @@ def test_boot_garante_tenant_readonly_e_indices():
     assert "DEFINE INDEX IF NOT EXISTS faturas__numero__unique ON TABLE faturas FIELDS tenant, numero UNIQUE" in sqls
     assert "DEFINE INDEX IF NOT EXISTS contas__email__unique ON TABLE contas FIELDS email UNIQUE" in sqls
     assert not any("ON TABLE contas TYPE string" in sql for sql in sqls)  # tabela global não tem tenant
+
+
+def test_unique_em_tabela_global_mantem_um_campo_chamado_tenant():
+    _, conn = _with_db(lambda d: asyncio.sleep(0), tables=(), shared=("vinculos",), unique={"vinculos": ["user", "tenant"]})
+    assert conn.calls[-1][0] == "DEFINE INDEX IF NOT EXISTS vinculos__user__tenant__unique ON TABLE vinculos FIELDS user, tenant UNIQUE"
 
 
 @pytest.mark.parametrize(
