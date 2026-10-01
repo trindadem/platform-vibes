@@ -1,0 +1,48 @@
+/* Único .css do frontend (README §6): entrada do Tailwind e tokens de design.
+   Componentes usam só os tokens semânticos (bg-surface, text-ink, border-line, bg-accent...):
+   trocar a marca ou o modo escuro é mudar valores aqui, nunca nos componentes. */
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-surface: oklch(0.985 0.002 260);
+  --color-panel: oklch(1 0 0);
+  --color-ink: oklch(0.22 0.02 260);
+  --color-muted: oklch(0.52 0.02 260);
+  --color-line: oklch(0.91 0.008 260);
+  --color-accent: oklch(0.52 0.19 265);
+  --color-accent-ink: oklch(0.99 0 0);
+  --color-success: oklch(0.55 0.14 155);
+  --color-warning: oklch(0.62 0.15 70);
+  --color-danger: oklch(0.55 0.2 27);
+  --color-info: oklch(0.55 0.13 235);
+
+  --radius-control: 0.5rem;
+  --radius-card: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-surface: oklch(0.17 0.01 260);
+    --color-panel: oklch(0.21 0.012 260);
+    --color-ink: oklch(0.94 0.005 260);
+    --color-muted: oklch(0.7 0.015 260);
+    --color-line: oklch(0.32 0.015 260);
+    --color-accent: oklch(0.7 0.15 265);
+    --color-accent-ink: oklch(0.17 0.01 260);
+    --color-success: oklch(0.72 0.14 155);
+    --color-warning: oklch(0.78 0.14 75);
+    --color-danger: oklch(0.7 0.18 27);
+    --color-info: oklch(0.72 0.12 235);
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light dark;
+    background-color: var(--color-surface);
+    color: var(--color-ink);
+  }
+}

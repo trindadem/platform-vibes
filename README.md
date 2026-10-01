@@ -56,14 +56,17 @@ cogniventure/
 └── frontend/                    # Vite + React + TypeScript + Tailwind (composição pura)
     ├── index.html               # Entrada do Vite
     ├── package.json
+    ├── package-lock.json        # Versões exatas das dependências (gerado pelo npm, versionado)
     ├── tsconfig.json
-    ├── vite.config.ts
+    ├── vite.config.ts           # Build, proxy para o gateway, trilhos e gerador do catálogo (seção 6)
     └── src/
-        ├── components/          # Biblioteca de primitivos densos (.tsx reutilizáveis)
-        ├── modules/             # Domínios de negócio isolados (páginas .tsx)
+        ├── components/          # Biblioteca de primitivos densos: 1 <Nome>.tsx por componente
+        │   └── CATALOG.md       # Gerado a partir dos componentes: o que existe para compor
+        ├── modules/             # Domínios de negócio isolados
         │   └── <module_name>/
+        │       └── page.tsx     # A tela: vira a rota /<module_name> e o item do menu
         ├── core/                # 1 arquivo por recurso: api.ts, auth.ts, theme.css
-        ├── App.tsx              # Router plano
+        ├── App.tsx              # Router plano, montado a partir de src/modules
         └── main.tsx             # Entrypoint DOM
 ```
 
@@ -275,9 +278,22 @@ endpoints:
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
-- **Apenas TSX/TS:** 100% Tailwind inline. O único `.css` permitido é `src/core/theme.css`, que contém apenas a entrada do Tailwind (`@import "tailwindcss"`) e os tokens de design (`@theme`).
-- **Páginas apenas compõem:** componentes densos vivem em `src/components/*.tsx`. Telas em `src/modules/*/` não implementam marcação estrutural de baixo nível; apenas instanciam e compõem blocos de `components/`.
-- **Consumo isolado:** toda requisição consome exclusivamente o Gateway por meio de `src/core/api.ts`.
+Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
+
+- **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente.
+- **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order }`. Vira a rota `/<module_name>` e um item do menu, sem registro manual. Um módulo tem só `page.tsx` e não importa outro módulo.
+- **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default), documentada com `/** ... */`, e `<Nome>Props` com cada prop documentada. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
+- **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código (nome, descrição, props, tipos). Ler o catálogo antes de criar uma tela; nunca editá-lo à mão.
+- **Consumo isolado:** toda requisição passa por `src/core/api.ts` (`useApi`, `api.get`, `api.post`…), sempre para o gateway. `fetch`, `XMLHttpRequest`, `WebSocket` e `EventSource` fora dele são erro. Gatilhos assíncronos usam `newIdempotencyKey()`.
+- **Sessão:** `src/core/auth.ts` (`useSession`, `signIn`, `signOut`, `hasRoles`). O conteúdo do token serve só para exibição; quem decide o acesso é o backend.
+- **Apenas TSX/TS:** 100% Tailwind inline nos componentes, só com os tokens semânticos (`bg-surface`, `text-ink`, `border-line`, `bg-accent`…). O único `.css` é `src/core/theme.css` (entrada do Tailwind, tokens `@theme`, modo escuro), importado por `main.tsx`.
+
+```bash
+cd frontend
+npm install
+npm run dev      # http://localhost:5173, com /api e /health encaminhados ao gateway (GATEWAY_URL, padrão :8088)
+npm run check    # tipos (TypeScript) + build com os trilhos; regenera o CATALOG.md
+```
 
 ## 7. Fluxo de Trabalho
 
@@ -285,8 +301,9 @@ endpoints:
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
 4. Rodar `tests/<service_name>.py` (seção 5.5).
-5. Subir e testar de verdade (abaixo).
-6. Conflito com o contrato → seção 8.
+5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx compondo componentes do CATALOG.md, seguindo o README."*
+6. Subir e testar de verdade (abaixo).
+7. Conflito com o contrato → seção 8.
 
 ### Ambiente local (`compose.yaml`)
 
@@ -301,6 +318,7 @@ docker compose down                     # para tudo (com -v, apaga também os da
 
 | Endereço | O quê |
 |---|---|
+| `http://localhost:5173` | Frontend (`npm run dev` em `frontend/`); entre pela tela Sessão com um token de teste |
 | `http://localhost:8088` | API, pelo Traefik (`GATEWAY_PORT`) |
 | `http://localhost:8233` | Temporal UI: workflows, activities e histórico |
 | `localhost:4222`, `localhost:8000`, `localhost:7233` | NATS, SurrealDB e Temporal, para serviços rodando no host |
