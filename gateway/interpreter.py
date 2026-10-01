@@ -2,8 +2,9 @@
 
 Nenhuma rota de negócio é escrita aqui: cada rota nasce de gateway/endpoints/<service_name>.yaml.
 - HTTP: repassa corpo, query e cabeçalhos permitidos ao serviço; o token segue junto e o serviço verifica de novo.
-- NATS: publica o corpo (objeto JSON) e responde 202 com o message_id. O cabeçalho Idempotency-Key faz a mesma
-  requisição repetida virar a mesma mensagem (e o mesmo workflow); a chave é isolada por usuário.
+- NATS: publica o corpo (objeto JSON) e responde 202 com o message_id. Quem chamou viaja no cabeçalho da mensagem
+  (core.nats_bus). O cabeçalho Idempotency-Key faz a mesma requisição repetida virar a mesma mensagem (e o mesmo
+  workflow); a chave é isolada por organização e usuário.
 Corpo acima de 1 MiB é recusado antes de chegar ao serviço.
 """
 import hashlib
@@ -110,8 +111,8 @@ def _message_id(request: Request) -> str:
     if not _IDEMPOTENCY_KEY.match(key):
         raise ServiceError("ERRO_GATEWAY_INVALID_IDEMPOTENCY_KEY", "Idempotency-Key: até 128 caracteres A-Z, a-z, 0-9, _ e -.", status=422)
     principal = getattr(request.state, "principal", None)
-    owner = principal.sub if principal else "anonymous"
-    # Isolado por usuário: a chave "1" de um cliente nunca colide com a chave "1" de outro.
+    owner = f"{principal.tenant or '-'}\n{principal.sub}" if principal else "anonymous"
+    # Isolado por organização e usuário: a chave "1" de um nunca colide com a chave "1" de outro.
     return hashlib.sha256(f"{owner}\n{request.url.path}\n{key}".encode()).hexdigest()[:32]
 
 

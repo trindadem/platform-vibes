@@ -2,7 +2,8 @@
 
 Regras (README §5.7):
 - Nega por padrão: install_security(app) exige token válido em TODA rota. Abrir é explícito: public=("/rota",).
-- Identidade vem do token (Principal), nunca do payload.
+- Identidade vem do token (Principal), nunca do payload. Durante a requisição, o evento ou a activity, ela
+  fica no contexto: current() diz quem age e current_tenant() de qual organização (README §5.9).
 - Tokens JWT só com chave assimétrica: EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk,
   Keycloak...). "none" e HS256 são recusados; issuer, audience e expiração são obrigatórios.
 - Senhas só via hash_password/verify_password (Argon2id, fora do event loop). Segredos só no ambiente.
@@ -10,13 +11,15 @@ Regras (README §5.7):
 
 Variáveis: ENVIRONMENT (production | development; padrão production), AUTH_ISSUER, AUTH_AUDIENCE e
 exatamente uma fonte de chave: AUTH_PUBLIC_KEY / AUTH_PRIVATE_KEY (chaves próprias) ou AUTH_JWKS_URL.
-Opcionais: AUTH_TOKEN_TTL_SECONDS (900), AUTH_ROLES_CLAIM (roles), AUTH_CLIENT_CLAIM (client_id),
+Opcionais: AUTH_TOKEN_TTL_SECONDS (900), AUTH_ROLES_CLAIM (roles), AUTH_TENANT_CLAIM (tenant),
 CORS_ORIGINS (origens separadas por vírgula; "*" é recusado).
 
-Ambiente local: uv run python -m core.security keygen (cria o .env) e uv run python -m core.security token <sub> [papel...].
+Ambiente local: uv run python -m core.security keygen (cria o .env) e
+uv run python -m core.security token <sub> [--tenant <organização>] [papel...].
 """
 import asyncio
 import base64
+import contextvars
 import functools
 import hmac
 import ipaddress
@@ -27,7 +30,8 @@ import socket
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -61,7 +65,7 @@ class SecuritySettings(BaseSettings):
     auth_jwks_url: str | None = None
     auth_token_ttl_seconds: int = Field(900, ge=60, le=86_400)
     auth_roles_claim: str = "roles"
-    auth_client_claim: str = "client_id"
+    auth_tenant_claim: str = "tenant"
     cors_origins: Annotated[list[str], NoDecode] = []
 
     @field_validator("cors_origins", mode="before")
@@ -110,18 +114,45 @@ def _jwks() -> jwt.PyJWKClient:
 # ── Identidade e tokens ──────────────────────────────────────────────────────
 
 class Principal(BaseModel, frozen=True):
-    """Quem está chamando. Vem sempre do token verificado."""
+    """Quem está chamando. Vem sempre do token verificado: usuário, organização ativa e papéis nela."""
 
     sub: str
+    tenant: str | None = None
     roles: frozenset[str] = frozenset()
-    client_id: str | None = None
 
     def has(self, *roles: str) -> bool:
         return set(roles) <= self.roles
 
 
+_current: contextvars.ContextVar[Principal | None] = contextvars.ContextVar("cv_principal", default=None)
+
+
+def current() -> Principal | None:
+    """Quem age agora: o Principal da requisição, do evento NATS ou da activity (None fora deles)."""
+    return _current.get()
+
+
+def current_tenant() -> str:
+    """Organização de quem age agora. Sem organização → ServiceError 403 (ERRO_TENANT_REQUIRED)."""
+    who = _current.get()
+    if who is None or not who.tenant:
+        raise ServiceError("ERRO_TENANT_REQUIRED", "Selecione uma organização para continuar.", status=403)
+    return who.tenant
+
+
+@contextmanager
+def acting_as(who: Principal | None) -> Iterator[Principal | None]:
+    """Executa o bloco em nome de alguém. O core usa ao receber requisição, evento ou activity;
+    use em testes e tarefas internas: with acting_as(Principal(sub="job", tenant="acme")): ..."""
+    token = _current.set(who)
+    try:
+        yield who
+    finally:
+        _current.reset(token)
+
+
 def issue_token(
-    sub: str, *, roles: Iterable[str] = (), client_id: str | None = None, ttl_seconds: int | None = None
+    sub: str, *, tenant: str | None = None, roles: Iterable[str] = (), ttl_seconds: int | None = None
 ) -> str:
     """Emite um JWT EdDSA. Só funciona onde AUTH_PRIVATE_KEY existe (o serviço que faz login)."""
     s = _settings()
@@ -139,8 +170,8 @@ def issue_token(
         "jti": uuid.uuid4().hex,
         s.auth_roles_claim: sorted(roles),
     }
-    if client_id is not None:
-        claims[s.auth_client_claim] = client_id
+    if tenant is not None:
+        claims[s.auth_tenant_claim] = tenant
     return jwt.encode(claims, private, algorithm="EdDSA")
 
 
@@ -166,7 +197,10 @@ def verify_token(token: str) -> Principal:
     roles = claims.get(s.auth_roles_claim) or []
     if isinstance(roles, str):
         roles = roles.split()
-    return Principal(sub=str(claims["sub"]), roles=frozenset(roles), client_id=claims.get(s.auth_client_claim))
+    tenant = claims.get(s.auth_tenant_claim)
+    if tenant is not None and not isinstance(tenant, str):
+        raise ServiceError("ERRO_AUTH_INVALID_TOKEN", "Token inválido ou expirado.", status=401)
+    return Principal(sub=str(claims["sub"]), tenant=tenant or None, roles=frozenset(roles))
 
 
 # ── Senhas ───────────────────────────────────────────────────────────────────
@@ -254,7 +288,8 @@ class _AuthMiddleware:
             )
             return await response(scope, receive, send)
         scope.setdefault("state", {})["principal"] = current
-        await self.app(scope, receive, send)
+        with acting_as(current):  # current()/current_tenant() valem até o fim da requisição
+            await self.app(scope, receive, send)
 
 
 class _HeadersMiddleware:
@@ -356,8 +391,8 @@ SURREAL_ROOT_PASSWORD={surreal_root_password}
 """
 
 _USAGE = """uso:
-  uv run python -m core.security keygen                  cria o .env local (chaves e senhas aleatórias)
-  uv run python -m core.security token <sub> [papel...]  emite um token de teste com as chaves do .env"""
+  uv run python -m core.security keygen                                   cria o .env local (chaves e senhas aleatórias)
+  uv run python -m core.security token <sub> [--tenant <org>] [papel...]  emite um token de teste com as chaves do .env"""
 
 
 def _keygen(env_file: Path) -> None:
@@ -374,19 +409,26 @@ def _keygen(env_file: Path) -> None:
     print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")
 
 
-def _token(env_file: Path, sub: str, roles: list[str]) -> None:
+def _token(env_file: Path, sub: str, args: list[str]) -> None:
+    tenant = None
+    if "--tenant" in args:
+        at = args.index("--tenant")
+        if at + 1 >= len(args):
+            sys.exit(_USAGE)
+        tenant = args[at + 1]
+        args = args[:at] + args[at + 2:]
     for line in env_file.read_text().splitlines() if env_file.exists() else []:
         name, sep, value = line.partition("=")
         if sep and not name.startswith("#"):
             os.environ.setdefault(name.strip(), value.strip())
-    print(issue_token(sub, roles=roles))
+    print(issue_token(sub, tenant=tenant, roles=args))
 
 
 if __name__ == "__main__":
     match sys.argv[1:]:
         case ["keygen"]:
             _keygen(Path(".env"))
-        case ["token", sub, *roles]:
-            _token(Path(".env"), sub, roles)
+        case ["token", sub, *args]:
+            _token(Path(".env"), sub, args)
         case _:
             sys.exit(_USAGE)

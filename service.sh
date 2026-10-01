@@ -67,11 +67,12 @@ render "$STAGE/spec.md" <<'EOF'
 TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio esperado.
 
 ## 2. Contrato de Entrada e Saída
-- Request (schemas.ExecutionInput): { client_id: str, payload: {...} }
+- Request (schemas.ExecutionInput): { payload: {...} }
 - Response (schemas.ExecutionResult, dentro do envelope): { task_id: str, status: str, data: {...} }
+- Quem chama e a organização vêm do token (core.security.current_tenant()), nunca do corpo.
 
 ## 3. Fluxo de Execução
-1. Persistência SurrealDB — tabela: __SNAKE___records
+1. Persistência SurrealDB — tabela por organização: __SNAKE___records (o core grava e filtra o tenant)
 2. Evento NATS — subject: events.__NAME__.processed (payload: ExecutionResult)
 3. Temporal — __PASCAL__Workflow → activity __NAME__.process_task (timeout 5 min, 3 tentativas)
 
@@ -97,8 +98,7 @@ TABLE = "__SNAKE___records"
 class ExecutionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")  # campo não declarado é recusado (mass assignment)
 
-    client_id: str = Field(..., description="ID do cliente ou da célula")
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict, description="Dados da tarefa")
 
 
 class ExecutionResult(BaseModel):
@@ -242,40 +242,44 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from core.security import Principal, acting_as, current_tenant
+
 import service
 from schemas import PROCESSED_SUBJECT, ExecutionInput, ExecutionResult
 
 
 @pytest.fixture
 def published(monkeypatch):
-    """Troca SurrealDB e NATS por dublês em memória e devolve os eventos publicados."""
+    """Troca SurrealDB e NATS por dublês em memória e roda o teste em nome de uma organização."""
     events = []
 
     async def create(table, data):
-        return {"id": f"{table}:1", **data}
+        return {"id": f"{table}:1", "tenant": current_tenant(), **data}  # como o core.surreal faz
 
     async def publish(subject, message, msg_id=None):
         events.append((subject, message))
 
     monkeypatch.setattr(service.db, "create", create)
     monkeypatch.setattr(service.bus, "publish", publish)
-    return events
+    with acting_as(Principal(sub="u1", tenant="t1")):
+        yield events
 
 
 def test_process_task(published):
-    result = asyncio.run(service.__PASCAL__Service().process_task(ExecutionInput(client_id="c1")))
+    result = asyncio.run(service.__PASCAL__Service().process_task(ExecutionInput(payload={"x": 1})))
     assert isinstance(result, ExecutionResult) and result.status == "SUCCESS"
+    assert result.data["tenant"] == "t1"
     assert [subject for subject, _ in published] == [PROCESSED_SUBJECT]
 
 
-def test_payload_sem_client_id_e_rejeitado():
+def test_organizacao_nao_vem_do_corpo():
     with pytest.raises(ValidationError):
-        ExecutionInput.model_validate({"payload": {}})
+        ExecutionInput.model_validate({"tenant": "outra", "payload": {}})
 
 
 def test_campo_nao_declarado_e_rejeitado():
     with pytest.raises(ValidationError):
-        ExecutionInput.model_validate({"client_id": "c1", "is_admin": True})
+        ExecutionInput.model_validate({"payload": {}, "is_admin": True})
 EOF
 
 # O compose.yaml novo também nasce na área temporária: a troca é um rename, nunca um arquivo pela metade.

@@ -33,8 +33,8 @@ cogniventure/
 │
 ├── core/                        # Recursos compartilhados (estritamente 1 arquivo .py por recurso)
 │   ├── envelope.py              # Envelope canônico de I/O + handlers de erro
-│   ├── security.py              # Autenticação, autorização, senhas, cabeçalhos, SSRF (seção 5.7)
-│   ├── surreal.py               # Conexão multiplexada e queries parametrizadas SurrealDB
+│   ├── security.py              # Autenticação, autorização, quem age (contexto), senhas, cabeçalhos, SSRF (seção 5.7)
+│   ├── surreal.py               # Conexão multiplexada, queries parametrizadas e isolamento por organização (seção 5.9)
 │   ├── nats_bus.py              # Eventos duráveis (JetStream) e RPC
 │   ├── temporal_runner.py       # Cliente, worker base e auto-registro de activities (@activities)
 │   └── http_client.py           # Client HTTPX para chamadas externas, protegido contra SSRF
@@ -170,6 +170,7 @@ Novo passo de negócio = novo método público em `service.py` + uma chamada em 
 - **Durável:** eventos `events.*` vivem no stream JetStream `EVENTS` (7 dias). Mensagem publicada com o serviço fora do ar é entregue quando ele voltar. Réplicas do mesmo serviço dividem o trabalho; serviços diferentes recebem cada um a sua cópia.
 - **Idempotente:** a entrega é at-least-once. O workflow nasce com `id=bus.message_id()`, o mesmo em toda reentrega, então uma mensagem nunca inicia duas execuções. Quem publica passa `msg_id=` para o JetStream descartar duplicatas.
 - **Falhas:** mensagem inválida é descartada sem reentrega; handler que falha é re-tentado até 5 vezes, com espera crescente.
+- **Quem age viaja junto:** usuário, organização e papéis seguem no cabeçalho da mensagem e do workflow; o handler e cada activity rodam em nome de quem disparou (seção 5.9).
 
 ### 5.4 Execução isolada
 
@@ -207,22 +208,22 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | Arquivo | Expõe |
 |---|---|
 | `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)` |
-| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
+| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service)`, `runner.start_workflow(run, arg, task_queue, id)` |
-| `surreal.py` | `db.connected(tables=[TABLE])`, `db.query(sql, **params)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
+| `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...})`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.create`, `db.select`, `db.merge`, `db.delete` |
 | `http_client.py` | `http.get`, `http.post`, `http.request` — só para APIs externas |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
 
-Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio modelo ("Mínimo de 2 caracteres.", "Deve ser maior que 0."), e cada detalhe aponta o campo em `loc`. As tabelas declaradas em `db.connected(tables=[...])` são garantidas no boot (no SurrealDB 3, consultar tabela inexistente é erro; assim a primeira listagem devolve `[]`).
+Erros de validação (422) saem com mensagens em pt-BR e os limites do próprio modelo ("Mínimo de 2 caracteres.", "Deve ser maior que 0."), e cada detalhe aponta o campo em `loc`. As tabelas declaradas em `db.connected(...)` são garantidas no boot (no SurrealDB 3, consultar tabela inexistente é erro; assim a primeira listagem devolve `[]`); tabela não declarada é erro. Valor repetido num índice `unique` sai como 409 `ERRO_RECORD_DUPLICATE`, sem ecoar o valor.
 
 ### 5.7 Segurança (`core/security.py`)
 
 Segurança não se implementa por serviço: importa-se do core. Proibido reimplementar autenticação, hash de senha, verificação de token ou proteção de URL.
 
 - **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. Papéis: `Depends(require("admin"))`.
-- **Identidade vem do token:** quem chama é o `Principal` (`Depends(principal)`), nunca um campo do payload.
+- **Identidade vem do token:** quem chama é o `Principal` (usuário, organização ativa e papéis nela; `Depends(principal)` ou `current()`), nunca um campo do payload.
 - **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
 - **Payload:** modelos de entrada usam `extra="forbid"` (campo não declarado é recusado); erro de validação nunca ecoa o valor recebido.
@@ -240,7 +241,7 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 | `AUTH_ISSUER`, `AUTH_AUDIENCE` | Obrigatórias: quem emite e para quem são os tokens |
 | `AUTH_PUBLIC_KEY` / `AUTH_PRIVATE_KEY` | Chaves próprias. A privada só no serviço que emite tokens |
 | `AUTH_JWKS_URL` | Alternativa às chaves próprias: provedor externo (https) |
-| `AUTH_TOKEN_TTL_SECONDS`, `AUTH_ROLES_CLAIM`, `AUTH_CLIENT_CLAIM`, `CORS_ORIGINS` | Opcionais (900, `roles`, `client_id`, nenhuma) |
+| `AUTH_TOKEN_TTL_SECONDS`, `AUTH_ROLES_CLAIM`, `AUTH_TENANT_CLAIM`, `CORS_ORIGINS` | Opcionais (900, `roles`, `tenant`, nenhuma) |
 | `SURREAL_URL`, `SURREAL_NAMESPACE`, `SURREAL_DATABASE`, `SURREAL_USER`, `SURREAL_PASSWORD` | Banco; só a URL tem padrão |
 | `SURREAL_ROOT_PASSWORD`, `GATEWAY_PORT` | Só no compose: senha root do SurrealDB (nenhum serviço a recebe) e porta local da API (8088) |
 | `NATS_URL`, `NATS_CREDS` | Mensageria; `.creds` obrigatório em produção |
@@ -250,7 +251,7 @@ Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca 
 
 ```bash
 uv run python -m core.security keygen
-uv run python -m core.security token <sub> [papel ...]
+uv run python -m core.security token <sub> [--tenant <organização>] [papel ...]
 ```
 
 ### 5.8 Gateway (`gateway/`)
@@ -285,6 +286,22 @@ endpoints:
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
 - **Contratos tipados:** `uv run python gateway/contracts.py` junta manifestos e `schemas.py` e gera `frontend/src/core/contracts.ts`: tipos TypeScript (com as descrições dos campos) e uma função por rota, como `billing.execute(body)` e `loja.detalhe({ fatura_id })`. Modelo citado e inexistente é erro. Arquivo desatualizado falha em `tests/gateway.py` (e em `--check`). Rode sempre que mudar um manifesto ou um `schemas.py`.
+
+### 5.9 Multi-tenancy (`core/surreal.py`)
+
+Cada cliente da plataforma é uma organização (`tenant`). Um usuário pode pertencer a várias; o token vale para uma, a organização ativa. O serviço não escreve código de tenant: o core descobre, grava, filtra e propaga.
+
+- **De onde vem:** do token (claim `tenant`), nunca do corpo. Durante a requisição, o evento NATS ou a activity, `current()` diz quem age e `current_tenant()` de qual organização (sem organização → 403 `ERRO_TENANT_REQUIRED`). Testes e tarefas internas usam `with acting_as(Principal(sub=..., tenant=...))`.
+- **Tabelas por organização (padrão):** `db.connected(tables=[TABLE])` cria no banco o campo `tenant`, indexado e `READONLY`. `db.create` grava a organização atual; `db.select`, `db.merge` e `db.delete` só enxergam registros dela (de outra organização, o registro não existe). Gravar `tenant` à mão é erro.
+- **Query:** `db.query` recebe `$tenant` sozinho e recusa SQL que não o cita:
+
+  ```python
+  await db.query("SELECT * FROM faturas WHERE tenant = $tenant AND status = $status", status="pago")
+  ```
+
+- **Únicos:** `unique={"faturas": ["numero"]}` vale dentro de cada organização (o `tenant` entra no índice sozinho).
+- **Tabelas globais:** `shared=[...]` e `db.query_shared(...)`, sem filtro de organização. Só o serviço de identidade (usuários, organizações, sessões) as usa.
+- **Assíncrono:** quem age viaja no cabeçalho do evento NATS e do workflow Temporal; o handler e cada activity rodam em nome de quem disparou. O cabeçalho é confiável porque só a plataforma publica no NATS (`NATS_CREDS` em produção).
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -350,9 +367,9 @@ Pré-requisitos: `uv` (instala o Python e as dependências sozinho), Node e Dock
 ```bash
 uv run python -m core.security keygen   # uma vez: cria o .env
 docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal e os serviços
-TOKEN=$(uv run python -m core.security token ana)
+TOKEN=$(uv run python -m core.security token ana --tenant acme)
 curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" -d '{"client_id": "c1"}'
+     -H "Content-Type: application/json" -d '{"payload": {}}'
 docker compose down                     # para tudo (com -v, apaga também os dados)
 ```
 
@@ -373,6 +390,7 @@ Se qualquer solicitação de usuário, dependência técnica ou implementação 
 - importar código de outro serviço;
 - implementar autenticação, autorização, hash de senha, verificação de token ou acesso de rede fora de `core/` (seção 5.7);
 - abrir uma rota (`public=`) que o spec não declara pública;
+- ler ou gravar dados sem o filtro de organização: `db.query_shared` fora do serviço de identidade, ou organização vinda do corpo;
 - alterar o envelope padrão de I/O;
 - violar ou desviar do que está declarado em `specs/<service_name>.md`;
 

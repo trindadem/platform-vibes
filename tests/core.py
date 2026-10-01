@@ -1,9 +1,10 @@
-"""core/ · testes sem infraestrutura. Fonte da verdade: README §5.6 e §5.7
+"""core/ · testes sem infraestrutura. Fonte da verdade: README §5.6, §5.7 e §5.9
 
 Rodar (da raiz): uv run python -m pytest tests/core.py
 """
 import asyncio
 import time
+from types import SimpleNamespace
 
 import jwt
 import pytest
@@ -12,6 +13,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from surrealdb import RecordID
+from surrealdb.errors import InternalError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -55,8 +57,8 @@ def _rejected(token):
 # ── Tokens ──────────────────────────────────────────────────────────────────
 
 def test_token_ida_e_volta(auth_env):
-    token = security.issue_token("u1", roles=["admin", "ops"], client_id="c9")
-    assert security.verify_token(token) == Principal(sub="u1", roles=frozenset({"admin", "ops"}), client_id="c9")
+    token = security.issue_token("u1", tenant="acme", roles=["admin", "ops"])
+    assert security.verify_token(token) == Principal(sub="u1", tenant="acme", roles=frozenset({"admin", "ops"}))
 
 
 def test_token_expirado_e_recusado(auth_env):
@@ -423,3 +425,275 @@ def test_resultados_do_surreal_viram_tipos_simples():
 
 def test_codigo_de_erro_segue_o_nome_do_servico():
     assert envelope.error_code("svc-user-auth", "INVALID_PAYLOAD") == "ERRO_USER_AUTH_INVALID_PAYLOAD"
+
+
+# ── Multi-tenancy: contexto, banco e propagação (README §5.9) ───────────────
+
+ACME = Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))
+
+
+def test_tenant_que_nao_e_texto_e_recusado(auth_env):
+    token = jwt.encode(_claims(tenant=["acme", "beta"]), auth_env, algorithm="EdDSA")
+    _rejected(token)
+
+
+def test_sem_organizacao_e_403():
+    for who in (None, Principal(sub="ana")):
+        with security.acting_as(who), pytest.raises(ServiceError) as exc:
+            security.current_tenant()
+        assert (exc.value.code, exc.value.status) == ("ERRO_TENANT_REQUIRED", 403)
+
+
+def test_acting_as_restaura_o_contexto_anterior():
+    with security.acting_as(ACME):
+        with security.acting_as(Principal(sub="job", tenant="beta")):
+            assert security.current_tenant() == "beta"
+        assert security.current() == ACME
+    assert security.current() is None
+
+
+def test_requisicao_roda_em_nome_do_token(auth_env):
+    app = FastAPI()
+    envelope.install_envelope(app, service="svc-teste")
+    security.install_security(app, service="svc-teste")
+
+    @app.get("/quem")
+    async def quem():
+        return {"sub": security.current().sub, "tenant": security.current_tenant()}
+
+    @app.get("/quem-sync")
+    def quem_sync():  # rota síncrona roda em outra thread: o contexto vai junto
+        return {"tenant": security.current_tenant()}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    acme = _bearer(security.issue_token("ana", tenant="acme"))
+    assert client.get("/quem", headers=acme).json() == {"sub": "ana", "tenant": "acme"}
+    assert client.get("/quem-sync", headers=acme).json() == {"tenant": "acme"}
+    sem_org = client.get("/quem", headers=_bearer(security.issue_token("ana")))
+    assert (sem_org.status_code, sem_org.json()["error"]["code"]) == (403, "ERRO_TENANT_REQUIRED")
+    assert security.current() is None
+
+
+class _FakeSurreal:
+    """Conexão falsa: registra o que o core manda ao banco e devolve respostas programadas."""
+
+    def __init__(self, select=None, query=None, error=None):
+        self.calls, self._select, self._query, self._error = [], select, query, error
+
+    async def query(self, sql, vars=None):
+        self.calls.append((sql, vars))
+        return self._query
+
+    async def create(self, table, data):
+        if self._error:
+            raise self._error
+        return {"id": RecordID(str(table), "f1"), **data}
+
+    async def select(self, rid):
+        return self._select
+
+    async def merge(self, rid, data):
+        return {"id": rid, **data}
+
+    async def delete(self, rid):
+        self.calls.append(("DELETE", rid))
+
+    async def close(self):
+        pass
+
+
+def _with_db(fn, conn=None, *, who=ACME, tables=("faturas",), shared=(), unique=None):
+    conn = conn or _FakeSurreal()
+
+    async def run():
+        d = surreal.Database()
+        d._conn = conn
+        async with d.connected(tables=tables, shared=shared, unique=unique):
+            with security.acting_as(who):
+                return await fn(d)
+
+    return asyncio.run(run()), conn
+
+
+def test_boot_garante_tenant_readonly_e_indices():
+    _, conn = _with_db(lambda d: asyncio.sleep(0), shared=("contas",), unique={"faturas": ["numero"], "contas": ["email"]})
+    sqls = [sql for sql, _ in conn.calls]
+    assert "DEFINE FIELD IF NOT EXISTS tenant ON TABLE faturas TYPE string READONLY" in sqls
+    assert "DEFINE INDEX IF NOT EXISTS faturas__numero__unique ON TABLE faturas FIELDS tenant, numero UNIQUE" in sqls
+    assert "DEFINE INDEX IF NOT EXISTS contas__email__unique ON TABLE contas FIELDS email UNIQUE" in sqls
+    assert not any("ON TABLE contas TYPE string" in sql for sql in sqls)  # tabela global não tem tenant
+
+
+@pytest.mark.parametrize(
+    "boot, erro",
+    [
+        ({"tables": ("faturas",), "shared": ("faturas",)}, "em tables e em shared"),
+        ({"tables": ("faturas",), "unique": {"outra": ["x"]}}, "unique cita tabela não declarada"),
+    ],
+)
+def test_declaracao_inconsistente_impede_o_boot(boot, erro):
+    with pytest.raises(ValueError, match=erro):
+        _with_db(lambda d: asyncio.sleep(0), **boot)
+
+
+def test_create_grava_a_organizacao_do_contexto():
+    record, _ = _with_db(lambda d: d.create("faturas", {"valor": 10}))
+    assert record == {"id": "faturas:f1", "valor": 10, "tenant": "acme"}
+
+
+def test_organizacao_nunca_e_gravada_a_mao():
+    with pytest.raises(ValueError, match="vem do contexto"):
+        _with_db(lambda d: d.create("faturas", {"valor": 10, "tenant": "beta"}))
+    with pytest.raises(ValueError, match="vem do contexto"):
+        _with_db(lambda d: d.merge("faturas:1", {"tenant": "beta"}))
+
+
+def test_tabela_nao_declarada_e_recusada():
+    with pytest.raises(ValueError, match="não declarada"):
+        _with_db(lambda d: d.create("outra", {}))
+
+
+def test_sem_organizacao_o_banco_recusa():
+    with pytest.raises(ServiceError) as exc:
+        _with_db(lambda d: d.create("faturas", {}), who=Principal(sub="ana"))
+    assert exc.value.code == "ERRO_TENANT_REQUIRED"
+
+
+def test_query_precisa_citar_tenant_e_o_recebe_do_contexto():
+    with pytest.raises(ValueError, match="query sem \\$tenant"):
+        _with_db(lambda d: d.query("SELECT * FROM faturas"))
+    with pytest.raises(ValueError, match="não passe tenant="):
+        _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant", tenant="beta"))
+    _, conn = _with_db(lambda d: d.query("SELECT * FROM faturas WHERE tenant = $tenant AND v > $v", v=1))
+    assert conn.calls[-1] == ("SELECT * FROM faturas WHERE tenant = $tenant AND v > $v", {"v": 1, "tenant": "acme"})
+
+
+def test_registro_de_outra_organizacao_nao_existe():
+    beta = _FakeSurreal(select={"id": "faturas:1", "tenant": "beta"})
+    assert _with_db(lambda d: d.select("faturas:1"), beta)[0] is None
+    acme = _FakeSurreal(select={"id": "faturas:1", "tenant": "acme"})
+    assert _with_db(lambda d: d.select("faturas:1"), acme)[0] == {"id": "faturas:1", "tenant": "acme"}
+
+
+def test_merge_e_delete_filtram_a_organizacao():
+    with pytest.raises(ServiceError) as exc:  # nenhum registro da organização com esse id
+        _with_db(lambda d: d.merge("faturas:1", {"valor": 0}), _FakeSurreal(query=[]))
+    assert exc.value.status == 404
+    _, conn = _with_db(lambda d: d.delete("faturas:1"))
+    sql, params = conn.calls[-1]
+    assert sql == "DELETE $rid WHERE tenant = $tenant" and params["tenant"] == "acme"
+
+
+def test_query_shared_so_para_quem_declarou_tabelas_globais():
+    with pytest.raises(RuntimeError, match="shared=\\[...\\]"):
+        _with_db(lambda d: d.query_shared("SELECT * FROM contas"))
+    _, conn = _with_db(lambda d: d.query_shared("SELECT * FROM contas WHERE email = $e", e="a@x"), shared=("contas",))
+    assert conn.calls[-1] == ("SELECT * FROM contas WHERE email = $e", {"e": "a@x"})
+
+
+def test_valor_repetido_vira_409_sem_ecoar_o_valor():
+    dup = InternalError("internal", "Database index `contas__email__unique` already contains 'a@x.com', with record `contas:1`")
+    with pytest.raises(ServiceError) as exc:
+        _with_db(lambda d: d.create("contas", {"email": "a@x.com"}), _FakeSurreal(error=dup), shared=("contas",))
+    assert (exc.value.code, exc.value.status) == ("ERRO_RECORD_DUPLICATE", 409)
+    assert "email" in exc.value.message and "a@x.com" not in exc.value.message
+
+
+class _FakeJetStream:
+    def __init__(self):
+        self.published, self.callback = [], None
+
+    async def publish(self, subject, data, headers=None):
+        self.published.append((subject, headers))
+
+    async def subscribe(self, subject, queue, cb, manual_ack, config):
+        self.callback = cb
+
+
+class _FakeMsg:
+    def __init__(self, data, headers):
+        self.data, self.headers, self.acked = data, headers, False
+        self.metadata = SimpleNamespace(sequence=SimpleNamespace(stream=7), num_delivered=1)
+
+    async def ack(self):
+        self.acked = True
+
+
+def _connected_bus():
+    b = nats_bus.Bus()
+    b._nc, b._js, b._service = object(), _FakeJetStream(), "svc-teste"
+    return b
+
+
+def test_evento_leva_quem_publicou():
+    b = _connected_bus()
+    with security.acting_as(ACME):
+        asyncio.run(b.publish("events.billing.trigger", Entrada(valor=1), msg_id="m1"))
+    asyncio.run(b.publish("events.billing.trigger", Entrada(valor=1)))  # fora de contexto: sem cabeçalho
+    (_, headers), (_, sem_contexto) = b._js.published
+    assert headers["Nats-Msg-Id"] == "m1"
+    assert Principal.model_validate_json(headers[nats_bus.PRINCIPAL_HEADER]) == ACME
+    assert sem_contexto is None
+
+
+def test_handler_roda_em_nome_de_quem_publicou():
+    b, seen = _connected_bus(), []
+
+    async def handler(data):
+        seen.append(security.current())
+
+    async def run():
+        await b.subscribe("events.billing.trigger", handler, Entrada)
+        msg = _FakeMsg(b'{"valor": 1}', {nats_bus.PRINCIPAL_HEADER: ACME.model_dump_json()})
+        await b._js.callback(msg)
+        await b._js.callback(_FakeMsg(b'{"valor": 1}', None))
+        return msg.acked
+
+    assert asyncio.run(run()) and seen == [ACME, None]
+    assert security.current() is None
+
+
+def test_cabecalho_do_temporal_ida_e_volta():
+    assert temporal_runner._decode(temporal_runner._encode(ACME)) == ACME
+    assert temporal_runner._decode(None) is None
+
+
+def test_workflow_iniciado_leva_quem_age():
+    class Next:
+        async def start_workflow(self, input):
+            return input.headers
+
+    outbound = temporal_runner._ClientOutbound(Next())
+    with security.acting_as(ACME):
+        headers = asyncio.run(outbound.start_workflow(SimpleNamespace(headers={})))
+    assert temporal_runner._decode(headers[temporal_runner._PRINCIPAL_HEADER]) == ACME
+
+
+def test_workflow_repassa_quem_age_para_as_activities():
+    class NextOut:
+        def start_activity(self, input):
+            return input.headers
+
+    class NextIn:
+        def init(self, outbound):
+            self.outbound = outbound
+
+        async def execute_workflow(self, input):
+            return self.outbound.start_activity(SimpleNamespace(headers={}))
+
+    inbound = temporal_runner._WorkflowInbound(NextIn())
+    inbound.init(NextOut())
+    header = temporal_runner._encode(ACME)
+    carried = asyncio.run(inbound.execute_workflow(SimpleNamespace(headers={temporal_runner._PRINCIPAL_HEADER: header})))
+    assert carried[temporal_runner._PRINCIPAL_HEADER] == header
+
+
+def test_activity_roda_em_nome_de_quem_disparou():
+    class Next:
+        async def execute_activity(self, input):
+            return security.current_tenant()
+
+    inbound = temporal_runner._ActivityInbound(Next())
+    input = SimpleNamespace(headers={temporal_runner._PRINCIPAL_HEADER: temporal_runner._encode(ACME)})
+    assert asyncio.run(inbound.execute_activity(input)) == "acme"
+    assert security.current() is None

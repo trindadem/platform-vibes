@@ -7,6 +7,10 @@ Trilhos de subject:
   id idempotente (o mesmo em toda reentrega).
 - rpc.<serviço>.<método>   → request / respond. Síncrono; a resposta trafega no ResponseEnvelope.
 
+Quem age viaja junto (README §5.9): publish e request anexam o Principal do contexto no cabeçalho Cv-Principal;
+subscribe e respond o restauram antes do handler, então current_tenant() funciona igual ao HTTP. O cabeçalho é
+confiável porque só a plataforma publica no NATS (em produção, NATS_CREDS com permissão por subject).
+
 Mensagem inválida é descartada sem reentrega; handler que falha é re-tentado com espera crescente.
 O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e NATS_CREDS
 (arquivo .creds com permissões por subject; obrigatório em produção, conforme README §5.7).
@@ -25,8 +29,10 @@ from pydantic import BaseModel, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.envelope import ResponseEnvelope, ServiceError, error_code
+from core.security import Principal, acting_as, current
 
 STREAM = "EVENTS"
+PRINCIPAL_HEADER = "Cv-Principal"
 MAX_DELIVER = 5
 _SUBJECT = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
 _message_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("message_id", default=None)
@@ -75,7 +81,7 @@ class Bus:
     async def publish(self, subject: str, message: BaseModel, *, msg_id: str | None = None) -> None:
         """Publica e espera a confirmação do JetStream. msg_id evita duplicata (janela de 2 min)."""
         _check(subject, "events")
-        headers = {"Nats-Msg-Id": msg_id} if msg_id else None
+        headers = _context_headers({"Nats-Msg-Id": msg_id} if msg_id else {})
         await self._jetstream().publish(subject, message.model_dump_json().encode(), headers=headers)
 
     async def subscribe(self, subject: str, handler: Callable[[M], Awaitable[None]], model: type[M]) -> None:
@@ -85,6 +91,7 @@ class Bus:
         async def on_message(msg: Any) -> None:
             try:
                 data = model.model_validate_json(msg.data)
+                who = _principal_from(msg.headers)
             except ValidationError:
                 log.warning("mensagem inválida em %s descartada", subject)
                 await msg.term()
@@ -93,7 +100,8 @@ class Bus:
             stable_id = (msg.headers or {}).get("Nats-Msg-Id") or f"{STREAM}-{meta.sequence.stream}"
             token = _message_id.set(stable_id)
             try:
-                await handler(data)
+                with acting_as(who):
+                    await handler(data)
             except Exception:
                 attempt = meta.num_delivered
                 if attempt >= MAX_DELIVER:
@@ -118,7 +126,8 @@ class Bus:
     async def request(self, subject: str, message: BaseModel, response_model: type[M], *, timeout: float = 5.0) -> M:
         """RPC: envia, espera a resposta e devolve o modelo. Erro remoto vira ServiceError com o mesmo código."""
         _check(subject, "rpc")
-        reply = await self._connection().request(subject, message.model_dump_json().encode(), timeout=timeout)
+        payload = message.model_dump_json().encode()
+        reply = await self._connection().request(subject, payload, timeout=timeout, headers=_context_headers({}))
         envelope = ResponseEnvelope.model_validate_json(reply.data)
         if not envelope.ok:
             raise ServiceError(envelope.error.code, envelope.error.message, status=envelope.error.status)
@@ -133,7 +142,9 @@ class Bus:
 
         async def on_request(msg: Any) -> None:
             try:
-                envelope = ResponseEnvelope.success(await handler(model.model_validate_json(msg.data)), service)
+                data, who = model.model_validate_json(msg.data), _principal_from(msg.headers)
+                with acting_as(who):
+                    envelope = ResponseEnvelope.success(await handler(data), service)
             except ValidationError:
                 envelope = ResponseEnvelope.failure(
                     error_code(service, "INVALID_PAYLOAD"), "Payload inválido.", service, 422
@@ -164,6 +175,18 @@ class Bus:
     def _jetstream(self) -> Any:
         self._connection()
         return self._js
+
+
+def _context_headers(headers: dict[str, str]) -> dict[str, str] | None:
+    who = current()
+    if who is not None:
+        headers[PRINCIPAL_HEADER] = who.model_dump_json()
+    return headers or None
+
+
+def _principal_from(headers: dict[str, str] | None) -> Principal | None:
+    raw = (headers or {}).get(PRINCIPAL_HEADER)
+    return Principal.model_validate_json(raw) if raw else None
 
 
 def _check(subject: str, kind: str) -> None:

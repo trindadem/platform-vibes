@@ -69,8 +69,8 @@ def gateway(auth_env, tmp_path, monkeypatch):
     return TestClient(app, raise_server_exceptions=False), calls, published
 
 
-def _bearer(sub="u1", roles=()):
-    return {"Authorization": f"Bearer {security.issue_token(sub, roles=roles)}"}
+def _bearer(sub="u1", roles=(), tenant=None):
+    return {"Authorization": f"Bearer {security.issue_token(sub, tenant=tenant, roles=roles)}"}
 
 
 # ── Trilhos do manifesto ────────────────────────────────────────────────────
@@ -213,6 +213,27 @@ def test_idempotency_key_e_isolada_por_usuario(gateway):
     other = client.post("/api/v1/billing/trigger", json={}, headers=bia).json()["data"]["message_id"]
     assert first == again != other
     assert [msg_id for *_, msg_id in published] == [first, first, other]
+
+
+def test_idempotency_key_e_isolada_por_organizacao(gateway):
+    client, _, _ = gateway
+    acme = {**_bearer("ana", tenant="acme"), "Idempotency-Key": "pedido-1"}
+    beta = {**_bearer("ana", tenant="beta"), "Idempotency-Key": "pedido-1"}
+    first = client.post("/api/v1/billing/trigger", json={}, headers=acme).json()["data"]["message_id"]
+    other = client.post("/api/v1/billing/trigger", json={}, headers=beta).json()["data"]["message_id"]
+    assert first != other
+
+
+def test_evento_e_publicado_em_nome_de_quem_chamou(gateway, monkeypatch):
+    client, _, _ = gateway
+    actors = []
+
+    async def publish(subject, message, msg_id=None):
+        actors.append(security.current())  # o core.nats_bus põe este Principal no cabeçalho da mensagem
+
+    monkeypatch.setattr(bus, "publish", publish)
+    client.post("/api/v1/billing/trigger", json={}, headers=_bearer("ana", roles=["ops"], tenant="acme"))
+    assert actors == [security.Principal(sub="ana", tenant="acme", roles=frozenset({"ops"}))]
 
 
 @pytest.mark.parametrize("body", [b"[1, 2]", b"nao-e-json", b'"texto"'])

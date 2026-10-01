@@ -4,6 +4,10 @@
 import: async def m(self, data: Modelo) -> Modelo. ServiceError com status < 500 vira erro não
 re-tentável (regra de negócio não melhora tentando de novo); qualquer outra falha é re-tentada.
 
+Quem age viaja junto (README §5.9): start_workflow grava o Principal do contexto num cabeçalho do Temporal, o
+workflow o repassa a cada activity e a activity roda dentro de acting_as(...). O serviço não escreve nada:
+current_tenant() funciona na activity como funcionou na requisição ou no evento que a disparou.
+
 Variáveis: TEMPORAL_ADDRESS (padrão localhost:7233), TEMPORAL_NAMESPACE (padrão default),
 TEMPORAL_API_KEY (Temporal Cloud; liga TLS).
 """
@@ -17,7 +21,8 @@ from typing import Any
 
 from pydantic import BaseModel, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from temporalio import activity
+from temporalio import activity, client, worker
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -25,8 +30,10 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.worker import Worker
 
 from core.envelope import ServiceError
+from core.security import Principal, acting_as, current
 
 _MARK = "__cv_activity__"
+_PRINCIPAL_HEADER = "cv-principal"
 
 
 class TemporalSettings(BaseSettings):
@@ -67,6 +74,7 @@ class Runner:
                 api_key=api_key,
                 tls=api_key is not None,
                 data_converter=pydantic_data_converter,
+                interceptors=[_PrincipalPropagation()],  # vale também para os workers criados com este cliente
             )
         return self._client
 
@@ -92,6 +100,79 @@ class Runner:
         except WorkflowAlreadyStartedError:
             return client.get_workflow_handle(workflow_id)
 
+
+# ── Propagação de quem age (cliente → workflow → activities) ────────────────
+
+def _encode(who: Principal) -> Payload:
+    return pydantic_data_converter.payload_converter.to_payload(who)
+
+
+def _decode(payload: Payload | None) -> Principal | None:
+    return pydantic_data_converter.payload_converter.from_payload(payload, Principal) if payload else None
+
+
+class _PrincipalPropagation(client.Interceptor, worker.Interceptor):
+    def intercept_client(self, next: client.OutboundInterceptor) -> client.OutboundInterceptor:
+        return _ClientOutbound(next)
+
+    def intercept_activity(self, next: worker.ActivityInboundInterceptor) -> worker.ActivityInboundInterceptor:
+        return _ActivityInbound(next)
+
+    def workflow_interceptor_class(
+        self, input: worker.WorkflowInterceptorClassInput
+    ) -> type[worker.WorkflowInboundInterceptor]:
+        return _WorkflowInbound
+
+
+class _ClientOutbound(client.OutboundInterceptor):
+    async def start_workflow(self, input: client.StartWorkflowInput) -> WorkflowHandle[Any, Any]:
+        who = current()
+        if who is not None:
+            input.headers = {**input.headers, _PRINCIPAL_HEADER: _encode(who)}
+        return await super().start_workflow(input)
+
+
+class _ActivityInbound(worker.ActivityInboundInterceptor):
+    async def execute_activity(self, input: worker.ExecuteActivityInput) -> Any:
+        with acting_as(_decode(input.headers.get(_PRINCIPAL_HEADER))):
+            return await super().execute_activity(input)
+
+
+class _WorkflowInbound(worker.WorkflowInboundInterceptor):
+    # O cabeçalho só é copiado (nunca decodificado) dentro do workflow: nada de I/O nem de não determinismo.
+    header: Payload | None = None
+
+    def init(self, outbound: worker.WorkflowOutboundInterceptor) -> None:
+        super().init(_WorkflowOutbound(outbound, self))
+
+    async def execute_workflow(self, input: worker.ExecuteWorkflowInput) -> Any:
+        self.header = input.headers.get(_PRINCIPAL_HEADER)
+        return await super().execute_workflow(input)
+
+
+class _WorkflowOutbound(worker.WorkflowOutboundInterceptor):
+    def __init__(self, next: worker.WorkflowOutboundInterceptor, inbound: _WorkflowInbound) -> None:
+        super().__init__(next)
+        self._inbound = inbound
+
+    def _carry(self, input: Any) -> None:
+        if self._inbound.header is not None:
+            input.headers = {**input.headers, _PRINCIPAL_HEADER: self._inbound.header}
+
+    def start_activity(self, input: worker.StartActivityInput) -> Any:
+        self._carry(input)
+        return super().start_activity(input)
+
+    def start_local_activity(self, input: worker.StartLocalActivityInput) -> Any:
+        self._carry(input)
+        return super().start_local_activity(input)
+
+    async def start_child_workflow(self, input: worker.StartChildWorkflowInput) -> Any:
+        self._carry(input)
+        return await super().start_child_workflow(input)
+
+
+# ── Trilho das activities ───────────────────────────────────────────────────
 
 def _is_model(tp: Any) -> bool:
     return inspect.isclass(tp) and issubclass(tp, BaseModel)

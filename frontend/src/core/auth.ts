@@ -12,7 +12,8 @@ export interface Session {
   token: string;
   sub: string;
   roles: string[];
-  clientId: string | null;
+  /** Organização ativa (claim tenant); null se o token não tem organização. */
+  tenant: string | null;
   expiresAt: Date;
 }
 
@@ -73,8 +74,8 @@ function decode(token: string): Session | null {
     const expiresAt = new Date(Number(claims.exp) * 1000);
     if (typeof claims.sub !== "string" || !(expiresAt.getTime() > Date.now())) return null;
     const roles = Array.isArray(claims.roles) ? claims.roles.filter((r): r is string => typeof r === "string") : [];
-    const clientId = typeof claims.client_id === "string" ? claims.client_id : null;
-    return { token, sub: claims.sub, roles, clientId, expiresAt };
+    const tenant = typeof claims.tenant === "string" ? claims.tenant : null;
+    return { token, sub: claims.sub, roles, tenant, expiresAt };
   } catch {
     return null;
   }
