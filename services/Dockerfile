@@ -2,21 +2,24 @@
 #   serviço: docker build -f services/Dockerfile --build-arg SERVICE=billing .
 #   gateway: docker build -f services/Dockerfile --build-arg APP_DIR=gateway .
 # A imagem contém só o core e a pasta do app, roda sem root e sem cabeçalho "server".
-FROM python:3.12-slim
 
+# Dependências: exatamente as versões do uv.lock, num estágio separado (o uv não vai para a imagem final).
+# Esta camada é compartilhada por todos os serviços e só é refeita quando o pyproject.toml ou o uv.lock mudam.
+FROM python:3.12-slim AS deps
+COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /bin/uv
+ENV UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+# --locked: lock defasado em relação ao pyproject.toml derruba o build (rode uv lock e versione).
+RUN uv sync --locked --no-dev --no-install-project --no-cache
+
+FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PATH="/opt/venv/bin:$PATH"
+COPY --from=deps /opt/venv /opt/venv
 WORKDIR /app
-
-# Dependências antes do código: esta camada é compartilhada por todos os serviços
-# e só é refeita quando o pyproject.toml muda.
-COPY pyproject.toml ./
-RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" \
-        > /tmp/requirements.txt \
-    && pip install -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
 
 ARG SERVICE
 ARG APP_DIR=services/svc-${SERVICE}

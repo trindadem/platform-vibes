@@ -1,7 +1,7 @@
 """Gateway · entrada única HTTP: verifica o token, aplica os manifestos e despacha. Fonte da verdade: README §5.8
 
 Manifesto inválido ou configuração de segurança ausente impedem o boot.
-Rodar (da raiz): python -m uvicorn --app-dir gateway main:app --port 8080 --env-file .env
+Rodar (da raiz): uv run python -m uvicorn --app-dir gateway main:app --port 8090 --env-file .env
 """
 from contextlib import asynccontextmanager
 

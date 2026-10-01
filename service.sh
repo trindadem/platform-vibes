@@ -164,7 +164,7 @@ render "$STAGE/svc/main.py" <<'EOF'
 HTTP POST /execute  → chamada direta ao service (síncrona). Exige token: nega por padrão.
 NATS TRIGGER_SUBJECT → inicia __PASCAL__Workflow (assíncrona, durável e idempotente).
 
-Rodar (da raiz): python -m uvicorn --app-dir services/svc-__NAME__ main:app --port 8100 --env-file .env
+Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-__NAME__ main:app --port 8100 --env-file .env
 """
 from contextlib import asynccontextmanager
 
@@ -235,7 +235,7 @@ EOF
 render "$STAGE/test.py" <<'EOF'
 """svc-__NAME__ · testes sem infraestrutura. Fonte da verdade: specs/__NAME__.md §2 e §4
 
-Rodar (da raiz): PYTHONPATH=services/svc-__NAME__ python -m pytest tests/__NAME__.py
+Rodar (da raiz): PYTHONPATH=services/svc-__NAME__ uv run python -m pytest tests/__NAME__.py
 """
 import asyncio
 
@@ -333,6 +333,6 @@ cat <<EOF
 
 Próximo passo: preencha ${SPEC_FILE} e peça à IA:
   "Implemente specs/${NAME}.md em ${SVC_DIR}/ seguindo o README."
-Testes: PYTHONPATH=${SVC_DIR} python -m pytest ${TEST_FILE}
-Contratos do frontend: python gateway/contracts.py
+Testes: PYTHONPATH=${SVC_DIR} uv run python -m pytest ${TEST_FILE}
+Contratos do frontend: uv run python gateway/contracts.py
 EOF

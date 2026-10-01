@@ -13,7 +13,7 @@ exatamente uma fonte de chave: AUTH_PUBLIC_KEY / AUTH_PRIVATE_KEY (chaves própr
 Opcionais: AUTH_TOKEN_TTL_SECONDS (900), AUTH_ROLES_CLAIM (roles), AUTH_CLIENT_CLAIM (client_id),
 CORS_ORIGINS (origens separadas por vírgula; "*" é recusado).
 
-Ambiente local: python -m core.security keygen (cria o .env) e python -m core.security token <sub> [papel...].
+Ambiente local: uv run python -m core.security keygen (cria o .env) e uv run python -m core.security token <sub> [papel...].
 """
 import asyncio
 import base64
@@ -340,7 +340,7 @@ def _b64e(raw: bytes) -> str:
 # ── Linha de comando (desenvolvimento local) ─────────────────────────────────
 
 _LOCAL_ENV = """\
-# Desenvolvimento local. Gerado por: python -m core.security keygen. Nunca versionar.
+# Desenvolvimento local. Gerado por: uv run python -m core.security keygen. Nunca versionar.
 # Produção: segredos no gerenciador do provedor; AUTH_PRIVATE_KEY só no serviço que emite tokens.
 ENVIRONMENT=development
 AUTH_ISSUER=http://localhost:8088
@@ -356,8 +356,8 @@ SURREAL_ROOT_PASSWORD={surreal_root_password}
 """
 
 _USAGE = """uso:
-  python -m core.security keygen                  cria o .env local (chaves e senhas aleatórias)
-  python -m core.security token <sub> [papel...]  emite um token de teste com as chaves do .env"""
+  uv run python -m core.security keygen                  cria o .env local (chaves e senhas aleatórias)
+  uv run python -m core.security token <sub> [papel...]  emite um token de teste com as chaves do .env"""
 
 
 def _keygen(env_file: Path) -> None:

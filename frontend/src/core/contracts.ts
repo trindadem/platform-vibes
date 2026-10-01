@@ -1,5 +1,5 @@
 // Gerado por gateway/contracts.py a partir de gateway/endpoints/*.yaml e services/*/schemas.py. Não edite:
-// depois de mudar um manifesto ou um schemas.py, rode (da raiz) `python gateway/contracts.py`.
+// depois de mudar um manifesto ou um schemas.py, rode (da raiz) `uv run python gateway/contracts.py`.
 import { request, type RequestOptions } from "./api";
 
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */

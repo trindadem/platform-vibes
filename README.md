@@ -20,6 +20,7 @@ cogniventure/
 ├── sprint.md                    # Log de bloqueios e revisões de contrato (seção 8)
 ├── service.sh                   # Scaffolder determinístico canônico (seção 3)
 ├── pyproject.toml               # Dependências Python únicas: core, gateway e serviços
+├── uv.lock                      # Versões exatas das dependências Python (gerado pelo uv, versionado)
 ├── compose.yaml                 # Ambiente local: Traefik, NATS, Temporal, SurrealDB, gateway e serviços
 │
 ├── specs/                       # Micro-PRDs (estritamente 1 arquivo .md por serviço)
@@ -175,8 +176,8 @@ Novo passo de negócio = novo método público em `service.py` + uma chamada em 
 Cada serviço roda de dentro da própria pasta, com imports irmãos (`from schemas import ...`). A partir da raiz:
 
 ```bash
-python -m uvicorn --app-dir services/svc-<service_name> main:app --port 8100 --env-file .env
-python -m uvicorn --app-dir gateway main:app --port 8090 --env-file .env
+uv run python -m uvicorn --app-dir services/svc-<service_name> main:app --port 8100 --env-file .env
+uv run python -m uvicorn --app-dir gateway main:app --port 8090 --env-file .env
 ```
 
 No host, use portas a partir de 8100: a 8000 é do SurrealDB no compose (seção 7).
@@ -189,14 +190,14 @@ Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e `svc-
 - **Core canônico:** cada recurso compartilhado vive em um único arquivo de `core/` (seção 5.6).
 - **Gateway declarativo:** zero rotas de negócio no código do Gateway. Toda rota pública vive em `gateway/endpoints/<service_name>.yaml` (seção 5.8). Rotas nascem com `auth: client_jwt`; `auth: public` só quando o spec §2 declarar.
 - **Envelope obrigatório:** toda resposta HTTP, de sucesso **e de erro**, sai no modelo de `core/envelope.py`.
-- **Dependências:** únicas, no `pyproject.toml` da raiz. Serviço não declara dependência própria.
-- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala o `pyproject.toml`, copia apenas `core/` e a pasta do app e roda sem root.
+- **Dependências:** únicas, no `pyproject.toml` da raiz, com as versões exatas travadas no `uv.lock`. Serviço não declara dependência própria. Dependência nova: `uv add <pacote>` (atualiza os dois arquivos juntos). Todo comando Python roda com `uv run`, que na primeira vez cria o `.venv` com as versões do lock.
+- **Imagem:** serviços e gateway usam `services/Dockerfile` (`SERVICE=<service_name>` ou `APP_DIR=gateway`); a imagem instala exatamente o `uv.lock` (lock defasado derruba o build), copia apenas `core/` e a pasta do app e roda sem root.
 - **Testes:** em `tests/<service_name>.py`, um serviço por processo, sem infraestrutura (SurrealDB e NATS viram dublês):
 
   ```bash
-  PYTHONPATH=services/svc-<service_name> python -m pytest tests/<service_name>.py
-  python -m pytest tests/core.py
-  PYTHONPATH=gateway python -m pytest tests/gateway.py
+  PYTHONPATH=services/svc-<service_name> uv run python -m pytest tests/<service_name>.py
+  uv run python -m pytest tests/core.py
+  PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
   ```
 
 ### 5.6 Contrato do core
@@ -248,8 +249,8 @@ Variáveis de ambiente (no `.env`; nenhum segredo tem valor padrão):
 Ambiente local: o `keygen` cria o `.env` com chaves e senhas aleatórias (nunca sobrescreve um existente); o `token` emite um token de teste com essas chaves.
 
 ```bash
-python -m core.security keygen
-python -m core.security token <sub> [papel ...]
+uv run python -m core.security keygen
+uv run python -m core.security token <sub> [papel ...]
 ```
 
 ### 5.8 Gateway (`gateway/`)
@@ -283,7 +284,7 @@ endpoints:
 - **Limites:** corpo acima de 1 MiB → 413 (no Traefik e no gateway). Rate limit por IP no Traefik (50 req/s, rajada de 100).
 - **Rota pública:** `auth: public` no YAML **e** `public=("/rota",)` no `install_security` do serviço. As duas declarações precisam bater.
 - **Novo serviço:** o gateway lê os manifestos no boot; rebuild do gateway publica as rotas novas.
-- **Contratos tipados:** `python gateway/contracts.py` junta manifestos e `schemas.py` e gera `frontend/src/core/contracts.ts`: tipos TypeScript (com as descrições dos campos) e uma função por rota, como `billing.execute(body)` e `loja.detalhe({ fatura_id })`. Modelo citado e inexistente é erro. Arquivo desatualizado falha em `tests/gateway.py` (e em `--check`). Rode sempre que mudar um manifesto ou um `schemas.py`.
+- **Contratos tipados:** `uv run python gateway/contracts.py` junta manifestos e `schemas.py` e gera `frontend/src/core/contracts.ts`: tipos TypeScript (com as descrições dos campos) e uma função por rota, como `billing.execute(body)` e `loja.detalhe({ fatura_id })`. Modelo citado e inexistente é erro. Arquivo desatualizado falha em `tests/gateway.py` (e em `--check`). Rode sempre que mudar um manifesto ou um `schemas.py`.
 
 ## 6. Invariantes do Frontend (A Regra do LEGO)
 
@@ -337,17 +338,19 @@ npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + Ty
 1. `./service.sh <service_name>`
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
-4. Rodar `tests/<service_name>.py` (seção 5.5) e `python gateway/contracts.py` (atualiza os tipos do frontend).
+4. Rodar `tests/<service_name>.py` (seção 5.5) e `uv run python gateway/contracts.py` (atualiza os tipos do frontend).
 5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx com as receitas do CATALOG.md (ResourcePage, QueryTable, ActionForm) e as funções de core/contracts.ts, seguindo o README."*
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
 
 ### Ambiente local (`compose.yaml`)
 
+Pré-requisitos: `uv` (instala o Python e as dependências sozinho), Node e Docker.
+
 ```bash
-python -m core.security keygen          # uma vez: cria o .env
+uv run python -m core.security keygen   # uma vez: cria o .env
 docker compose up --build -d            # sobe Traefik, gateway, NATS, SurrealDB, Temporal e os serviços
-TOKEN=$(python -m core.security token ana)
+TOKEN=$(uv run python -m core.security token ana)
 curl -X POST localhost:8088/api/v1/<service_name>/execute -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" -d '{"client_id": "c1"}'
 docker compose down                     # para tudo (com -v, apaga também os dados)

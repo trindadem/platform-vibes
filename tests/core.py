@@ -1,6 +1,6 @@
 """core/ · testes sem infraestrutura. Fonte da verdade: README §5.6 e §5.7
 
-Rodar (da raiz): python -m pytest tests/core.py
+Rodar (da raiz): uv run python -m pytest tests/core.py
 """
 import asyncio
 import time

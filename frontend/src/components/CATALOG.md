@@ -316,7 +316,7 @@ Etiqueta curta para status, papéis ou categorias. _(Formatação)_
 Trecho de código, comando ou identificador em fonte monoespaçada. _(Formatação)_
 
 ```tsx
-<Code>{"python gateway/contracts.py"}</Code>
+<Code>{"uv run python gateway/contracts.py"}</Code>
 ```
 
 - `children`: `string`: Texto exibido em fonte monoespaçada.

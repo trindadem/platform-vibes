@@ -1,6 +1,6 @@
 """gateway/ · testes sem infraestrutura. Fonte da verdade: README §5.8
 
-Rodar (da raiz): PYTHONPATH=gateway python -m pytest tests/gateway.py
+Rodar (da raiz): PYTHONPATH=gateway uv run python -m pytest tests/gateway.py
 """
 import json
 
@@ -298,7 +298,7 @@ def loja_dirs(tmp_path):
 def test_contrato_versionado_esta_em_dia():
     import contracts
 
-    assert contracts.OUTPUT.read_text(encoding="utf-8") == contracts.generate(), "rode: python gateway/contracts.py"
+    assert contracts.OUTPUT.read_text(encoding="utf-8") == contracts.generate(), "rode: uv run python gateway/contracts.py"
 
 
 def test_contrato_gera_tipos_a_partir_do_pydantic(loja_dirs):

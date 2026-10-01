@@ -10,7 +10,7 @@ export interface CodeProps {
  *
  * @category Formatação
  * @example
- * <Code>{"python gateway/contracts.py"}</Code>
+ * <Code>{"uv run python gateway/contracts.py"}</Code>
  */
 export function Code({ children, block = false }: CodeProps) {
   if (block) {

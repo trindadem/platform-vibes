@@ -70,7 +70,7 @@ export default function Sessao() {
   return (
     <Page title="Sessão" description="Entre colando um token (ambiente de desenvolvimento).">
       <Card title="Entrar com token" description="Enquanto não existe um serviço de login, gere um token de teste na raiz do projeto:">
-        <Code block>{"python -m core.security token <usuario> [papel ...]"}</Code>
+        <Code block>{"uv run python -m core.security token <usuario> [papel ...]"}</Code>
         <Form onSubmit={enter}>
           <TextArea label="Token" value={token} onChange={setToken} rows={5} monospace required error={error ?? undefined} placeholder="eyJ..." />
           <Row>

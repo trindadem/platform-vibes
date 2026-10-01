@@ -1,4 +1,4 @@
-# Ambiente local completo (README §7). Antes, uma vez: python -m core.security keygen (cria o .env).
+# Ambiente local completo (README §7). Antes, uma vez: uv run python -m core.security keygen (cria o .env).
 #   docker compose up --build -d   → API em http://localhost:8088/api/v1/..., Temporal UI em http://localhost:8233
 # Toda porta é publicada só em 127.0.0.1: nada fica exposto na rede.
 # O service.sh acrescenta cada serviço no FIM deste arquivo: mantenha "services:" como a última seção.
@@ -6,9 +6,9 @@ name: cv-frame
 
 x-auth-env: &auth-env
   ENVIRONMENT: ${ENVIRONMENT:-development}
-  AUTH_ISSUER: ${AUTH_ISSUER:?rode python -m core.security keygen}
-  AUTH_AUDIENCE: ${AUTH_AUDIENCE:?rode python -m core.security keygen}
-  AUTH_PUBLIC_KEY: ${AUTH_PUBLIC_KEY:?rode python -m core.security keygen}
+  AUTH_ISSUER: ${AUTH_ISSUER:?rode uv run python -m core.security keygen}
+  AUTH_AUDIENCE: ${AUTH_AUDIENCE:?rode uv run python -m core.security keygen}
+  AUTH_PUBLIC_KEY: ${AUTH_PUBLIC_KEY:?rode uv run python -m core.security keygen}
   NATS_URL: nats://nats:4222
 
 x-service: &service
@@ -18,10 +18,10 @@ x-service: &service
   environment:
     <<: *auth-env
     SURREAL_URL: ws://surrealdb:8000
-    SURREAL_NAMESPACE: ${SURREAL_NAMESPACE:?rode python -m core.security keygen}
-    SURREAL_DATABASE: ${SURREAL_DATABASE:?rode python -m core.security keygen}
-    SURREAL_USER: ${SURREAL_USER:?rode python -m core.security keygen}
-    SURREAL_PASSWORD: ${SURREAL_PASSWORD:?rode python -m core.security keygen}
+    SURREAL_NAMESPACE: ${SURREAL_NAMESPACE:?rode uv run python -m core.security keygen}
+    SURREAL_DATABASE: ${SURREAL_DATABASE:?rode uv run python -m core.security keygen}
+    SURREAL_USER: ${SURREAL_USER:?rode uv run python -m core.security keygen}
+    SURREAL_PASSWORD: ${SURREAL_PASSWORD:?rode uv run python -m core.security keygen}
     TEMPORAL_ADDRESS: temporal:7233
   depends_on:
     nats: { condition: service_healthy }
@@ -80,7 +80,7 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:v3.3.0
     user: root  # a imagem roda como nonroot e não grava no volume; é o que a documentação oficial indica
-    command: ["start", "--user", "root", "--pass", "${SURREAL_ROOT_PASSWORD:?rode python -m core.security keygen}", "surrealkv:/data/db"]
+    command: ["start", "--user", "root", "--pass", "${SURREAL_ROOT_PASSWORD:?rode uv run python -m core.security keygen}", "surrealkv:/data/db"]
     ports: ["127.0.0.1:8000:8000"]
     volumes: ["surreal-data:/data"]
     healthcheck:
@@ -95,11 +95,11 @@ services:
     depends_on:
       surrealdb: { condition: service_healthy }
     environment:
-      ROOT_PASSWORD: ${SURREAL_ROOT_PASSWORD:?rode python -m core.security keygen}
-      NS: ${SURREAL_NAMESPACE:?rode python -m core.security keygen}
-      DB: ${SURREAL_DATABASE:?rode python -m core.security keygen}
-      APP_USER: ${SURREAL_USER:?rode python -m core.security keygen}
-      APP_PASSWORD: ${SURREAL_PASSWORD:?rode python -m core.security keygen}
+      ROOT_PASSWORD: ${SURREAL_ROOT_PASSWORD:?rode uv run python -m core.security keygen}
+      NS: ${SURREAL_NAMESPACE:?rode uv run python -m core.security keygen}
+      DB: ${SURREAL_DATABASE:?rode uv run python -m core.security keygen}
+      APP_USER: ${SURREAL_USER:?rode uv run python -m core.security keygen}
+      APP_PASSWORD: ${SURREAL_PASSWORD:?rode uv run python -m core.security keygen}
     entrypoint: ["sh", "-c"]
     command:
       - |

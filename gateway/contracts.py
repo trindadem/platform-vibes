@@ -4,8 +4,8 @@ Junta os manifestos (gateway/endpoints/*.yaml: rota, método, request/response) 
 services/svc-<nome>/schemas.py e escreve tipos TypeScript e uma função por rota. O frontend nunca adivinha
 caminho nem campo: se errar, o TypeScript acusa. Modelo citado no manifesto e ausente no schemas.py é erro.
 
-Rodar (da raiz):  python gateway/contracts.py           gera o arquivo
-                  python gateway/contracts.py --check   falha se o arquivo estiver desatualizado
+Rodar (da raiz):  uv run python gateway/contracts.py           gera o arquivo
+                  uv run python gateway/contracts.py --check   falha se o arquivo estiver desatualizado
 """
 import importlib.util
 import json
@@ -29,7 +29,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 HEADER = """\
 // Gerado por gateway/contracts.py a partir de gateway/endpoints/*.yaml e services/*/schemas.py. Não edite:
-// depois de mudar um manifesto ou um schemas.py, rode (da raiz) `python gateway/contracts.py`.
+// depois de mudar um manifesto ou um schemas.py, rode (da raiz) `uv run python gateway/contracts.py`.
 import { request, type RequestOptions } from "./api";
 
 /** Resposta de toda rota NATS: o id da mensagem publicada (o mesmo para a mesma Idempotency-Key). */
@@ -188,7 +188,7 @@ if __name__ == "__main__":
     current = OUTPUT.read_text(encoding="utf-8") if OUTPUT.exists() else None
     if "--check" in sys.argv[1:]:
         if content != current:
-            sys.exit(f"{OUTPUT.relative_to(ROOT)} está desatualizado: rode python gateway/contracts.py")
+            sys.exit(f"{OUTPUT.relative_to(ROOT)} está desatualizado: rode uv run python gateway/contracts.py")
         print(f"{OUTPUT.relative_to(ROOT)} em dia.")
     elif content != current:
         OUTPUT.write_text(content, encoding="utf-8")
