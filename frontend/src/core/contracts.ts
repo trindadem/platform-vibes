@@ -1004,6 +1004,127 @@ export const plans = {
     request<PlansAccount>("POST", "/api/v1/plans/assign", body, options),
 };
 
+export interface ProcessosModeloProcesso {
+  id: "contas-a-pagar" | "conciliacao-bancaria" | "faturamento-cobranca" | "fechamento-mes" | "gestao-contratos" | "publicacoes-processos" | "certidoes-negativas" | "admissao-colaborador" | "compras-cotacao" | "vencimentos-empresa" | "qualificacao-leads" | "proposta-comercial" | "reativacao-carteira";
+  area: "financeiro" | "juridico" | "administrativo" | "vendas";
+  titulo: string;
+  resumo: string;
+  gatilho: string;
+  /** O que agentes e automações fazem sem ninguém */
+  roda_sozinho: string;
+  /** Quando uma pessoa entra (a exceção) */
+  handoff: string;
+  /** O que precisa estar conectado */
+  integracoes: string[];
+  /** O que, no perfil, indica que o processo serve */
+  sinais: string[];
+}
+
+export interface ProcessosBiblioteca {
+  itens: ProcessosModeloProcesso[];
+}
+
+export interface ProcessosProcesso {
+  id: string;
+  /** Modelo da biblioteca; vazio num processo só da empresa */
+  modelo: "contas-a-pagar" | "conciliacao-bancaria" | "faturamento-cobranca" | "fechamento-mes" | "gestao-contratos" | "publicacoes-processos" | "certidoes-negativas" | "admissao-colaborador" | "compras-cotacao" | "vencimentos-empresa" | "qualificacao-leads" | "proposta-comercial" | "reativacao-carteira" | null;
+  area: "financeiro" | "juridico" | "administrativo" | "vendas";
+  titulo: string;
+  descricao: string;
+  /** Por que o agente sugeriu (o que no briefing indica o processo) */
+  motivo: string | null;
+  origem: "sugestao" | "cliente";
+  status: "sugerido" | "aceito" | "recusado";
+  prioridade: "alta" | "media" | "baixa";
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProcessosProcessoPage {
+  items: ProcessosProcesso[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface ProcessosProcessoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "titulo" | "-titulo" | "prioridade" | "-prioridade" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "sugerido" | "aceito" | "recusado" | null;
+  area?: "financeiro" | "juridico" | "administrativo" | "vendas" | null;
+}
+
+export interface ProcessosResumo {
+  sugeridos: number;
+  aceitos: number;
+  recusados: number;
+}
+
+export interface ProcessosEmpty {
+}
+
+export interface ProcessosDescoberta {
+  /** Resumo do agente para o cliente */
+  texto: string;
+  /** Os sugeridos agora */
+  processos: ProcessosProcesso[];
+}
+
+/** Um passo do agente enquanto trabalha (pedaço do stream). */
+export interface ProcessosPassoAgente {
+  ferramenta: string;
+  texto: string;
+  status: "running" | "done" | "failed";
+}
+
+export interface ProcessosDescricao {
+  /** O processo, como o cliente explicaria a alguém */
+  texto: string;
+}
+
+export interface ProcessosProcessoRef {
+  id: string;
+}
+
+export interface ProcessosProcessoMudou {
+  id: string;
+  action: "sugerido" | "aceito" | "recusado" | "descrito";
+}
+
+/** svc-processos · /api/v1/processos */
+export const processos = {
+  /** GET /api/v1/processos/biblioteca · http · exige token */
+  biblioteca: (options?: RequestOptions) =>
+    request<ProcessosBiblioteca>("GET", "/api/v1/processos/biblioteca", undefined, options),
+  /** GET /api/v1/processos/processos · http · exige token */
+  listar: (query?: ProcessosProcessoQuery, options?: RequestOptions) =>
+    request<ProcessosProcessoPage>("GET", withQuery("/api/v1/processos/processos", query), undefined, options),
+  /** GET /api/v1/processos/resumo · http · exige token */
+  resumo: (options?: RequestOptions) =>
+    request<ProcessosResumo>("GET", "/api/v1/processos/resumo", undefined, options),
+  /** POST /api/v1/processos/descoberta · http · em pedaços (options.onDelta) · exige token */
+  descoberta: (body: ProcessosEmpty, options?: StreamOptions<ProcessosPassoAgente>) =>
+    stream<ProcessosPassoAgente, ProcessosDescoberta>("POST", "/api/v1/processos/descoberta", body, options),
+  /** POST /api/v1/processos/descrever · http · exige token */
+  descrever: (body: ProcessosDescricao, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/descrever", body, options),
+  /** POST /api/v1/processos/processos/aceitar · http · exige token */
+  aceitar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/processos/aceitar", body, options),
+  /** POST /api/v1/processos/processos/recusar · http · exige token */
+  recusar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/processos/recusar", body, options),
+};
+
 export interface WebhooksEndpoint {
   id: string;
   url: string;
@@ -1157,6 +1278,8 @@ export interface LiveTopics {
   "notify.nova": NotifyNotification;
   /** svc-plans · bus.live("plans.uso", ...) */
   "plans.uso": PlansUsageChanged;
+  /** svc-processos · bus.live("processos.processos", ...) */
+  "processos.processos": ProcessosProcessoMudou;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
@@ -1168,6 +1291,7 @@ export const appModules = {
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
+  processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos e aceitos", category: "Sua empresa", core: false },
   webhooks: { title: "Webhooks", description: "Eventos para os sistemas da organização", category: "Integrações", core: true },
 } as const;
 

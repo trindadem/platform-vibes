@@ -21,7 +21,7 @@ from core.security import Principal, acting_as
 from core.storage import StoredFile, storage
 from core.testing import service_app
 
-from schemas import TRIGGER_SUBJECT, LeituraFalha, LeituraPedido, LeituraRef, MensagemIn, NovoConhecimento, Perfil
+from schemas import BUSCA_SUBJECT, CONTEXTO_SUBJECT, TRIGGER_SUBJECT, BuscaQuery, Empty, LeituraFalha, LeituraPedido, LeituraRef, MensagemIn, NovoConhecimento, Perfil
 
 OWNER = ("ana", "acme", "owner")
 ACME = Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))
@@ -335,7 +335,9 @@ def test_documentos_viram_itens_e_remover_a_leitura_apaga_itens_e_arquivo(arquiv
                     resultados.append(exc.code)
         itens = (await ana.get("/itens", params={"fonte": "documento", "size": 50})).json()["data"]["items"]
         busca = (await ana.get("/busca", params={"q": "cotações compra"})).json()["data"]["itens"]
-        removida = await ana.post("/leituras/remove", json={"id": leituras[0]["id"]})
+        listada = (await ana.get("/leituras", params={"sort": "origem"})).json()["data"]["items"]
+        assert all(":" not in lt["id"] for lt in listada)  # a lista devolve a chave, como a criação
+        removida = await ana.post("/leituras/remove", json={"id": next(lt["id"] for lt in listada if lt["origem"] == "politica.docx")})
         resto = (await ana.get("/itens", params={"fonte": "documento"})).json()["data"]["total"]
         resumo = (await ana.get("/resumo")).json()["data"]
         return resultados, itens, busca, removida, resto, resumo
@@ -348,6 +350,23 @@ def test_documentos_viram_itens_e_remover_a_leitura_apaga_itens_e_arquivo(arquiv
     assert busca[0]["titulo"] == "politica.docx"
     assert removida.json()["data"]["status"] == "removida" and apagados == [chave.format(1)]
     assert resto == 4 and resumo["por_fonte"] == {"documento": 4} and resumo["topicos_total"] == 6
+
+
+def test_rpc_de_contexto_e_busca_para_outros_servicos_na_organizacao_de_quem_pede():
+    async def cenario(app):
+        await app.user(*OWNER).post("/briefing/perfil", json=COMPLETO)
+        await app.user(*OWNER).post("/itens", json={"titulo": "Pagamentos", "conteudo": "Boleto toda sexta"})
+        with acting_as(ACME):
+            contexto = await app.handlers[CONTEXTO_SUBJECT](Empty())
+            achados = await app.handlers[BUSCA_SUBJECT](BuscaQuery(q="boleto"))
+        with acting_as(Principal(sub="bia", tenant="beta", roles=frozenset({"owner"}))):
+            da_beta = await app.handlers[BUSCA_SUBJECT](BuscaQuery(q="boleto"))
+        return contexto, achados, da_beta
+
+    contexto, achados, da_beta = service_app(cenario)
+    assert contexto.perfil.segmento == "padaria" and sum(t.status == "feito" for t in contexto.topicos) == 6
+    assert contexto.concluido_em is None
+    assert [a.titulo for a in achados.itens] == ["Pagamentos"] and da_beta.itens == []
 
 
 def test_modelos_de_entrada_recusam_campo_nao_declarado():

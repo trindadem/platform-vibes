@@ -16,6 +16,7 @@ vê, corrige e apaga o que a plataforma sabe dele; o workspace mostra em que pé
 - `GET /leituras?page&size&sort&status&tipo` → `LeituraPage` de `Leitura {id, tipo: site|documento, origem, status: lendo|pronta|falhou, paginas, itens, erro, created_at}`. `POST /leituras/remove {id}` apaga a leitura e os itens dela.
 - `GET /resumo` → `Resumo {topicos_feitos, topicos_total, concluido_em, itens, por_fonte, leituras_lendo}` (workspace).
 - Ao vivo: `conhecimento.briefing`, `conhecimento.leituras` e `conhecimento.itens`.
+- RPC para outros serviços, na organização de quem pede: `rpc.conhecimento.contexto {}` → `ContextoEmpresa {perfil, topicos, concluido_em}`; `rpc.conhecimento.busca {q}` → `Achados`.
 
 ## 3. Fluxo de Execução
 1. SurrealDB, por organização: `conhecimento_perfil` (um por organização, com `concluido_em`), `conhecimento_mensagens` (papel, texto, passos), `conhecimento_itens` (cadastro, busca BM25 em título e conteúdo) e `conhecimento_leituras` (tipo, origem, arquivo, status, itens).

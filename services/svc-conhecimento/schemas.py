@@ -19,6 +19,8 @@ TRIGGER_SUBJECT = "events.conhecimento.trigger"
 PROCESSED_SUBJECT = "events.conhecimento.processed"
 LIVE_BRIEFING = "conhecimento.briefing"  # perfil ou conversa mudou
 LIVE_LEITURAS = "conhecimento.leituras"  # leitura de site ou documento mudou de estado
+CONTEXTO_SUBJECT = "rpc.conhecimento.contexto"  # outros serviços (svc-processos) leem o perfil da empresa
+BUSCA_SUBJECT = "rpc.conhecimento.busca"  # e buscam no conhecimento, sempre na organização de quem pede
 
 PERFIL = "conhecimento_perfil"  # um por organização (chave fixa, única)
 MENSAGENS = "conhecimento_mensagens"
@@ -141,6 +143,14 @@ class Briefing(BaseModel):
     mensagens: list[Mensagem]
     concluido_em: datetime | None = None
     pode_concluir: bool
+
+
+class ContextoEmpresa(BaseModel):
+    """Resposta do rpc.conhecimento.contexto: o que os outros agentes precisam saber da empresa."""
+
+    perfil: Perfil
+    topicos: list[Topico]
+    concluido_em: datetime | None = None
 
 
 class MensagemIn(_Input):
@@ -268,6 +278,12 @@ class Leitura(BaseModel):
     erro: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        """"tabela:⟨abc⟩" → "abc": na API, o id é só a chave (as listas do db.page vêm com a tabela)."""
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
 
 
 class LeituraQuery(ListQuery):

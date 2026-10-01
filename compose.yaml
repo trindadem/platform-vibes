@@ -270,3 +270,12 @@ services:
       <<: *service-env
       # Modelo do agente de briefing, como cadastrado no svc-ai (specs/conhecimento.md §3).
       CONHECIMENTO_MODEL: ${CONHECIMENTO_MODEL:-cv/agente}
+
+  svc-processos:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: processos } }
+    profiles: [modules, processos]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      # Modelo dos agentes de descoberta e descrição, como cadastrado no svc-ai (specs/processos.md §3).
+      PROCESSOS_MODEL: ${PROCESSOS_MODEL:-cv/agente}

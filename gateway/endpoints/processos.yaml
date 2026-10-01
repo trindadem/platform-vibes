@@ -1,0 +1,67 @@
+# svc-processos · rotas públicas no Gateway. Fonte da verdade: specs/processos.md §2
+service: processos
+base_path: /api/v1/processos
+
+live:
+  - topic: processos                # um processo foi sugerido, aceito, recusado ou descrito
+    model: ProcessoMudou
+
+endpoints:
+  - path: /biblioteca
+    method: GET
+    auth: client_jwt
+    response: Biblioteca
+    target_type: http
+    target_url: http://svc-processos:8000/biblioteca
+
+  - path: /processos
+    name: listar
+    method: GET
+    auth: client_jwt
+    query: ProcessoQuery
+    response: ProcessoPage
+    target_type: http
+    target_url: http://svc-processos:8000/processos
+
+  - path: /resumo
+    method: GET
+    auth: client_jwt
+    response: Resumo
+    target_type: http
+    target_url: http://svc-processos:8000/resumo
+
+  - path: /descoberta
+    method: POST
+    auth: client_jwt
+    stream: true                    # os passos do agente em pedaços; as sugestões no fim
+    request: Empty
+    delta: PassoAgente
+    response: Descoberta
+    target_type: http
+    target_url: http://svc-processos:8000/descoberta
+    timeout: 120
+
+  - path: /descrever
+    method: POST
+    auth: client_jwt
+    request: Descricao
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/descrever
+    timeout: 120
+
+  - path: /processos/aceitar
+    method: POST
+    auth: client_jwt
+    request: ProcessoRef
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/processos/aceitar
+
+  - path: /processos/recusar
+    method: POST
+    auth: client_jwt
+    request: ProcessoRef
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/processos/recusar

@@ -4,6 +4,7 @@ HTTP /briefing...   → briefing com o agente (a mensagem responde em pedaços: 
 HTTP /itens...      → cadastro declarado em schemas.RESOURCES (core/resources.py): lista, item, cria, edita, remove.
 HTTP /site, /documentos, /leituras → leituras de site e documentos, em segundo plano.
 NATS TRIGGER_SUBJECT → inicia LeituraWorkflow (assíncrona, durável e idempotente).
+NATS rpc.conhecimento.contexto e rpc.conhecimento.busca → perfil e busca para outros serviços (svc-processos).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-conhecimento main:app --port 8100 --env-file .env
 """
@@ -23,6 +24,8 @@ from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    BUSCA_SUBJECT,
+    CONTEXTO_SUBJECT,
     MODULE,
     RESOURCES,
     SEARCH,
@@ -63,6 +66,8 @@ async def lifespan(app: FastAPI):
     ):
         await storage.connected(SERVICE)  # documentos enviados (README §5.14)
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=LeituraPedido)
+        await bus.respond(CONTEXTO_SUBJECT, svc.contexto, model=Empty)  # svc-processos: o perfil da empresa
+        await bus.respond(BUSCA_SUBJECT, svc.buscar, model=BuscaQuery)  # e a busca no conhecimento
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
 

@@ -58,6 +58,7 @@ from schemas import (
     BuscaQuery,
     Conhecimento,
     ConhecimentoSettings,
+    ContextoEmpresa,
     Empty,
     KeepRequest,
     Leitura,
@@ -136,6 +137,12 @@ class ConhecimentoService:
         await db.merge(_ref(PERFIL, row), {"concluido_em": None})
         await bus.live(LIVE_BRIEFING, BriefingMudou(action="reaberto"))
         return await self._briefing()
+
+    async def contexto(self, data: Empty) -> ContextoEmpresa:
+        """rpc.conhecimento.contexto: perfil, tópicos e conclusão, para os agentes de outros serviços."""
+        row = await self._perfil()
+        perfil = _perfil_de(row)
+        return ContextoEmpresa(perfil=perfil, topicos=_topicos(perfil), concluido_em=row.get("concluido_em"))
 
     # ── Busca e workspace ────────────────────────────────────────────────────
 
