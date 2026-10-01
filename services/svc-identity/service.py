@@ -59,6 +59,7 @@ from schemas import (
     AccessChanged,
     AuthResult,
     Cleaned,
+    ColorInput,
     Contact,
     Contacts,
     ContactsRequest,
@@ -397,7 +398,7 @@ class IdentityService:
             items=[Contact(id=_key(row["id"]), name=row["name"], email=row["email"]) for row in rows],
         )
 
-    # ── Organização: nome e logo ────────────────────────────────────────────
+    # ── Organização: nome, logo e cor da marca ──────────────────────────────
 
     async def organization(self, data: Empty) -> Organization:
         _, tenant = await self._member()
@@ -418,6 +419,12 @@ class IdentityService:
             await storage.delete(old["key"])
         return await self._organization(tenant)
 
+    async def set_color(self, data: ColorInput) -> Organization:
+        """Cor da marca da organização (donos e administradores): a tela a usa como cor principal."""
+        _, tenant = await self._manager()
+        await db.merge(f"{TENANTS}:{tenant}", {"color": data.color})
+        return await self._organization(tenant)
+
     async def remove_logo(self, data: Empty) -> Organization:
         _, tenant = await self._manager()
         record = await db.select(f"{TENANTS}:{tenant}")
@@ -432,7 +439,7 @@ class IdentityService:
             raise _not_member()
         logo = record.get("logo")
         url = storage.url(logo["key"], ttl=LOGO_SECONDS, filename=logo["filename"], content_type=logo["content_type"]) if logo else None
-        return Organization(id=tenant, name=record["name"], logo_url=url)
+        return Organization(id=tenant, name=record["name"], logo_url=url, color=record.get("color"))
 
     # ── Manutenção (workflows.py) ───────────────────────────────────────────
 

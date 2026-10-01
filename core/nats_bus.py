@@ -12,10 +12,13 @@ Trilhos de subject:
 
 Quem age viaja junto (README §5.9): publish e request anexam o Principal do contexto no cabeçalho Cv-Principal;
 subscribe e respond o restauram antes do handler, então current_tenant() funciona igual ao HTTP. O cabeçalho é
-confiável porque só a plataforma publica no NATS (em produção, NATS_CREDS com permissão por subject).
+confiável porque só a plataforma publica no NATS (em produção, NATS_CREDS com permissão por subject). Antes do handler
+rodam as conferências do core (core/security.py, check_gates): mensagem de quem tem o módulo desligado no plano é
+recusada sem reentrega; RPC responde o erro (402 ERRO_PLAN_MODULE).
 
 O trace viaja junto (README §5.18): publish e request levam o traceparent no cabeçalho; subscribe e respond continuam o
-mesmo trace, num span por mensagem, e contam cada resultado em cv.nats.processed (ok, retry, dropped, invalid).
+mesmo trace, num span por mensagem, e contam cada resultado em cv.nats.processed (ok, retry, dropped, invalid,
+refused).
 
 Mensagem inválida é descartada sem reentrega; handler que falha é re-tentado com espera crescente.
 O log nunca inclui o payload. Variáveis: NATS_URL (padrão nats://localhost:4222) e a credencial: NATS_USER e
@@ -42,7 +45,7 @@ from pydantic import BaseModel, Field, SecretStr, ValidationError, model_validat
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.envelope import ResponseEnvelope, ServiceError, error_code
-from core.security import Principal, acting_as, current, current_tenant
+from core.security import Principal, acting_as, check_gates, current, current_tenant
 
 STREAM = "EVENTS"
 PRINCIPAL_HEADER = "Cv-Principal"
@@ -154,6 +157,12 @@ class Bus:
             token = _message_id.set(stable_id)
             try:
                 with acting_as(who):
+                    try:
+                        await check_gates(who)  # ex.: módulo desligado no plano da organização (core/plans.py)
+                    except ServiceError as exc:
+                        log.info("mensagem em %s recusada: %s", subject, exc.code)
+                        await msg.term()
+                        return "refused"
                     await handler(data)
             except Exception as exc:
                 trace.get_current_span().record_exception(exc)
@@ -204,6 +213,7 @@ class Bus:
                 try:
                     data, who = model.model_validate_json(msg.data), _principal_from(msg.headers)
                     with acting_as(who):
+                        await check_gates(who)  # ex.: módulo desligado no plano da organização (core/plans.py)
                         envelope = ResponseEnvelope.success(await handler(data), service)
                 except ValidationError:
                     envelope = ResponseEnvelope.failure(

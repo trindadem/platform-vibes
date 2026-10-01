@@ -15,7 +15,7 @@ from core.envelope import ServiceError
 from core.security import Principal, acting_as, current_tenant, new_secret
 
 import service
-from schemas import LIMITS, SEARCH, SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelQuery, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
+from schemas import MODULE, SEARCH, SHARED_TABLES, TENANT_TABLES, UNIQUE, Empty, ModelInput, ModelQuery, ModelUpdate, ProviderInput, ProviderRef, ResolveRequest, UsageEvent
 
 PLATAFORMA = Principal(sub="ana", tenant="plat", roles=frozenset({"owner"}))
 ACME = Principal(sub="bia", tenant="acme", roles=frozenset({"owner"}))
@@ -48,7 +48,7 @@ def ambiente(monkeypatch):
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "_service", "svc-ai")
     monkeypatch.setattr(service.plans, "_declared", {})
-    asyncio.run(service.plans.declare(LIMITS))  # como o boot: custo e tokens no catálogo
+    asyncio.run(service.plans.declare(MODULE))  # como o boot: o módulo, com custo e tokens, no catálogo
 
     def provedor(request):
         pedidos.append(request)

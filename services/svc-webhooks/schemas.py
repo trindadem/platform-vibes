@@ -5,7 +5,7 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings
 
-from core.plans import Limit
+from core.plans import Limit, Module
 from core.surreal import ListQuery, Page
 from core.webhooks import CATALOG_SUBJECT, EMIT_SUBJECT, Catalog, CatalogEvent, Emitted, WebhookEvent  # contrato do core
 
@@ -58,8 +58,10 @@ class Ping(BaseModel):
     endpoint: str = Field(..., description="Id do endereço testado")
 
 
-# Limite do plano (README §5.17): endereços por organização; sem plano, 20.
-LIMITS = [Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")]
+# O módulo (README §5.17), da plataforma. Limite: endereços por organização; sem plano, 20.
+MODULE = Module("Webhooks", "Eventos para os sistemas da organização", category="Integrações", core=True, limits=[
+    Limit("enderecos", "Endereços de webhook", default=20, unit="endereços"),
+])
 
 WEBHOOKS = [WebhookEvent("teste", "Teste enviado pela tela de webhooks, para conferir o endereço e a assinatura.", Ping)]
 

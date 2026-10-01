@@ -24,7 +24,7 @@ import { type ListState, type QueryState, useAction, useListQuery, useLiveQuery,
 import { hasAnyRole, useSession } from "@/core/auth";
 import { type AiModel, type AiProviderList, type AiUsageSummary, ai } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "IA", order: 4 };
+export const meta: PageMeta = { title: "IA", order: 4, module: "ai" };
 
 const ORIGEM = { organization: "Sua organização", platform: "Plataforma" };
 const TIPO = { chat: "Conversa", embedding: "Vetores" };

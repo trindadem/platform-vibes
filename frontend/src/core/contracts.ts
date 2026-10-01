@@ -302,6 +302,8 @@ export interface IdentityOrganization {
   name: string;
   /** Link assinado da imagem do logo (vale 1 h) */
   logo_url: string | null;
+  /** Cor da marca (#RRGGBB): a tela a usa como cor principal; null: a da plataforma */
+  color: string | null;
 }
 
 /** O que a tela diz antes de enviar: nome, tipo e tamanho do arquivo (o envio só vale para esse tamanho e tipo). */
@@ -324,6 +326,11 @@ export interface IdentityUpload {
 export interface IdentityKeepRequest {
   /** A key devolvida em Upload */
   key: string;
+}
+
+export interface IdentityColorInput {
+  /** #RRGGBB; null volta à cor da plataforma */
+  color: string | null;
 }
 
 export interface IdentityMembersChanged {
@@ -391,6 +398,9 @@ export const identity = {
   /** POST /api/v1/identity/organization/logo · http · exige token */
   setLogo: (body: IdentityKeepRequest, options?: RequestOptions) =>
     request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo", body, options),
+  /** POST /api/v1/identity/organization/color · http · exige token */
+  setColor: (body: IdentityColorInput, options?: RequestOptions) =>
+    request<IdentityOrganization>("POST", "/api/v1/identity/organization/color", body, options),
   /** POST /api/v1/identity/organization/logo/remove · http · exige token */
   removeLogo: (body: unknown, options?: RequestOptions) =>
     request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo/remove", body, options),
@@ -483,6 +493,24 @@ export interface PlansLimitState {
   used: number;
 }
 
+export interface PlansModuleState {
+  /** Nome do serviço, sem svc- (o mesmo de /api/v1/<nome>) */
+  name: string;
+  service: string;
+  title: string;
+  description: string;
+  /** Grupo no menu */
+  category: string;
+  /** Módulo da plataforma: sempre ligado */
+  core: boolean;
+  /** Ligado quando o plano não diz nada (e para quem não tem plano) */
+  default: boolean;
+  /** Módulos sem os quais este não funciona */
+  requires: string[];
+  /** Ligado para a organização: ajuste dela, plano ou default, com os requires ligados */
+  enabled: boolean;
+}
+
 export interface PlansPlan {
   slug: string;
   name: string;
@@ -497,6 +525,8 @@ export interface PlansPlan {
   default: boolean;
   /** Limite → valor (null: sem limite); o que falta vale o default */
   limits: Record<string, number | null>;
+  /** Módulo → incluído; o que falta vale o default do módulo */
+  modules: Record<string, boolean>;
 }
 
 export interface PlansCurrent {
@@ -507,6 +537,7 @@ export interface PlansCurrent {
   /** AAAA-MM, em UTC: o mês dos consumos */
   month: string;
   limits: PlansLimitState[];
+  modules: PlansModuleState[];
   manages_platform: boolean;
 }
 
@@ -516,6 +547,11 @@ export interface PlansPlanList {
   current: string | null;
   /** Quem pede administra os planos da plataforma */
   manages_platform: boolean;
+}
+
+/** Os módulos da plataforma e se cada um está ligado para a organização ativa (o menu esconde os desligados). */
+export interface PlansModuleList {
+  items: PlansModuleState[];
 }
 
 export interface PlansCatalogLimit {
@@ -531,8 +567,26 @@ export interface PlansCatalogLimit {
   currency: string | null;
 }
 
-export interface PlansLimitList {
-  items: PlansCatalogLimit[];
+export interface PlansCatalogModule {
+  /** Nome do serviço, sem svc- (o mesmo de /api/v1/<nome>) */
+  name: string;
+  service: string;
+  title: string;
+  description: string;
+  /** Grupo no menu */
+  category: string;
+  /** Módulo da plataforma: sempre ligado */
+  core: boolean;
+  /** Ligado quando o plano não diz nada (e para quem não tem plano) */
+  default: boolean;
+  /** Módulos sem os quais este não funciona */
+  requires: string[];
+}
+
+/** O que os serviços declararam: os módulos (por categoria) e os limites. */
+export interface PlansCatalog {
+  modules: PlansCatalogModule[];
+  limits: PlansCatalogLimit[];
 }
 
 export interface PlansPlanInput {
@@ -546,7 +600,9 @@ export interface PlansPlanInput {
   public?: boolean;
   default?: boolean;
   /** Limite → valor (null: sem limite) */
-  limits?: Record<string, unknown>;
+  limits?: Record<string, number | null>;
+  /** Módulo → incluído (o que falta vale o default) */
+  modules?: Record<string, boolean>;
 }
 
 export interface PlansPlanUpdate {
@@ -558,24 +614,37 @@ export interface PlansPlanUpdate {
   public?: boolean | null;
   default?: boolean | null;
   /** Substitui a lista inteira */
-  limits?: Record<string, unknown> | null;
+  limits?: Record<string, number | null> | null;
+  /** Substitui a lista inteira */
+  modules?: Record<string, boolean> | null;
 }
 
 export interface PlansPlanRef {
   slug: string;
 }
 
+export interface PlansAccount {
+  tenant: string;
+  tenant_name: string;
+  /** Plano em vigor (atribuído ou o padrão); null: sem plano */
+  plan: string | null;
+  plan_name: string;
+  /** O plano foi atribuído (false: vale o padrão) */
+  assigned: boolean;
+  /** Ajuste da organização além do plano: módulo → ligado */
+  modules: Record<string, boolean>;
+}
+
+export interface PlansAccountRef {
+  tenant: string;
+}
+
 export interface PlansAssignInput {
   /** Id da organização (aparece para ela na tela Plano) */
   tenant: string;
   plan: string;
-}
-
-export interface PlansAccount {
-  tenant: string;
-  tenant_name: string;
-  plan: string;
-  plan_name: string;
+  /** Ajuste da organização: módulo → ligado, além do plano. null: mantém o ajuste; {}: só o plano */
+  modules?: Record<string, boolean> | null;
 }
 
 /** Consumo ou total que mudou (também vai ao vivo para a tela da organização). */
@@ -592,9 +661,12 @@ export const plans = {
   /** GET /api/v1/plans/plans · http · exige token */
   list: (options?: RequestOptions) =>
     request<PlansPlanList>("GET", "/api/v1/plans/plans", undefined, options),
-  /** GET /api/v1/plans/limits · http · exige token */
-  limits: (options?: RequestOptions) =>
-    request<PlansLimitList>("GET", "/api/v1/plans/limits", undefined, options),
+  /** GET /api/v1/plans/modules · http · exige token */
+  modules: (options?: RequestOptions) =>
+    request<PlansModuleList>("GET", "/api/v1/plans/modules", undefined, options),
+  /** GET /api/v1/plans/catalog · http · exige token */
+  catalog: (options?: RequestOptions) =>
+    request<PlansCatalog>("GET", "/api/v1/plans/catalog", undefined, options),
   /** POST /api/v1/plans/plans · http · exige token */
   createPlan: (body: PlansPlanInput, options?: RequestOptions) =>
     request<PlansPlan>("POST", "/api/v1/plans/plans", body, options),
@@ -604,6 +676,9 @@ export const plans = {
   /** POST /api/v1/plans/plans/remove · http · exige token */
   removePlan: (body: PlansPlanRef, options?: RequestOptions) =>
     request<PlansPlanList>("POST", "/api/v1/plans/plans/remove", body, options),
+  /** GET /api/v1/plans/account · http · exige token */
+  account: (query?: PlansAccountRef, options?: RequestOptions) =>
+    request<PlansAccount>("GET", withQuery("/api/v1/plans/account", query), undefined, options),
   /** POST /api/v1/plans/assign · http · exige token */
   assign: (body: PlansAssignInput, options?: RequestOptions) =>
     request<PlansAccount>("POST", "/api/v1/plans/assign", body, options),
@@ -759,3 +834,15 @@ export interface LiveTopics {
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
+
+/** Módulos (o MODULE de cada services/svc-<nome>/schemas.py): o meta.module das telas e os grupos do menu. */
+export const appModules = {
+  ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
+  identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
+  notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
+  plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
+  webhooks: { title: "Webhooks", description: "Eventos para os sistemas da organização", category: "Integrações", core: true },
+} as const;
+
+/** Nome de um módulo: o do serviço, sem svc-. */
+export type ModuleName = keyof typeof appModules;

@@ -16,7 +16,7 @@ from surrealdb import AsyncSurreal
 from core import nats_bus
 from core.envelope import ServiceError
 from core.notify import SEND_SUBJECT
-from core.plans import CatalogLimit, CountReport, LimitCatalog, LimitsRequest, UsageReport
+from core.plans import CatalogLimit, CatalogModule, CountReport, LimitsRequest, ModuleCatalog, UsageReport
 from core.security import Principal, acting_as, system
 
 import service
@@ -25,6 +25,7 @@ from schemas import (
     TENANT_TABLES,
     UNIQUE,
     USAGE_LIVE,
+    AccountRef,
     AssignInput,
     AssignRequest,
     Contacts,
@@ -41,14 +42,23 @@ BETA = Principal(sub="duda", tenant="beta", roles=frozenset({"admin"}))
 ORGS = {"acme": "Acme", "beta": "Beta", "plat": "Plataforma"}
 MES = datetime.now(UTC).strftime("%Y-%m")
 
+def _modulo(name, title, category, core=False, default=True, requires=()):
+    return CatalogModule(name=name, service=f"svc-{name}", title=title, description=f"Módulo {title}", category=category,
+                         core=core, default=default, requires=list(requires))
+
+
 CATALOGO = [
-    LimitCatalog(service="svc-ai", limits=[
+    ModuleCatalog(service="svc-ai", module=_modulo("ai", "IA", "Integrações", core=True), limits=[
         CatalogLimit(name="ai.custo", service="svc-ai", description="Gasto com IA no mês", default=None, monthly=True, currency="USD"),
         CatalogLimit(name="ai.tokens", service="svc-ai", description="Tokens de IA no mês", default=None, monthly=True, unit="tokens"),
     ]),
-    LimitCatalog(service="svc-webhooks", limits=[
+    ModuleCatalog(service="svc-webhooks", module=_modulo("webhooks", "Webhooks", "Integrações", core=True), limits=[
         CatalogLimit(name="webhooks.enderecos", service="svc-webhooks", description="Endereços de webhook", default=20, monthly=False, unit="endereços"),
     ]),
+    ModuleCatalog(service="svc-crm", module=_modulo("crm", "CRM", "Comercial"), limits=[]),
+    ModuleCatalog(service="svc-vendas", module=_modulo("vendas", "Vendas", "Comercial", requires=["crm"]), limits=[]),
+    ModuleCatalog(service="svc-juridico", module=_modulo("juridico", "Jurídico", "Serviços", default=False), limits=[]),
+    ModuleCatalog(service="svc-relatorios", module=_modulo("relatorios", "Relatórios", "Gestão", requires=["bi"]), limits=[]),
 ]
 
 
@@ -124,17 +134,27 @@ def _limites(resolved):
     return {s.name: (s.limit, s.used) for s in resolved.limits}
 
 
+def _ligados(resolved):
+    return sorted(m.name for m in resolved.modules if m.enabled)
+
+
 # ── Catálogo e resolução ────────────────────────────────────────────────────
 
 def test_sem_plano_valem_os_defaults_declarados():
     async def cenario(svc):
-        await svc.record_catalog(LimitCatalog(service="svc-ai", limits=CATALOGO[0].limits[:1]))  # tokens saiu da lista
-        return await como(ACME, lambda: svc.resolve(LimitsRequest())), await como(ACME, lambda: svc.list_limits(Empty()))
+        mudou = CATALOGO[0].model_copy(update={"limits": CATALOGO[0].limits[:1]})  # tokens saiu da lista
+        await svc.record_catalog(mudou)
+        return await como(ACME, lambda: svc.resolve(LimitsRequest())), await como(ACME, lambda: svc.catalog(Empty()))
 
     resolved, catalogo = run(cenario)
     assert (resolved.plan, resolved.plan_name, resolved.month) == (None, "Sem plano", MES)
     assert _limites(resolved) == {"ai.custo": (None, 0.0), "webhooks.enderecos": (20, 0)}
-    assert [c.name for c in catalogo.items] == ["ai.custo", "webhooks.enderecos"]  # o que saiu da lista sai do catálogo
+    assert [c.name for c in catalogo.limits] == ["ai.custo", "webhooks.enderecos"]  # o que saiu da lista sai do catálogo
+    # Por categoria e título. Jurídico não vem ligado sem plano; Relatórios precisa de BI, que não está instalado.
+    assert [(m.category, m.name) for m in catalogo.modules] == [
+        ("Comercial", "crm"), ("Comercial", "vendas"), ("Gestão", "relatorios"), ("Integrações", "ai"),
+        ("Integrações", "webhooks"), ("Serviços", "juridico")]
+    assert _ligados(resolved) == ["ai", "crm", "vendas", "webhooks"]
 
 
 def test_plano_padrao_vale_para_quem_nao_tem_e_atribuido_vale_para_quem_tem(box):
@@ -149,7 +169,7 @@ def test_plano_padrao_vale_para_quem_nao_tem_e_atribuido_vale_para_quem_tem(box)
 
     antes, conta, depois, beta, atual = run(cenario)
     assert (antes.plan, _limites(antes)) == ("gratis", {"ai.custo": (1, 0.0), "ai.tokens": (None, 0.0), "webhooks.enderecos": (2, 0)})
-    assert conta.model_dump() == {"tenant": "acme", "tenant_name": "Acme", "plan": "pro", "plan_name": "Pro"}
+    assert conta.model_dump() == {"tenant": "acme", "tenant_name": "Acme", "plan": "pro", "plan_name": "Pro", "assigned": True, "modules": {}}
     assert box.contacts == [("rpc.identity.contacts", "acme", "system:svc-plans")]  # confere a organização no svc-identity
     # O plano cita null (sem limite) para tokens e nada para endereços: vale o default declarado (20).
     assert (depois.plan, _limites(depois)) == ("pro", {"ai.custo": (50, 0.0), "ai.tokens": (None, 0.0), "webhooks.enderecos": (20, 0)})
@@ -225,6 +245,75 @@ def test_um_padrao_so_comparacao_publica_e_remocao_protegida():
     assert ([p.slug for p in beta.items], beta.current) == (["gratis", "pro", "sob-medida"], "sob-medida")  # o seu aparece
     assert erros == ["ERRO_PLANS_IN_USE", "ERRO_PLANS_IN_USE"]
     assert [p.slug for p in sobra.items] == ["pro", "sob-medida"]
+
+
+# ── Módulos: plano, ajuste da organização e requisitos ──────────────────────
+
+def test_modulos_vem_do_plano_e_do_ajuste_da_organizacao():
+    async def cenario(svc):
+        await planos(svc)
+        await como(PLATAFORMA, lambda: svc.update_plan(PlanUpdate(slug="gratis", modules={"crm": True, "vendas": False})))
+        await como(PLATAFORMA, lambda: svc.update_plan(PlanUpdate(slug="pro", modules={"juridico": True})))
+        gratis = await como(ACME, lambda: svc.resolve(LimitsRequest()))  # sem plano atribuído: o padrão (grátis)
+        conta = await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro", modules={"vendas": False})))
+        ajustado = await como(ACME, lambda: svc.resolve(LimitsRequest()))
+        mantido = await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro")))  # null: mantém
+        acme = await como(PLATAFORMA, lambda: svc.account(AccountRef(tenant="acme")))
+        beta = await como(PLATAFORMA, lambda: svc.account(AccountRef(tenant="beta")))
+        await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro", modules={})))  # {}: só o plano
+        so_plano = await como(ACME_MEMBRO, lambda: svc.modules(Empty()))
+        pro = (await como(PLATAFORMA, lambda: svc.list_plans(Empty()))).items[1]
+        return gratis, conta, ajustado, mantido, acme, beta, so_plano, pro
+
+    gratis, conta, ajustado, mantido, acme, beta, so_plano, pro = run(cenario)
+    assert _ligados(gratis) == ["ai", "crm", "webhooks"]
+    assert conta.modules == {"vendas": False} and mantido.modules == {"vendas": False}
+    assert _ligados(ajustado) == ["ai", "crm", "juridico", "webhooks"]  # pro com Jurídico, menos Vendas (só para a Acme)
+    assert (acme.plan, acme.assigned, acme.modules, acme.tenant_name) == ("pro", True, {"vendas": False}, "Acme")
+    assert (beta.plan, beta.assigned, beta.modules) == ("gratis", False, {})  # sem atribuição: vale o padrão
+    assert sorted(m.name for m in so_plano.items if m.enabled) == ["ai", "crm", "juridico", "vendas", "webhooks"]
+    assert (pro.slug, pro.modules) == ("pro", {"juridico": True})
+
+
+def test_trilhos_dos_modulos():
+    async def cenario(svc):
+        await planos(svc)
+        resultados = []
+        for call in (
+            lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"estoque": True})),
+            lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"ai": False})),
+            lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"crm": False, "vendas": True})),
+            lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"crm": False})),  # vendas vem ligado
+            lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"relatorios": True})),  # BI não instalado
+            lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro", modules={"crm": False})),
+        ):
+            with pytest.raises(ServiceError) as exc:
+                await como(PLATAFORMA, call)
+            resultados.append((exc.value.code, exc.value.status, exc.value.message))
+        ok = await como(PLATAFORMA, lambda: svc.create_plan(PlanInput(slug="novo", name="Novo", modules={"ai": True, "crm": False, "vendas": False})))
+        return resultados, ok
+
+    resultados, ok = run(cenario)
+    assert [(code, status) for code, status, _ in resultados] == [
+        ("ERRO_PLANS_UNKNOWN_MODULE", 422), ("ERRO_PLANS_CORE_MODULE", 422), ("ERRO_PLANS_MODULE_REQUIRES", 422),
+        ("ERRO_PLANS_MODULE_REQUIRES", 422), ("ERRO_PLANS_MODULE_REQUIRES", 422), ("ERRO_PLANS_MODULE_REQUIRES", 422),
+    ]
+    assert resultados[2][2] == "Vendas precisa de CRM: ligue também ou desligue Vendas."
+    assert resultados[3][2] == "Vendas precisa de CRM: desligue também ou mantenha ligado."
+    assert "bi" in resultados[4][2]
+    assert ok.modules == {"crm": False, "vendas": False}  # o da plataforma não é guardado: está sempre ligado
+    with pytest.raises(ValidationError):
+        PlanInput(slug="x", name="Xis", modules={"Vendas": True})
+
+
+def test_rpc_assign_com_modulo_avulso():
+    async def cenario(svc):
+        await planos(svc)
+        trocado = await como(system("svc-pagamentos", "acme"), lambda: svc.assign(AssignRequest(plan="gratis", modules={"juridico": True})))
+        return trocado, await como(ACME, lambda: svc.resolve(LimitsRequest()))
+
+    trocado, resolved = run(cenario)
+    assert trocado.modules == {"juridico": True} and "juridico" in _ligados(resolved)
 
 
 # ── Consumo do mês, totais e avisos ─────────────────────────────────────────

@@ -14,10 +14,14 @@ from core.plans import (  # contrato com core/plans.py
     Assigned,
     AssignRequest,
     CatalogLimit,
+    CatalogModule,
     CountReport,
-    LimitCatalog,
     LimitsRequest,
     LimitState,
+    Module,
+    ModuleCatalog,
+    ModuleName,
+    ModuleState,
     PlanLimits,
     PlanSlug,
     UsageReport,
@@ -28,15 +32,16 @@ SERVICE = "svc-plans"
 TASK_QUEUE = "plans-queue"
 USAGE_LIVE = "plans.uso"  # ao vivo para a organização quando um consumo ou um total muda (README §5.10)
 
-# Catálogo, planos e o plano de cada organização (org = id dela) valem para a plataforma: quem a administra precisa
-# saber se um plano está em uso. Consumo e totais são de cada organização.
-LIMITS = "plan_limits"
+# Catálogo (módulos e limites), planos e o plano de cada organização (org = id dela) valem para a plataforma: quem a
+# administra precisa saber se um plano está em uso. Consumo e totais são de cada organização.
+LIMIT_CATALOG = "plan_limits"
+MODULE_CATALOG = "plan_modules"
 TIERS = "plan_tiers"
 ACCOUNTS = "plan_accounts"
 USAGE = "plan_usage"
 USAGE_LOG = "plan_usage_log"
 COUNTS = "plan_counts"
-SHARED_TABLES = [LIMITS, TIERS, ACCOUNTS]
+SHARED_TABLES = [LIMIT_CATALOG, MODULE_CATALOG, TIERS, ACCOUNTS]
 TENANT_TABLES = [USAGE, USAGE_LOG, COUNTS]
 UNIQUE = {TIERS: ["slug"], ACCOUNTS: ["org"], USAGE: ["name", "month"], USAGE_LOG: ["message"], COUNTS: ["name"]}
 
@@ -50,6 +55,10 @@ LimitName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]*\.[a-z][a
 LimitValue = Annotated[float, Field(ge=0)]
 Currency = Literal["BRL", "USD", "EUR"]  # as moedas que a tela formata (Money)
 Id = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+
+# O próprio módulo (README §5.17): da plataforma, sempre ligado.
+MODULE = Module("Plano", "Plano, módulos e consumo da organização", category="Organização", core=True)
 
 
 class PlansSettings(BaseSettings):
@@ -73,6 +82,7 @@ class Plan(BaseModel):
     public: bool = Field(..., description="Aparece para as organizações na comparação de planos")
     default: bool = Field(..., description="Plano de quem ainda não tem um atribuído")
     limits: dict[str, float | None] = Field(..., description="Limite → valor (null: sem limite); o que falta vale o default")
+    modules: dict[str, bool] = Field(..., description="Módulo → incluído; o que falta vale o default do módulo")
 
 
 class PlanInput(_Input):
@@ -84,6 +94,7 @@ class PlanInput(_Input):
     public: bool = True
     default: bool = False
     limits: dict[LimitName, LimitValue | None] = Field(default_factory=dict, description="Limite → valor (null: sem limite)")
+    modules: dict[ModuleName, bool] = Field(default_factory=dict, description="Módulo → incluído (o que falta vale o default)")
 
 
 class PlanUpdate(_Input):
@@ -95,6 +106,7 @@ class PlanUpdate(_Input):
     public: bool | None = None
     default: bool | None = None
     limits: dict[LimitName, LimitValue | None] | None = Field(None, description="Substitui a lista inteira")
+    modules: dict[ModuleName, bool] | None = Field(None, description="Substitui a lista inteira")
 
 
 class PlanRef(_Input):
@@ -107,8 +119,17 @@ class PlanList(BaseModel):
     manages_platform: bool = Field(..., description="Quem pede administra os planos da plataforma")
 
 
-class LimitList(BaseModel):
-    items: list[CatalogLimit]
+class Catalog(BaseModel):
+    """O que os serviços declararam: os módulos (por categoria) e os limites."""
+
+    modules: list[CatalogModule]
+    limits: list[CatalogLimit]
+
+
+class ModuleList(BaseModel):
+    """Os módulos da plataforma e se cada um está ligado para a organização ativa (o menu esconde os desligados)."""
+
+    items: list[ModuleState]
 
 
 class Current(BaseModel):
@@ -116,19 +137,29 @@ class Current(BaseModel):
     plan: Plan | None = Field(..., description="Plano em vigor (atribuído ou o padrão); null: sem plano")
     month: str = Field(..., description="AAAA-MM, em UTC: o mês dos consumos")
     limits: list[LimitState]
+    modules: list[ModuleState]
     manages_platform: bool
 
 
 class AssignInput(_Input):
     tenant: Id = Field(..., description="Id da organização (aparece para ela na tela Plano)")
     plan: PlanSlug
+    modules: dict[ModuleName, bool] | None = Field(
+        None, description="Ajuste da organização: módulo → ligado, além do plano. null: mantém o ajuste; {}: só o plano"
+    )
+
+
+class AccountRef(_Input):
+    tenant: Id
 
 
 class Account(BaseModel):
     tenant: str
     tenant_name: str
-    plan: str
+    plan: str | None = Field(..., description="Plano em vigor (atribuído ou o padrão); null: sem plano")
     plan_name: str
+    assigned: bool = Field(..., description="O plano foi atribuído (false: vale o padrão)")
+    modules: dict[str, bool] = Field(..., description="Ajuste da organização além do plano: módulo → ligado")
 
 
 class UsageChanged(BaseModel):

@@ -26,7 +26,7 @@ from core.webhooks import webhooks
 from schemas import (
     CONTACTS_SUBJECT,
     COOKIE_PATH,
-    LIMITS,
+    MODULE,
     PUBLIC_PATHS,
     REFRESH_COOKIE,
     SERVICE,
@@ -35,6 +35,7 @@ from schemas import (
     TRIGGER_SUBJECT,
     UNIQUE,
     WEBHOOKS,
+    ColorInput,
     ContactsRequest,
     Empty,
     ForgotInput,
@@ -77,7 +78,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
         await webhooks.declare(WEBHOOKS)  # membro-entrou e membro-saiu no catálogo (README §5.16)
-        await plans.declare(LIMITS)  # pessoas por organização no catálogo de limites dos planos (README §5.17)
+        await plans.declare(MODULE)  # o módulo, com pessoas por organização, no catálogo dos planos (README §5.17)
         yield
 
 
@@ -202,6 +203,11 @@ async def logo_upload(data: UploadRequest) -> ResponseEnvelope:
 @app.post("/organization/logo", response_model=ResponseEnvelope)
 async def set_logo(data: KeepRequest) -> ResponseEnvelope:
     return _ok(await svc.set_logo(data))
+
+
+@app.post("/organization/color", response_model=ResponseEnvelope)
+async def set_color(data: ColorInput) -> ResponseEnvelope:
+    return _ok(await svc.set_color(data))
 
 
 @app.post("/organization/logo/remove", response_model=ResponseEnvelope)

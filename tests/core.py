@@ -663,11 +663,14 @@ class _FakeJetStream:
 
 class _FakeMsg:
     def __init__(self, data, headers):
-        self.data, self.headers, self.acked = data, headers, False
+        self.data, self.headers, self.acked, self.termed = data, headers, False, False
         self.metadata = SimpleNamespace(sequence=SimpleNamespace(stream=7), num_delivered=1)
 
     async def ack(self):
         self.acked = True
+
+    async def term(self):
+        self.termed = True
 
 
 def _connected_bus():
@@ -1667,6 +1670,8 @@ from core.plans import (  # noqa: E402
     Assigned,
     Limit,
     LimitState,
+    Module,
+    ModuleState,
     PlanLimits,
     plans,
 )
@@ -1674,6 +1679,12 @@ from core.plans import (  # noqa: E402
 BETA = Principal(sub="bia", tenant="beta", roles=frozenset({"owner"}))
 ENDERECOS = Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")
 CUSTO = Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD")
+MODULO_FATURAS = Module("Faturas", "Faturas e cobranças da organização", category="Financeiro", limits=[ENDERECOS, CUSTO])
+
+
+def _modulo(name="faturas", enabled=True, title="Faturas"):
+    return ModuleState(name=name, service=f"svc-{name}", title=title, description="Módulo de teste", category="Financeiro",
+                       core=False, default=True, requires=[], enabled=enabled)
 
 
 def _estado(name, limit, used=0, monthly=False, description="Endereços de webhook", unit="endereços", currency=None):
@@ -1683,8 +1694,8 @@ def _estado(name, limit, used=0, monthly=False, description="Endereços de webho
 
 @pytest.fixture
 def plano(monkeypatch):
-    """Serviço svc-faturas com dois limites declarados e um svc-plans de mentira. Devolve o que aconteceu."""
-    box = SimpleNamespace(published=[], requests=[], limits=[], plan="pro", fail=None)
+    """Serviço svc-faturas (módulo com dois limites) e um svc-plans de mentira. Devolve o que aconteceu."""
+    box = SimpleNamespace(published=[], requests=[], limits=[], modules=[], plan="pro", fail=None)
 
     async def publish(subject, message, msg_id=None):
         box.published.append((subject, message, msg_id, security.current()))
@@ -1694,15 +1705,16 @@ def plano(monkeypatch):
         if box.fail is not None:
             raise box.fail
         if subject == ASSIGN_SUBJECT:
-            return Assigned(tenant=security.current_tenant(), plan=message.plan, plan_name=message.plan.title())
-        return PlanLimits(plan=box.plan, plan_name=(box.plan or "").title(), month="2026-10", limits=box.limits)
+            return Assigned(tenant=security.current_tenant(), plan=message.plan, plan_name=message.plan.title(), modules=message.modules or {})
+        return PlanLimits(plan=box.plan, plan_name=(box.plan or "").title(), month="2026-10", limits=box.limits, modules=box.modules)
 
     monkeypatch.setattr(nats_bus.bus, "publish", publish)
     monkeypatch.setattr(nats_bus.bus, "request", request)
     monkeypatch.setattr(nats_bus.bus, "_service", "svc-faturas")
     monkeypatch.setattr(plans, "_declared", {})
+    monkeypatch.setattr(plans, "_module", None)  # a conferência de módulo é do processo: volta ao fim do teste
     plans.clear()
-    asyncio.run(plans.declare([ENDERECOS, CUSTO]))
+    asyncio.run(plans.declare(MODULO_FATURAS))
     yield box
     plans.clear()
 
@@ -1722,15 +1734,100 @@ def _limite(call):
     return exc.value.message
 
 
-def test_limites_declarados_vao_ao_catalogo(plano):
+def test_modulo_e_limites_declarados_vao_ao_catalogo(plano):
     subject, catalog, msg_id, _ = plano.published[0]
-    assert (subject, catalog.service, msg_id.startswith("limits-svc-faturas-")) == ("events.plans.catalog", "svc-faturas", True)
+    assert (subject, catalog.service, msg_id.startswith("catalog-svc-faturas-")) == ("events.plans.catalog", "svc-faturas", True)
+    module = catalog.module
+    assert (module.name, module.title, module.category, module.core, module.default, module.requires) == (
+        "faturas", "Faturas", "Financeiro", False, True, [])
     assert [(c.name, c.default, c.monthly, c.unit, c.currency) for c in catalog.limits] == [
         ("faturas.enderecos", 20, False, "endereços", None), ("faturas.custo", None, True, "", "USD")]
     with pytest.raises(ValueError, match="repetido"):
-        asyncio.run(plans.declare([ENDERECOS, ENDERECOS]))
+        Module("Faturas", "Faturas da organização", limits=[ENDERECOS, ENDERECOS])
     with pytest.raises(ValueError, match="kebab-case"):
         Limit("Endereços", "Endereços de webhook")
+    with pytest.raises(ValueError, match="sem svc-"):
+        Module("Vendas", "Funil e propostas", requires=["svc-crm"])
+    with pytest.raises(ValueError, match="não depende"):
+        Module("Pessoas", "Contas e acesso", core=True, requires=["crm"])
+    with pytest.raises(ValueError, match="si mesmo"):
+        asyncio.run(plans.declare(Module("Faturas", "Faturas da organização", requires=["faturas"])))
+
+
+def test_modulo_desligado_recusa_quem_chama_e_o_default_vale_ate_o_catalogo(plano, monkeypatch):
+    plano.modules = [_modulo(enabled=False)]
+    with pytest.raises(ServiceError) as fora:
+        _como(ACME, lambda: plans._gate(ACME))
+    assert (fora.value.code, fora.value.status) == ("ERRO_PLAN_MODULE", 402)
+    assert fora.value.message == "Faturas não está incluído no plano Pro. Veja em Plano."
+    plano.modules, plano.plan = [_modulo(enabled=True)], None
+    plans.clear()
+    _como(ACME, lambda: plans._gate(ACME))
+    plano.modules = []  # o svc-plans ainda não gravou o catálogo: vale o default declarado
+    plans.clear()
+    _como(ACME, lambda: plans._gate(ACME))
+    monkeypatch.setattr(plans, "_module", Module("Faturas", "Faturas da organização", default=False))
+    plans.clear()
+    with pytest.raises(ServiceError, match="para a organização"):
+        _como(ACME, lambda: plans._gate(ACME))
+    plano.fail = nats_bus.nats.errors.NoRespondersError()  # svc-plans fora do ar e nada guardado: todo módulo ligado
+    plans.clear()
+    _como(ACME, lambda: plans._gate(ACME))
+    monkeypatch.setattr(plans, "_module", Module("Pessoas", "Contas e acesso", core=True))
+    plano.fail, plano.modules = None, [_modulo(enabled=False)]
+    plans.clear()
+    _como(ACME, lambda: plans._gate(ACME))  # módulo da plataforma: sempre ligado, nem pergunta
+    assert [s for s, _ in plano.requests].count(LIMITS_SUBJECT) == 5  # o da plataforma não perguntou
+
+
+def test_modulo_desligado_recusa_http_evento_e_rpc_mas_nao_a_plataforma(plano, auth_env):
+    plano.modules = [_modulo(enabled=False)]
+    client = _app()
+    acme = {"Authorization": f"Bearer {security.issue_token('u1', tenant='acme')}"}
+    sem_org = {"Authorization": f"Bearer {security.issue_token('u1')}"}
+    negado = client.get("/privada", headers=acme)
+    assert negado.status_code == 402 and negado.json()["error"]["code"] == "ERRO_PLAN_MODULE"
+    assert client.get("/privada", headers=sem_org).status_code == 200  # sem organização: o serviço decide
+    assert client.get("/aberta").status_code == 200  # rota pública não tem organização de quem chama
+
+    b, seen, replies = _connected_bus(), [], []
+
+    async def handler(data):
+        seen.append(security.current().sub)
+        return data
+
+    async def subscribe(subject, queue, cb):
+        b._rpc_callback = cb
+
+    async def respond(raw):
+        replies.append(envelope.ResponseEnvelope.model_validate_json(raw))
+
+    b._nc = SimpleNamespace(subscribe=subscribe)
+
+    async def run():
+        await b.subscribe("events.faturas.trigger", handler, Entrada)
+        recusada = _FakeMsg(b'{"valor": 1}', {nats_bus.PRINCIPAL_HEADER: ACME.model_dump_json()})
+        await b._js.callback(recusada)
+        tarefa = _FakeMsg(b'{"valor": 1}', {nats_bus.PRINCIPAL_HEADER: security.system("svc-faturas", "acme").model_dump_json()})
+        await b._js.callback(tarefa)
+        await b.respond("rpc.faturas.total", handler, Entrada)
+        pedido = SimpleNamespace(data=b'{"valor": 1}', headers={nats_bus.PRINCIPAL_HEADER: ACME.model_dump_json()}, respond=respond)
+        await b._rpc_callback(pedido)
+        return recusada, tarefa
+
+    recusada, tarefa = asyncio.run(run())
+    assert (recusada.termed, recusada.acked, tarefa.acked) == (True, False, True)  # recusada sem reentrega
+    assert seen == ["system:svc-faturas"]  # a tarefa da plataforma passa
+    assert (replies[0].ok, replies[0].error.code, replies[0].error.status) == (False, "ERRO_PLAN_MODULE", 402)
+
+
+def test_modulo_de_outro_servico_ligado_ou_nao(plano):
+    plano.modules = [_modulo("crm", enabled=False, title="CRM"), _modulo("estoque")]
+    assert _como(ACME, lambda: plans.enabled("crm")) is False
+    assert _como(ACME, lambda: plans.enabled("estoque")) is True
+    assert _como(ACME, lambda: plans.enabled("desconhecido")) is True  # o svc-plans não conhece: não bloqueia
+    with pytest.raises(ValueError, match="sem svc-"):
+        _como(ACME, lambda: plans.enabled("svc-crm"))
 
 
 def test_limite_total_confere_quanto_existe_e_o_default_vale_sem_plano(plano):
@@ -1806,6 +1903,8 @@ def test_trocar_de_plano_so_como_tarefa_da_plataforma(plano):
         _como(ACME, lambda: plans.assign("pro"))
     assigned = _como(security.system("svc-pagamentos", "acme"), lambda: plans.assign("pro"))
     assert (assigned.tenant, assigned.plan, plano.requests[-1]) == ("acme", "pro", (ASSIGN_SUBJECT, "acme"))
+    avulso = _como(security.system("svc-pagamentos", "acme"), lambda: plans.assign("pro", modules={"juridico": True}))
+    assert avulso.modules == {"juridico": True}  # módulo comprado à parte, além do plano
     _como(ACME, lambda: plans.check("enderecos", used=0))
     assert [s for s, _ in plano.requests].count(LIMITS_SUBJECT) == 2  # trocar esquece a resolução guardada
 
@@ -1813,7 +1912,7 @@ def test_trocar_de_plano_so_como_tarefa_da_plataforma(plano):
 def test_planos_exigem_bus_conectado(monkeypatch):
     monkeypatch.setattr(nats_bus.bus, "_service", None)
     with pytest.raises(RuntimeError, match="bus não conectado"):
-        asyncio.run(plans_module.plans.declare([]))
+        asyncio.run(plans_module.plans.declare(MODULO_FATURAS))
 
 
 # ── Observabilidade: core/telemetry.py (README §5.18) ────────────────────────

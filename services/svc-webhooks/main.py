@@ -22,7 +22,7 @@ from core.webhooks import webhooks
 from schemas import (
     CATALOG_SUBJECT,
     EMIT_SUBJECT,
-    LIMITS,
+    MODULE,
     RETRY_SUBJECT,
     SERVICE,
     SHARED_TABLES,
@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(EMIT_SUBJECT, on_emit, model=Emitted)
         await bus.subscribe(RETRY_SUBJECT, on_retry, model=DeliveryRef)
         await webhooks.declare(WEBHOOKS)  # o próprio webhooks.teste entra no catálogo
-        await plans.declare(LIMITS)  # endereços por organização no catálogo de limites dos planos (README §5.17)
+        await plans.declare(MODULE)  # o módulo, com endereços por organização, no catálogo dos planos (README §5.17)
         yield
 
 

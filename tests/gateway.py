@@ -428,7 +428,10 @@ LOJA_SCHEMAS = """
 from enum import Enum
 from typing import ClassVar, Literal
 from pydantic import BaseModel, Field
+from core.plans import Limit, Module
 from core.surreal import ListQuery, Page
+
+MODULE = Module("Loja", "Faturas e pedidos da loja", category="Comercial", limits=[Limit("faturas", "Faturas no mês", monthly=True)])
 
 class Status(str, Enum):
     ABERTA = "aberta"
@@ -534,6 +537,18 @@ def test_contrato_com_modelo_inexistente_e_erro(loja_dirs):
     broken = {**LOJA, "endpoints": [{**LOJA["endpoints"][0], "request": "FaturaInn"}]}
     (endpoints / "loja.yaml").write_text(json.dumps(broken))
     with pytest.raises(RuntimeError, match="cita FaturaInn"):
+        contracts.generate(endpoints, services)
+
+
+def test_contrato_lista_os_modulos_para_o_menu_e_tipa_o_nome(loja_dirs):
+    import contracts
+
+    endpoints, services = loja_dirs
+    ts = contracts.generate(endpoints, services)
+    assert 'loja: { title: "Loja", description: "Faturas e pedidos da loja", category: "Comercial", core: false },' in ts
+    assert "export type ModuleName = keyof typeof appModules;" in ts
+    (services / "svc-loja" / "schemas.py").write_text(LOJA_SCHEMAS.replace("MODULE = ", "OUTRO = "))
+    with pytest.raises(RuntimeError, match="não declara MODULE"):  # todo serviço com rota é um módulo
         contracts.generate(endpoints, services)
 
 

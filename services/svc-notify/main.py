@@ -12,12 +12,14 @@ from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import install_security
 from core.surreal import db
 from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    MODULE,
     SEND_SUBJECT,
     SERVICE,
     SHARED_TABLES,
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
         runner.worker(TASK_QUEUE, workflows=[NotifyWorkflow, NotifyCleanupWorkflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(SEND_SUBJECT, on_send, model=NotifyRequest)
+        await plans.declare(MODULE)  # o módulo, da plataforma, no catálogo dos planos (README §5.17)
         yield
 
 

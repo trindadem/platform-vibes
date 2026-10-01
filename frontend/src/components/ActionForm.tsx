@@ -16,11 +16,11 @@ export interface ActionFormProps<B> {
     running: boolean;
     error: { message: string; details?: { loc?: (string | number)[]; msg?: string; type?: string }[] } | null;
   };
-  /** Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options. */
+  /** Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; color dá #rrggbb. */
   fields: {
     name: keyof B & string;
     label: string;
-    kind?: "text" | "email" | "password" | "number" | "textarea" | "select";
+    kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "color";
     required?: boolean;
     placeholder?: string;
     hint?: string;

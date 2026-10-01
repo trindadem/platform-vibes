@@ -1,44 +1,82 @@
 /**
- * Router plano (README §6): cada src/modules/<modulo>/page.tsx vira a rota /<modulo>.
- * Nada é registrado à mão: criar a pasta com page.tsx publica a tela.
+ * Router montado a partir de src/modules (README §6): cada page.tsx vira uma rota, sem registro manual.
+ * - modules/<modulo>/page.tsx          → /<modulo>         (item do menu)
+ * - modules/<modulo>/<parte>/page.tsx  → /<modulo>/<parte> (subitem, abaixo do item do módulo)
+ * - modules/<modulo>/[id]/page.tsx     → /<modulo>/:id     (fora do menu; o valor vem de useParams)
  *
  * meta.access decide quem vê:
  * - "private" (padrão): exige sessão, aparece no menu, dentro do AppShell. Sem sessão → /entrar?next=<rota>.
  * - "public": aberta com ou sem sessão (ex.: /convite), fora do menu, dentro do AuthShell.
  * - "guest": só sem sessão (ex.: /entrar, /cadastro). Com sessão, segue para ?next= ou para o início.
+ *
+ * meta.module diz de que módulo (serviço) é a tela (README §5.17): o menu a agrupa pela categoria do módulo e a
+ * esconde quando o plano da organização não inclui o módulo; aberta pelo endereço, mostra o aviso de fora do plano.
+ * As subtelas herdam o módulo da tela do módulo. Sem resposta do svc-plans, tudo aparece (o serviço confere de novo).
+ *
+ * A moldura usa o nome, o logo e a cor da organização ativa (svc-identity).
  */
-import type { ComponentType, ReactNode } from "react";
+import { type ComponentType, createContext, type ReactNode, useContext } from "react";
 import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router";
-import { AppShell } from "@/components/AppShell";
+import { AppShell, type NavItem } from "@/components/AppShell";
 import { AuthShell } from "@/components/AuthShell";
+import { Button } from "@/components/Button";
 import { EmptyState } from "@/components/EmptyState";
 import { NotificationBell } from "@/components/NotificationBell";
 import { SessionStatus } from "@/components/SessionStatus";
 import { Spinner } from "@/components/Spinner";
 import { TenantSwitcher } from "@/components/TenantSwitcher";
-import { useLiveQuery } from "@/core/api";
-import { logout, switchTenant, useAuthState } from "@/core/auth";
-import { notify } from "@/core/contracts";
+import { useLiveQuery, useQuery } from "@/core/api";
+import { logout, type Session, switchTenant, useAuthState } from "@/core/auth";
+import { appModules, identity, type ModuleName, notify, plans } from "@/core/contracts";
 
 const BRAND = "CV-Frame";
 const LOGIN = "/entrar";
 const NEW_TENANT = "/organizacoes";
+const PLAN = "/plano";
 
-/** O que cada page.tsx exporta como `meta`: o texto do menu, a posição e quem pode ver. */
+/** O que cada page.tsx exporta como `meta`: o texto do menu, a posição, quem pode ver e de que módulo é. */
 export interface PageMeta {
   title: string;
   order?: number;
   access?: "private" | "public" | "guest";
+  /** Módulo (serviço, sem svc-) da tela: agrupa no menu e some quando o plano não o inclui. Subtela herda o do módulo. */
+  module?: ModuleName;
 }
 
-const found = import.meta.glob<{ default: ComponentType; meta: PageMeta }>("./modules/*/page.tsx", { eager: true });
+interface Screen {
+  path: string;
+  /** Rota da tela do módulo (/<modulo>), de quem as subtelas herdam o módulo. */
+  root: string;
+  Page: ComponentType;
+  meta: PageMeta;
+  module?: ModuleName;
+  /** No menu: telas privadas sem parâmetro na rota. */
+  listed: boolean;
+}
 
-const pages = Object.entries(found)
-  .map(([file, module]) => ({ path: `/${file.split("/")[2]}`, Page: module.default, meta: module.meta }))
+const found = import.meta.glob<{ default: ComponentType; meta: PageMeta }>("./modules/**/page.tsx", { eager: true });
+
+const screens: Screen[] = Object.entries(found)
+  .map(([file, page]) => {
+    const dirs = file.split("/").slice(2, -1); // ./modules/<modulo>/.../page.tsx
+    const path = `/${dirs.map((dir) => (dir.startsWith("[") ? `:${dir.slice(1, -1)}` : dir)).join("/")}`;
+    const access = page.meta.access ?? "private";
+    return { path, root: `/${dirs[0]}`, Page: page.default, meta: page.meta, listed: access === "private" && !path.includes(":") };
+  })
+  .map((screen, _, all) => ({ ...screen, module: screen.meta.module ?? all.find((s) => s.path === screen.root)?.meta.module }))
   .sort((a, b) => (a.meta.order ?? 100) - (b.meta.order ?? 100) || a.meta.title.localeCompare(b.meta.title));
-const privatePages = pages.filter((p) => (p.meta.access ?? "private") === "private");
-const openPages = pages.filter((p) => p.meta.access === "public" || p.meta.access === "guest");
-const home = privatePages[0]?.path ?? "/";
+const privatePages = screens.filter((s) => (s.meta.access ?? "private") === "private");
+const openPages = screens.filter((s) => s.meta.access === "public" || s.meta.access === "guest");
+/** Início: a primeira tela do menu que todo plano tem (sem módulo ou de módulo da plataforma). */
+const home = privatePages.find((s) => s.listed && always(s.module))?.path ?? "/";
+
+function always(module?: ModuleName): boolean {
+  return module === undefined || appModules[module].core;
+}
+
+/** Módulo ligado para a organização ativa? null enquanto o svc-plans não respondeu. */
+type Included = (module?: ModuleName) => boolean | null;
+const ModulesContext = createContext<Included>(() => true);
 
 export function App() {
   const { ready } = useAuthState();
@@ -64,8 +102,16 @@ export function App() {
             />
           ))}
           <Route element={<PrivateShell />}>
-            {privatePages.map(({ path, Page }) => (
-              <Route key={path} path={path} element={<Page />} />
+            {privatePages.map(({ path, Page, module }) => (
+              <Route
+                key={path}
+                path={path}
+                element={
+                  <ModuleGate module={module}>
+                    <Page />
+                  </ModuleGate>
+                }
+              />
             ))}
             <Route path="/" element={<Navigate to={home} replace />} />
             <Route
@@ -83,32 +129,79 @@ export function App() {
   );
 }
 
-/** Telas privadas: sem sessão, vai para o login lembrando a rota; com sessão, menu, organização e conta. */
+/** Telas privadas: sem sessão, vai para o login lembrando a rota; com sessão, a moldura da organização ativa. */
 function PrivateShell() {
   const { session } = useAuthState();
   const location = useLocation();
-  const navigate = useNavigate();
   if (!session) {
     const next = location.pathname === "/" ? "" : `?next=${encodeURIComponent(location.pathname + location.search)}`;
     return <Navigate to={LOGIN + next} replace />;
   }
+  // Trocar de organização monta a moldura de novo: módulos, marca e avisos são de cada organização.
+  return <TenantShell key={session.tenant?.id ?? ""} session={session} />;
+}
+
+/** Menu com os módulos que o plano inclui, marca da organização (nome, logo e cor), seletor e conta. */
+function TenantShell({ session }: { session: Session }) {
+  const navigate = useNavigate();
+  const tenant = session.tenant;
+  const modules = useQuery(plans.modules); // sem organização ativa, as duas respondem erro: tudo aparece, marca padrão
+  const organization = useQuery(identity.organization);
+  const included: Included = (module) => {
+    if (always(module) || modules.error) return true; // sem resposta do svc-plans, tudo aparece
+    if (!modules.data) return null;
+    return modules.data.items.find((m) => m.name === module)?.enabled ?? true;
+  };
   return (
-    <AppShell
-      actions={session.tenant && <UnreadBell key={session.tenant.id} />}
-      brand={BRAND}
-      nav={privatePages.map(({ path, meta }) => ({ to: path, label: meta.title }))}
-      switcher={
-        <TenantSwitcher
-          tenants={session.tenants}
-          current={session.tenant?.id ?? null}
-          onSwitch={(id) => void switchTenant(id).then(() => navigate(home))}
-          onCreate={() => navigate(NEW_TENANT)}
-        />
-      }
-      aside={<SessionStatus user={session.user.name} detail={session.user.email} onSignOut={() => void logout()} />}
-    >
-      <Outlet />
-    </AppShell>
+    <ModulesContext.Provider value={included}>
+      <AppShell
+        actions={tenant && <UnreadBell />}
+        brand={organization.data?.name ?? tenant?.name ?? BRAND}
+        logo={organization.data?.logo_url}
+        color={organization.data?.color}
+        nav={menu(included)}
+        switcher={
+          <TenantSwitcher
+            tenants={session.tenants}
+            current={tenant?.id ?? null}
+            onSwitch={(id) => void switchTenant(id).then(() => navigate(home))}
+            onCreate={() => navigate(NEW_TENANT)}
+          />
+        }
+        aside={<SessionStatus user={session.user.name} detail={session.user.email} onSignOut={() => void logout()} />}
+      >
+        <Outlet />
+      </AppShell>
+    </ModulesContext.Provider>
+  );
+}
+
+/** Itens do menu: telas listadas dos módulos incluídos; subtelas abaixo da tela do módulo; grupo = categoria. */
+function menu(included: Included): NavItem[] {
+  const shown = privatePages.filter((s) => s.listed && included(s.module) === true);
+  const roots = new Set(shown.filter((s) => s.path === s.root).map((s) => s.path));
+  return shown
+    .filter((s) => s.path === s.root || !roots.has(s.root))
+    .map((s) => ({
+      to: s.path,
+      label: s.meta.title,
+      group: s.module ? appModules[s.module].category : undefined,
+      items: shown.filter((sub) => sub.root === s.path && sub.path !== s.path).map((sub) => ({ to: sub.path, label: sub.meta.title })),
+    }));
+}
+
+/** Tela de módulo fora do plano, aberta pelo endereço: diz por quê e leva ao plano. */
+function ModuleGate({ module, children }: { module?: ModuleName; children: ReactNode }) {
+  const included = useContext(ModulesContext)(module);
+  const navigate = useNavigate();
+  if (included === null) return <Spinner label="Conferindo o plano" />;
+  if (included || !module) return children;
+  return (
+    <EmptyState
+      title={`${appModules[module].title} não está no seu plano`}
+      description={appModules[module].description}
+      action={<Button onClick={() => navigate(PLAN)}>Ver plano</Button>}
+    />
   );
 }
 

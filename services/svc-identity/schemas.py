@@ -7,7 +7,7 @@ from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings
 
 from core.notify import CONTACTS_SUBJECT, Contact, Contacts, ContactsRequest  # avisos (README §5.15): contrato do core
-from core.plans import Limit  # planos (README §5.17)
+from core.plans import Limit, Module  # módulos e planos (README §5.17)
 from core.storage import IMAGES, KeepRequest, Upload, UploadRequest  # arquivos (README §5.14): contrato do core
 from core.webhooks import WebhookEvent  # webhooks (README §5.16)
 
@@ -230,7 +230,7 @@ class Cleaned(BaseModel):
     resets: int = 0
 
 
-# ── Organização: nome e logo (arquivos, README §5.14) ─────────────────────────
+# ── Organização: nome, logo (arquivos, README §5.14) e cor da marca ──────────
 
 LOGO_TYPES = IMAGES
 LOGO_MAX_BYTES = 2_000_000
@@ -241,6 +241,13 @@ class Organization(BaseModel):
     id: str
     name: str
     logo_url: str | None = Field(None, description="Link assinado da imagem do logo (vale 1 h)")
+    color: str | None = Field(None, description="Cor da marca (#RRGGBB): a tela a usa como cor principal; null: a da plataforma")
+
+
+class ColorInput(_Input):
+    color: Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^#[0-9a-fA-F]{6}$")] | None = Field(
+        ..., description="#RRGGBB; null volta à cor da plataforma"
+    )
 
 
 # ── Webhooks: o que este serviço avisa aos sistemas da organização (README §5.16) ─
@@ -264,6 +271,8 @@ WEBHOOKS = [
 ]
 
 
-# ── Planos: o que este serviço limita (README §5.17) ─────────────────────────
+# ── Módulo: da plataforma, e o que ele limita (README §5.17) ─────────────────
 
-LIMITS = [Limit("membros", "Pessoas na organização", unit="pessoas")]  # sem plano: sem limite
+MODULE = Module("Pessoas e acesso", "Contas, organizações, membros e convites", category="Organização", core=True, limits=[
+    Limit("membros", "Pessoas na organização", unit="pessoas"),  # sem plano: sem limite
+])

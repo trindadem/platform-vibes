@@ -24,12 +24,13 @@ from core.storage import KeepRequest, UploadRequest
 
 import service
 from schemas import (
-    LIMITS,
     MEMBER_JOINED_SUBJECT,
+    MODULE,
     SHARED_TABLES,
     TENANT_CREATED_SUBJECT,
     UNIQUE,
     WEBHOOKS,
+    ColorInput,
     Empty,
     ForgotInput,
     InviteCode,
@@ -82,7 +83,7 @@ def events(monkeypatch):
     monkeypatch.setattr(service.plans, "_declared", {})
     PLANO.update(membros=None, contagens=[])
     asyncio.run(service.webhooks.declare(WEBHOOKS))  # como o boot: eventos no catálogo
-    asyncio.run(service.plans.declare(LIMITS))
+    asyncio.run(service.plans.declare(MODULE))
     published.clear()
     yield published
     _clear()
@@ -418,6 +419,29 @@ def test_logo_enviado_trocado_e_removido_so_por_quem_gerencia(events, bucket):
     _error(foreign_key, "ERRO_FILE_NOT_FOUND", 404)
     _error(wrong_type, "ERRO_FILE_TYPE", 422)
     assert removed.logo_url is None and not [k for k in _stored(bucket) if k.startswith("t/")]
+
+
+def test_cor_da_marca_so_por_quem_gerencia(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@x.com", organization=None, invite=await _code(svc, ana))
+        with as_user(ana):
+            colorida = await svc.set_color(ColorInput(color="#1E40AF"))
+        with as_user(bia):
+            vista = await svc.organization(Empty())
+            with pytest.raises(ServiceError) as membro:
+                await svc.set_color(ColorInput(color="#000000"))
+        with as_user(ana):
+            padrao = await svc.set_color(ColorInput(color=None))
+        return colorida, vista, membro, padrao
+
+    colorida, vista, membro, padrao = run(scenario)
+    assert colorida.color == "#1e40af" and vista.color == "#1e40af"  # minúsculas; membro vê a cor, só não troca
+    _error(membro, "ERRO_IDENTITY_FORBIDDEN", 403)
+    assert padrao.color is None  # volta à cor da plataforma
+    for invalida in ("azul", "#12345", "#gggggg", "rgb(0,0,0)"):
+        with pytest.raises(ValidationError):
+            ColorInput(color=invalida)
 
 
 # ── Avisos e e-mail (README §5.15) ──────────────────────────────────────────

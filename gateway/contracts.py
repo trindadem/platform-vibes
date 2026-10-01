@@ -6,6 +6,8 @@ caminho nem campo: se errar, o TypeScript acusa. Modelo citado no manifesto e au
 Rota com query: (GET de lista) recebe os parâmetros da URL tipados em query?, montados por withQuery (api.ts).
 Rota stream: true vira função com options.onDelta (pedaços tipados) que resolve com o resultado final; os tópicos
 live: viram a interface LiveTopics, que dá o tipo de cada evento em useLive/useLiveQuery (README §5.10).
+O MODULE de cada schemas.py (core/plans.py) vira a constante appModules e o tipo ModuleName: o meta.module de uma tela
+só aceita módulo que existe, e o menu agrupa pela categoria (README §5.17 e §6). Serviço com manifesto sem MODULE é erro.
 
 Rodar (da raiz):  uv run python gateway/contracts.py           gera o arquivo
                   uv run python gateway/contracts.py --check   falha se o arquivo estiver desatualizado
@@ -22,6 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(1, str(ROOT))  # o interpreter importa core/; rodando da raiz, a raiz precisa estar no path
 
 from pydantic import BaseModel  # noqa: E402
+
+from core.plans import Module  # noqa: E402
 
 from interpreter import ENDPOINTS_DIR, load_manifests  # noqa: E402
 from schemas import Endpoint, Manifest  # noqa: E402
@@ -59,11 +63,12 @@ export const gateway = {
 
 
 def generate(endpoints_dir: Path = ENDPOINTS_DIR, services_dir: Path = SERVICES_DIR) -> str:
-    sections, topics = [HEADER], []
+    sections, topics, modules = [HEADER], [], []
     for manifest in load_manifests(endpoints_dir):
-        section, service_topics = _service_section(manifest, services_dir)
+        section, service_topics, module = _service_section(manifest, services_dir)
         sections.append(section)
         topics += service_topics
+        modules.append((manifest.service, module))
     endpoints = [ep for manifest in load_manifests(endpoints_dir) for ep in manifest.endpoints]
     imports = ["request"]
     if any(ep.stream for ep in endpoints):
@@ -79,12 +84,33 @@ def generate(endpoints_dir: Path = ENDPOINTS_DIR, services_dir: Path = SERVICES_
         "/** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */\n"
         f"export interface LiveTopics {{\n{lines}}}\n"
     )
+    sections.append(_modules_section(modules))
     return "\n".join(sections)
 
 
-def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[tuple[str, str, str]]]:
+def _modules_section(modules: list[tuple[str, Module]]) -> str:
+    """appModules: o MODULE de cada serviço (título, categoria do menu, se é da plataforma) e o tipo ModuleName."""
+    entries = "".join(
+        f"  {_key(name)}: {{ title: {json.dumps(m.title, ensure_ascii=False)}, description: {json.dumps(m.description, ensure_ascii=False)}, "
+        f"category: {json.dumps(m.category, ensure_ascii=False)}, core: {json.dumps(m.core)} }},\n"
+        for name, m in modules
+    )
+    return (
+        "/** Módulos (o MODULE de cada services/svc-<nome>/schemas.py): o meta.module das telas e os grupos do menu. */\n"
+        f"export const appModules = {{\n{entries}}} as const;\n\n"
+        "/** Nome de um módulo: o do serviço, sem svc-. */\n"
+        "export type ModuleName = keyof typeof appModules;\n"
+    )
+
+
+def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[tuple[str, str, str]], Module]:
     prefix = _pascal(manifest.service)
     module = _load_schemas(services_dir / f"svc-{manifest.service}" / "schemas.py", manifest.service)
+    declared = getattr(module, "MODULE", None)
+    if not isinstance(declared, Module):
+        raise RuntimeError(
+            f"contracts: services/svc-{manifest.service}/schemas.py não declara MODULE = Module(...) (README §5.17)"
+        )
     types: dict[str, str] = {}
     functions = []
     for ep in manifest.endpoints:
@@ -102,7 +128,7 @@ def _service_section(manifest: Manifest, services_dir: Path) -> tuple[str, list[
         for t in manifest.live
     ]
     client = f"/** svc-{manifest.service} · {manifest.base_path} */\nexport const {_camel(manifest.service)} = {{\n" + "\n".join(functions) + "\n};\n"
-    return "\n".join([*types.values(), client]), topics
+    return "\n".join([*types.values(), client]), topics, declared
 
 
 def _function(manifest: Manifest, ep: Endpoint, body: str, result: str, delta: str | None = None, query: str | None = None) -> str:
@@ -198,6 +224,9 @@ def _ts(schema: dict[str, Any], prefix: str) -> str:
             fields = "; ".join(f"{_key(k)}{'' if k in schema.get('required', []) else '?'}: {_ts(v, prefix)}" for k, v in schema["properties"].items())
             return "{ " + fields + " }"
         extra = schema.get("additionalProperties")
+        if not (isinstance(extra, dict) and extra) and schema.get("patternProperties"):  # dict com chave restrita
+            values = list(schema["patternProperties"].values())
+            extra = values[0] if len(values) == 1 else {"anyOf": values}
         return f"Record<string, {_ts(extra, prefix)}>" if isinstance(extra, dict) and extra else "Record<string, unknown>"
     return "unknown"
 

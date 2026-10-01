@@ -4,6 +4,8 @@
 Deixar qualquer serviço usar IA de qualquer provedor compatível com a API da OpenAI sem tocar em chave: guarda
 provedores (endereço + chave criptografada) da plataforma e de cada organização, o catálogo curado de modelos e o
 uso com custo por organização. Os serviços chamam pelo `core/llm.py` (README §5.11).
+Módulo `ai` ("IA", categoria Integrações), da plataforma: sempre ligado; os limites dele são `ai.custo` e
+`ai.tokens` (README §5.17).
 
 ## 2. Contrato de Entrada e Saída
 Todas as rotas exigem token; gerenciar exige `owner` ou `admin` (provedor da plataforma: `owner`/`admin` da

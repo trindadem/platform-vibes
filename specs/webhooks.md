@@ -4,6 +4,8 @@
 Avisar os sistemas de cada organização quando algo acontece na plataforma: a organização cadastra endereços HTTPS e
 escolhe os eventos; cada evento sai assinado (padrão Standard Webhooks), com retentativas e registro de cada entrega.
 Os serviços emitem pelo `core/webhooks.py` (README §5.16) e nunca fazem a chamada eles mesmos.
+Módulo `webhooks` ("Webhooks", categoria Integrações), da plataforma: sempre ligado; limite `webhooks.enderecos`
+(README §5.17).
 
 ## 2. Contrato de Entrada e Saída
 Todas as rotas exigem token de `owner` ou `admin` e valem para a organização ativa.

@@ -70,7 +70,7 @@
 
 **Aplicação**: moldura e sessão (usados pelo App.tsx, não pelas páginas)
 
-- [AppShell](#appshell): Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, aside?, switcher?, actions?`
+- [AppShell](#appshell): Moldura da aplicação: menu lateral em grupos (gaveta no celular), marca com logo e cor, barra superior com a tela atual e conteúdo centralizado. `brand, nav, children, logo?, color?, aside?, switcher?, actions?`
 - [AuthShell](#authshell): Moldura das telas abertas (entrar, cadastro, convite): marca no topo e conteúdo numa coluna estreita e centralizada. `brand, children`
 - [NotificationBell](#notificationbell): Sino da barra superior com a quantidade de avisos não lidos; leva à lista de avisos. `count, to?`
 - [SessionStatus](#sessionstatus): Sessão no pé do menu: avatar com iniciais e menu para sair, ou aviso de que não há sessão. `user, onSignOut, detail?`
@@ -96,7 +96,7 @@ Receita de formulário: campos a partir de uma lista, envio pela ação, erro do
 ```
 
 - `action`: `{ run: (body: B) => Promise<unknown>; running: boolean; error: { message: string; details?: { loc?: (string | number)[]; msg?: string; type?: string }[] } | null; }`: Estado de useAction(...) (src/core/api.ts): o formulário chama action.run(valores).
-- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options.
+- `fields`: `{ name: keyof B & string; label: string; kind?: "text" | "email" | "password" | "number" | "textarea" | "select" | "color"; required?: boolean; placeholder?: string; hint?: string; options?: { value: string; label: string }[]; /** Dica de preenchimento automático (ex.: "email", "current-password", "new-password"). */ autoComplete?: string; }[]`: Campos na ordem. name é a chave do corpo da ação (o TypeScript confere); kind padrão text; number vira número; select usa options; color dá #rrggbb.
 - `submitLabel?`: `string`: Texto do botão de envio. Padrão: "Salvar".
 - `successMessage?`: `string`: Mensagem exibida após sucesso (o formulário é limpo).
 - `initial?`: `Partial<Record<keyof B & string, string>>`: Valores iniciais por campo.
@@ -644,7 +644,7 @@ Campo de texto de uma linha com rótulo, ajuda e erro ligados para acessibilidad
 - `label`: `string`: Rótulo visível (também é o nome acessível).
 - `value`: `string`
 - `onChange`: `(value: string) => void`: Recebe o novo texto, não o evento.
-- `type?`: `"text" | "email" | "password" | "number" | "search" | "url"`: Padrão: text.
+- `type?`: `"text" | "email" | "password" | "number" | "search" | "url" | "color"`: Padrão: text. color: seletor de cor, o valor é #rrggbb.
 - `hint?`: `string`: Ajuda abaixo do campo.
 - `error?`: `string`: Mensagem de erro: marca o campo como inválido.
 - `required?`: `boolean`
@@ -756,16 +756,23 @@ Link no meio do texto para outra tela da aplicação. _(Texto)_
 
 ## AppShell
 
-Moldura da aplicação: menu lateral (gaveta no celular), barra superior com a tela atual e conteúdo centralizado. _(Aplicação)_
+Moldura da aplicação: menu lateral em grupos (gaveta no celular), marca com logo e cor, barra superior com a tela atual e conteúdo centralizado. _(Aplicação)_
 
 ```tsx
-<AppShell brand="CV-Frame" nav={[{ to: "/faturas", label: "Faturas" }]} aside={<SessionStatus user={usuario} onSignOut={sair} />}>
+<AppShell
+  brand="Acme"
+  color="#1e40af"
+  nav={[{ to: "/inicio", label: "Início" }, { to: "/faturas", label: "Faturas", group: "Financeiro", items: [{ to: "/faturas/recorrentes", label: "Recorrentes" }] }]}
+  aside={<SessionStatus user={usuario} onSignOut={sair} />}
+>
   <Text>Conteúdo</Text>
 </AppShell>
 ```
 
-- `brand`: `string`: Nome exibido no topo do menu lateral.
-- `nav`: `{ to: string; label: string }[]`: Itens do menu: { to: "/rota", label: "Texto" }.
+- `brand`: `string`: Nome exibido no topo do menu lateral (ex.: o da organização).
+- `logo?`: `string | null`: Link da imagem do logo; sem ele, as iniciais do nome.
+- `color?`: `string | null`: Cor da marca (#RRGGBB): vira a cor principal da tela inteira (botões, foco, menu); sem ela, a do tema.
+- `nav`: `NavItem[]`: Itens do menu, já na ordem: os sem grupo no topo; os grupos na ordem em que aparecem.
 - `aside?`: `ReactNode`: Conteúdo no pé do menu lateral (ex.: SessionStatus).
 - `switcher?`: `ReactNode`: Seletor no topo do menu, abaixo da marca (ex.: TenantSwitcher).
 - `actions?`: `ReactNode`: Ações à direita da barra superior (ex.: NotificationBell).

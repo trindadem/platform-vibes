@@ -9,11 +9,11 @@ import { DataTable } from "@/components/DataTable";
 import { FileField } from "@/components/FileField";
 import { Page } from "@/components/Page";
 import { Picture } from "@/components/Picture";
-import { useAction, useQuery, useUpload } from "@/core/api";
+import { refresh, useAction, useQuery, useUpload } from "@/core/api";
 import { createTenant, switchTenant, useSession } from "@/core/auth";
 import { identity } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "Organizações", order: 4 };
+export const meta: PageMeta = { title: "Organizações", order: 4, module: "identity" };
 
 const PAPEL = { owner: "Dono", admin: "Administrador", member: "Membro" };
 
@@ -22,8 +22,11 @@ export default function Organizacoes() {
   const criar = useAction(createTenant);
   const trocar = useAction(switchTenant);
   const org = useQuery(identity.organization);
-  const enviar = useUpload(identity.logoUpload, identity.setLogo, { onSuccess: org.reload });
-  const remover = useAction(() => identity.removeLogo({}), { onSuccess: org.reload });
+  const marca = () => refresh(identity.organization); // esta tela e a moldura (nome, logo e cor) atualizam juntas
+  const enviar = useUpload(identity.logoUpload, identity.setLogo, { onSuccess: marca });
+  const remover = useAction(() => identity.removeLogo({}), { onSuccess: marca });
+  const colorir = useAction((v: { color: string }) => identity.setColor({ color: v.color }), { onSuccess: marca });
+  const descolorir = useAction(() => identity.setColor({ color: null }), { onSuccess: marca });
   const logoUrl = org.data?.logo_url;
 
   return (
@@ -61,6 +64,23 @@ export default function Organizacoes() {
           </ConfirmButton>
         )}
         {remover.error && <Alert tone="danger">{remover.error.message}</Alert>}
+      </Card>
+      <Card title="Cor da marca" description="A cor principal da tela para todos da organização: botões, foco e menu.">
+        {org.data && (
+          <ActionForm
+            key={org.data.color ?? "padrao"}
+            action={colorir}
+            submitLabel="Usar esta cor"
+            initial={{ color: org.data.color ?? "#2563eb" }}
+            fields={[{ name: "color", label: "Cor principal", kind: "color", required: true }]}
+          />
+        )}
+        {org.data?.color && (
+          <Button variant="secondary" onClick={() => void descolorir.run()} loading={descolorir.running}>
+            Voltar à cor da plataforma
+          </Button>
+        )}
+        {descolorir.error && <Alert tone="danger">{descolorir.error.message}</Alert>}
       </Card>
     </Page>
   );

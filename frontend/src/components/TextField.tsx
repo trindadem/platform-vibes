@@ -8,8 +8,8 @@ export interface TextFieldProps {
   value: string;
   /** Recebe o novo texto, não o evento. */
   onChange: (value: string) => void;
-  /** Padrão: text. */
-  type?: "text" | "email" | "password" | "number" | "search" | "url";
+  /** Padrão: text. color: seletor de cor, o valor é #rrggbb. */
+  type?: "text" | "email" | "password" | "number" | "search" | "url" | "color";
   /** Ajuda abaixo do campo. */
   hint?: string;
   /** Mensagem de erro: marca o campo como inválido. */

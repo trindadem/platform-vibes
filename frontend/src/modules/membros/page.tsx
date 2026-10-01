@@ -14,7 +14,7 @@ import { useAction, useLiveQuery } from "@/core/api";
 import { hasAnyRole, hasRoles, inviteLink, useSession } from "@/core/auth";
 import { identity } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "Membros", order: 3 };
+export const meta: PageMeta = { title: "Membros", order: 3, module: "identity" };
 
 const PAPEL = { owner: "Dono", admin: "Administrador", member: "Membro" };
 

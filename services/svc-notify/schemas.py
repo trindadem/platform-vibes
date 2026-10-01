@@ -6,12 +6,16 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings
 
 from core.notify import CONTACTS_SUBJECT, SEND_SUBJECT, Contacts, ContactsRequest, NotifyRequest  # contrato com core/notify.py
+from core.plans import Module
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-notify"
 TASK_QUEUE = "notify-queue"
 NEW_LIVE = "notify.nova"  # ao vivo só para a pessoa avisada (README §5.10)
+
+# O módulo (README §5.17): da plataforma, sempre ligado.
+MODULE = Module("Avisos", "Avisos na tela e por e-mail", category="Organização", core=True)
 
 # Avisos são por organização; e-mails e preferências são globais (a pessoa é a mesma em todas as organizações).
 ITEMS = "notify_items"

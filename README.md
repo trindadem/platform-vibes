@@ -44,7 +44,7 @@ cogniventure/
 │   ├── storage.py               # Arquivos: S3 compatível, envio direto por link assinado, isolado por organização (seção 5.14)
 │   ├── notify.py                # Avisos na tela e por e-mail, entregues pelo svc-notify (seção 5.15)
 │   ├── webhooks.py              # Webhooks: eventos para os sistemas das organizações e conferência dos que chegam (seção 5.16)
-│   ├── plans.py                 # Planos e limites: o que cada organização pode usar, conferido no serviço (seção 5.17)
+│   ├── plans.py                 # Módulos, planos e limites: o que cada organização usa, conferido pelo core (seção 5.17)
 │   └── telemetry.py             # Observabilidade: logs estruturados, trace ponta a ponta, métricas e /health (seção 5.18)
 │
 ├── gateway/                     # Ponto único de entrada HTTP (atrás do Traefik)
@@ -75,11 +75,13 @@ cogniventure/
         ├── components/          # Catálogo: 1 <Nome>.tsx por componente, construído sobre o shadcn/ui
         │   ├── CATALOG.md       # Gerado a partir dos componentes: o que existe para compor
         │   └── ui/              # Primitivos do shadcn/ui (npx shadcn add <nome>), código de origem preservado
-        ├── modules/             # Domínios de negócio isolados
+        ├── modules/             # Domínios de negócio isolados (as telas de cada módulo)
         │   └── <module_name>/
-        │       └── page.tsx     # A tela: vira a rota /<module_name> e o item do menu
+        │       ├── page.tsx     # A tela do módulo: vira a rota /<module_name> e o item do menu
+        │       ├── <parte>/page.tsx  # Telas a mais (até 2 níveis): /<module_name>/<parte>, subitem no menu
+        │       └── [id]/page.tsx     # Tela com parâmetro: /<module_name>/:id, fora do menu (useParams)
         ├── core/                # 1 arquivo por recurso: api.ts, auth.ts, contracts.ts (gerado), theme.css
-        ├── App.tsx              # Router plano, montado a partir de src/modules
+        ├── App.tsx              # Router montado a partir de src/modules, menu por módulo e moldura da organização
         └── main.tsx             # Entrypoint DOM
 ```
 
@@ -99,6 +101,8 @@ Exemplo para `user-auth`:
 | Eventos NATS (duráveis) | `events.user-auth.trigger`, `events.user-auth.processed` | kebab |
 | RPC NATS (request/reply) | `rpc.user-auth.<método>` | kebab |
 | Tópicos ao vivo (`bus.live`) | `user-auth.<evento>` | kebab |
+| Módulo (plano e menu) e tela | `user-auth`, `frontend/src/modules/user-auth/page.tsx` (`/user-auth`) | kebab |
+| Cliente no frontend | `userAuth.<função>` (`core/contracts.ts`) | camel |
 | Task queue e activities | `user-auth-queue`, `user-auth.<método>` | kebab |
 | Tabela SurrealDB | `user_auth_records` | snake |
 | Classes Python | `UserAuthService`, `UserAuthWorkflow` | Pascal |
@@ -119,6 +123,7 @@ O código vive somente em `service.sh` (este README não o duplica). O script:
 - valida o nome (seção 2) e aborta sem tocar em nada se o serviço ou a rota já existirem;
 - cria `specs/<service_name>.md` com o template de 4 tópicos — **ou preserva o spec, se já existir** (spec-first);
 - cria `services/svc-<service_name>/` com os 4 arquivos já amarrados (activities, workflow, ingress HTTP + NATS, worker), uma lista paginada com busca (`GET /records`, seção 5.12) e as listas vazias `SCHEDULES` e `MIGRATIONS` já ligadas (seção 5.13);
+- declara o serviço como módulo (`MODULE` no `schemas.py`, `plans.declare` no boot, seção 5.17) e cria a tela `frontend/src/modules/<service_name>/page.tsx` (lista com busca e criação, já com `meta.module`), ou preserva a que já existir;
 - cria `gateway/endpoints/<service_name>.yaml` e `tests/<service_name>.py` (no SurrealDB embutido), e registra o serviço no fim do `compose.yaml`;
 - gera tudo numa área temporária, verifica a sintaxe e só então publica (tudo ou nada).
 
@@ -218,7 +223,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | Arquivo | Expõe |
 |---|---|
 | `envelope.py` | `ResponseEnvelope.success(data, service)`, `ServiceError(code, message, status)`, `install_envelope(app, service)`, `stream_response(gerador, service, final=Modelo)` |
-| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `system(service, tenant)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same` |
+| `security.py` | `install_security(app, service, public)`, `principal`, `require(*papéis)`, `current()`, `current_tenant()`, `acting_as(principal)`, `system(service, tenant)`, `issue_token`, `verify_token`, `hash_password`, `verify_password`, `assert_public_url`, `redact`, `new_secret`, `same`, `add_gate` (só para o core) |
 | `nats_bus.py` | `bus.connected(service)`, `bus.publish(subject, model, msg_id)`, `bus.subscribe(subject, handler, model)`, `bus.message_id()`, `bus.request(...)`, `bus.respond(...)`, `bus.live(tópico, model, user=None)`, `bus.live_feed(principal)` |
 | `temporal_runner.py` | `@activities(prefixo)`, `runner.worker(task_queue, workflows, service, schedules)`, `runner.start_workflow(run, arg, task_queue, id)`, `Schedule` |
 | `surreal.py` | `db.connected(tables=[TABLE], shared=[...], unique={...}, search={...}, migrations=[...], service=SERVICE)`, `db.query(sql, **params)`, `db.query_shared(...)`, `db.page(TABLE, query, ModeloPage)`, `db.create`, `db.select`, `db.merge`, `db.delete`, `db.tenants(TABLE)`, `ListQuery`, `Page`, `Migration` |
@@ -227,7 +232,7 @@ Importar o core nunca conecta em nada nem exige variáveis: a configuração é 
 | `storage.py` | `storage.connected(service)`, `storage.upload(pedido, accept, max_bytes, folder)`, `storage.keep(key)`, `storage.url(key, ttl, filename, content_type)`, `storage.delete(key)`, `UploadRequest`, `Upload`, `KeepRequest`, `StoredFile`, `IMAGES` (seção 5.14) |
 | `notify.py` | `notify.user(sub, title, body, link, action, send_email, key)`, `notify.roles(*papéis, title=...)`, `notify.email(endereço, title, body, link, action, key)` — o único jeito de avisar alguém (seção 5.15) |
 | `webhooks.py` | `WebhookEvent(nome, descrição, Modelo)`, `webhooks.declare(lista)`, `webhooks.emit(nome, modelo, key)`, `webhooks.verify(segredo, cabeçalhos, corpo)`, `sign`, `new_secret` (seção 5.16) |
-| `plans.py` | `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(lista)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.limits()`, `plans.assign(plano)` (seção 5.17) |
+| `plans.py` | `Module(título, descrição, category, limits, requires, core, default)`, `Limit(nome, descrição, default, monthly, unit, currency)`, `plans.declare(MODULE)`, `plans.check(nome, used=)`, `plans.use(nome, quantidade, key)`, `plans.count(nome, total)`, `plans.enabled(módulo)`, `plans.limits()`, `plans.assign(plano, modules=)` (seção 5.17) |
 | `telemetry.py` | `install_telemetry(app, service, edge, health)`, `telemetry.counter(nome, descrição)`, `telemetry.histogram(nome, descrição)` (seção 5.18) |
 
 Erro de negócio do spec §4: `raise ServiceError("ERRO_<UPPER>_<CASO>", "mensagem", status=409)`. Ele sai no envelope pelo HTTP e, com status < 500, nunca é re-tentado pelo Temporal.
@@ -240,6 +245,7 @@ Segurança não se implementa por serviço: importa-se do core. Proibido reimple
 
 - **Nega por padrão:** `install_security(app, service=SERVICE)` exige token válido em **toda** rota, inclusive as que a IA criar depois. Abrir é explícito e só se o spec §2 declarar: `public=("/rota",)`. A única exceção é `/health` (seção 5.18), que só diz se as dependências respondem. Papéis: `Depends(require("admin"))`.
 - **Identidade vem do token:** quem chama é o `Principal` (usuário, organização ativa e papéis nela; `Depends(principal)` ou `current()`), nunca um campo do payload.
+- **Conferências do core:** depois da autenticação, toda chamada de uma pessoa numa organização (requisição HTTP, evento NATS e RPC) passa pelas conferências que o core registra (`add_gate`); hoje, uma só: o módulo do serviço fora do plano da organização recusa com 402 `ERRO_PLAN_MODULE` (seção 5.17). Tarefa da plataforma (`system`) e rota pública passam. Serviço não registra conferência.
 - **Tokens:** JWT com chave assimétrica. EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk, Keycloak…). `none` e HS256 são recusados; `iss`, `aud`, `exp` e `sub` são obrigatórios. Só o serviço que faz login tem a chave privada.
 - **Login e sessão:** o `svc-identity` (`specs/identity.md`) é o único emissor de tokens e o único container com `AUTH_PRIVATE_KEY`: cadastro, login, senha esquecida (link por e-mail de 30 min, uso único, que derruba as sessões), organizações, convites e membros. Token de acesso de 15 min; refresh de 30 dias só no cookie `cv_refresh` (HttpOnly, SameSite=Strict, `Path=/api/v1/identity`, Secure em produção), nunca no corpo, trocado a cada uso; um refresh antigo que reaparece derruba a sessão inteira.
 - **Senhas:** só `hash_password` / `verify_password` (Argon2id, fora do event loop). Nunca md5, sha ou hash próprio.
@@ -524,30 +530,37 @@ async def pagamentos(request: Request) -> ResponseEnvelope:
 
 Provedor com esquema próprio (`stripe-signature`, `x-hub-signature-256`) se confere com `hmac` e `core.security.same` (comparação em tempo constante). A organização dona do evento vem do conteúdo (a conta no provedor), nunca de um parâmetro da URL.
 
-### 5.17 Planos e limites (`core/plans.py` e `svc-plans`)
+### 5.17 Módulos, planos e limites (`core/plans.py` e `svc-plans`)
 
-Cada organização tem um plano, e o plano diz quanto ela pode usar. O serviço declara o que limita e confere com uma linha; quem guarda planos, consumo e avisos é o `svc-plans` (`specs/plans.md`).
+Todo serviço é um **módulo** da plataforma: a organização o tem ou não pelo plano, e o menu mostra só os que ela tem. Uma plataforma (de um cliente, ou a compartilhada) é a composição dos módulos. O serviço declara o módulo e o que ele limita em um lugar só; quem guarda planos, consumo e avisos é o `svc-plans` (`specs/plans.md`).
 
 ```python
-LIMITS = [
-    Limit("enderecos", "Endereços de webhook", default=20, unit="endereços"),           # total do que existe agora
-    Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD"),                 # consumo somado no mês
-]                                                                                         # schemas.py
-await plans.declare(LIMITS)                         # main.py, no lifespan (depois do bus)
+MODULE = Module(
+    "Webhooks", "Eventos para os sistemas da organização", category="Integrações",
+    limits=[
+        Limit("enderecos", "Endereços de webhook", default=20, unit="endereços"),       # total do que existe agora
+        Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD"),             # consumo somado no mês
+    ],
+)                                                                                     # schemas.py
+await plans.declare(MODULE)                         # main.py, no lifespan (depois do bus)
 await plans.check("enderecos", used=total)          # antes de criar: 402 ERRO_PLAN_LIMIT se já chegou ao limite
 await plans.count("enderecos", total)               # depois de criar ou remover: a tela mostra "3 de 20"
 await plans.check("custo")                          # antes de gastar: quem já passou do limite do mês para aqui
 await plans.use("custo", 0.0123, key=message_id)    # depois de gastar: soma no mês
+await plans.enabled("crm")                          # outro módulo está ligado? (integração opcional)
 ```
 
-- **Nome:** `<serviço>.<limite>` (`webhooks.enderecos`). Só o próprio serviço declara, conta e soma os seus; conferir vale também com o nome completo de outro serviço (o `core/llm.py` confere `ai.custo` em quem chama a IA). Limite não declarado é erro.
+- **Módulo:** o nome é o do serviço (sem `svc-`); `title`, `description` e `category` aparecem no menu (o grupo é a categoria), no plano e na comparação. `requires=("crm",)`: só funciona com esses ligados. `core=True`: módulo da plataforma, sempre ligado (identidade, avisos, plano, IA, webhooks). `default`: ligado quando o plano não diz nada (e para quem não tem plano); `default=False` para o que só entra quando o plano incluir.
+- **Ligado ou não:** o ajuste da organização, senão o plano, senão o `default`; e só com os `requires` ligados (requisito não instalado desliga quem depende dele). Desligado: o core recusa as chamadas das pessoas da organização antes do serviço, com 402 `ERRO_PLAN_MODULE` (HTTP, evento sem reentrega e RPC); tarefa da plataforma passa. O serviço não escreve nada para isso.
+- **Limite:** `<serviço>.<limite>` (`webhooks.enderecos`). Só o próprio serviço declara, conta e soma os seus; conferir vale também com o nome completo de outro serviço (o `core/llm.py` confere `ai.custo` em quem chama a IA). Limite não declarado é erro.
 - **Valor:** o do plano da organização atual. O que o plano não cita, ou organização sem plano, vale o `default` declarado. `None`: sem limite; `0`: o recurso não está no plano.
 - **Total × mensal:** no total, quem conta é o serviço, dono dos dados (`used=`), antes de criar; duas criações ao mesmo tempo podem passar do limite em uma. No mensal, o `svc-plans` soma o mês (UTC), uma vez por mensagem; a chamada que cruza o limite termina e as seguintes param. Em 80% e em 100%, donos e administradores recebem um aviso (seção 5.15), uma vez por mês e por patamar.
-- **Resolução guardada 60 s** por processo: trocar de plano ou mudar um limite vale em até 1 min. Com o `svc-plans` fora do ar, vale a última resposta e, sem ela, nenhum limite: plano é regra comercial, não de segurança.
-- **Planos:** quem administra a plataforma (`owner` ou `admin` da organização `PLATFORM_TENANT`) cria os planos na tela, com preço (informativo), limites e se aparecem na comparação; um deles pode ser o padrão, que vale para quem não tem plano atribuído. Plano padrão ou em uso não sai.
-- **Troca de plano:** pela tela (aba Gerenciar, com o código que a organização vê na aba Uso) ou pelo serviço de pagamentos do produto, depois de confirmar o pagamento, como tarefa da plataforma: `with acting_as(system(SERVICE, org)): await plans.assign("pro")`. A cobrança fica no produto.
+- **Resolução guardada 60 s** por processo: trocar de plano, ligar um módulo ou mudar um limite vale em até 1 min. Com o `svc-plans` fora do ar, vale a última resposta e, sem ela, nenhum limite e todo módulo ligado: plano é regra comercial, não de segurança.
+- **Planos:** quem administra a plataforma (`owner` ou `admin` da organização `PLATFORM_TENANT`) cria os planos na tela, com preço (informativo), módulos incluídos, limites e se aparecem na comparação; um deles pode ser o padrão, que vale para quem não tem plano atribuído. Plano padrão ou em uso não sai. Ligar um módulo sem os `requires` (ou desligar um requisito de um ligado) é recusado.
+- **Plano de uma organização:** pela tela (aba Gerenciar, com o código que a organização vê na aba Uso), com o plano e o ajuste de módulos só dela (um módulo a mais ou a menos que o plano), ou pelo serviço de pagamentos do produto, depois de confirmar o pagamento, como tarefa da plataforma: `with acting_as(system(SERVICE, org)): await plans.assign("pro", modules={"juridico": True})`. A cobrança fica no produto.
 - **Limites da plataforma:** `identity.membros` (pessoas na organização), `webhooks.enderecos` (sem plano, 20), `ai.custo` (US$, a moeda dos provedores, sem conversão) e `ai.tokens`.
-- **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Planos (comparação dos públicos e do atual) e, para quem administra a plataforma, Gerenciar (planos e atribuição).
+- **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Módulos (por categoria, o que está no plano), Planos (comparação dos públicos e do atual, com módulos e limites) e, para quem administra a plataforma, Gerenciar (planos e o plano de cada organização).
+- **No frontend:** o `MODULE` de cada serviço vira `appModules` e o tipo `ModuleName` no `contracts.ts` (manifesto sem `MODULE` não gera o contrato); a tela diz o seu em `meta.module` (seção 6).
 
 ### 5.18 Observabilidade (`core/telemetry.py`)
 
@@ -562,7 +575,7 @@ pagas.add(1, {"forma": "pix"})                                     # atributo de
 - **Logs:** uma linha JSON por evento em stdout (em development, texto legível), com `service`, `trace_id`, `span_id`, `tenant` e `user` (o `sub`; nunca nome, e-mail, corpo nem segredo). Campos em `extra=` entram mascarados por `redact`. Toda requisição gera uma linha com método, rota (o molde `/itens/{id}`, não o id), status, duração, organização e pessoa; o log de acesso do uvicorn sai.
 - **Trace ponta a ponta (OpenTelemetry):** a requisição HTTP, as chamadas HTTP de saída, cada mensagem NATS (publicar e processar, RPC), cada workflow e activity do Temporal e cada consulta ao SurrealDB (o texto da SurrealQL, nunca os valores) entram no mesmo trace: gateway → serviço → NATS → Temporal → banco. O trace começa no gateway: `traceparent` vindo de fora é ignorado, e não há baggage.
 - **Id para o suporte:** toda resposta leva `x-trace-id`; o erro 500 informa esse mesmo id. Com ele se acha o trace e todos os logs da requisição, em todos os serviços.
-- **Métricas:** duração das requisições HTTP (servidor e cliente, no padrão estável), das mensagens NATS com o resultado (`cv.nats.processed`: ok, retry, dropped, invalid) e das consultas (`db.client.operation.duration`). Organização e pessoa nunca viram atributo de métrica (cardinalidade): ficam no trace e no log.
+- **Métricas:** duração das requisições HTTP (servidor e cliente, no padrão estável), das mensagens NATS com o resultado (`cv.nats.processed`: ok, retry, dropped, invalid, refused) e das consultas (`db.client.operation.duration`). Organização e pessoa nunca viram atributo de métrica (cardinalidade): ficam no trace e no log.
 - **Exportação:** OTLP/HTTP para `OTEL_EXPORTER_OTLP_ENDPOINT` (Grafana Cloud, Tempo, Jaeger, Honeycomb, Datadog...). Sem a variável, nada sai do processo e os ids continuam nos logs. No ambiente local, o Grafana (`grafana/otel-lgtm`) recebe tudo e mostra traces (Tempo), métricas (Prometheus) e logs (Loki) em `http://localhost:3000`.
 - **Saúde:** `GET /health` em cada serviço e no gateway confere NATS, SurrealDB e Temporal do processo (`200` ou `503` dizendo qual caiu, sem detalhe interno). É aberto, não gera trace nem log e serve ao `healthcheck` do compose e ao orquestrador de produção.
 
@@ -570,8 +583,10 @@ pagas.add(1, {"forma": "pix"})                                     # atributo de
 
 Telas nascem da composição de componentes existentes; a IA não inventa estrutura. As regras abaixo não dependem de boa vontade: o `vite.config.ts` as verifica em todo `npm run dev` (tela de erro na hora) e em todo `npm run build` (o build falha), dizendo o arquivo e o que corrigir.
 
-- **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente. Navegação e parâmetros da URL vêm do `react-router` (`useSearchParams`, `useNavigate`); links, por `TextLink` ou `Button to=`.
-- **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order, access }`. Vira a rota `/<module_name>`, sem registro manual. `access` diz quem vê: `"private"` (padrão: exige sessão e aparece no menu; sem sessão, vai para `/entrar?next=`), `"public"` (aberta, fora do menu, ex.: `/convite`) ou `"guest"` (só sem sessão, ex.: `/entrar` e `/cadastro`). Um módulo tem só `page.tsx` e não importa outro módulo.
+- **Páginas apenas compõem:** `src/modules/<module_name>/page.tsx` não usa tag HTML (`<div>`, `<p>`…), nem `className`, nem `style`. Só instancia componentes de `src/components/`. Faltou peça? Cria-se um componente. Navegação e parâmetros da URL vêm do `react-router` (`useSearchParams`, `useNavigate`, `useParams`); links, por `TextLink` ou `Button to=`.
+- **Rotas se montam sozinhas:** cada `page.tsx` exporta a tela (`export default`) e `export const meta: PageMeta = { title, order, access, module }`. `<module_name>/page.tsx` vira `/<module_name>`; telas a mais do módulo ficam em subpastas, até 2 níveis: `<parte>/page.tsx` vira `/<module_name>/<parte>` (subitem no menu, abaixo da tela do módulo) e `[id]/page.tsx` vira `/<module_name>/:id` (fora do menu; o valor vem de `useParams`). Nenhum registro manual. `access` diz quem vê: `"private"` (padrão: exige sessão e aparece no menu; sem sessão, vai para `/entrar?next=`), `"public"` (aberta, fora do menu, ex.: `/convite`) ou `"guest"` (só sem sessão, ex.: `/entrar` e `/cadastro`). Uma pasta de módulo só tem `page.tsx` (nela e nas subpastas) e não importa outro módulo.
+- **Menu por módulo:** `module` é o módulo (serviço) da tela, tipado pelo `contracts.ts` (seção 5.17); as subtelas herdam o da tela do módulo. O menu agrupa as telas pela categoria do módulo e esconde as de módulo fora do plano da organização; aberta pelo endereço, a tela mostra o aviso de fora do plano com o caminho para `/plano`. Tela sem `module` aparece sempre, no topo.
+- **Marca da organização:** a moldura usa o nome, o logo e a cor da organização ativa (tela `organizacoes`); a cor vira o token `--primary` da tela inteira.
 - **Componentes têm formato único:** `src/components/<Nome>.tsx` exporta `function <Nome>` (export nomeado, nunca default) e `<Nome>Props` com cada prop documentada. O JSDoc da função começa com uma frase dizendo o que ele é e traz `@category` (uma das categorias do `vite.config.ts`: Receitas, Layout, Dados, Formatação, Formulários, Feedback, Texto, Aplicação) e `@example`: uma expressão JSX que usa o próprio componente e segue as regras de página. Componente só apresenta: recebe dados por props e não importa `core/`, `modules/` nem `App`.
 - **shadcn/ui é o substrato:** os primitivos vivem em `src/components/ui/` e entram só por `npx shadcn add <nome>` (dentro de `frontend/`), sem edição à mão, para seguirem o original. Componentes do catálogo os usam; página nunca importa de `ui/`. Peça nova = `shadcn add` do primitivo + um componente do catálogo que o envolve com props simples.
 - **Catálogo antes de compor:** `src/components/CATALOG.md` é gerado do próprio código. Começa por um **índice por categoria** (uma linha por componente: o que é e as props, obrigatórias primeiro) e segue com o detalhe de cada um (exemplo pronto para copiar e props tipadas). Ler o índice, abrir só o detalhe do que vai usar e copiar o exemplo; nunca editar o catálogo à mão. Cada `@example` é compilado pelo TypeScript em `npm run check` (arquivo gerado `.cv/catalog-examples.tsx`): exemplo que mente sobre as props quebra o check.
@@ -619,7 +634,7 @@ npm run check    # build com os trilhos (regenera CATALOG.md e os exemplos) + Ty
 2. Preencher `specs/<service_name>.md` (ou escrevê-lo antes: o scaffolder preserva).
 3. Pedir à IA: *"Implemente specs/<service_name>.md em services/svc-<service_name>/ seguindo o README."*
 4. Rodar `tests/<service_name>.py` (seção 5.5) e `uv run python gateway/contracts.py` (atualiza os tipos do frontend).
-5. Tela: pedir à IA *"Crie src/modules/<module_name>/page.tsx com as receitas do CATALOG.md (ResourcePage, QueryTable, ActionForm) e as funções de core/contracts.ts, seguindo o README."*
+5. Tela: o `service.sh` já criou `src/modules/<service_name>/page.tsx`. Para adaptá-la ou criar outras, pedir à IA *"Ajuste src/modules/<module_name>/page.tsx (ou crie <module_name>/<parte>/page.tsx) com as receitas do CATALOG.md (ListView, ResourcePage, ActionForm) e as funções de core/contracts.ts, seguindo o README."*
 6. Subir e testar de verdade (abaixo).
 7. Conflito com o contrato → seção 8.
 

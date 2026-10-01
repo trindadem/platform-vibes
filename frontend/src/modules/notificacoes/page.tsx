@@ -15,7 +15,7 @@ import { Toggle } from "@/components/Toggle";
 import { refresh, useAction, useListQuery, useQuery } from "@/core/api";
 import { notify, type NotifyNotification } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "Notificações", order: 90 };
+export const meta: PageMeta = { title: "Notificações", order: 90, module: "notify" };
 
 export default function Notificacoes() {
   const navigate = useNavigate();

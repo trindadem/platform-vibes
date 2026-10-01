@@ -25,7 +25,7 @@ from core.webhooks import Catalog, CatalogEvent, Emitted, verify
 
 import service
 from schemas import (
-    LIMITS,
+    MODULE,
     RETRY_SUBJECT,
     SHARED_TABLES,
     TENANT_TABLES,
@@ -90,7 +90,7 @@ def hooks(monkeypatch):
     monkeypatch.setattr(service.bus, "request", request)
     service.plans.clear()
     monkeypatch.setattr(service.plans, "_declared", {})
-    asyncio.run(service.plans.declare(LIMITS))
+    asyncio.run(service.plans.declare(MODULE))
     box.counts.clear()
     yield box
     security._settings.cache_clear()

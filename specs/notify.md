@@ -3,6 +3,7 @@
 ## 1. Objetivo Operacional
 Avisar pessoas: na tela (sino com a contagem ao vivo e a lista de avisos) e por e-mail. Os serviços chamam pelo
 `core/notify.py` (README §5.15) e nunca falam com servidor de e-mail: só este serviço tem as credenciais SMTP.
+Módulo `notify` ("Avisos", categoria Organização), da plataforma: sempre ligado (README §5.17).
 
 ## 2. Contrato de Entrada e Saída
 Todas as rotas exigem token e valem para quem chama, na organização ativa: ninguém vê aviso de outra pessoa.

@@ -3,6 +3,7 @@
  * violou, a tela de erro (dev) ou o build dizem o arquivo e o que corrigir.
  *
  * - src/modules/<modulo>/page.tsx: só compõe. Sem tag HTML, sem className/style; exporta default e meta.
+ *   Telas a mais do módulo em subpastas: <modulo>/<parte>/page.tsx e <modulo>/[param]/page.tsx (até 2 níveis).
  * - src/components/<Nome>.tsx: exporta <Nome> com JSDoc e <Nome>Props; não importa core/, modules/ nem App.
  * - src/components/ui/<nome>.tsx: primitivos do shadcn/ui (npx shadcn add <nome>), código de origem preservado.
  *   Só componentes do catálogo os usam; página nunca importa de ui/.
@@ -43,6 +44,8 @@ interface Violation {
 
 const COMPONENT_FILE = /^[A-Z][A-Za-z0-9]*\.tsx$/;
 const MODULE_DIR = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+const PARAM_DIR = /^\[[a-z][a-zA-Z0-9]*\]$/; // [id], [faturaId]: vira :id na rota
+const MAX_PAGE_DEPTH = 2; // subpastas abaixo do módulo
 const UI_FILE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*\.tsx?$/;
 const CORE_FILES = new Set(["api.ts", "auth.ts", "contracts.ts", "theme.css"]);
 const ROOT_FILES = new Set(["App.tsx", "main.tsx"]);
@@ -102,15 +105,27 @@ function scan(): Violation[] {
       (parts[0] === "core" && parts.length === 2 && CORE_FILES.has(parts[1]!)) ||
       (parts[0] === "components" && parts.length === 2 && (COMPONENT_FILE.test(parts[1]!) || parts[1] === "CATALOG.md")) ||
       (parts[0] === "components" && parts[1] === "ui" && parts.length === 3 && UI_FILE.test(parts[2]!)) ||
-      (parts[0] === "modules" && parts.length === 3 && MODULE_DIR.test(parts[1]!) && parts[2] === "page.tsx");
+      isPage(parts);
     if (!ok) {
-      violations.push({ file: r, message: "arquivo fora da topologia (README §1): componente em src/components/<Nome>.tsx, tela em src/modules/<modulo>/page.tsx" });
+      violations.push({
+        file: r,
+        message:
+          "arquivo fora da topologia (README §1): componente em src/components/<Nome>.tsx, tela em src/modules/<modulo>/page.tsx " +
+          "(telas a mais: <modulo>/<parte>/page.tsx ou <modulo>/[param]/page.tsx, até 2 níveis)",
+      });
     } else if (/\.tsx?$/.test(file)) {
       violations.push(...checkSource(file, fs.readFileSync(file, "utf8")));
     }
   }
   writeCatalog();
   return violations;
+}
+
+/** modules/<modulo>/page.tsx, ou até 2 subpastas abaixo: <parte> (kebab-case) ou [param] (vira :param na rota). */
+function isPage(parts: string[]): boolean {
+  if (parts[0] !== "modules" || parts.at(-1) !== "page.tsx" || !MODULE_DIR.test(parts[1] ?? "")) return false;
+  const below = parts.slice(2, -1);
+  return below.length <= MAX_PAGE_DEPTH && below.every((dir) => MODULE_DIR.test(dir) || PARAM_DIR.test(dir));
 }
 
 function checkSource(file: string, code: string): Violation[] {
@@ -215,7 +230,7 @@ function checkPage(body: Node[], fail: (m: string) => void) {
   const hasMeta = body.some(
     (n) => n.type === "ExportNamedDeclaration" && n.declaration?.type === "VariableDeclaration" && n.declaration.declarations.some((d: Node) => d.id?.name === "meta"),
   );
-  if (!hasMeta) fail('page.tsx exporta "meta": { title: "...", order?: n } (vira o item do menu)');
+  if (!hasMeta) fail('page.tsx exporta "meta": { title: "...", order?: n, module?: "<serviço>" } (vira o item do menu)');
 }
 
 // ── Catálogo ─────────────────────────────────────────────────────────────────

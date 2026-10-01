@@ -1,25 +1,31 @@
-"""Planos e limites (README §5.17): o que cada organização pode usar, conferido com uma linha no serviço.
+"""Módulos, planos e limites (README §5.17): o que cada organização usa, ligado pelo plano e conferido pelo core.
 
-    LIMITS = [Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")]    # schemas.py
-    await plans.declare(LIMITS)                        # main.py, no lifespan (depois do bus)
+    MODULE = Module("Webhooks", "Eventos para os sistemas da organização", category="Integrações",
+                    limits=[Limit("enderecos", "Endereços de webhook", default=20, unit="endereços")])  # schemas.py
+    await plans.declare(MODULE)                        # main.py, no lifespan (depois do bus)
     await plans.check("enderecos", used=total)         # antes de criar: 402 ERRO_PLAN_LIMIT se já chegou ao limite
     await plans.count("enderecos", total)              # depois de criar ou remover: a tela mostra "3 de 20"
 
-    LIMITS = [Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD")]
+    Limit("custo", "Gasto com IA no mês", monthly=True, currency="USD")
     await plans.check("custo")                         # antes de gastar: quem já passou do limite do mês para aqui
     await plans.use("custo", 0.0123, key=message_id)   # depois de gastar: soma no mês; aviso em 80% e em 100%
 
 Trilhos:
+- Todo serviço é um módulo, com o nome dele (sem svc-). Módulo desligado para a organização recusa as chamadas das
+  pessoas dela com 402 ERRO_PLAN_MODULE (HTTP, evento e RPC), sem código no serviço: o core confere antes. Tarefa da
+  plataforma (system) passa. core=True: módulo da plataforma, sempre ligado.
+- Ligado ou não: o ajuste da organização, senão o plano, senão o default declarado; e só com os requires ligados.
 - O limite se chama <serviço>.<nome> (webhooks.enderecos). Só o próprio serviço declara, conta e soma os seus; conferir
   vale também com o nome completo de outro serviço (o core/llm.py confere ai.custo em quem chama a IA).
 - O valor vem do plano da organização atual. Limite que o plano não cita, ou organização sem plano, vale o default
   declarado. None: sem limite. 0: o recurso não está no plano.
 - Total (padrão): quem conta é o serviço, dono dos dados (used=), antes de criar. Mensal: o svc-plans soma o uso do mês
   (UTC); a chamada que cruza o limite termina e as seguintes param.
-- Resolução guardada 60 s por processo: troca de plano ou de limite vale em até 1 min. Com o svc-plans fora do ar, vale
-  a última resposta e, sem ela, nenhum limite: plano é regra comercial, não de segurança.
+- Resolução guardada 60 s por processo: troca de plano, de módulo ou de limite vale em até 1 min. Com o svc-plans fora
+  do ar, vale a última resposta e, sem ela, nenhum limite e todo módulo ligado: plano é regra comercial, não de
+  segurança.
 - Cobrança fica no produto: o serviço de pagamentos confirma o pagamento e, como tarefa da plataforma
-  (acting_as(system(SERVICE, org))), chama plans.assign("pro").
+  (acting_as(system(SERVICE, org))), chama plans.assign("pro") (ou plans.assign("pro", modules={"juridico": True})).
 """
 import hashlib
 import logging
@@ -36,11 +42,11 @@ from pydantic import BaseModel, Field, StringConstraints
 
 from core.envelope import ServiceError
 from core.nats_bus import bus
-from core.security import current, current_tenant
+from core.security import Principal, add_gate, current, current_tenant
 
 __all__ = [
-    "plans", "Plans", "Limit", "LimitCatalog", "CatalogLimit", "LimitState", "PlanLimits", "LimitsRequest",
-    "UsageReport", "CountReport", "AssignRequest", "Assigned",
+    "plans", "Plans", "Module", "Limit", "ModuleCatalog", "CatalogModule", "CatalogLimit", "ModuleState", "LimitState",
+    "PlanLimits", "LimitsRequest", "UsageReport", "CountReport", "AssignRequest", "Assigned", "ModuleName", "PlanSlug",
     "CATALOG_SUBJECT", "USAGE_SUBJECT", "COUNT_SUBJECT", "LIMITS_SUBJECT", "ASSIGN_SUBJECT",
 ]
 
@@ -58,6 +64,7 @@ _CURRENCY = re.compile(r"^[A-Z]{3}$")
 log = logging.getLogger("core.plans")
 
 PlanSlug = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", max_length=40)]
+ModuleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", max_length=40)]
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,42 @@ class Limit:
             raise ValueError(f"Limit {self.name!r}: unit até 30 caracteres")
 
 
+@dataclass(frozen=True)
+class Module:
+    """O serviço como módulo da plataforma: o que a organização liga pelo plano e vê no menu (o nome é o do serviço).
+
+    title, description: como aparece no menu, no plano e na comparação. category: o grupo no menu ("Comercial").
+    limits: o que o módulo limita. requires: módulos sem os quais este não funciona (nomes de serviço, sem svc-).
+    core=True: módulo da plataforma, sempre ligado. default: ligado quando o plano não diz nada (e sem plano).
+    """
+
+    title: str
+    description: str
+    category: str = "Geral"
+    limits: Sequence[Limit] = ()
+    requires: Sequence[str] = ()
+    core: bool = False
+    default: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "limits", tuple(self.limits))
+        object.__setattr__(self, "requires", tuple(self.requires))
+        if not 2 <= len(self.title) <= 40:
+            raise ValueError(f"Module {self.title!r}: título de 2 a 40 caracteres")
+        if not 3 <= len(self.description) <= 200:
+            raise ValueError(f"Module {self.title!r}: descrição de 3 a 200 caracteres")
+        if not 2 <= len(self.category) <= 30:
+            raise ValueError(f"Module {self.title!r}: categoria de 2 a 30 caracteres")
+        names = [limit.name for limit in self.limits]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Module {self.title!r}: limite repetido")
+        for required in self.requires:
+            if not _NAME.match(required) or required.startswith("svc-"):
+                raise ValueError(f"Module {self.title!r}: requires {required!r} é o nome de outro serviço, sem svc-")
+        if self.core and self.requires:
+            raise ValueError(f"Module {self.title!r}: módulo da plataforma (core) não depende de outro")
+
+
 class CatalogLimit(BaseModel):
     name: str = Field(..., description="Nome completo: <serviço>.<limite>")
     service: str
@@ -98,11 +141,27 @@ class CatalogLimit(BaseModel):
     currency: str | None = None
 
 
-class LimitCatalog(BaseModel):
-    """events.plans.catalog: os limites que um serviço declara (o que sair da lista sai do catálogo)."""
+class CatalogModule(BaseModel):
+    name: str = Field(..., description="Nome do serviço, sem svc- (o mesmo de /api/v1/<nome>)")
+    service: str
+    title: str
+    description: str
+    category: str = Field(..., description="Grupo no menu")
+    core: bool = Field(..., description="Módulo da plataforma: sempre ligado")
+    default: bool = Field(..., description="Ligado quando o plano não diz nada (e para quem não tem plano)")
+    requires: list[str] = Field(..., description="Módulos sem os quais este não funciona")
+
+
+class ModuleCatalog(BaseModel):
+    """events.plans.catalog: o módulo que um serviço declara e os limites dele (o limite que sai da lista sai do catálogo)."""
 
     service: str
+    module: CatalogModule
     limits: list[CatalogLimit]
+
+
+class ModuleState(CatalogModule):
+    enabled: bool = Field(..., description="Ligado para a organização: ajuste dela, plano ou default, com os requires ligados")
 
 
 class LimitState(CatalogLimit):
@@ -111,15 +170,19 @@ class LimitState(CatalogLimit):
 
 
 class PlanLimits(BaseModel):
-    """rpc.plans.limits: os limites da organização de quem pergunta, já resolvidos."""
+    """rpc.plans.limits: módulos e limites da organização de quem pergunta, já resolvidos."""
 
     plan: str | None = Field(..., description="Slug do plano; null: sem plano (valem os defaults)")
     plan_name: str
     month: str = Field(..., description="AAAA-MM, em UTC: o mês dos consumos")
     limits: list[LimitState]
+    modules: list[ModuleState] = Field(default_factory=list)
 
     def get(self, name: str) -> LimitState | None:
         return next((state for state in self.limits if state.name == name), None)
+
+    def module(self, name: str) -> ModuleState | None:
+        return next((state for state in self.modules if state.name == name), None)
 
 
 class LimitsRequest(BaseModel):
@@ -146,36 +209,58 @@ class AssignRequest(BaseModel):
     """rpc.plans.assign: troca o plano da organização do cabeçalho (só tarefa da plataforma)."""
 
     plan: PlanSlug
+    modules: dict[ModuleName, bool] | None = Field(
+        None, description="Ajuste da organização: módulo → ligado, além do plano. null: mantém o ajuste; {}: só o plano"
+    )
 
 
 class Assigned(BaseModel):
     tenant: str
     plan: str
     plan_name: str
+    modules: dict[str, bool] = Field(default_factory=dict, description="Ajuste da organização além do plano")
 
 
 class Plans:
     def __init__(self) -> None:
+        self._module: Module | None = None
         self._declared: dict[str, Limit] = {}
         self._cache: dict[str, tuple[float, PlanLimits]] = {}
 
-    async def declare(self, limits: Sequence[Limit]) -> None:
-        """No boot: guarda os limites deste serviço e publica o catálogo para o svc-plans (a tela de planos os lista)."""
+    async def declare(self, module: Module) -> None:
+        """No boot: guarda o módulo deste serviço e os limites dele e publica o catálogo para o svc-plans (o plano, o
+        menu e a comparação os listam). Daí em diante, chamada de quem tem o módulo desligado é recusada."""
         service = _service()
-        names = [limit.name for limit in limits]
-        if len(names) != len(set(names)):
-            raise ValueError("plans.declare: limite repetido")
         prefix = service.removeprefix("svc-")
-        self._declared = {f"{prefix}.{limit.name}": limit for limit in limits}
-        catalog = LimitCatalog(service=service, limits=[
-            CatalogLimit(
-                name=name, service=service, description=limit.description, default=limit.default, monthly=limit.monthly,
-                unit=limit.unit, currency=limit.currency,
-            )
-            for name, limit in self._declared.items()
-        ])
+        if prefix in module.requires:
+            raise ValueError(f"plans.declare: o módulo {prefix} não depende de si mesmo")
+        self._module = module
+        self._declared = {f"{prefix}.{limit.name}": limit for limit in module.limits}
+        catalog = ModuleCatalog(
+            service=service,
+            module=CatalogModule(
+                name=prefix, service=service, title=module.title, description=module.description, category=module.category,
+                core=module.core, default=module.default, requires=list(module.requires),
+            ),
+            limits=[
+                CatalogLimit(
+                    name=name, service=service, description=limit.description, default=limit.default, monthly=limit.monthly,
+                    unit=limit.unit, currency=limit.currency,
+                )
+                for name, limit in self._declared.items()
+            ],
+        )
         digest = hashlib.sha256(catalog.model_dump_json().encode()).hexdigest()[:24]
-        await bus.publish(CATALOG_SUBJECT, catalog, msg_id=f"limits-{service}-{digest}")  # réplicas: um só
+        await bus.publish(CATALOG_SUBJECT, catalog, msg_id=f"catalog-{service}-{digest}")  # réplicas: um só
+
+    async def enabled(self, name: str) -> bool:
+        """O módulo <name> (nome do serviço, sem svc-) está ligado para a organização atual? Para mostrar ou usar uma
+        integração opcional com outro módulo. Sem resposta do svc-plans: ligado."""
+        if not _NAME.match(name) or name.startswith("svc-"):
+            raise ValueError(f"plans.enabled: {name!r} é o nome de um serviço, sem svc-")
+        resolved = await self._resolve()
+        state = resolved.module(name) if resolved is not None else None
+        return True if state is None else state.enabled
 
     async def check(self, name: str, *, used: float | None = None, adding: float = 1) -> None:
         """Confere o limite na organização atual. Total: used= é quanto existe agora e adding= quanto vai entrar.
@@ -223,8 +308,8 @@ class Plans:
         await bus.publish(COUNT_SUBJECT, CountReport(name=full, total=total, at=datetime.now(UTC)))
 
     async def limits(self) -> PlanLimits:
-        """Os limites da organização atual (plano, valores e consumo do mês), guardados por 60 s. Com o svc-plans fora
-        do ar e sem resposta guardada: nenhum limite (lista vazia)."""
+        """Módulos e limites da organização atual (plano, valores e consumo do mês), guardados por 60 s. Com o svc-plans
+        fora do ar e sem resposta guardada: nenhum limite e nenhum módulo (listas vazias)."""
         return await self._resolve() or PlanLimits(plan=None, plan_name="", month=_month(), limits=[])
 
     async def _resolve(self) -> PlanLimits | None:
@@ -243,20 +328,39 @@ class Plans:
         self._cache[tenant] = (time.monotonic() + CACHE_SECONDS, resolved)
         return resolved
 
-    async def assign(self, plan: str) -> Assigned:
+    async def assign(self, plan: str, *, modules: dict[str, bool] | None = None) -> Assigned:
         """Troca o plano da organização atual. Só tarefa da plataforma: o serviço de pagamentos do produto, depois de
-        confirmar, com acting_as(system(SERVICE, org)). Plano inexistente → 404 ERRO_PLANS_NOT_FOUND."""
+        confirmar, com acting_as(system(SERVICE, org)). modules= ajusta módulos além do plano (um módulo avulso
+        comprado: {"juridico": True}); None mantém o ajuste. Plano inexistente → 404 ERRO_PLANS_NOT_FOUND."""
         who = current()
         if who is None or not who.is_system:
             raise PermissionError("plans.assign é para tarefas da plataforma: acting_as(system(SERVICE, org))")
         tenant = current_tenant()
-        assigned = await bus.request(ASSIGN_SUBJECT, AssignRequest(plan=plan), Assigned, timeout=5)
+        assigned = await bus.request(ASSIGN_SUBJECT, AssignRequest(plan=plan, modules=modules), Assigned, timeout=5)
         self._cache.pop(tenant, None)
         return assigned
 
     def clear(self) -> None:
         """Esquece as resoluções guardadas (ex.: testes ou logo depois de trocar um plano)."""
         self._cache.clear()
+
+    async def _gate(self, who: Principal) -> None:
+        """Conferência do core em toda chamada de uma pessoa (core/security.py): módulo deste serviço desligado para a
+        organização dela → 402 ERRO_PLAN_MODULE. Módulo da plataforma, ou ainda não declarado, passa."""
+        module = self._module
+        if module is None or module.core:
+            return
+        resolved = await self._resolve()
+        if resolved is None:
+            return
+        state = resolved.module(_service().removeprefix("svc-"))
+        if state is None:  # o svc-plans ainda não gravou o catálogo deste serviço: vale o default declarado
+            if module.default:
+                return
+        elif state.enabled:
+            return
+        plan = f"no plano {resolved.plan_name}" if resolved.plan else "para a organização"
+        raise ServiceError("ERRO_PLAN_MODULE", f"{module.title} não está incluído {plan}. Veja em Plano.", status=402)
 
     def _unavailable(self, cached: tuple[float, PlanLimits] | None, exc: Exception) -> PlanLimits | None:
         log.warning("svc-plans não respondeu (%s): %s", type(exc).__name__, "vale a última resposta" if cached else "sem limites")
@@ -272,7 +376,7 @@ class Plans:
         full = f"{_service().removeprefix('svc-')}.{name}"
         own = self._declared.get(full)
         if own is None:
-            raise ValueError(f"plans: limite {full!r} não declarado (plans.declare no lifespan, README §5.17)")
+            raise ValueError(f"plans: limite {full!r} não declarado (Module(limits=[...]) e plans.declare no lifespan, README §5.17)")
         return full, own
 
 
@@ -295,3 +399,4 @@ def _service() -> str:
 
 
 plans = Plans()
+add_gate(plans._gate)  # módulo desligado recusa a chamada antes do serviço (HTTP, evento e RPC)

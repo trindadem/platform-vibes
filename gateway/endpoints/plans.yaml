@@ -23,12 +23,19 @@ endpoints:
     target_type: http
     target_url: http://svc-plans:8000/plans
 
-  - path: /limits
+  - path: /modules
     method: GET
     auth: client_jwt
-    response: LimitList
+    response: ModuleList
     target_type: http
-    target_url: http://svc-plans:8000/limits
+    target_url: http://svc-plans:8000/modules
+
+  - path: /catalog
+    method: GET
+    auth: client_jwt
+    response: Catalog
+    target_type: http
+    target_url: http://svc-plans:8000/catalog
 
   - path: /plans
     name: createPlan
@@ -56,6 +63,14 @@ endpoints:
     response: PlanList
     target_type: http
     target_url: http://svc-plans:8000/plans/remove
+
+  - path: /account
+    method: GET
+    auth: client_jwt
+    query: AccountRef
+    response: Account
+    target_type: http
+    target_url: http://svc-plans:8000/account
 
   - path: /assign
     method: POST

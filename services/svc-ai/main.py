@@ -25,7 +25,7 @@ from schemas import (
     SHARED_TABLES,
     TASK_QUEUE,
     TENANT_TABLES,
-    LIMITS,
+    MODULE,
     SEARCH,
     TRIGGER_SUBJECT,
     UNIQUE,
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ProviderRef)
         await bus.subscribe(USAGE_SUBJECT, on_usage, model=UsageEvent)
         await bus.respond(RESOLVE_SUBJECT, svc.resolve, model=ResolveRequest)
-        await plans.declare(LIMITS)  # custo e tokens do mês entram no catálogo de limites dos planos
+        await plans.declare(MODULE)  # o módulo, com custo e tokens do mês, no catálogo dos planos (README §5.17)
         yield
 
 

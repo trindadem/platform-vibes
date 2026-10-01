@@ -3,6 +3,7 @@
 ## 1. Objetivo Operacional
 Dar a cada pessoa uma conta e a cada cliente uma organização isolada: cadastro, login, sessão renovável e convites.
 É o único serviço que emite tokens (só ele tem `AUTH_PRIVATE_KEY`); suas tabelas são globais (README §5.7 e §5.9).
+Módulo `identity` ("Pessoas e acesso", categoria Organização), da plataforma: sempre ligado (README §5.17).
 
 ## 2. Contrato de Entrada e Saída
 Públicas (sem token):
@@ -20,9 +21,11 @@ Com token:
 - `POST /invites` (`InviteInput { role: admin | member, email? }`) → `Invite { code, role, expires_at, email }` · só
   owner/admin; com `email`, o convite também vai por e-mail
 - `POST /members/remove` (`MemberRef { user }`) → `MemberList` · só owner/admin
-- `GET /organization` → `Organization { id, name, logo_url }` (link assinado do logo, 1 h)
+- `GET /organization` → `Organization { id, name, logo_url, color }` (link assinado do logo, 1 h; `color`: a cor da
+  marca, `#rrggbb`, ou `null` para a da plataforma); a moldura da tela usa o nome, o logo e a cor
 - `POST /organization/logo/upload` (`UploadRequest`) → `Upload`; `POST /organization/logo` (`KeepRequest`) e
   `POST /organization/logo/remove` → `Organization` · só owner/admin (README §5.14)
+- `POST /organization/color` (`ColorInput { color: "#rrggbb" | null }`) → `Organization` · só owner/admin
 
 RPC `rpc.identity.contacts` (`ContactsRequest { users, roles }`) → `Contacts { tenant_name, items: Contact[] }`, com
 `Contact { id, name, email }`: só quem é membro da organização de quem pergunta (o `svc-notify`, README §5.15).

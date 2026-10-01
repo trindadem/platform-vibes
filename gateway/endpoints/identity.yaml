@@ -137,7 +137,7 @@ endpoints:
     target_type: http
     target_url: http://svc-identity:8000/members/remove
 
-  # Organização: nome e logo. O arquivo vai direto do navegador ao armazenamento (README §5.14):
+  # Organização: nome, logo e cor da marca. O arquivo vai direto do navegador ao armazenamento (README §5.14):
   # 1) logoUpload devolve o link assinado, 2) a tela envia, 3) setLogo confirma.
   - path: /organization
     method: GET
@@ -163,6 +163,15 @@ endpoints:
     response: Organization
     target_type: http
     target_url: http://svc-identity:8000/organization/logo
+
+  - path: /organization/color
+    name: setColor
+    method: POST
+    auth: client_jwt
+    request: ColorInput
+    response: Organization
+    target_type: http
+    target_url: http://svc-identity:8000/organization/color
 
   - path: /organization/logo/remove
     name: removeLogo

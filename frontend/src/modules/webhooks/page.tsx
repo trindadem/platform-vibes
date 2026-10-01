@@ -32,7 +32,7 @@ import {
   webhooks,
 } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "Webhooks", order: 5 };
+export const meta: PageMeta = { title: "Webhooks", order: 5, module: "webhooks" };
 
 const STATUS = { pending: "Tentando", sent: "Entregue", failed: "Falhou", skipped: "Pulada" };
 const TOM = { pending: "warning", sent: "success", failed: "danger", skipped: "neutral" } as const;

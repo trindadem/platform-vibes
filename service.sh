@@ -3,18 +3,23 @@
 #
 #   ./service.sh <nome-em-kebab-case>        ex.: ./service.sh billing | ./service.sh user-auth
 #
-# Um nome, quatro grafias derivadas (nenhuma é digitada à mão):
-#   kebab   user-auth    pastas e arquivos, URL, subjects NATS, task queue, prefixo das activities
+# Um nome, seis grafias derivadas (nenhuma é digitada à mão):
+#   kebab   user-auth    pastas e arquivos, URL, subjects NATS, task queue, prefixo das activities, módulo
 #   snake   user_auth    tabela SurrealDB
-#   Pascal  UserAuth     classes Python
+#   Pascal  UserAuth     classes Python e a tela
+#   camel   userAuth     cliente do frontend (core/contracts.ts)
 #   UPPER   USER_AUTH    códigos de erro
+#   Título  User auth    nome do módulo no menu e no plano (troque à vontade no MODULE e no meta da tela)
 #
 # Cada serviço roda de dentro da própria pasta (imports irmãos: from schemas import ...).
 # Motivo: o sandbox do Temporal reimporta o workflow pelo nome do módulo, e "svc-x" com hífen
 # não é importável como pacote. Bônus: nenhum "import" de outro serviço funciona (vira SyntaxError
 # ou ModuleNotFoundError) — o acoplamento lateral quebra na hora, não em produção.
 #
-# Garantias: valida o nome; nunca sobrescreve; preserva um spec já escrito (spec-first);
+# Todo serviço é um módulo (README §5.17): MODULE no schemas.py, declarado no boot, e a tela
+# frontend/src/modules/<nome>/page.tsx, que entra no menu e some quando o plano não inclui o módulo.
+#
+# Garantias: valida o nome; nunca sobrescreve; preserva um spec ou uma tela já escritos (spec-first);
 # gera tudo numa área temporária, confere a sintaxe e só então publica (tudo ou nada).
 # Roda no bash 3.2 do macOS.
 set -euo pipefail
@@ -33,12 +38,16 @@ fi
 SNAKE="$(printf '%s' "$NAME" | tr '-' '_')"
 UPPER="$(printf '%s' "$SNAKE" | tr '[:lower:]' '[:upper:]')"
 PASCAL="$(printf '%s' "$NAME" | awk -F- '{ for (i = 1; i <= NF; i++) printf "%s%s", toupper(substr($i, 1, 1)), substr($i, 2) }')"
+CAMEL="$(printf '%s' "$PASCAL" | awk '{ printf "%s%s", tolower(substr($0, 1, 1)), substr($0, 2) }')"
+TITLE="$(printf '%s' "$NAME" | tr '-' ' ' | awk '{ printf "%s%s", toupper(substr($0, 1, 1)), substr($0, 2) }')"
 
 SVC_DIR="services/svc-${NAME}"
 SPEC_FILE="specs/${NAME}.md"
 ENDPOINT_FILE="gateway/endpoints/${NAME}.yaml"
 TEST_FILE="tests/${NAME}.py"
 COMPOSE_FILE="compose.yaml"
+PAGES_DIR="frontend/src/modules"
+PAGE_FILE="${PAGES_DIR}/${NAME}/page.tsx"
 
 # 1. Idempotência: nada é tocado se o serviço, a rota ou o teste já existirem.
 for target in "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"; do
@@ -49,15 +58,18 @@ if [[ -f "$COMPOSE_FILE" ]] && grep -q "^  svc-${NAME}:$" "$COMPOSE_FILE"; then
 fi
 KEEP_SPEC=0
 if [[ -f "$SPEC_FILE" ]]; then KEEP_SPEC=1; fi
+# Tela: só onde há frontend; a que já existe é preservada (como o spec).
+MAKE_PAGE=0
+if [[ -d "$PAGES_DIR" && ! -e "$PAGES_DIR/$NAME" ]]; then MAKE_PAGE=1; fi
 
 # 2. Gera tudo numa área temporária no mesmo disco (a publicação vira um rename).
 STAGE="$(mktemp -d .scaffold.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/svc"
 
-render() {  # render <destino>  — template via stdin, placeholders __NAME__ __SNAKE__ __PASCAL__ __UPPER__
-  sed -e "s/__NAME__/${NAME}/g" -e "s/__SNAKE__/${SNAKE}/g" \
-      -e "s/__PASCAL__/${PASCAL}/g" -e "s/__UPPER__/${UPPER}/g" > "$1"
+render() {  # render <destino>  — template via stdin, placeholders __NAME__ __SNAKE__ __PASCAL__ __CAMEL__ __UPPER__ __TITLE__
+  sed -e "s/__NAME__/${NAME}/g" -e "s/__SNAKE__/${SNAKE}/g" -e "s/__PASCAL__/${PASCAL}/g" \
+      -e "s/__CAMEL__/${CAMEL}/g" -e "s/__UPPER__/${UPPER}/g" -e "s/__TITLE__/${TITLE}/g" > "$1"
 }
 
 render "$STAGE/spec.md" <<'EOF'
@@ -65,6 +77,7 @@ render "$STAGE/spec.md" <<'EOF'
 
 ## 1. Objetivo Operacional
 TODO: em 2 a 3 linhas, a dor que este serviço resolve e o resultado de negócio esperado.
+Módulo (schemas.MODULE): "__TITLE__", categoria Geral, ligado por padrão; tela em /__NAME__.
 
 ## 2. Contrato de Entrada e Saída
 - Request (schemas.ExecutionInput): { title: str, payload: {...} }
@@ -92,6 +105,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.plans import Module
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -102,6 +116,10 @@ PROCESSED_SUBJECT = "events.__NAME__.processed"
 PROCESSED_LIVE = "__NAME__.processado"  # ao vivo para a organização (README §5.10)
 TABLE = "__SNAKE___records"
 SEARCH = {TABLE: ["title"]}  # campos com busca por palavras (db.page com q, README §5.12)
+
+# O serviço como módulo (README §5.17): título e categoria no menu e no plano; limits=[Limit(...)] o que ele limita;
+# requires=("outro",) os módulos sem os quais não funciona; default=False se só entra quando o plano incluir.
+MODULE = Module("__TITLE__", "Descreva em uma frase o que o módulo faz (specs/__NAME__.md §1)", category="Geral")
 
 
 class ExecutionInput(BaseModel):
@@ -217,12 +235,13 @@ from fastapi import FastAPI, Query
 
 from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
+from core.plans import plans
 from core.security import install_security
 from core.surreal import db
 from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
-from schemas import SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
+from schemas import MODULE, SEARCH, SERVICE, TABLE, TASK_QUEUE, TRIGGER_SUBJECT, ExecutionInput, RecordQuery
 from service import MIGRATIONS, __PASCAL__Service
 from workflows import SCHEDULES, __PASCAL__Workflow
 
@@ -242,6 +261,7 @@ async def lifespan(app: FastAPI):
         runner.worker(TASK_QUEUE, workflows=[__PASCAL__Workflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ExecutionInput)
+        await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
 
 
@@ -397,6 +417,50 @@ def test_lista_so_ordena_pelos_campos_declarados():
         RecordQuery(sort="payload")
 EOF
 
+if [[ $MAKE_PAGE -eq 1 ]]; then
+  render "$STAGE/page.tsx" <<'EOF'
+// Tela do módulo __NAME__ (gerada pelo service.sh): só compõe o catálogo (src/components/CATALOG.md, README §6).
+// Fonte da verdade: specs/__NAME__.md. Telas a mais: src/modules/__NAME__/<parte>/page.tsx ou [id]/page.tsx.
+import { useState } from "react";
+import type { PageMeta } from "@/App";
+import { ActionForm } from "@/components/ActionForm";
+import { Button } from "@/components/Button";
+import { DateTime } from "@/components/DateTime";
+import { ListView } from "@/components/ListView";
+import { Page } from "@/components/Page";
+import { SidePanel } from "@/components/SidePanel";
+import { useAction, useListQuery } from "@/core/api";
+import { __CAMEL__ } from "@/core/contracts";
+
+export const meta: PageMeta = { title: "__TITLE__", module: "__NAME__" };
+
+export default function __PASCAL__() {
+  const [criando, setCriando] = useState(false);
+  const lista = useListQuery(__CAMEL__.records, { live: "__NAME__.processado" }); // registro novo aparece sozinho
+  const criar = useAction(__CAMEL__.execute, { onSuccess: lista.reload });
+  return (
+    <Page title="__TITLE__" description="Registros do módulo, só da sua organização.">
+      <ListView
+        list={lista}
+        rowKey={(r) => r.id}
+        search="título"
+        noun="registros"
+        empty="Nenhum registro ainda."
+        actions={<Button onClick={() => setCriando(true)}>Novo registro</Button>}
+        columns={[
+          { key: "title", header: "Título", sort: "title" },
+          { key: "created_at", header: "Criado", sort: "created_at", render: (r) => <DateTime value={r.created_at} format="relative" /> },
+        ]}
+      />
+      <SidePanel open={criando} onClose={() => setCriando(false)} title="Novo registro">
+        <ActionForm action={criar} submitLabel="Criar" onDone={() => setCriando(false)} fields={[{ name: "title", label: "Título", required: true }]} />
+      </SidePanel>
+    </Page>
+  );
+}
+EOF
+fi
+
 # O compose.yaml novo também nasce na área temporária: a troca é um rename, nunca um arquivo pela metade.
 COMPOSE_STATUS="ausente: serviço não registrado"
 if [[ -f "$COMPOSE_FILE" ]]; then
@@ -424,34 +488,42 @@ fi
 
 # 4. Publica. Se um rename falhar no meio, desfaz o que já foi movido.
 mkdir -p services specs gateway/endpoints tests
+undo() {  # desfaz o que já foi publicado
+  rm -rf "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"
+  if [[ $KEEP_SPEC -eq 0 ]]; then rm -f "$SPEC_FILE"; fi
+  if [[ $MAKE_PAGE -eq 1 ]]; then rm -rf "${PAGES_DIR:?}/$NAME"; fi
+}
 publish() {
   mv "$STAGE/svc" "$SVC_DIR" || return 1
-  mv "$STAGE/endpoint.yaml" "$ENDPOINT_FILE" || { rm -rf "$SVC_DIR"; return 1; }
-  mv "$STAGE/test.py" "$TEST_FILE" || { rm -rf "$SVC_DIR" "$ENDPOINT_FILE"; return 1; }
+  mv "$STAGE/endpoint.yaml" "$ENDPOINT_FILE" || { undo; return 1; }
+  mv "$STAGE/test.py" "$TEST_FILE" || { undo; return 1; }
   if [[ $KEEP_SPEC -eq 0 ]]; then
-    mv "$STAGE/spec.md" "$SPEC_FILE" || { rm -rf "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"; return 1; }
+    mv "$STAGE/spec.md" "$SPEC_FILE" || { undo; return 1; }
+  fi
+  if [[ $MAKE_PAGE -eq 1 ]]; then
+    { mkdir "$PAGES_DIR/$NAME" && mv "$STAGE/page.tsx" "$PAGE_FILE"; } || { undo; return 1; }
   fi
   if [[ -f "$STAGE/compose.yaml" ]]; then
-    mv "$STAGE/compose.yaml" "$COMPOSE_FILE" || {
-      rm -rf "$SVC_DIR" "$ENDPOINT_FILE" "$TEST_FILE"
-      if [[ $KEEP_SPEC -eq 0 ]]; then rm -f "$SPEC_FILE"; fi
-      return 1
-    }
+    mv "$STAGE/compose.yaml" "$COMPOSE_FILE" || { undo; return 1; }
   fi
 }
 publish || die "falha ao publicar; nada foi mantido."
 
 if [[ $KEEP_SPEC -eq 1 ]]; then SPEC_STATUS="preservado"; else SPEC_STATUS="novo"; fi
+if [[ $MAKE_PAGE -eq 1 ]]; then PAGE_STATUS="nova: /${NAME} no menu"
+elif [[ -d "$PAGES_DIR" ]]; then PAGE_STATUS="preservada"
+else PAGE_STATUS="sem frontend"; fi
 cat <<EOF
-==> svc-${NAME} provisionado.
+==> svc-${NAME} provisionado (módulo "${TITLE}").
     ${SPEC_FILE}  (${SPEC_STATUS})
     ${SVC_DIR}/{schemas,service,workflows,main}.py
     ${ENDPOINT_FILE}
     ${TEST_FILE}
+    ${PAGE_FILE}  (${PAGE_STATUS})
     ${COMPOSE_FILE}  (${COMPOSE_STATUS})
 
 Próximo passo: preencha ${SPEC_FILE} e peça à IA:
   "Implemente specs/${NAME}.md em ${SVC_DIR}/ seguindo o README."
 Testes: PYTHONPATH=${SVC_DIR} uv run python -m pytest ${TEST_FILE}
-Contratos do frontend: uv run python gateway/contracts.py
+Contratos do frontend (antes de abrir a tela): uv run python gateway/contracts.py
 EOF

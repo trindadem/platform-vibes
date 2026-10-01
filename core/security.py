@@ -5,6 +5,8 @@ Regras (README §5.7):
   A exceção é /health (core/telemetry.py), que só diz se as dependências respondem.
 - Identidade vem do token (Principal), nunca do payload. Durante a requisição, o evento ou a activity, ela
   fica no contexto: current() diz quem age e current_tenant() de qual organização (README §5.9).
+- Conferências do core (add_gate) rodam depois da autenticação em toda chamada de uma pessoa numa organização:
+  requisição HTTP, evento e RPC (core/nats_bus.py). Hoje, uma só: módulo desligado no plano (core/plans.py).
 - Tokens JWT só com chave assimétrica: EdDSA com chaves próprias ou JWKS de um provedor (Auth0, Clerk,
   Keycloak...). "none" e HS256 são recusados; issuer, audience e expiração são obrigatórios.
 - Senhas só via hash_password/verify_password (Argon2id, fora do event loop). Segredos só no ambiente.
@@ -32,7 +34,7 @@ import socket
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -162,6 +164,25 @@ def current_tenant() -> str:
     if who is None or not who.tenant:
         raise ServiceError("ERRO_TENANT_REQUIRED", "Selecione uma organização para continuar.", status=403)
     return who.tenant
+
+
+Gate = Callable[[Principal], Awaitable[None]]
+_gates: list[Gate] = []
+
+
+def add_gate(gate: Gate) -> None:
+    """Registra uma conferência do core para toda chamada de uma pessoa numa organização (HTTP, evento e RPC), depois
+    da autenticação. Recusa levantando ServiceError. Só o core registra (core/plans.py: módulo fora do plano)."""
+    if gate not in _gates:
+        _gates.append(gate)
+
+
+async def check_gates(who: Principal | None) -> None:
+    """Roda as conferências do core para quem age. Tarefa da plataforma (system) e quem não tem organização passam."""
+    if who is None or who.is_system or not who.tenant:
+        return
+    for gate in _gates:
+        await gate(who)
 
 
 @contextmanager
@@ -317,6 +338,11 @@ class _AuthMiddleware:
             return await response(scope, receive, send)
         scope.setdefault("state", {})["principal"] = current
         with acting_as(current):  # current()/current_tenant() valem até o fim da requisição
+            if not is_public:
+                try:
+                    await check_gates(current)  # ex.: módulo desligado no plano da organização (core/plans.py)
+                except ServiceError as exc:
+                    return await error_response(self.service, exc.status, exc.code, exc.message)(scope, receive, send)
             await self.app(scope, receive, send)
 
 

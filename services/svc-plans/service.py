@@ -4,9 +4,10 @@ Trilho (validado no import por @activities): todo método público é async, rec
 de schemas.py, retorna 1 modelo de schemas.py e vira a activity Temporal "plans.<método>".
 Helpers começam com _ e nunca viram activities.
 
-Serviço de plataforma (README §5.17): guarda o catálogo de limites que os serviços declaram, os planos (geridos por
-quem administra a plataforma, PLATFORM_TENANT), o plano de cada organização e o consumo do mês. Quem confere o limite
-é o core/plans.py, no serviço que vai criar ou gastar; aqui só se resolve, soma e avisa.
+Serviço de plataforma (README §5.17): guarda o catálogo de módulos e limites que os serviços declaram, os planos
+(geridos por quem administra a plataforma, PLATFORM_TENANT), o plano e o ajuste de módulos de cada organização e o
+consumo do mês. Quem confere é o core/plans.py, no serviço chamado (módulo) ou que vai criar ou gastar (limite); aqui
+só se resolve, soma e avisa.
 """
 import functools
 import uuid
@@ -24,6 +25,7 @@ from core.temporal_runner import activities
 
 from schemas import (
     ACCOUNTS,
+    MODULE_CATALOG,
     ALERTS,
     CONTACTS_SUBJECT,
     COUNTS,
@@ -37,20 +39,24 @@ from schemas import (
     USAGE_LIVE,
     USAGE_LOG,
     Account,
+    AccountRef,
     Assigned,
     AssignInput,
     AssignRequest,
+    Catalog,
     CatalogLimit,
+    CatalogModule,
     Cleaned,
     Contacts,
     ContactsRequest,
     CountReport,
     Current,
     Empty,
-    LimitCatalog,
-    LimitList,
     LimitsRequest,
     LimitState,
+    ModuleCatalog,
+    ModuleList,
+    ModuleState,
     Plan,
     PlanInput,
     PlanLimits,
@@ -90,17 +96,22 @@ class PlansService:
 
     async def current(self, data: Empty) -> Current:
         who = _member()
-        tier = await self._tier_of(who.tenant)
+        tier, _ = await self._plan_of(who.tenant)
         resolved = await self.resolve(LimitsRequest())
         return Current(
             tenant=who.tenant, plan=_plan(tier) if tier else None, month=resolved.month, limits=resolved.limits,
-            manages_platform=_manages_platform(who),
+            modules=resolved.modules, manages_platform=_manages_platform(who),
         )
+
+    async def modules(self, data: Empty) -> ModuleList:
+        """Os módulos e se cada um está ligado para a organização ativa: o menu da tela esconde os desligados."""
+        _member()
+        return ModuleList(items=(await self.resolve(LimitsRequest())).modules)
 
     async def list_plans(self, data: Empty) -> PlanList:
         """Os públicos e o da própria organização; quem administra a plataforma vê todos."""
         who = _member()
-        tier = await self._tier_of(who.tenant)
+        tier, _ = await self._plan_of(who.tenant)
         manages = _manages_platform(who)
         rows = await db.query_shared(
             "SELECT * FROM plan_tiers WHERE public = true OR slug = $current OR $all = true ORDER BY price, name",
@@ -108,10 +119,9 @@ class PlansService:
         )
         return PlanList(items=[_plan(row) for row in rows], current=tier["slug"] if tier else None, manages_platform=manages)
 
-    async def list_limits(self, data: Empty) -> LimitList:
+    async def catalog(self, data: Empty) -> Catalog:
         _member()
-        rows = await db.query_shared("SELECT * FROM plan_limits ORDER BY name")
-        return LimitList(items=[_catalog(row) for row in rows])
+        return Catalog(modules=list((await _module_catalog()).values()), limits=await _limit_catalog())
 
     # ── Planos (quem administra a plataforma) ───────────────────────────────
 
@@ -120,7 +130,7 @@ class PlansService:
         record = {
             "slug": data.slug, "name": data.name, "description": data.description, "price": data.price,
             "currency": data.currency, "public": data.public, "is_default": data.default,
-            "limits": await _checked_limits(data.limits),
+            "limits": await _checked_limits(data.limits), "modules": await _checked_modules(data.modules, {}),
         }
         try:
             row = await db.create(TIERS, record)
@@ -135,9 +145,11 @@ class PlansService:
     async def update_plan(self, data: PlanUpdate) -> Plan:
         _platform_manager()
         row = await _tier(data.slug)
-        changes = data.model_dump(exclude={"slug", "default", "limits"}, exclude_none=True)
+        changes = data.model_dump(exclude={"slug", "default", "limits", "modules"}, exclude_none=True)
         if data.limits is not None:
             changes["limits"] = await _checked_limits(data.limits)
+        if data.modules is not None:
+            changes["modules"] = await _checked_modules(data.modules, {})
         if data.default is not None:
             changes["is_default"] = data.default
         if changes:
@@ -161,16 +173,26 @@ class PlansService:
         await db.delete(row["id"])
         return await self.list_plans(Empty())
 
+    async def account(self, data: AccountRef) -> Account:
+        """Pela tela: quem administra a plataforma vê o plano e o ajuste de módulos de uma organização, pelo id dela."""
+        _platform_manager()
+        name = await _tenant_name(data.tenant)
+        tier, account = await self._plan_of(data.tenant)
+        return Account(
+            tenant=data.tenant, tenant_name=name, plan=tier["slug"] if tier else None, plan_name=tier["name"] if tier else NO_PLAN,
+            assigned=account is not None, modules=_flags(account, "modules"),
+        )
+
     async def assign_plan(self, data: AssignInput) -> Account:
-        """Pela tela: quem administra a plataforma troca o plano de uma organização, pelo id dela."""
+        """Pela tela: quem administra a plataforma troca o plano (e o ajuste de módulos) de uma organização, pelo id."""
         who = _platform_manager()
         tier = await _tier(data.plan)
+        name = await _tenant_name(data.tenant)
         with acting_as(system(SERVICE, data.tenant)):
-            found = await bus.request(CONTACTS_SUBJECT, ContactsRequest(), Contacts, timeout=5)
-            if not found.tenant_name:
-                raise ServiceError("ERRO_PLANS_TENANT_NOT_FOUND", "Organização não encontrada.", 404)
-            await self._assign(tier, by=who.sub)
-        return Account(tenant=data.tenant, tenant_name=found.tenant_name, plan=tier["slug"], plan_name=tier["name"])
+            modules = await self._assign(tier, data.modules, by=who.sub)
+        return Account(
+            tenant=data.tenant, tenant_name=name, plan=tier["slug"], plan_name=tier["name"], assigned=True, modules=modules
+        )
 
     async def assign(self, data: AssignRequest) -> Assigned:
         """rpc.plans.assign: o serviço de pagamentos do produto troca o plano, como tarefa da plataforma."""
@@ -178,32 +200,45 @@ class PlansService:
         if who is None or not who.is_system:
             raise ServiceError("ERRO_PLANS_FORBIDDEN", "Só tarefas da plataforma trocam o plano por aqui.", 403)
         tier = await _tier(data.plan)
-        await self._assign(tier, by=who.sub)
-        return Assigned(tenant=current_tenant(), plan=tier["slug"], plan_name=tier["name"])
+        modules = await self._assign(tier, data.modules, by=who.sub)
+        return Assigned(tenant=current_tenant(), plan=tier["slug"], plan_name=tier["name"], modules=modules)
 
     # ── Serviços (core/plans.py) ────────────────────────────────────────────
 
     async def resolve(self, data: LimitsRequest) -> PlanLimits:
-        """rpc.plans.limits: plano da organização de quem pergunta, valores de cada limite e consumo do mês."""
+        """rpc.plans.limits: plano da organização de quem pergunta, módulos ligados, valores de cada limite e consumo
+        do mês."""
         tenant = current_tenant()
-        tier = await self._tier_of(tenant)
+        tier, account = await self._plan_of(tenant)
         values = _values(tier)
         month = _month()
         sums = {row["name"]: row["used"] for row in await db.query(
             "SELECT name, used FROM plan_usage WHERE tenant = $tenant AND month = $month", month=month
         )}
         totals = {row["name"]: row["total"] for row in await db.query("SELECT name, total FROM plan_counts WHERE tenant = $tenant")}
-        states = []
-        for row in await db.query_shared("SELECT * FROM plan_limits ORDER BY name"):
-            limit = _catalog(row)
-            states.append(LimitState(
+        states = [
+            LimitState(
                 **limit.model_dump(),
                 limit=values[limit.name] if limit.name in values else limit.default,
                 used=sums.get(limit.name, 0.0) if limit.monthly else totals.get(limit.name, 0),
-            ))
-        return PlanLimits(plan=tier["slug"] if tier else None, plan_name=tier["name"] if tier else NO_PLAN, month=month, limits=states)
+            )
+            for limit in await _limit_catalog()
+        ]
+        return PlanLimits(
+            plan=tier["slug"] if tier else None, plan_name=tier["name"] if tier else NO_PLAN, month=month, limits=states,
+            modules=_module_states(await _module_catalog(), tier, account),
+        )
 
-    async def record_catalog(self, data: LimitCatalog) -> Empty:
+    async def record_catalog(self, data: ModuleCatalog) -> Empty:
+        """events.plans.catalog: o módulo e os limites que um serviço declarou no boot."""
+        module = data.module
+        await db.query_shared(
+            "UPSERT $id SET name = $name, service = $service, title = $title, description = $description, "
+            "category = $category, is_core = $core, default_enabled = $default, requires = $requires",
+            id=RecordID(MODULE_CATALOG, module.name), name=module.name, service=data.service, title=module.title,
+            description=module.description, category=module.category, core=module.core, default=module.default,
+            requires=module.requires,
+        )
         for limit in data.limits:
             await db.query_shared(
                 "UPSERT $id SET name = $name, service = $service, description = $description, default_value = $default, "
@@ -274,31 +309,38 @@ class PlansService:
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    async def _tier_of(self, org: str) -> dict | None:
-        """Plano em vigor: o atribuído à organização ou, sem ele, o padrão (None: sem plano, valem os defaults)."""
-        rows = await db.query_shared(
-            "SELECT * FROM plan_tiers WHERE slug = (SELECT VALUE plan FROM plan_accounts WHERE org = $org)[0]", org=org
-        )
-        if rows:
-            return rows[0]
+    async def _plan_of(self, org: str) -> tuple[dict | None, dict | None]:
+        """Plano em vigor (o atribuído ou, sem ele, o padrão; None: sem plano, valem os defaults) e a linha da
+        organização em plan_accounts (o ajuste de módulos), se houver."""
+        accounts = await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org)
+        account = accounts[0] if accounts else None
+        if account:
+            rows = await db.query_shared("SELECT * FROM plan_tiers WHERE slug = $slug", slug=account["plan"])
+            if rows:
+                return rows[0], account
         rows = await db.query_shared("SELECT * FROM plan_tiers WHERE is_default = true ORDER BY slug LIMIT 1")
-        return rows[0] if rows else None
+        return (rows[0] if rows else None), account
 
-    async def _assign(self, tier: dict, *, by: str) -> None:
-        """Troca o plano da organização atual e recomeça os patamares de aviso do mês."""
+    async def _assign(self, tier: dict, modules: dict[str, bool] | None, *, by: str) -> dict[str, bool]:
+        """Troca o plano da organização atual (e o ajuste de módulos, se veio) e recomeça os patamares de aviso do
+        mês. Devolve o ajuste que ficou."""
         org = current_tenant()
-        rows = await db.query_shared("SELECT id FROM plan_accounts WHERE org = $org", org=org)
+        rows = await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org)
+        own = _flags(rows[0] if rows else None, "modules") if modules is None else modules
+        stored = await _checked_modules(own, _flags(tier, "modules"))
+        record = {"plan": tier["slug"], "modules": stored, "assigned_by": by}
         if rows:
-            await db.merge(rows[0]["id"], {"plan": tier["slug"], "assigned_by": by})
+            await db.merge(rows[0]["id"], record)
         else:
-            await db.create(ACCOUNTS, {"org": org, "plan": tier["slug"], "assigned_by": by})
+            await db.create(ACCOUNTS, {"org": org, **record})
         await db.query("UPDATE plan_usage SET alerted = 0 WHERE tenant = $tenant AND month = $month", month=_month())
+        return {item["name"]: item["enabled"] for item in stored}
 
     async def _alert(self, row: dict) -> None:
         """Avisa donos e administradores ao cruzar 80% e 100% de um limite mensal (uma vez por mês e por patamar)."""
         if row["month"] != _month() or row.get("alerted", 0) >= ALERTS[0]:
             return
-        tier = await self._tier_of(current_tenant())
+        tier, _ = await self._plan_of(current_tenant())
         catalog = await db.query_shared("SELECT * FROM plan_limits WHERE name = $name", name=row["name"])
         if not catalog:
             return
@@ -351,6 +393,70 @@ async def _checked_limits(limits: dict[str, float | None]) -> list[dict[str, Any
     return [{"name": name, "value": value} for name, value in sorted(limits.items())]
 
 
+async def _checked_modules(modules: dict[str, bool], base: dict[str, bool]) -> list[dict[str, Any]]:
+    """Só módulos do catálogo; os da plataforma ficam sempre ligados (ligar é ignorado, desligar é erro). Quem fica
+    ligado precisa dos requires ligados, contando base (o plano, para o ajuste de uma organização) e os defaults."""
+    catalog = await _module_catalog()
+    if unknown := sorted(set(modules) - set(catalog)):
+        raise ServiceError("ERRO_PLANS_UNKNOWN_MODULE", f"Módulo fora do catálogo: {', '.join(unknown)}.", 422)
+    if core := sorted(catalog[name].title for name, on in modules.items() if catalog[name].core and not on):
+        raise ServiceError("ERRO_PLANS_CORE_MODULE", f"{', '.join(core)}: módulo da plataforma, sempre ligado.", 422)
+    chosen = {name: module.core or modules.get(name, base.get(name, module.default)) for name, module in catalog.items()}
+    for name in sorted(name for name, on in modules.items() if on):  # quem liga precisa dos requires ligados
+        if missing := [required for required in catalog[name].requires if not chosen.get(required, False)]:
+            titles = ", ".join(catalog[required].title if required in catalog else required for required in missing)
+            raise ServiceError(
+                "ERRO_PLANS_MODULE_REQUIRES", f"{catalog[name].title} precisa de {titles}: ligue também ou desligue {catalog[name].title}.", 422
+            )
+    for name in sorted(name for name, on in modules.items() if not on):  # quem desliga não pode faltar a um ligado
+        if needed_by := [catalog[other].title for other in catalog if chosen[other] and name in catalog[other].requires]:
+            raise ServiceError(
+                "ERRO_PLANS_MODULE_REQUIRES", f"{', '.join(needed_by)} precisa de {catalog[name].title}: desligue também ou mantenha ligado.", 422
+            )
+    return [{"name": name, "enabled": on} for name, on in sorted(modules.items()) if not catalog[name].core]
+
+
+def _module_states(catalog: dict[str, CatalogModule], tier: dict | None, account: dict | None) -> list[ModuleState]:
+    """Ligado: módulo da plataforma; senão o ajuste da organização, o plano ou o default. E só com os requires ligados
+    (requisito fora do catálogo, não instalado, desliga quem depende dele)."""
+    plan, own = _flags(tier, "modules"), _flags(account, "modules")
+    chosen = {name: module.core or own.get(name, plan.get(name, module.default)) for name, module in catalog.items()}
+    effective: dict[str, bool] = {}
+
+    def on(name: str, path: tuple[str, ...] = ()) -> bool:
+        if name in effective:
+            return effective[name]
+        if not chosen.get(name, False) or name in path:  # fora do catálogo, desligado ou dependência circular
+            return False
+        effective[name] = all(on(required, (*path, name)) for required in catalog[name].requires)
+        return effective[name]
+
+    return [ModuleState(**module.model_dump(), enabled=on(name)) for name, module in catalog.items()]
+
+
+async def _module_catalog() -> dict[str, CatalogModule]:
+    rows = await db.query_shared("SELECT * FROM plan_modules ORDER BY category, title")
+    return {row["name"]: _module(row) for row in rows}
+
+
+async def _limit_catalog() -> list[CatalogLimit]:
+    return [_catalog(row) for row in await db.query_shared("SELECT * FROM plan_limits ORDER BY name")]
+
+
+async def _tenant_name(tenant: str) -> str:
+    """Nome da organização pelo svc-identity; inexistente → 404."""
+    with acting_as(system(SERVICE, tenant)):
+        found = await bus.request(CONTACTS_SUBJECT, ContactsRequest(), Contacts, timeout=5)
+    if not found.tenant_name:
+        raise ServiceError("ERRO_PLANS_TENANT_NOT_FOUND", "Organização não encontrada.", 404)
+    return found.tenant_name
+
+
+def _flags(row: dict | None, field: str) -> dict[str, bool]:
+    """Lista de { name, enabled } (módulos do plano ou o ajuste da organização) → módulo → ligado."""
+    return {item["name"]: bool(item["enabled"]) for item in (row or {}).get(field) or []}
+
+
 def _values(tier: dict | None) -> dict[str, float | None]:
     """Limites que o plano cita. Sem value (o banco não guarda nulo dentro do objeto): sem limite."""
     return {item["name"]: item.get("value") for item in (tier or {}).get("limits", [])}
@@ -360,6 +466,7 @@ def _plan(row: dict) -> Plan:
     return Plan(
         slug=row["slug"], name=row["name"], description=row.get("description", ""), price=row["price"],
         currency=row["currency"], public=row["public"], default=bool(row.get("is_default")), limits=_values(row),
+        modules=_flags(row, "modules"),
     )
 
 
@@ -367,6 +474,14 @@ def _catalog(row: dict) -> CatalogLimit:
     return CatalogLimit(
         name=row["name"], service=row["service"], description=row["description"], default=row.get("default_value"),
         monthly=row["monthly"], unit=row.get("unit") or "", currency=row.get("currency"),
+    )
+
+
+def _module(row: dict) -> CatalogModule:
+    return CatalogModule(
+        name=row["name"], service=row["service"], title=row["title"], description=row["description"],
+        category=row["category"], core=bool(row.get("is_core")), default=bool(row.get("default_enabled")),
+        requires=row.get("requires") or [],
     )
 
 
