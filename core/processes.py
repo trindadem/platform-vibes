@@ -4,8 +4,12 @@
                       Documento, Conferencia, risk="leitura", example=Conferencia(divergente=False))]
     await processes.declare(ACTIONS)                    # main.py, no lifespan: o catálogo vai para o svc-processos
 
-    xml = to_bpmn(fluxo, process_id="p_acme_contas", name="Contas a pagar")   # o fluxo tipado vira BPMN com diagrama
-    definicao = await camunda.deploy(xml, "p_acme_contas")                     # só o svc-processos implanta
+    async with processes.worker(SERVICE, ACTIONS, svc):  # main.py: cada ação roda o método de mesmo nome do service.py
+        ...                                              # (conferir_pedido(self, data: Documento) -> Conferencia)
+
+    xml = to_bpmn(fluxo, process_id=process_id("acme", "contas"), name="Contas a pagar", actions=catalogo)
+    definicao = await camunda.deploy(xml, "p_acme_contas")                     # só o svc-processos implanta e inicia
+    execucao = await camunda.start("p_acme_contas", {"gatilho": {...}})
 
 Trilhos:
 - O fluxo (Fluxo) é o que se edita: passos tipados, ligações e condições estruturadas. Ninguém escreve BPMN nem FEEL:
@@ -15,32 +19,74 @@ Trilhos:
   mudar um limite é uma versão nova no motor, e a execução usa os valores da versão em que começou.
 - Ação: <serviço>.<nome>, com entrada, saída, risco (leitura, escrita, externa, irreversivel), exemplo de saída (a
   simulação usa) e conexões que exige. O exemplo é conferido contra a saída na declaração.
+- Execução: o worker de cada pacote pega os jobs <serviço>.<ação> no motor e age como a organização do processo (o id
+  no motor é p_<organização>_<processo>, só o svc-processos implanta). A entrada vem dos passos anteriores pelo nome do
+  campo (o mais perto antes dele; senão, do gatilho); a saída validada vai para <passo>. Ação que não pode seguir
+  levanta Handoff(motivo) (ou um ServiceError de negócio, status < 500): com caminho de exceção, vira a tarefa do staff;
+  sem ele, incidente. Erro de infraestrutura volta ao motor para nova tentativa. Módulo fora do plano vira handoff.
+- O que cada worker fez num passo sai em events.processos.passo (o acompanhamento no svc-processos). O svc-processos
+  também atende os jobs que o BPMN gera para ele: começo da execução, tarefa de pessoa criada, espera e fim.
+- Mensagens no motor levam a organização no nome (<organização>.<mensagem>): uma organização não acorda a outra.
 - O motor fica atrás deste arquivo: trocar o Camunda por outro motor BPMN muda to_bpmn e o cliente, não os serviços.
 
 Variáveis: CAMUNDA_URL (API REST do Orchestration Cluster; padrão http://localhost:8080).
 """
+import asyncio
 import hashlib
+import inspect
+import json
+import logging
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import Any, Literal, get_type_hints
 from xml.sax.saxutils import escape
 
 import httpx
+from opentelemetry import metrics
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.envelope import ServiceError
 from core.nats_bus import bus
+from core.plans import plans
+from core.security import acting_as, system
 
 __all__ = [
     "Action", "ActionCatalog", "Alternative", "CatalogAction", "Condition", "Flow", "Fluxo", "Step", "Trigger", "Deployed",
-    "camunda", "processes", "to_bpmn", "CATALOG_SUBJECT", "START", "HANDOFF_ERROR",
+    "Started", "Job", "Handoff", "StepEvent", "camunda", "processes", "to_bpmn", "process_id", "parse_process_id",
+    "CATALOG_SUBJECT", "STEP_SUBJECT", "START", "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END",
 ]
 
 CATALOG_SUBJECT = "events.processos.catalogo"
+STEP_SUBJECT = "events.processos.passo"  # o que um worker fez num passo (concluiu, handoff, incidente)
 START = "inicio"  # id reservado: o começo do fluxo (o gatilho)
 HANDOFF_ERROR = "handoff"  # código do erro BPMN que leva um passo à tarefa do staff
+HANDOFF_HOURS = 4  # prazo da tarefa de exceção do staff
+# Jobs que o BPMN gera para o svc-processos (o acompanhamento): passo de agente e os ouvintes de execução e de tarefa.
+JOB_AGENT = "agentes.executar"
+JOB_START = "processos.inicio"  # a execução começou (qualquer gatilho, inclusive agenda)
+JOB_TASK = "processos.tarefa"  # uma tarefa de pessoa foi criada (aprovação do cliente, exceção do staff)
+JOB_WAIT = "processos.espera"  # a execução entrou numa espera (mensagem ou tempo)
+JOB_END = "processos.fim"  # a execução chegou a um fim
+_PROCESS_ID = re.compile(r"^p_([A-Za-z0-9]{1,40})_([A-Za-z0-9]{1,64})$")
+log = logging.getLogger("core.processes")
+
+
+def process_id(tenant: str, processo: str) -> str:
+    """Id do processo no motor: p_<organização>_<processo>. A organização no id é de onde o worker tira quem age."""
+    value = f"p_{tenant}_{processo}"
+    if not _PROCESS_ID.match(value):
+        raise ValueError(f"process_id: organização e processo só com letras e números ({tenant!r}, {processo!r})")
+    return value
+
+
+def parse_process_id(value: str) -> tuple[str, str] | None:
+    """p_<organização>_<processo> → (organização, processo); outro formato → None (não é um processo nosso)."""
+    match = _PROCESS_ID.match(value or "")
+    return (match.group(1), match.group(2)) if match else None
 Risk = Literal["leitura", "escrita", "externa", "irreversivel"]
 _ID = r"^[a-z][a-z0-9_]{0,39}$"
 _ACTION = re.compile(r"^[a-z][a-z0-9-]*\.[a-z][a-z0-9_]{0,39}$")
@@ -150,6 +196,76 @@ class ActionCatalog(BaseModel):
     actions: list[CatalogAction]
 
 
+class Job(BaseModel):
+    """Um job do motor, já traduzido: de que organização e processo, em que passo, com que variáveis."""
+
+    key: str
+    type: str
+    kind: str = Field("BPMN_ELEMENT", description="BPMN_ELEMENT (passo), TASK_LISTENER ou EXECUTION_LISTENER")
+    listener: str = Field("UNSPECIFIED", description="Ouvinte: START, END, CREATING...")
+    tenant: str
+    processo: str = Field(..., description="Id do processo no svc-processos")
+    process_id: str
+    version: int = Field(..., description="Versão no motor")
+    instance: str = Field(..., description="Execução (process instance) no motor")
+    element: str = Field(..., description="Elemento do BPMN: o id do passo (ou do processo, no ouvinte do processo)")
+    element_instance: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    variables: dict[str, Any] = Field(default_factory=dict)
+    user_task: dict[str, Any] | None = None
+    retries: int = 3
+
+    @classmethod
+    def from_engine(cls, raw: Mapping[str, Any]) -> "Job":
+        parsed = parse_process_id(str(raw.get("processDefinitionId", "")))
+        if parsed is None:
+            raise ValueError(f"job de processo fora do padrão: {raw.get('processDefinitionId')!r}")
+        return cls(key=str(raw["jobKey"]), type=raw["type"], kind=raw.get("kind") or "BPMN_ELEMENT",
+                   listener=raw.get("listenerEventType") or "UNSPECIFIED", tenant=parsed[0], processo=parsed[1],
+                   process_id=raw["processDefinitionId"], version=int(raw.get("processDefinitionVersion") or 0),
+                   instance=str(raw["processInstanceKey"]), element=raw.get("elementId") or "",
+                   element_instance=str(raw.get("elementInstanceKey") or ""), headers=raw.get("customHeaders") or {},
+                   variables=raw.get("variables") or {}, user_task=raw.get("userTask"), retries=int(raw.get("retries") or 0))
+
+
+class Handoff(Exception):
+    """O passo não pode seguir sozinho (documento ilegível, dado faltando, módulo fora do plano): vai para a tarefa de
+    exceção do staff com o motivo. Sem caminho de exceção no passo, vira incidente no motor."""
+
+    def __init__(self, motivo: str) -> None:
+        super().__init__(motivo)
+        self.motivo = motivo[:500]
+
+
+class StepEvent(BaseModel):
+    """events.processos.passo: o que um worker fez num passo da execução (o acompanhamento no svc-processos)."""
+
+    instancia: str
+    processo: str
+    motor_versao: int
+    passo: str
+    tipo: str = Field(..., description="Tipo do job (<serviço>.<ação> ou agentes.executar)")
+    status: Literal["concluido", "handoff", "incidente", "tentando"]
+    motivo: str | None = None
+    saida: dict[str, Any] = Field(default_factory=dict)
+    em: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Quando o worker terminou o passo")
+
+
+class Outcome(BaseModel):
+    """Como o job termina: concluído (com variáveis), handoff (erro BPMN) ou falha (o motor tenta de novo ou abre
+    incidente quando acabam as tentativas)."""
+
+    status: Literal["concluido", "handoff", "falhou"]
+    variables: dict[str, Any] = Field(default_factory=dict)
+    message: str | None = None
+    retries: int = 0
+
+
+JobHandler = Callable[[Job], Awaitable[dict[str, Any] | None]]
+_jobs_counter = metrics.get_meter("core.processes").create_counter(
+    "cv.processos.jobs", unit="{job}", description="Jobs do motor de processos tratados, por tipo e resultado")
+
+
 class Processes:
     def __init__(self) -> None:
         self._declared: dict[str, Action] = {}
@@ -176,6 +292,129 @@ class Processes:
 
     def declared(self) -> dict[str, Action]:
         return dict(self._declared)
+
+    @asynccontextmanager
+    async def worker(
+        self, service: str, actions: Sequence[Action] = (), implementation: object | None = None, *,
+        jobs: Mapping[str, JobHandler] | None = None, concurrency: int = 4, lock_seconds: int = 300,
+    ) -> AsyncIterator[None]:
+        """No lifespan: pega no motor os jobs das ações deste pacote (cada uma roda implementation.<nome>, conferida
+        aqui: um parâmetro do tipo da entrada, retorno do tipo da saída) e os jobs de jobs= (tipo → função(Job)).
+        Um laço de espera longa por tipo; até concurrency jobs ao mesmo tempo."""
+        prefix = service.removeprefix("svc-")
+        handlers: dict[str, JobHandler] = {}
+        for action in actions:
+            handlers[f"{prefix}.{action.name}"] = self._action_handler(prefix, action, implementation)
+        handlers.update(jobs or {})
+        if not handlers:
+            yield None
+            return
+        gate = asyncio.Semaphore(concurrency)
+        loops = [asyncio.create_task(self._poll(service, kind, handler, gate, lock_seconds), name=f"jobs:{kind}")
+                 for kind, handler in handlers.items()]
+        try:
+            yield None
+        finally:
+            for loop in loops:
+                loop.cancel()
+            await asyncio.gather(*loops, return_exceptions=True)
+
+    def _action_handler(self, prefix: str, action: Action, implementation: object | None) -> JobHandler:
+        method = getattr(implementation, action.name, None)
+        if method is None or not inspect.iscoroutinefunction(method):
+            raise RuntimeError(f"processes.worker: a ação {action.name!r} precisa de um método async {action.name}() no service.py")
+        hints = get_type_hints(method)
+        params = [p for p in inspect.signature(method).parameters.values()]
+        if len(params) != 1 or hints.get(params[0].name) is not action.input or hints.get("return") is not action.output:
+            raise RuntimeError(f"processes.worker: {action.name}(self, data: {action.input.__name__}) -> {action.output.__name__}")
+
+        async def handle(job: Job) -> dict[str, Any]:
+            if not await plans.enabled(prefix):
+                raise Handoff(f"O módulo {prefix} não está no plano da organização.")
+            try:
+                data = action.input.model_validate(job.variables.get("entrada") or {})
+            except ValidationError as exc:
+                faltam = ", ".join(str(e["loc"][0]) for e in exc.errors() if e.get("loc"))
+                raise Handoff(f"Faltam dados para {action.title.lower()}: {faltam or 'entrada inválida'}.") from None
+            result = await method(data)
+            return {"resultado": result.model_dump(mode="json")}
+
+        return handle
+
+    async def run_job(self, service: str, handler: JobHandler, job: Job) -> Outcome:
+        """Roda um job como a organização do processo e diz como ele termina (o kit de testes usa direto)."""
+        with acting_as(system(service, job.tenant)):
+            try:
+                variables = await handler(job)
+                return Outcome(status="concluido", variables=variables or {})
+            except Handoff as exc:
+                return Outcome(status="handoff", message=exc.motivo)
+            except ServiceError as exc:
+                if exc.status < 500:  # erro de negócio: tentar de novo não muda nada
+                    return Outcome(status="handoff", message=exc.message)
+                return Outcome(status="falhou", message=exc.message, retries=max(0, job.retries - 1))
+            except Exception as exc:  # noqa: BLE001 - infraestrutura: o motor tenta de novo
+                log.exception("job %s (%s) falhou", job.type, job.element)
+                return Outcome(status="falhou", message=f"Falha interna ({type(exc).__name__}).", retries=max(0, job.retries - 1))
+
+    async def report(self, job: Job, outcome: Outcome) -> None:
+        """Publica o que aconteceu num passo (só jobs de passo; os ouvintes são do próprio svc-processos)."""
+        if job.kind != "BPMN_ELEMENT":
+            return
+        status = {"concluido": "concluido", "falhou": "tentando" if outcome.retries else "incidente"}.get(outcome.status)
+        if outcome.status == "handoff":
+            status = "handoff" if job.headers.get("excecao") else "incidente"
+        saida = outcome.variables.get("resultado") if isinstance(outcome.variables.get("resultado"), dict) else {}
+        with acting_as(system(bus.service or "svc-processos", job.tenant)):
+            await bus.publish(STEP_SUBJECT, StepEvent(
+                instancia=job.instance, processo=job.processo, motor_versao=job.version, passo=job.element, tipo=job.type,
+                status=status or "incidente", motivo=outcome.message, saida=saida or {},
+            ), msg_id=f"passo-{job.key}-{outcome.status}-{outcome.retries}")
+
+    async def _poll(self, service: str, kind: str, handler: JobHandler, gate: asyncio.Semaphore, lock_seconds: int) -> None:
+        wait, running = 1.0, set()
+        while True:
+            try:
+                await gate.acquire()
+                gate.release()
+                raws = await camunda.activate(kind, worker=service, max_jobs=4, lock_seconds=lock_seconds)
+                wait = 1.0
+            except ServiceError as exc:  # motor fora do ar: espera crescente
+                log.warning("motor sem resposta para %s (%s): nova tentativa em %.0fs", kind, exc.code, wait)
+                await asyncio.sleep(wait)
+                wait = min(wait * 2, 30.0)
+                continue
+            if not raws:  # a espera longa voltou vazia (ou o motor respondeu na hora): não gira em falso
+                await asyncio.sleep(0.2)
+            for raw in raws:
+                await gate.acquire()
+                task = asyncio.create_task(self._handle(service, handler, raw))
+                running.add(task)
+                task.add_done_callback(lambda t: (running.discard(t), gate.release()))
+
+    async def _handle(self, service: str, handler: JobHandler, raw: Mapping[str, Any]) -> None:
+        try:
+            job = Job.from_engine(raw)
+        except ValueError as exc:  # não é um processo nosso: incidente, sem tentar de novo
+            await camunda.fail_job(str(raw.get("jobKey")), retries=0, message=str(exc))
+            return
+        outcome = await self.run_job(service, handler, job)
+        try:
+            await self._settle(job, outcome)
+            _jobs_counter.add(1, {"type": job.type, "status": outcome.status})
+            await self.report(job, outcome)
+        except Exception:  # noqa: BLE001 - o motor devolve o job ao vencer o prazo (lock_seconds)
+            log.exception("não consegui devolver o job %s ao motor", job.key)
+
+    async def _settle(self, job: Job, outcome: Outcome) -> None:
+        if outcome.status == "concluido":
+            await camunda.complete_job(job.key, outcome.variables)
+        elif outcome.status == "handoff" and job.kind == "BPMN_ELEMENT" and job.headers.get("excecao"):
+            await camunda.throw_error(job.key, HANDOFF_ERROR, outcome.message or "Exceção")
+        elif outcome.status == "handoff":  # sem caminho de exceção: incidente para o staff ver no motor
+            await camunda.fail_job(job.key, retries=0, message=outcome.message or "Exceção")
+        else:
+            await camunda.fail_job(job.key, retries=outcome.retries, message=outcome.message or "Falha", backoff_ms=15_000)
 
 
 processes = Processes()
@@ -221,14 +460,24 @@ def feel(condition: Condition) -> str:
 
 
 def _kind(step: Step | None) -> str:
+    if step is not None and step.tipo == "espera" and step.espera == "mensagem":
+        return "task"  # receiveTask: atividade, aceita o prazo na borda
     if step is None or step.tipo in ("espera", "fim"):
         return "event"
     return "gateway" if step.tipo == "decisao" else "task"
 
 
-def _layout(fluxo: Fluxo) -> dict[str, tuple[float, float, int, int]]:
-    """Posição (x, y, largura, altura) de cada nó: camadas da esquerda para a direita pelo caminho mais longo,
-    ramos empilhados; as tarefas de exceção ficam logo abaixo do passo."""
+def _handoff_kind(step: Step) -> str | None:
+    """De onde sai a tarefa de exceção do staff: erro (ação ou agente com excecao) ou prazo (espera de mensagem)."""
+    if step.excecao and step.tipo in ("acao", "agente"):
+        return "erro"
+    if step.tipo == "espera" and step.espera == "mensagem" and step.horas:
+        return "prazo"
+    return None
+
+
+def _ranks(fluxo: Fluxo) -> tuple[dict[str, int], list[str]]:
+    """Camada de cada nó pelo caminho mais longo a partir do início (laços não empurram camada)."""
     rank: dict[str, int] = {START: 0}
     order = [START]
     stack: set[str] = set()
@@ -246,6 +495,47 @@ def _layout(fluxo: Fluxo) -> dict[str, tuple[float, float, int, int]]:
         stack.discard(node)
 
     visit(START)
+    return rank, order
+
+
+def step_outputs(step: Step, actions: Mapping[str, "CatalogAction"]) -> list[str]:
+    """Os campos que o passo grava sob o id dele (o que condições e entradas dos seguintes podem usar)."""
+    if step.tipo == "agente":
+        return list(step.saidas)
+    if step.tipo == "acao" and step.acao in actions:
+        return list(actions[step.acao].output_fields)
+    if step.tipo == "tarefa":
+        return ["aprovado", "comentario"]
+    return []
+
+
+def input_sources(fluxo: Fluxo, step: Step, actions: Mapping[str, "CatalogAction"]) -> dict[str, str]:
+    """De onde vem cada campo da entrada de uma ação: do passo mais perto antes dela que tem um campo com esse nome;
+    sem nenhum, do gatilho (gatilho.<campo>)."""
+    action = actions.get(step.acao or "")
+    if action is None:
+        return {}
+    rank, _ = _ranks(fluxo)
+    before: set[str] = set()
+    pending = [f.de for f in fluxo.ligacoes if f.para == step.id]
+    while pending:
+        node = pending.pop()
+        if node in before or node == START or fluxo.step(node) is None:
+            continue
+        before.add(node)
+        pending += [f.de for f in fluxo.ligacoes if f.para == node]
+    ordered = sorted((fluxo.step(n) for n in before), key=lambda st: -rank.get(st.id, 0))
+    sources: dict[str, str] = {}
+    for field in action.input_schema.get("properties", {}):
+        origin = next((st.id for st in ordered if field in step_outputs(st, actions)), None)
+        sources[field] = f"{origin}.{field}" if origin else f"gatilho.{field}"
+    return sources
+
+
+def _layout(fluxo: Fluxo) -> dict[str, tuple[float, float, int, int]]:
+    """Posição (x, y, largura, altura) de cada nó: camadas da esquerda para a direita pelo caminho mais longo,
+    ramos empilhados; as tarefas de exceção ficam logo abaixo do passo."""
+    rank, order = _ranks(fluxo)
     for step in fluxo.passos:  # soltos (ainda sem ligação) ficam no fim
         if step.id not in rank:
             rank[step.id] = max(rank.values()) + 1
@@ -260,7 +550,7 @@ def _layout(fluxo: Fluxo) -> dict[str, tuple[float, float, int, int]]:
         cx, cy = _LEFT + layer * _GAP_X + 55, _TOP + row * _ROW_Y + 40
         pos[node] = (cx - w / 2, cy - h / 2, w, h)
     for step in fluxo.passos:
-        if step.excecao and step.tipo in ("acao", "agente") and step.id in pos:
+        if _handoff_kind(step) and step.id in pos:
             x, y, w, h = pos[step.id]
             pos[f"{step.id}__excecao"] = (x, y + h + 70, *_SIZE["task"])
     return pos
@@ -279,10 +569,16 @@ def _edge(src: tuple[float, float, int, int], dst: tuple[float, float, int, int]
     return [start, (mid, start[1]), (mid, end[1]), end]
 
 
-def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str) -> str:
-    """O fluxo tipado como BPMN 2.0 com as extensões do Camunda 8 (zeebe:) e o desenho (DI) para a tela."""
-    if not re.match(r"^[A-Za-z_][A-Za-z0-9_.-]{0,99}$", process_id):
-        raise ValueError(f"to_bpmn: id de processo inválido {process_id!r}")
+def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str, actions: Mapping[str, CatalogAction] | None = None) -> str:
+    """O fluxo tipado como BPMN 2.0 com as extensões do Camunda 8 (zeebe:) e o desenho (DI) para a tela.
+
+    process_id é p_<organização>_<processo> (process_id()): a organização prefixa as mensagens. Com actions (o
+    catálogo), cada ação recebe a entrada dos passos anteriores pelo nome do campo (input_sources)."""
+    parsed = parse_process_id(process_id)
+    if parsed is None:
+        raise ValueError(f"to_bpmn: id de processo inválido {process_id!r} (use process_id(organização, processo))")
+    tenant = parsed[0]
+    catalog = actions or {}
     a = lambda v: escape(str(v), {'"': "&quot;"})  # noqa: E731 - atributo XML
     pos = _layout(fluxo)
     messages: dict[str, str] = {}
@@ -290,19 +586,28 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str) -> str:
     flows: list[tuple[str, str, str, Condition | None]] = []
     uses_error = False
 
+    def listener(kind: str, event: str = "start") -> str:
+        return f'<zeebe:executionListeners><zeebe:executionListener eventType="{event}" type="{kind}" /></zeebe:executionListeners>'
+
     def message_ref(message: str, key: str | None) -> str:
         ref = "m_" + re.sub(r"[^a-z0-9]", "_", message)
         sub = f'<bpmn:extensionElements><zeebe:subscription correlationKey="={a(key)}" /></bpmn:extensionElements>' if key else ""
-        messages.setdefault(ref, f'<bpmn:message id="{ref}" name="{a(message)}">{sub}</bpmn:message>')
+        messages.setdefault(ref, f'<bpmn:message id="{ref}" name="{a(f"{tenant}.{message}")}">{sub}</bpmn:message>')
         return ref
 
+    def user_task(task_id: str, label: str, group: str, hours: float | None, question: str | None) -> str:
+        due = f'<zeebe:taskSchedule dueDate="=now() + duration(&quot;PT{int(hours)}H&quot;)" />' if hours else ""
+        props = f'<zeebe:properties><zeebe:property name="pergunta" value="{a(question)}" /></zeebe:properties>' if question else ""
+        return (f'<bpmn:userTask id="{task_id}" name="{label}"><bpmn:extensionElements><zeebe:userTask />'
+                f'<zeebe:assignmentDefinition candidateGroups="{a(group)}" />{due}{props}'
+                f'<zeebe:taskListeners><zeebe:taskListener eventType="creating" type="{JOB_TASK}" /></zeebe:taskListeners>'
+                "</bpmn:extensionElements></bpmn:userTask>")
+
     trigger = fluxo.gatilho
-    if trigger.tipo == "evento" and trigger.evento:
-        definition = f'<bpmn:messageEventDefinition messageRef="{message_ref(trigger.evento, None)}" />'
-    elif trigger.tipo == "agenda" and trigger.agenda:
+    # Evento e manual: o svc-processos inicia pela API (sabe quais processos da organização o evento inicia).
+    definition = ""
+    if trigger.tipo == "agenda" and trigger.agenda:
         definition = f'<bpmn:timerEventDefinition><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">{escape(trigger.agenda)}</bpmn:timeCycle></bpmn:timerEventDefinition>'
-    else:
-        definition = ""
     # Os parâmetros vão no BPMN (saída do início): cada versão publicada carrega os seus valores.
     params = "".join(f'<zeebe:output source="{a("=" + _feel_value(v))}" target="parametros.{k}" />' for k, v in fluxo.parametros.items())
     params = f"<bpmn:extensionElements><zeebe:ioMapping>{params}</zeebe:ioMapping></bpmn:extensionElements>" if params else ""
@@ -310,44 +615,54 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str) -> str:
 
     for step in fluxo.passos:
         sid, label = step.id, a(step.nome)
+        handoff = _handoff_kind(step)
         if step.tipo in ("acao", "agente"):
-            job = step.acao if step.tipo == "acao" else "agentes.executar"
+            job = step.acao if step.tipo == "acao" else JOB_AGENT
             headers = [("passo", sid)]
             if step.tipo == "agente":
                 headers += [("objetivo", step.objetivo or ""), ("saidas", ",".join(step.saidas))]
+            if handoff:
+                headers.append(("excecao", "sim"))
             header_xml = "".join(f'<zeebe:header key="{k}" value="{a(v)}" />' for k, v in headers)
+            inputs = "".join(f'<zeebe:input source="={a(src)}" target="entrada.{field}" />'
+                             for field, src in input_sources(fluxo, step, catalog).items()) if step.tipo == "acao" else ""
             elements.append(f'<bpmn:serviceTask id="{sid}" name="{label}"><bpmn:extensionElements>'
                             f'<zeebe:taskDefinition type="{a(job or "")}" retries="3" />'
+                            f'<zeebe:ioMapping>{inputs}<zeebe:output source="=resultado" target="{sid}" /></zeebe:ioMapping>'
                             f"<zeebe:taskHeaders>{header_xml}</zeebe:taskHeaders></bpmn:extensionElements></bpmn:serviceTask>")
         elif step.tipo == "tarefa":
-            due = f'<zeebe:taskSchedule dueDate="=now() + duration(&quot;PT{int(step.horas)}H&quot;)" />' if step.horas else ""
-            elements.append(f'<bpmn:userTask id="{sid}" name="{label}"><bpmn:extensionElements><zeebe:userTask />'
-                            f'<zeebe:assignmentDefinition candidateGroups="{a(step.responsavel or "cliente")}" />{due}'
-                            f'<zeebe:properties><zeebe:property name="pergunta" value="{a(step.pergunta or step.nome)}" /></zeebe:properties>'
-                            "</bpmn:extensionElements></bpmn:userTask>")
+            elements.append(user_task(sid, label, step.responsavel or "cliente", step.horas, step.pergunta or step.nome))
         elif step.tipo == "decisao":
             default = next((f for f in fluxo.outgoing(sid) if f.condicao is None), None)
             attr = f' default="f_{sid}_{default.para}"' if default else ""
             elements.append(f'<bpmn:exclusiveGateway id="{sid}" name="{label}"{attr} />')
+        elif step.tipo == "espera" and step.espera == "mensagem" and step.mensagem:
+            elements.append(f'<bpmn:receiveTask id="{sid}" name="{label}" messageRef="{message_ref(step.mensagem, step.chave)}">'
+                            f'<bpmn:extensionElements><zeebe:ioMapping><zeebe:output source="=mensagem" target="{sid}" />'
+                            f"</zeebe:ioMapping>{listener(JOB_WAIT)}</bpmn:extensionElements></bpmn:receiveTask>")
         elif step.tipo == "espera":
-            if step.espera == "mensagem" and step.mensagem:
-                inner = f'<bpmn:messageEventDefinition messageRef="{message_ref(step.mensagem, step.chave)}" />'
-            else:
-                inner = f'<bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT{int(step.horas or 1)}H</bpmn:timeDuration></bpmn:timerEventDefinition>'
-            elements.append(f'<bpmn:intermediateCatchEvent id="{sid}" name="{label}">{inner}</bpmn:intermediateCatchEvent>')
+            elements.append(f'<bpmn:intermediateCatchEvent id="{sid}" name="{label}"><bpmn:extensionElements>{listener(JOB_WAIT)}'
+                            '</bpmn:extensionElements><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">'
+                            f"PT{int(step.horas or 1)}H</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>")
         else:
-            elements.append(f'<bpmn:endEvent id="{sid}" name="{label}" />')
+            elements.append(f'<bpmn:endEvent id="{sid}" name="{label}"><bpmn:extensionElements>{listener(JOB_END)}'
+                            "</bpmn:extensionElements></bpmn:endEvent>")
         for flow in fluxo.outgoing(sid):
             if fluxo.step(flow.para) is not None:  # ligação para passo que não existe (rascunho): fica de fora
                 flows.append((f"f_{sid}_{flow.para}", sid, flow.para, flow.condicao if step.tipo == "decisao" else None))
-        if step.excecao and step.tipo in ("acao", "agente"):
-            uses_error = True
+        if handoff:
             nxt = next((f.para for f in fluxo.outgoing(sid) if fluxo.step(f.para) is not None), None)
-            elements.append(f'<bpmn:boundaryEvent id="{sid}__erro" attachedToRef="{sid}">'
-                            f'<bpmn:errorEventDefinition errorRef="e_{HANDOFF_ERROR}" /></bpmn:boundaryEvent>')
-            elements.append(f'<bpmn:userTask id="{sid}__excecao" name="Exceção: {label}"><bpmn:extensionElements>'
-                            '<zeebe:userTask /><zeebe:assignmentDefinition candidateGroups="staff" /></bpmn:extensionElements></bpmn:userTask>')
-            flows.append((f"f_{sid}__erro", f"{sid}__erro", f"{sid}__excecao", None))
+            if handoff == "erro":
+                uses_error = True
+                trigger_xml = f'<bpmn:errorEventDefinition errorRef="e_{HANDOFF_ERROR}" />'
+                task_name = f"Exceção: {label}"
+            else:
+                trigger_xml = ('<bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">'
+                               f"PT{int(step.horas or 1)}H</bpmn:timeDuration></bpmn:timerEventDefinition>")
+                task_name = f"Prazo: {label}"
+            elements.append(f'<bpmn:boundaryEvent id="{sid}__{handoff}" attachedToRef="{sid}">{trigger_xml}</bpmn:boundaryEvent>')
+            elements.append(user_task(f"{sid}__excecao", task_name, "staff", HANDOFF_HOURS, None))
+            flows.append((f"f_{sid}__{handoff}", f"{sid}__{handoff}", f"{sid}__excecao", None))
             if nxt:
                 flows.append((f"f_{sid}__excecao_{nxt}", f"{sid}__excecao", nxt, None))
     for flow in fluxo.outgoing(START):
@@ -359,15 +674,16 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str) -> str:
         elements.append(f'<bpmn:sequenceFlow id="{fid}" sourceRef="{src}" targetRef="{dst}">{body}</bpmn:sequenceFlow>')
 
     shapes, edges = [], []
+    boundary = {f"{st.id}__{kind}": st.id for st in fluxo.passos if (kind := _handoff_kind(st))}
     for node, (x, y, w, h) in pos.items():
         shapes.append(f'<bpmndi:BPMNShape id="{node}_di" bpmnElement="{node}"><dc:Bounds x="{x:.0f}" y="{y:.0f}" width="{w}" height="{h}" /></bpmndi:BPMNShape>')
-        if node.endswith("__excecao"):
-            step_id = node.removesuffix("__excecao")
+    for event_id, step_id in boundary.items():
+        if step_id in pos:
             sx, sy, sw, sh = pos[step_id]
-            shapes.append(f'<bpmndi:BPMNShape id="{step_id}__erro_di" bpmnElement="{step_id}__erro"><dc:Bounds x="{sx + sw - 30:.0f}" y="{sy + sh - 18:.0f}" width="36" height="36" /></bpmndi:BPMNShape>')
+            shapes.append(f'<bpmndi:BPMNShape id="{event_id}_di" bpmnElement="{event_id}"><dc:Bounds x="{sx + sw - 30:.0f}" y="{sy + sh - 18:.0f}" width="36" height="36" /></bpmndi:BPMNShape>')
     for fid, src, dst, _ in flows:
-        if src.endswith("__erro"):  # do evento de erro, na borda de baixo do passo, até a exceção logo abaixo
-            sx, sy, sw, sh = pos[src.removesuffix("__erro")]
+        if src in boundary:  # do evento na borda de baixo do passo até a exceção logo abaixo
+            sx, sy, sw, sh = pos[boundary[src]]
             points = [(sx + sw - 12, sy + sh + 18), (sx + sw - 12, pos[dst][1])]
         elif src in pos and dst in pos:
             points = _edge(pos[src], pos[dst])
@@ -377,8 +693,9 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str) -> str:
         edges.append(f'<bpmndi:BPMNEdge id="{fid}_di" bpmnElement="{fid}">{waypoints}</bpmndi:BPMNEdge>')
 
     error = f'<bpmn:error id="e_{HANDOFF_ERROR}" name="Exceção" errorCode="{HANDOFF_ERROR}" />' if uses_error else ""
+    process_ext = f"<bpmn:extensionElements>{listener(JOB_START)}</bpmn:extensionElements>"
     return (
-        f'{_ANCHOR_BASE}<bpmn:process id="{process_id}" name="{a(name)}" isExecutable="true">{"".join(elements)}</bpmn:process>'
+        f'{_ANCHOR_BASE}<bpmn:process id="{process_id}" name="{a(name)}" isExecutable="true">{process_ext}{"".join(elements)}</bpmn:process>'
         f"{''.join(messages.values())}{error}"
         f'<bpmndi:BPMNDiagram id="diagrama"><bpmndi:BPMNPlane id="plano" bpmnElement="{process_id}">'
         f"{''.join(shapes)}{''.join(edges)}</bpmndi:BPMNPlane></bpmndi:BPMNDiagram></bpmn:definitions>"
@@ -391,6 +708,13 @@ class CamundaSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="CAMUNDA_", extra="ignore")
 
     url: str = "http://localhost:8080"
+
+
+class Started(BaseModel):
+    """Execução iniciada: a chave dela no motor e a versão do processo em que vai rodar até o fim."""
+
+    instance: str
+    version: int
 
 
 class Deployed(BaseModel):
@@ -419,9 +743,73 @@ class Camunda:
                                 version=int(definition["processDefinitionVersion"]))
         raise ServiceError("ERRO_PROCESSOS_MOTOR", "O motor não devolveu a definição implantada.", status=502)
 
-    async def _call(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    async def start(self, process_id: str, variables: Mapping[str, Any]) -> "Started":
+        """Inicia uma execução na última versão implantada do processo."""
+        response = await self._call("POST", "/v2/process-instances", json={"processDefinitionId": process_id, "variables": dict(variables)})
+        body = self._ok(response, "iniciar a execução")
+        return Started(instance=str(body["processInstanceKey"]), version=int(body["processDefinitionVersion"]))
+
+    async def message(self, name: str, key: str, variables: Mapping[str, Any], *, ttl_seconds: int = 3600,
+                      message_id: str | None = None) -> None:
+        """Publica uma mensagem (<organização>.<mensagem>) para a execução que espera com esta chave; chegando antes da
+        espera abrir, fica guardada por ttl_seconds. message_id: a mesma mensagem de novo (reentrega) não duplica."""
+        body = {"name": name, "correlationKey": key, "variables": dict(variables), "timeToLive": ttl_seconds * 1000}
+        if message_id:
+            body["messageId"] = message_id[:200]
+        response = await self._call("POST", "/v2/messages/publication", json=body)
+        self._ok(response, "entregar a mensagem")
+
+    async def activate(self, job_type: str, *, worker: str, max_jobs: int, lock_seconds: int, wait_seconds: int = 20) -> list[dict[str, Any]]:
+        """Pega até max_jobs jobs do tipo (espera até wait_seconds por um); ficam com este worker por lock_seconds."""
+        response = await self._call("POST", "/v2/jobs/activation", json={
+            "type": job_type, "worker": worker[:60], "timeout": lock_seconds * 1000, "maxJobsToActivate": max_jobs,
+            "requestTimeout": wait_seconds * 1000}, timeout=wait_seconds + 15)
+        return list(self._ok(response, "pegar jobs").get("jobs", []))
+
+    async def complete_job(self, key: str, variables: Mapping[str, Any]) -> None:
+        self._ok(await self._call("POST", f"/v2/jobs/{key}/completion", json={"variables": dict(variables)}), "concluir o job")
+
+    async def throw_error(self, key: str, code: str, message: str) -> None:
+        response = await self._call("POST", f"/v2/jobs/{key}/error", json={"errorCode": code, "errorMessage": message[:500]})
+        self._ok(response, "levar o passo à exceção")
+
+    async def fail_job(self, key: str, *, retries: int, message: str, backoff_ms: int = 0) -> None:
+        response = await self._call("POST", f"/v2/jobs/{key}/failure", json={
+            "retries": retries, "errorMessage": message[:500], "retryBackOff": backoff_ms})
+        self._ok(response, "devolver o job")
+
+    async def complete_task(self, key: str, variables: Mapping[str, Any]) -> None:
+        """Conclui uma tarefa de pessoa; já concluída ou inexistente → 409 ERRO_PROCESSOS_TAREFA_FECHADA."""
+        response = await self._call("POST", f"/v2/user-tasks/{key}/completion", json={"variables": dict(variables)})
+        if response.status_code in (404, 409):
+            raise ServiceError("ERRO_PROCESSOS_TAREFA_FECHADA", "Esta tarefa já foi resolvida.", status=409)
+        self._ok(response, "concluir a tarefa")
+
+    async def path(self, instance: str) -> list[dict[str, Any]]:
+        """Os elementos por onde a execução passou ou está (id, tipo, estado), na ordem."""
+        response = await self._call("POST", "/v2/element-instances/search", json={
+            "filter": {"processInstanceKey": instance}, "page": {"limit": 200}, "sort": [{"field": "startDate"}]})
+        return [{"id": e["elementId"], "tipo": e["type"], "estado": e["state"], "incidente": e.get("hasIncident", False)}
+                for e in self._ok(response, "ler o caminho").get("items", [])]
+
+    async def cancel(self, instance: str) -> None:
+        response = await self._call("POST", f"/v2/process-instances/{instance}/cancellation", json={})
+        if response.status_code != 404:
+            self._ok(response, "cancelar a execução")
+
+    def _ok(self, response: httpx.Response, what: str) -> dict[str, Any]:
+        if response.status_code >= 500:
+            raise ServiceError("ERRO_PROCESSOS_MOTOR", f"O motor de processos falhou ao {what}.", status=503)
+        if response.status_code >= 400:
+            raise ServiceError("ERRO_PROCESSOS_MOTOR_RECUSOU", f"O motor recusou {what}: {_problem(response)}", status=422)
+        return response.json() if response.content else {}
+
+    async def _call(self, method: str, path: str, *, timeout: float | None = None, **kwargs: Any) -> httpx.Response:
         if self._client is None:
-            self._client = httpx.AsyncClient(base_url=CamundaSettings().url, timeout=httpx.Timeout(30.0, connect=5.0))
+            self._client = httpx.AsyncClient(base_url=CamundaSettings().url, timeout=httpx.Timeout(30.0, connect=5.0),
+                                             limits=httpx.Limits(max_connections=50))
+        if timeout is not None:
+            kwargs["timeout"] = httpx.Timeout(timeout, connect=5.0)
         try:
             return await self._client.request(method, path, **kwargs)
         except httpx.TransportError:

@@ -8,6 +8,8 @@ O arquivo nunca passa pelos serviços nem pelo gateway: o navegador envia direto
     await db.merge(registro, {"logo": arquivo.key})                           #    e o serviço guarda a chave
     link = storage.url(arquivo.key)                                           # 4. download/visualização (5 min)
     conteudo = await storage.read(arquivo.key, max_bytes=10_000_000)          #    o serviço lê (ex.: extrair texto)
+    anexo = await storage.save(dados, filename="nf.pdf", content_type="application/pdf", max_bytes=10_000_000)
+                                                                              #    o serviço guarda o que recebeu
     await storage.delete(arquivo.key)                                         # 5. ao apagar o registro
 
 Trilhos:
@@ -188,6 +190,23 @@ class Storage:
             content_type=head.get("ContentType", "application/octet-stream"),
             size=head["ContentLength"],
         )
+
+    async def save(self, data: bytes, *, filename: str, content_type: str, max_bytes: int, folder: str = "files") -> StoredFile:
+        """Guarda um arquivo que o próprio serviço recebeu (anexo de e-mail, retorno de uma integração), direto na
+        área definitiva da organização atual. Para arquivo que vem da tela, use upload + keep."""
+        s = self._ready()
+        if len(data) > max_bytes:
+            raise ServiceError("ERRO_FILE_TOO_LARGE", f"Arquivo maior que o permitido ({_human(max_bytes)}).", status=422)
+        if not re.fullmatch(r"[a-z0-9-]{1,40}", folder):
+            raise ValueError(f"folder inválido: {folder!r} (a-z, 0-9 e hífen)")
+        kind = content_type.strip().lower()
+        if not _CONTENT_TYPE.match(kind):
+            kind = "application/octet-stream"
+        name = _clean_name(filename) or "arquivo"
+        key = f"t/{_tenant_segment()}/{self._service}/{folder}/{uuid.uuid4().hex}"
+        await asyncio.to_thread(self._client.put_object, Bucket=s.bucket, Key=key, Body=data, ContentType=kind,
+                                Metadata={_FILENAME_META: quote(name)})
+        return StoredFile(key=key, filename=name, content_type=kind, size=len(data))
 
     def url(self, key: str, *, ttl: int = DOWNLOAD_SECONDS, filename: str | None = None, content_type: str | None = None) -> str:
         """Link de GET assinado (padrão 5 min) para um arquivo guardado da organização atual."""

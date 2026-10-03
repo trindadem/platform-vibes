@@ -12,6 +12,7 @@ Trilhos:
 - Login sempre como usuário do banco (DEFINE USER ... ON DATABASE), nunca root: menor privilégio.
 - Resultados voltam como tipos simples: "tabela:id" em vez de RecordID; select de um registro → dict | None.
 - Valor repetido em índice unique → ServiceError 409 ERRO_RECORD_DUPLICATE (sem ecoar o valor).
+- Conflito de escrita entre transações simultâneas (o banco diz "can be retried"): o core repete até 3 vezes.
 - Trace (README §5.18): toda consulta vira um span "surrealdb <comando>" com o texto da SurrealQL (sem os valores, que
   vão sempre como parâmetros) e entra em db.client.operation.duration.
 - Carimbos (README §5.13): toda tabela declarada ganha created_at, created_by, updated_at e updated_by, que o próprio
@@ -29,6 +30,7 @@ SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER, SURREAL_PASSWORD.
 """
 import asyncio
 import logging
+import random
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -62,6 +64,7 @@ log = logging.getLogger("core.surreal")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _TENANT_PARAM = re.compile(r"\$tenant\b")
 _DUPLICATE = re.compile(r"index `[a-z0-9_]+?__(?P<fields>[a-z0-9_]+)__unique` already contains")
+_CONFLICT = "This transaction can be retried"  # conflito de escrita entre transações simultâneas
 _VERSION = re.compile(r"(\d+)\.\d+")
 _CASCADE = re.compile(r"not executed due to a failed transaction|Cannot COMMIT")
 # Busca por palavras: início de palavra, sem diferença de maiúscula nem de acento ("pad" acha "Padaria", "joao" acha "João").
@@ -498,23 +501,30 @@ class Database:
                 _duration.record(time.perf_counter() - started, {"db.system.name": "surrealdb", "db.operation.name": operation})
 
     async def _call_once(self, method: str, *args: Any) -> Any:
-        # Conexão caiu (restart do banco, rede): reconecta uma vez e repete.
-        for attempt in (1, 2):
+        # Conexão caiu (restart do banco, rede): reconecta uma vez e repete. Conflito de escrita entre transações
+        # simultâneas (o banco diz que pode repetir): repete até 3 vezes, com espera curta e aleatória.
+        reconnected, conflicts = False, 0
+        while True:
             conn = await self._connection()
             try:
                 if method == "query":
                     return _plain(await _query(conn, *args))
                 return _plain(await getattr(conn, method)(*args))
             except (ConnectionUnavailableError, ConnectionError):
-                if attempt == 2:
+                if reconnected:
                     raise
+                reconnected = True
                 async with self._lock:
                     self._conn = None
-            except ServerError as exc:
+            except Exception as exc:  # noqa: BLE001 - ServerError e QueryError do SDK: o texto diz o que houve
                 # Índice único violado é erro de negócio (409), sem ecoar o valor repetido (pode ser um e-mail).
                 if duplicate := _DUPLICATE.search(str(exc)):
                     fields = duplicate["fields"].replace("__", ", ")
                     raise ServiceError("ERRO_RECORD_DUPLICATE", f"Já existe um registro com o mesmo valor em: {fields}.", status=409) from None
+                if _CONFLICT in str(exc) and conflicts < 3:
+                    conflicts += 1
+                    await asyncio.sleep(random.uniform(0.01, 0.05) * conflicts)
+                    continue
                 raise
 
 

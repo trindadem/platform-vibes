@@ -1,0 +1,20 @@
+# svc-financeiro · rotas públicas no Gateway. Fonte da verdade: specs/financeiro.md §2
+service: financeiro
+base_path: /api/v1/financeiro
+
+# Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+# financeiro.<cadastro>, e vira financeiro.<cadastro> no frontend.
+resources: [fornecedores]
+
+live:
+  - topic: titulos                  # um título foi agendado ou pago
+    model: TituloMudou
+
+endpoints:
+  - path: /titulos
+    method: GET
+    auth: client_jwt
+    query: TituloQuery
+    response: TituloPage
+    target_type: http
+    target_url: http://svc-financeiro:8000/titulos

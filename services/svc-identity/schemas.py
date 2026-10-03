@@ -42,7 +42,7 @@ INVITE_DAYS = 7
 RESET_MINUTES = 30  # validade do link de redefinir senha
 MAX_RESETS_PER_HOUR = 3  # por pessoa: mais pedidos que isso são ignorados em silêncio
 
-Role = Literal["owner", "admin", "member"]
+Role = Literal["owner", "admin", "member", "operador"]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=80)]
 Email = Annotated[
     str,
@@ -96,7 +96,7 @@ class TenantInput(_Input):
 
 
 class InviteInput(_Input):
-    role: Literal["admin", "member"] = Field("member", description="Papel de quem aceitar o convite")
+    role: Literal["admin", "member", "operador"] = Field("member", description="Papel de quem aceitar o convite (operador: o staff da Cogniventure)")
     email: Email | None = Field(None, description="Se informado, o convite também vai por e-mail para este endereço")
 
 

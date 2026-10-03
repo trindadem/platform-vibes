@@ -14,7 +14,7 @@ import { identity } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Convite", access: "public" };
 
-const PAPEL = { owner: "dono", admin: "administrador", member: "membro" };
+const PAPEL = { owner: "dono", admin: "administrador", member: "membro", operador: "operador" };
 
 export default function Convite() {
   const [params] = useSearchParams();

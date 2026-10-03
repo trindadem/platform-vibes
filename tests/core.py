@@ -363,6 +363,22 @@ def test_http_client_para_de_ler_o_corpo_acima_de_max_bytes():
     assert (erro.code, erro.status) == ("ERRO_HTTP_TOO_LARGE", 422)
 
 
+def test_http_client_com_teto_le_resposta_comprimida_uma_vez_so():
+    """Achado do N4: o Mailpit (e quase todo site) responde em gzip; o corpo lido com teto não pode ser descomprimido de novo."""
+    import gzip
+
+    async def chamada():
+        client = HttpClient()
+        client._http()._transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=gzip.compress(b"From: x\r\n\r\ncorpo"), headers={"Content-Encoding": "gzip"}))
+        resposta = await client.get("https://1.1.1.1/raw", max_bytes=5000)
+        await client.close()
+        return resposta
+
+    resposta = asyncio.run(chamada())
+    assert resposta.content == b"From: x\r\n\r\ncorpo" and "content-encoding" not in resposta.headers
+
+
 # ── Utilidades ──────────────────────────────────────────────────────────────
 
 def test_http_client_nunca_reenvia_cookie():
@@ -1630,6 +1646,19 @@ def test_arquivo_guardado_e_lido_pelo_servico_com_teto_de_tamanho(arquivos):
     assert exc.value.code == "ERRO_FILE_NOT_FOUND"  # de outra organização: não existe
 
 
+def test_arquivo_recebido_pelo_servico_e_guardado_direto_na_organizacao(arquivos):
+    s, client = arquivos
+    with security.acting_as(ACME):
+        guardado = asyncio.run(s.save(b"%PDF-1.4 boleto", filename="../boleto maio.pdf", content_type="application/pdf", max_bytes=100))
+        assert asyncio.run(s.read(guardado.key, max_bytes=100)) == b"%PDF-1.4 boleto"
+        with pytest.raises(ServiceError) as grande:
+            asyncio.run(s.save(b"x" * 101, filename="a.pdf", content_type="application/pdf", max_bytes=100))
+    assert guardado.key.split("/")[:4] == ["t", "acme", "svc-notas", "files"] and guardado.filename == "boleto maio.pdf"
+    assert grande.value.code == "ERRO_FILE_TOO_LARGE"
+    with security.acting_as(Principal(sub="bia", tenant="beta")), pytest.raises(ServiceError):
+        asyncio.run(s.read(guardado.key, max_bytes=100))  # de outra organização: não existe
+
+
 def test_arquivo_recusado_antes_de_assinar_e_chaves_forjadas(arquivos):
     s, client = arquivos
     with security.acting_as(ACME):
@@ -2586,33 +2615,58 @@ def _fluxo_pagamento() -> Fluxo:
     )
 
 
+def _catalogo_pagamento() -> dict:
+    from core.processes import CatalogAction
+
+    entrada = {"properties": {"valor": {"type": "number"}, "vencimento": {"type": "string"}, "documento_id": {"type": "string"}}}
+    return {"financeiro.agendar_pagamento": CatalogAction(
+        name="financeiro.agendar_pagamento", service="svc-financeiro", title="Agendar", description="Agenda", risk="irreversivel",
+        output_fields=["id", "data"], input_schema=entrada)}
+
+
 def test_fluxo_vira_bpmn_do_camunda_com_extensoes_condicoes_e_desenho():
-    raiz = _ET.fromstring(to_bpmn(_fluxo_pagamento(), process_id="p_acme_pagar", name="Pagar & conferir"))
+    fluxo = _fluxo_pagamento()
+    fluxo.passos[4].horas = 48  # espera do comprovante com prazo: vira exceção do staff
+    raiz = _ET.fromstring(to_bpmn(fluxo, process_id="p_acme_pagar", name="Pagar & conferir", actions=_catalogo_pagamento()))
     processo = raiz.find("bpmn:process", _NS)
     assert processo.get("id") == "p_acme_pagar" and processo.get("name") == "Pagar & conferir"
+    ouvintes = {(o.get("eventType"), o.get("type")) for o in processo.find("bpmn:extensionElements", _NS).iter(f"{{{_NS['zeebe']}}}executionListener")}
+    assert ouvintes == {("start", "processos.inicio")}  # o svc-processos fica sabendo de toda execução
     inicio = processo.find("bpmn:startEvent", _NS)
-    assert inicio.get("id") == "inicio" and inicio.find("bpmn:messageEventDefinition", _NS) is not None
+    assert inicio.get("id") == "inicio" and inicio.find("bpmn:messageEventDefinition", _NS) is None  # evento: o svc-processos inicia
     saidas = [(o.get("source"), o.get("target")) for o in inicio.findall(".//zeebe:output", _NS)]
     assert saidas == [("=5000", "parametros.limite")]  # o parâmetro vai com a versão
     tarefas = {t.get("id"): t for t in processo.findall("bpmn:serviceTask", _NS)}
     assert tarefas["pagar"].find(".//zeebe:taskDefinition", _NS).get("type") == "financeiro.agendar_pagamento"
     assert tarefas["ler"].find(".//zeebe:taskDefinition", _NS).get("type") == "agentes.executar"
     headers = {h.get("key"): h.get("value") for h in tarefas["ler"].findall(".//zeebe:header", _NS)}
-    assert headers == {"passo": "ler", "objetivo": 'Extrair "valor"', "saidas": "valor"}
+    assert headers == {"passo": "ler", "objetivo": 'Extrair "valor"', "saidas": "valor", "excecao": "sim"}
+    entradas = {i.get("target"): i.get("source") for i in tarefas["pagar"].findall(".//zeebe:input", _NS)}
+    assert entradas == {"entrada.valor": "=ler.valor", "entrada.vencimento": "=gatilho.vencimento", "entrada.documento_id": "=gatilho.documento_id"}
+    assert [(o.get("source"), o.get("target")) for o in tarefas["pagar"].findall(".//zeebe:output", _NS)] == [("=resultado", "pagar")]
     humanas = {t.get("id"): t for t in processo.findall("bpmn:userTask", _NS)}
     assert humanas["aprovar"].find(".//zeebe:assignmentDefinition", _NS).get("candidateGroups") == "cliente"
+    assert humanas["aprovar"].find(".//zeebe:taskListener", _NS).get("type") == "processos.tarefa"
     assert humanas["ler__excecao"].find(".//zeebe:assignmentDefinition", _NS).get("candidateGroups") == "staff"
-    assert processo.find("bpmn:boundaryEvent", _NS).get("attachedToRef") == "ler"
+    assert "PT4H" in humanas["ler__excecao"].find(".//zeebe:taskSchedule", _NS).get("dueDate")  # handoff tem prazo
+    assert humanas["aguardar__excecao"].get("name") == "Prazo: Comprovante"
+    bordas = {b.get("id"): b for b in processo.findall("bpmn:boundaryEvent", _NS)}
+    assert bordas["ler__erro"].get("attachedToRef") == "ler" and bordas["aguardar__prazo"].get("attachedToRef") == "aguardar"
+    espera = processo.find("bpmn:receiveTask", _NS)
+    assert espera.get("id") == "aguardar" and [(o.get("source"), o.get("target")) for o in espera.findall(".//zeebe:output", _NS)] == [("=mensagem", "aguardar")]
+    assert processo.find("bpmn:endEvent", _NS).find(".//zeebe:executionListener", _NS).get("type") == "processos.fim"
     decisao = processo.find("bpmn:exclusiveGateway", _NS)
     assert decisao.get("default") == "f_precisa_pagar"
     caminhos = {f.get("id"): f for f in processo.findall("bpmn:sequenceFlow", _NS)}
     assert caminhos["f_precisa_aprovar"].find("bpmn:conditionExpression", _NS).text == "=ler.valor > parametros.limite"
     assert caminhos["f_ler__excecao_precisa"].get("targetRef") == "precisa"  # a exceção resolvida segue o fluxo
     mensagens = {m.get("name"): m for m in raiz.findall("bpmn:message", _NS)}
-    assert mensagens["banco.pago"].find(".//zeebe:subscription", _NS).get("correlationKey") == "=pagar.id"
+    assert mensagens["acme.banco.pago"].find(".//zeebe:subscription", _NS).get("correlationKey") == "=pagar.id"  # só da acme
     desenhados = {s.get("bpmnElement") for s in raiz.findall(".//bpmndi:BPMNShape", _NS)}
-    assert {"inicio", "ler", "precisa", "aprovar", "pagar", "aguardar", "fim", "ler__excecao", "ler__erro"} <= desenhados
+    assert {"inicio", "ler", "precisa", "aprovar", "pagar", "aguardar", "fim", "ler__excecao", "ler__erro", "aguardar__prazo"} <= desenhados
     assert len(raiz.findall(".//bpmndi:BPMNEdge", _NS)) == len(caminhos)
+    with pytest.raises(ValueError):
+        to_bpmn(fluxo, process_id="contas", name="x")  # sem a organização no id: mensagens e workers não saberiam de quem é
 
 
 def test_condicao_vira_feel_com_valor_escapado():
@@ -2685,3 +2739,183 @@ def test_condicao_com_alternativas_vira_or_no_feel():
     condicao = Condition(campo="ler.valor", operador=">", valor="parametros.limite",
                          ou=[{"campo": "conferir.fornecedor_novo", "operador": "verdadeiro"}])
     assert feel(condicao) == "=(ler.valor > parametros.limite) or (conferir.fornecedor_novo = true)"
+
+
+class _Pagamento(BaseModel):
+    valor: float
+    vencimento: str
+
+
+class _Agendamento(BaseModel):
+    pagamento_id: str
+
+
+_AGENDAR = Action("agendar", "Agendar pagamento", "Agenda no banco", _Pagamento, _Agendamento, risk="irreversivel",
+                  example=_Agendamento(pagamento_id="PG-1"))
+
+
+class _Pacote:
+    def __init__(self):
+        self.recebidos = []
+
+    async def agendar(self, data: _Pagamento) -> _Agendamento:
+        self.recebidos.append(data)
+        if data.valor > 1_000_000:
+            raise ServiceError("ERRO_FINANCEIRO_LIMITE_BANCO", "Acima do limite do banco.", 409)
+        if data.valor == 503:
+            raise ServiceError("ERRO_INTEGRACOES_FORA", "Banco fora do ar.", 503)
+        return _Agendamento(pagamento_id=f"PG-{int(data.valor)}")
+
+
+def _job_bruto(**extra):
+    bruto = {"jobKey": 77, "type": "financeiro.agendar", "processDefinitionId": "p_acme_contas", "processDefinitionVersion": 2,
+             "processInstanceKey": 501, "elementId": "agendar", "elementInstanceKey": 502, "customHeaders": {"passo": "agendar"},
+             "variables": {"entrada": {"valor": 1250.0, "vencimento": "2026-10-15"}}, "retries": 3, "kind": "BPMN_ELEMENT"}
+    return {**bruto, **extra}
+
+
+def test_job_do_motor_roda_a_acao_como_a_organizacao_do_processo(monkeypatch):
+    from core.processes import Handoff, Job, processes as procs
+    from core.security import current
+
+    async def ligado(nome):
+        return True
+
+    monkeypatch.setattr(processes_module.plans, "enabled", ligado)
+    pacote = _Pacote()
+    handler = procs._action_handler("financeiro", _AGENDAR, pacote)
+    quem = []
+
+    async def espia(job):
+        quem.append((current().sub, current().tenant))
+        raise Handoff("Documento ilegível")
+
+    async def cenario():
+        ok = await procs.run_job("svc-financeiro", handler, Job.from_engine(_job_bruto()))
+        faltando = await procs.run_job("svc-financeiro", handler, Job.from_engine(_job_bruto(variables={"entrada": {"valor": None}})))
+        negocio = await procs.run_job("svc-financeiro", handler, Job.from_engine(_job_bruto(variables={"entrada": {"valor": 2e6, "vencimento": "x"}})))
+        fora = await procs.run_job("svc-financeiro", handler, Job.from_engine(_job_bruto(variables={"entrada": {"valor": 503, "vencimento": "x"}})))
+        handoff = await procs.run_job("svc-financeiro", espia, Job.from_engine(_job_bruto()))
+        return ok, faltando, negocio, fora, handoff
+
+    ok, faltando, negocio, fora, handoff = asyncio.run(cenario())
+    assert (ok.status, ok.variables) == ("concluido", {"resultado": {"pagamento_id": "PG-1250"}})
+    assert faltando.status == "handoff" and "valor" in faltando.message and "vencimento" in faltando.message
+    assert (negocio.status, negocio.message) == ("handoff", "Acima do limite do banco.")  # erro de negócio não se tenta de novo
+    assert (fora.status, fora.retries) == ("falhou", 2)  # infraestrutura: o motor tenta de novo
+    assert (handoff.status, handoff.message) == ("handoff", "Documento ilegível")
+    assert quem == [("system:svc-financeiro", "acme")]  # a organização vem do id do processo no motor
+    with pytest.raises(ValueError):
+        Job.from_engine(_job_bruto(processDefinitionId="processo_de_outro"))
+
+    class _Errado:
+        async def agendar(self, data: _Pagamento) -> _Pagamento:
+            return data
+
+    with pytest.raises(RuntimeError, match="agendar"):
+        procs._action_handler("financeiro", _AGENDAR, _Errado())  # retorno fora da saída declarada: não sobe
+
+
+def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
+    from core.processes import Handoff, processes as procs
+
+    chamadas, publicados = [], []
+    fila = [[_job_bruto()], [_job_bruto(jobKey=78, customHeaders={"excecao": "sim"}, variables={"entrada": {}})],
+            [_job_bruto(jobKey=79, variables={"entrada": {}})]]
+
+    def motor(request):
+        corpo = json.loads(request.content) if request.content else {}
+        chamadas.append((request.url.path, corpo))
+        if request.url.path == "/v2/jobs/activation":
+            return httpx.Response(200, json={"jobs": fila.pop(0) if fila else []})
+        return httpx.Response(204)
+
+    async def publish(subject, message, msg_id=None):
+        publicados.append((subject, message))
+
+    async def ligado(nome):
+        return nome == "financeiro"
+
+    monkeypatch.setattr(processes_module.plans, "enabled", ligado)
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-financeiro")
+    monkeypatch.setattr(processes_module.camunda, "_client",
+                        httpx.AsyncClient(base_url="http://camunda:8080", transport=httpx.MockTransport(motor)))
+
+    async def cenario():
+        async with procs.worker("svc-financeiro", [_AGENDAR], _Pacote()):
+            for _ in range(200):
+                if sum(1 for path, _ in chamadas if path != "/v2/jobs/activation") >= 3:
+                    break
+                await asyncio.sleep(0.01)
+
+    asyncio.run(cenario())
+    respostas = {path: corpo for path, corpo in chamadas if path != "/v2/jobs/activation"}
+    assert respostas["/v2/jobs/77/completion"] == {"variables": {"resultado": {"pagamento_id": "PG-1250"}}}
+    assert respostas["/v2/jobs/78/error"]["errorCode"] == "handoff"  # com caminho de exceção: tarefa do staff
+    assert respostas["/v2/jobs/79/failure"]["retries"] == 0  # sem caminho de exceção: incidente
+    ativacao = next(corpo for path, corpo in chamadas if path == "/v2/jobs/activation")
+    assert ativacao["type"] == "financeiro.agendar" and ativacao["worker"] == "svc-financeiro"
+    assert sorted(m.status for _, m in publicados) == ["concluido", "handoff", "incidente"]
+    assert all(subject == "events.processos.passo" and m.instancia == "501" and m.processo == "contas" for subject, m in publicados)
+    assert Handoff("x").motivo == "x"
+
+
+def test_motor_inicia_entrega_mensagem_e_conclui_tarefa(monkeypatch):
+    def motor(request):
+        if request.url.path == "/v2/process-instances":
+            return httpx.Response(200, json={"processInstanceKey": 9, "processDefinitionVersion": 4})
+        if request.url.path == "/v2/user-tasks/5/completion":
+            return httpx.Response(409, json={"title": "INVALID_STATE"})
+        if request.url.path == "/v2/messages/publication":
+            assert json.loads(request.content)["name"] == "acme.banco.pago"
+            return httpx.Response(200, json={"messageKey": "1"})
+        return httpx.Response(500)
+
+    async def cenario():
+        motor_falso = processes_module.Camunda()
+        motor_falso._client = httpx.AsyncClient(base_url="http://camunda:8080", transport=httpx.MockTransport(motor))
+        iniciada = await motor_falso.start("p_acme_contas", {"gatilho": {"documento_id": "d1"}})
+        await motor_falso.message("acme.banco.pago", "PG-1", {"mensagem": {"valor": 10}})
+        with pytest.raises(ServiceError) as fechada:
+            await motor_falso.complete_task("5", {"aprovar": {"aprovado": True}})
+        with pytest.raises(ServiceError) as caiu:
+            await motor_falso.complete_job("6", {})
+        await motor_falso.close()
+        return iniciada, fechada.value, caiu.value
+
+    iniciada, fechada, caiu = asyncio.run(cenario())
+    assert (iniciada.instance, iniciada.version) == ("9", 4)
+    assert (fechada.code, fechada.status) == ("ERRO_PROCESSOS_TAREFA_FECHADA", 409)
+    assert (caiu.code, caiu.status) == ("ERRO_PROCESSOS_MOTOR", 503)
+    assert processes_module.process_id("acme", "contas") == "p_acme_contas"
+    assert processes_module.parse_process_id("p_acme_contas") == ("acme", "contas")
+    with pytest.raises(ValueError):
+        processes_module.process_id("acme", "contas_a_pagar")  # o _ separa organização e processo
+
+
+def test_conflito_de_escrita_entre_transacoes_e_repetido_pelo_core():
+    """Achado do N4: duas aberturas simultâneas do desenho → "Transaction write conflict ... can be retried" (500)."""
+
+    class _Conexao:
+        def __init__(self, falhas):
+            self.falhas, self.chamadas = falhas, 0
+
+        async def query_raw(self, sql, params):
+            self.chamadas += 1
+            if self.chamadas <= self.falhas:
+                raise RuntimeError("There was a problem with the key-value store: Transaction conflict: Transaction write "
+                                   "conflict. This transaction can be retried")
+            return {"result": [{"status": "OK", "result": [{"ok": True}]}]}
+
+    async def cenario(falhas):
+        d = surreal.Database()
+        d._conn = _Conexao(falhas)
+        with security.acting_as(ACME):
+            try:
+                return await d.query("SELECT * FROM notas WHERE tenant = $tenant"), d._conn.chamadas
+            except RuntimeError:
+                return "falhou", d._conn.chamadas
+
+    assert asyncio.run(cenario(2)) == ([{"ok": True}], 3)  # repetiu e passou
+    assert asyncio.run(cenario(9)) == ("falhou", 4)  # desiste depois de 3 repetições

@@ -498,6 +498,133 @@ export const conhecimento = {
   },
 };
 
+/** Uma conta a pagar que o processo agendou: do agendamento à conciliação. */
+export interface FinanceiroTitulo {
+  id: string;
+  fornecedor: string | null;
+  valor: number;
+  vencimento: string | null;
+  /** Data agendada no banco */
+  data: string;
+  pagamento_id: string;
+  status: "agendado" | "pago";
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface FinanceiroTituloPage {
+  items: FinanceiroTitulo[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface FinanceiroTituloQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "data" | "-data" | "valor" | "-valor" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "agendado" | "pago" | null;
+}
+
+export interface FinanceiroTituloMudou {
+  id: string;
+  action: "agendado" | "pago";
+}
+
+export interface FinanceiroFornecedor {
+  nome: string;
+  cnpj?: string | null;
+  conta?: string;
+  centro_custo?: string | null;
+  /** Mensal; documento com outro valor diverge */
+  valor_contrato?: number | null;
+}
+
+/** Fornecedores: só os campos que mudam. */
+export interface FinanceiroFornecedorUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  cnpj?: string | null;
+  conta?: string | null;
+  centro_custo?: string | null;
+  /** Mensal; documento com outro valor diverge */
+  valor_contrato?: number | null;
+}
+
+/** Fornecedores: página, busca, filtros e ordem pela URL. */
+export interface FinanceiroFornecedorQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "nome" | "-nome" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
+/** Fornecedores: um registro. */
+export interface FinanceiroFornecedorItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  cnpj: string | null;
+  conta: string;
+  centro_custo: string | null;
+  /** Mensal; documento com outro valor diverge */
+  valor_contrato: number | null;
+}
+
+export interface FinanceiroFornecedorPage {
+  items: FinanceiroFornecedorItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** svc-financeiro · /api/v1/financeiro */
+export const financeiro = {
+  /** GET /api/v1/financeiro/titulos · http · exige token */
+  titulos: (query?: FinanceiroTituloQuery, options?: RequestOptions) =>
+    request<FinanceiroTituloPage>("GET", withQuery("/api/v1/financeiro/titulos", query), undefined, options),
+  /** Cadastro Fornecedores (core/resources.py) · /api/v1/financeiro/fornecedores · exige token */
+  fornecedores: {
+    /** GET /api/v1/financeiro/fornecedores · página, busca, filtros e ordem */
+    list: (query?: FinanceiroFornecedorQuery, options?: RequestOptions) =>
+      request<FinanceiroFornecedorPage>("GET", withQuery("/api/v1/financeiro/fornecedores", query), undefined, options),
+    /** GET /api/v1/financeiro/fornecedores/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<FinanceiroFornecedorItem>("GET", withQuery("/api/v1/financeiro/fornecedores/item", query), undefined, options),
+    /** POST /api/v1/financeiro/fornecedores */
+    create: (body: FinanceiroFornecedor, options?: RequestOptions) =>
+      request<FinanceiroFornecedorItem>("POST", "/api/v1/financeiro/fornecedores", body, options),
+    /** POST /api/v1/financeiro/fornecedores/update · só os campos que vierem mudam */
+    update: (body: FinanceiroFornecedorUpdate, options?: RequestOptions) =>
+      request<FinanceiroFornecedorItem>("POST", "/api/v1/financeiro/fornecedores/update", body, options),
+    /** POST /api/v1/financeiro/fornecedores/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/financeiro/fornecedores/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Fornecedores", "live": "financeiro.fornecedores", "fields": [{"name": "nome", "label": "Nome", "kind": "text", "required": true}, {"name": "cnpj", "label": "CNPJ", "kind": "text", "required": false}, {"name": "conta", "label": "Conta do plano de contas", "kind": "text", "required": false}, {"name": "centro_custo", "label": "Centro de custo", "kind": "text", "required": false}, {"name": "valor_contrato", "label": "Valor do contrato", "kind": "money", "required": false, "hint": "Mensal; documento com outro valor diverge"}], "columns": [{"key": "nome", "header": "Nome", "kind": "text", "sort": "nome"}, {"key": "cnpj", "header": "CNPJ", "kind": "text"}, {"key": "conta", "header": "Conta do plano de contas", "kind": "text"}, {"key": "centro_custo", "header": "Centro de custo", "kind": "text"}, {"key": "valor_contrato", "header": "Valor do contrato", "kind": "money"}], "filters": [], "search": "nome, cnpj"} satisfies ResourceMeta,
+  },
+};
+
 export interface IdentitySignupInput {
   /** Nome da pessoa */
   name: string;
@@ -514,7 +641,7 @@ export interface IdentitySignupInput {
 export interface IdentityTenant {
   id: string;
   name: string;
-  roles: ("owner" | "admin" | "member")[];
+  roles: ("owner" | "admin" | "member" | "operador")[];
 }
 
 export interface IdentityUser {
@@ -552,7 +679,7 @@ export interface IdentityInviteCode {
 
 export interface IdentityInviteInfo {
   tenant_name: string;
-  role: "owner" | "admin" | "member";
+  role: "owner" | "admin" | "member" | "operador";
   expires_at: string;
 }
 
@@ -585,8 +712,8 @@ export interface IdentityTenantInput {
 }
 
 export interface IdentityInviteInput {
-  /** Papel de quem aceitar o convite */
-  role?: "admin" | "member";
+  /** Papel de quem aceitar o convite (operador: o staff da Cogniventure) */
+  role?: "admin" | "member" | "operador";
   /** Se informado, o convite também vai por e-mail para este endereço */
   email?: string | null;
 }
@@ -594,7 +721,7 @@ export interface IdentityInviteInput {
 export interface IdentityInvite {
   /** Código para o link de convite (mostrado uma única vez) */
   code: string;
-  role: "owner" | "admin" | "member";
+  role: "owner" | "admin" | "member" | "operador";
   expires_at: string;
   /** Para quem o convite foi enviado por e-mail */
   email: string | null;
@@ -604,7 +731,7 @@ export interface IdentityMember {
   id: string;
   name: string;
   email: string;
-  roles: ("owner" | "admin" | "member")[];
+  roles: ("owner" | "admin" | "member" | "operador")[];
   joined_at: string;
 }
 
@@ -724,6 +851,166 @@ export const identity = {
   /** POST /api/v1/identity/organization/logo/remove · http · exige token */
   removeLogo: (body: unknown, options?: RequestOptions) =>
     request<IdentityOrganization>("POST", "/api/v1/identity/organization/logo/remove", body, options),
+};
+
+export interface IntegracoesConexao {
+  id: string;
+  tipo: "caixa_entrada" | "banco_simulado";
+  nome: string;
+  /** caixa_entrada: para onde encaminhar boletos e notas */
+  endereco: string | null;
+  /** banco_simulado: segundos até o banco confirmar um pagamento */
+  confirmar_apos: number | null;
+  created_at: string | null;
+}
+
+export interface IntegracoesConexoes {
+  itens: IntegracoesConexao[];
+}
+
+export interface IntegracoesNovaConexao {
+  tipo: "caixa_entrada" | "banco_simulado";
+  nome?: string | null;
+  /** banco_simulado: segundos até confirmar o pagamento */
+  confirmar_apos?: number;
+}
+
+export interface IntegracoesConexaoRef {
+  id: string;
+}
+
+export interface IntegracoesResumo {
+  /** Endereço da caixa de entrada, se conectada */
+  caixa_entrada: string | null;
+  banco: boolean;
+  documentos: number;
+  agendados: number;
+}
+
+export interface IntegracoesDocumento {
+  id: string;
+  origem: "email";
+  de: string | null;
+  assunto: string | null;
+  nome: string;
+  tipo: string;
+  tamanho: number;
+  /** Falso em imagem ou PDF escaneado: o agente não lê (sem OCR) */
+  tem_texto: boolean;
+  created_at: string | null;
+}
+
+export interface IntegracoesDocumentoPage {
+  items: IntegracoesDocumento[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface IntegracoesDocumentoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "nome" | "-nome" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
+export interface IntegracoesLink {
+  url: string;
+  nome: string;
+  tipo: string;
+}
+
+export interface IntegracoesDocumentoRef {
+  id: string;
+}
+
+export interface IntegracoesPagamento {
+  id: string;
+  pagamento_id: string;
+  valor: number;
+  /** Data agendada (AAAA-MM-DD) */
+  data: string;
+  fornecedor: string | null;
+  linha_digitavel: string | null;
+  status: "agendado" | "pago";
+  pago_em: string | null;
+  created_at: string | null;
+}
+
+export interface IntegracoesPagamentoPage {
+  items: IntegracoesPagamento[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface IntegracoesPagamentoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "data" | "-data" | "valor" | "-valor" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "agendado" | "pago" | null;
+}
+
+export interface IntegracoesPagamentoRef {
+  id: string;
+}
+
+export interface IntegracoesConexaoMudou {
+  id: string;
+  action: "conectada" | "removida";
+}
+
+export interface IntegracoesDocumentoMudou {
+  id: string;
+  action: "recebido";
+}
+
+export interface IntegracoesPagamentoMudou {
+  id: string;
+  action: "agendado" | "pago";
+}
+
+/** svc-integracoes · /api/v1/integracoes */
+export const integracoes = {
+  /** GET /api/v1/integracoes/conexoes · http · exige token */
+  conexoes: (options?: RequestOptions) =>
+    request<IntegracoesConexoes>("GET", "/api/v1/integracoes/conexoes", undefined, options),
+  /** POST /api/v1/integracoes/conexoes · http · exige token */
+  conectar: (body: IntegracoesNovaConexao, options?: RequestOptions) =>
+    request<IntegracoesConexao>("POST", "/api/v1/integracoes/conexoes", body, options),
+  /** POST /api/v1/integracoes/conexoes/remover · http · exige token */
+  desconectar: (body: IntegracoesConexaoRef, options?: RequestOptions) =>
+    request<IntegracoesConexao>("POST", "/api/v1/integracoes/conexoes/remover", body, options),
+  /** GET /api/v1/integracoes/resumo · http · exige token */
+  resumo: (options?: RequestOptions) =>
+    request<IntegracoesResumo>("GET", "/api/v1/integracoes/resumo", undefined, options),
+  /** GET /api/v1/integracoes/documentos · http · exige token */
+  documentos: (query?: IntegracoesDocumentoQuery, options?: RequestOptions) =>
+    request<IntegracoesDocumentoPage>("GET", withQuery("/api/v1/integracoes/documentos", query), undefined, options),
+  /** GET /api/v1/integracoes/documentos/arquivo · http · exige token */
+  arquivo: (query?: IntegracoesDocumentoRef, options?: RequestOptions) =>
+    request<IntegracoesLink>("GET", withQuery("/api/v1/integracoes/documentos/arquivo", query), undefined, options),
+  /** GET /api/v1/integracoes/pagamentos · http · exige token */
+  pagamentos: (query?: IntegracoesPagamentoQuery, options?: RequestOptions) =>
+    request<IntegracoesPagamentoPage>("GET", withQuery("/api/v1/integracoes/pagamentos", query), undefined, options),
+  /** POST /api/v1/integracoes/pagamentos/confirmar · http · exige token */
+  confirmarPagamento: (body: IntegracoesPagamentoRef, options?: RequestOptions) =>
+    request<IntegracoesPagamento>("POST", "/api/v1/integracoes/pagamentos/confirmar", body, options),
 };
 
 export interface NotifyNotification {
@@ -1169,6 +1456,8 @@ export interface ProcessosMotor {
   processo: string;
   chave: string;
   versao: number;
+  /** Impressão do BPMN implantado (publicar o mesmo BPMN não muda nada) */
+  hash: string | null;
 }
 
 export interface ProcessosProblema {
@@ -1283,6 +1572,191 @@ export interface ProcessosSimulacao {
   problemas: string[];
 }
 
+export interface ProcessosExecucao {
+  id: string;
+  /** Execução no motor */
+  instancia: string;
+  processo: string;
+  titulo: string;
+  /** Versão nossa (a que estava publicada quando começou) */
+  versao: number | null;
+  motor_versao: number;
+  status: "andamento" | "concluida" | "incidente" | "cancelada";
+  /** Como terminou (o fim alcançado: pago, recusado...) */
+  resultado: string | null;
+  origem: "evento" | "manual" | "agenda";
+  /** O que iniciou (ex.: o documento recebido) */
+  resumo: string | null;
+  passo_atual: string | null;
+  passo_nome: string | null;
+  aguardando: "cliente" | "staff" | "evento" | null;
+  /** Exceções que foram para o staff (execução com handoff não conta na autonomia) */
+  handoffs: number;
+  marcos: ProcessosMarco[];
+  /** O que cada passo devolveu */
+  saidas: Record<string, Record<string, unknown>>;
+  concluida_em: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Um acontecimento na linha do tempo da execução. */
+export interface ProcessosMarco {
+  passo: string;
+  nome: string;
+  status: "iniciada" | "concluido" | "handoff" | "incidente" | "tentando" | "tarefa" | "resolvido" | "aguardando" | "fim";
+  em: string;
+  motivo: string | null;
+  /** Quem resolveu (tarefa de pessoa) */
+  por: string | null;
+}
+
+export interface ProcessosExecucaoPage {
+  items: ProcessosExecucao[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface ProcessosExecucaoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "andamento" | "concluida" | "incidente" | "cancelada" | null;
+  processo?: string | null;
+}
+
+export interface ProcessosExecucaoDetalhe {
+  execucao: ProcessosExecucao;
+  /** O BPMN da versão em que a execução roda */
+  bpmn: string;
+  /** Elementos e ligações por onde passou (para pintar no diagrama) */
+  caminho: string[];
+  /** Onde está agora */
+  atuais: string[];
+}
+
+export interface ProcessosExecucaoRef {
+  id: string;
+}
+
+export interface ProcessosIniciar {
+  processo: string;
+  /** O que o gatilho traria (ex.: documento_id) */
+  dados?: Record<string, string | number | boolean>;
+}
+
+/** Um campo que a pessoa preenche ao resolver uma exceção (a saída do passo que parou). */
+export interface ProcessosCampo {
+  nome: string;
+  rotulo: string;
+  tipo: "texto" | "numero" | "sim_nao";
+  /** O que o agente ou a ação chegou a ver */
+  valor: string | number | boolean | null;
+}
+
+export interface ProcessosItem {
+  rotulo: string;
+  valor: string;
+}
+
+export interface ProcessosTarefa {
+  id: string;
+  /** Tarefa no motor */
+  chave: string;
+  /** Id da execução */
+  execucao: string;
+  instancia: string;
+  processo: string;
+  /** Título do processo */
+  titulo: string;
+  /** Passo do fluxo a que a resposta pertence */
+  passo: string;
+  nome: string;
+  tipo: "aprovacao" | "excecao";
+  responsavel: "cliente" | "staff";
+  pergunta: string;
+  /** Exceção: por que o passo parou */
+  motivo: string | null;
+  contexto: ProcessosItem[];
+  campos: ProcessosCampo[];
+  documento_id: string | null;
+  prazo: string | null;
+  status: "aberta" | "concluida";
+  resposta: Record<string, unknown>;
+  concluida_por: string | null;
+  concluida_em: string | null;
+  created_at: string | null;
+}
+
+export interface ProcessosTarefaPage {
+  items: ProcessosTarefa[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface ProcessosTarefaQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "prazo" | "-prazo" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberta" | "concluida" | null;
+  responsavel?: "cliente" | "staff" | null;
+  execucao?: string | null;
+}
+
+export interface ProcessosResposta {
+  id: string;
+  /** Aprovação: sim ou não */
+  aprovado?: boolean | null;
+  comentario?: string | null;
+  /** Exceção: a saída do passo */
+  dados?: Record<string, string | number | boolean | null>;
+}
+
+export interface ProcessosAcompanhamentoProcesso {
+  processo: string;
+  titulo: string;
+  andamento: number;
+  geral: ProcessosAutonomia;
+  por_versao: ProcessosAutonomia[];
+}
+
+export interface ProcessosAutonomia {
+  versao: number | null;
+  concluidas: number;
+  sem_handoff: number;
+  /** Execuções sem handoff ÷ concluídas (0 a 1) */
+  autonomia: number | null;
+}
+
+export interface ProcessosAcompanhamento {
+  andamento: number;
+  concluidas: number;
+  incidentes: number;
+  tarefas_cliente: number;
+  tarefas_staff: number;
+  atrasadas: number;
+  autonomia: number | null;
+  processos: ProcessosAcompanhamentoProcesso[];
+}
+
 export interface ProcessosProcessoMudou {
   id: string;
   action: "sugerido" | "aceito" | "recusado" | "descrito";
@@ -1291,6 +1765,16 @@ export interface ProcessosProcessoMudou {
 export interface ProcessosDesenhoMudou {
   processo: string;
   action: "alterado" | "mensagem" | "publicado" | "ajustado" | "descartado";
+}
+
+export interface ProcessosExecucaoMudou {
+  id: string;
+  action: "iniciada" | "mudou" | "concluida";
+}
+
+export interface ProcessosTarefaMudou {
+  id: string;
+  action: "criada" | "concluida";
 }
 
 /** svc-processos · /api/v1/processos */
@@ -1340,6 +1824,24 @@ export const processos = {
   /** POST /api/v1/processos/desenho/descartar · http · exige token */
   descartar: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
     request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/descartar", body, options),
+  /** GET /api/v1/processos/execucoes · http · exige token */
+  execucoes: (query?: ProcessosExecucaoQuery, options?: RequestOptions) =>
+    request<ProcessosExecucaoPage>("GET", withQuery("/api/v1/processos/execucoes", query), undefined, options),
+  /** GET /api/v1/processos/execucoes/item · http · exige token */
+  execucao: (query?: ProcessosExecucaoRef, options?: RequestOptions) =>
+    request<ProcessosExecucaoDetalhe>("GET", withQuery("/api/v1/processos/execucoes/item", query), undefined, options),
+  /** POST /api/v1/processos/execucoes/iniciar · http · exige token */
+  iniciar: (body: ProcessosIniciar, options?: RequestOptions) =>
+    request<ProcessosExecucao>("POST", "/api/v1/processos/execucoes/iniciar", body, options),
+  /** GET /api/v1/processos/tarefas · http · exige token */
+  tarefas: (query?: ProcessosTarefaQuery, options?: RequestOptions) =>
+    request<ProcessosTarefaPage>("GET", withQuery("/api/v1/processos/tarefas", query), undefined, options),
+  /** POST /api/v1/processos/tarefas/responder · http · exige token */
+  responder: (body: ProcessosResposta, options?: RequestOptions) =>
+    request<ProcessosTarefa>("POST", "/api/v1/processos/tarefas/responder", body, options),
+  /** GET /api/v1/processos/acompanhamento · http · exige token */
+  acompanhamento: (options?: RequestOptions) =>
+    request<ProcessosAcompanhamento>("GET", "/api/v1/processos/acompanhamento", undefined, options),
 };
 
 export interface WebhooksEndpoint {
@@ -1487,10 +1989,20 @@ export interface LiveTopics {
   "conhecimento.leituras": ConhecimentoLeituraMudou;
   /** svc-conhecimento · cadastro itens (core/resources.py) */
   "conhecimento.itens": ResourceChanged;
+  /** svc-financeiro · bus.live("financeiro.titulos", ...) */
+  "financeiro.titulos": FinanceiroTituloMudou;
+  /** svc-financeiro · cadastro fornecedores (core/resources.py) */
+  "financeiro.fornecedores": ResourceChanged;
   /** svc-identity · bus.live("identity.membros", ...) */
   "identity.membros": IdentityMembersChanged;
   /** svc-identity · bus.live("identity.acesso", ...) */
   "identity.acesso": IdentityAccessChanged;
+  /** svc-integracoes · bus.live("integracoes.conexoes", ...) */
+  "integracoes.conexoes": IntegracoesConexaoMudou;
+  /** svc-integracoes · bus.live("integracoes.documentos", ...) */
+  "integracoes.documentos": IntegracoesDocumentoMudou;
+  /** svc-integracoes · bus.live("integracoes.pagamentos", ...) */
+  "integracoes.pagamentos": IntegracoesPagamentoMudou;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
   /** svc-plans · bus.live("plans.uso", ...) */
@@ -1499,6 +2011,10 @@ export interface LiveTopics {
   "processos.processos": ProcessosProcessoMudou;
   /** svc-processos · bus.live("processos.desenho", ...) */
   "processos.desenho": ProcessosDesenhoMudou;
+  /** svc-processos · bus.live("processos.execucoes", ...) */
+  "processos.execucoes": ProcessosExecucaoMudou;
+  /** svc-processos · bus.live("processos.tarefas", ...) */
+  "processos.tarefas": ProcessosTarefaMudou;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
@@ -1507,7 +2023,9 @@ export interface LiveTopics {
 export const appModules = {
   ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
   conhecimento: { title: "Conhecimento", description: "Briefing da empresa e a base de conhecimento que os agentes consultam", category: "Sua empresa", core: false },
+  financeiro: { title: "Financeiro", description: "Pacote de ações financeiras do BPO: contas a pagar, conciliação, cobrança e fechamento", category: "Pacotes", core: false },
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
+  integracoes: { title: "Integrações", description: "Conexões da empresa com o mundo de fora: a caixa de entrada de documentos e o banco", category: "Integrações", core: false },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
   processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados", category: "Sua empresa", core: false },

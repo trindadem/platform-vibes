@@ -126,7 +126,7 @@ _CREATE_TENANT = """{
     RETURN $t.id;
 }"""
 
-_ROLE_NAMES = {"owner": "dono", "admin": "administrador", "member": "membro"}
+_ROLE_NAMES = {"owner": "dono", "admin": "administrador", "member": "membro", "operador": "operador"}
 
 _dummy_hash: str | None = None
 

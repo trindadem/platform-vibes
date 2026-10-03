@@ -5,6 +5,8 @@ modelo de schemas.py (ou é um gerador de pedaços, que não vira activity), e v
 O perfil e o conhecimento da empresa vêm do svc-conhecimento por RPC (rpc.conhecimento.*), na organização de quem age.
 """
 import asyncio
+import hashlib
+import inspect
 import json
 import re
 from collections.abc import AsyncIterator, Callable
@@ -12,18 +14,67 @@ from datetime import UTC, datetime
 from typing import Any
 
 from nats.errors import Error as NatsError
+from pydantic import BaseModel, create_model
 
 from core.envelope import ServiceError
 from core.llm import AgentStep, llm
 from core.nats_bus import bus
 from core.plans import plans
-from core.processes import START, ActionCatalog, CatalogAction, Condition, Flow, Fluxo, Step, Trigger, camunda, to_bpmn
+from core.notify import notify
+from core.processes import (
+    START,
+    ActionCatalog,
+    CatalogAction,
+    Condition,
+    Flow,
+    Fluxo,
+    Handoff,
+    Job,
+    Step,
+    Trigger,
+    camunda,
+    process_id,
+    step_outputs,
+    to_bpmn,
+)
 from core.security import current, current_tenant
 from core.surreal import Migration, db
 from core.temporal_runner import activities
 
 from schemas import (
     ACOES,
+    DOCUMENTO_SUBJECT,
+    EXECUCAO_INSTRUCOES,
+    EXECUCOES,
+    LIVE_EXECUCOES,
+    LIVE_TAREFAS,
+    OPERADORES,
+    STARTERS,
+    TAREFAS,
+    Acompanhamento,
+    AcompanhamentoProcesso,
+    Autonomia,
+    Campo,
+    DocumentoRef,
+    DocumentoTexto,
+    EventoExterno,
+    Execucao,
+    ExecucaoDetalhe,
+    ExecucaoMudou,
+    ExecucaoPage,
+    ExecucaoQuery,
+    ExecucaoRef,
+    Iniciar,
+    Item,
+    LeituraDocumento,
+    Marco,
+    PassoFeito,
+    Resposta,
+    SaidaAgente,
+    Tarefa,
+    TarefaMudou,
+    TarefaPage,
+    TarefaQuery,
     BIBLIOTECA,
     BUSCA_SUBJECT,
     CONTEXTO_SUBJECT,
@@ -284,24 +335,30 @@ class ProcessosService:
         processo = await _processo_por_id(data.processo)
         rascunho = await _rascunho(processo.id)
         fluxo = Fluxo.model_validate(rascunho["fluxo"])
-        erros = [p for p in _problemas(fluxo, await _catalogo()) if p.nivel == "erro"]
+        catalogo = await _catalogo()
+        erros = [p for p in _problemas(fluxo, catalogo) if p.nivel == "erro"]
         if erros:
             raise ServiceError("ERRO_PROCESSOS_FLUXO_INVALIDO", "O fluxo tem problemas: " + "; ".join(e.texto for e in erros[:3]), 409)
+        motor_id = _motor_id(processo.id)
+        xml = to_bpmn(fluxo, process_id=motor_id, name=processo.titulo, actions=catalogo)
+        digest = hashlib.sha256(xml.encode()).hexdigest()[:24]
         publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
-        if publicada is not None and Fluxo.model_validate(publicada["fluxo"]) == fluxo:
-            raise ServiceError("ERRO_PROCESSOS_SEM_MUDANCA", "O rascunho está igual à versão publicada: mude o fluxo ou descarte o rascunho.", 409)
+        if publicada is not None:
+            hash_publicado = (publicada.get("motor") or {}).get("hash")
+            # O mesmo BPMN de novo daria a mesma versão no motor. Mudou só o compilador (ou o catálogo)? Aí publica.
+            if hash_publicado == digest or (hash_publicado is None and Fluxo.model_validate(publicada["fluxo"]) == fluxo):
+                raise ServiceError("ERRO_PROCESSOS_SEM_MUDANCA", "O rascunho está igual à versão publicada: mude o fluxo ou descarte o rascunho.", 409)
         if processo.publicada is None:
             ativos = await db.query(f"SELECT count() AS total FROM (SELECT id FROM {PROCESSOS} WHERE tenant = $tenant "
                                     "AND publicada != NONE AND publicada != NULL) GROUP ALL")
             await plans.check("ativos", used=ativos[0]["total"] if ativos else 0)
-        motor_id = _motor_id(processo.id)
-        implantado = await camunda.deploy(to_bpmn(fluxo, process_id=motor_id, name=processo.titulo), motor_id)
+        implantado = await camunda.deploy(xml, motor_id)
         for versao in await _versoes(processo.id):
             if versao["status"] == "publicada":
                 await db.merge(_ref(VERSOES, versao), {"status": "arquivada"})
         await db.merge(_ref(VERSOES, rascunho), {
             "status": "publicada", "publicada_em": datetime.now(UTC), "anteriores": [],
-            "motor": Motor(processo=motor_id, chave=implantado.key, versao=implantado.version).model_dump()})
+            "motor": Motor(processo=motor_id, chave=implantado.key, versao=implantado.version, hash=digest).model_dump()})
         await db.merge(f"{PROCESSOS}:{processo.id}", {"publicada": int(rascunho["numero"])})
         await plans.count("ativos", await _publicados())
         await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="publicado"))
@@ -330,6 +387,239 @@ class ProcessosService:
         await db.delete(_ref(VERSOES, rascunho))
         await bus.live(LIVE_DESENHO, DesenhoMudou(processo=data.processo, action="descartado"))
         return await _desenho(data.processo)
+
+
+    # ── Execução: gatilhos, acompanhamento e tarefas de pessoas ───────────────
+
+    async def receber_evento(self, data: EventoExterno) -> Empty:
+        """events.integracoes.evento: inicia os processos publicados cujo gatilho é este evento e, com chave, entrega a
+        mensagem à execução que espera por ela (ex.: banco.pago com o id do pagamento)."""
+        origem = bus.message_id()
+        resumo = data.dados.get("nome") or data.dados.get("assunto")
+        for processo, versao in await _publicados_por_evento(data.nome):
+            await _iniciar(processo, versao, origem="evento", gatilho=data.dados, resumo=str(resumo) if resumo else data.nome,
+                           chave=f"{origem}:{processo.id}" if origem else None)
+        if data.chave:
+            await camunda.message(f"{current_tenant()}.{data.nome}", data.chave, {"mensagem": data.dados}, message_id=origem)
+        return Empty()
+
+    async def iniciar(self, data: Iniciar) -> Execucao:
+        """Inicia à mão uma execução do processo publicado (dono, admin ou operador); dados = o que o gatilho traria."""
+        who = current()
+        if who is None or not (who.is_system or STARTERS & who.roles):
+            raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só donos, administradores e operadores iniciam execuções.", 403)
+        processo = await _processo_por_id(data.processo)
+        publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
+        if publicada is None:
+            raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", "Publique o processo antes de iniciar uma execução.", 409)
+        return await _iniciar(processo, publicada, origem="manual", gatilho={**data.dados, "origem": "manual"}, resumo="Iniciada à mão")
+
+    async def execucoes(self, data: ExecucaoQuery) -> ExecucaoPage:
+        return await db.page(EXECUCOES, data, ExecucaoPage)
+
+    async def execucao(self, data: ExecucaoRef) -> ExecucaoDetalhe:
+        """A execução com o BPMN da versão dela e o caminho percorrido (o motor diz por onde passou)."""
+        row = await db.select(f"{EXECUCOES}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Execução não encontrada.", 404)
+        execucao = Execucao.model_validate(row)
+        versao = await _versao_do_motor(execucao.processo, execucao.motor_versao)
+        fluxo = Fluxo.model_validate(versao["fluxo"]) if versao else Fluxo()
+        bpmn = to_bpmn(fluxo, process_id=_motor_id(execucao.processo), name=execucao.titulo, actions=await _catalogo())
+        elementos = await camunda.path(execucao.instancia)
+        visitados = [e["id"] for e in elementos]
+        concluidos = {e["id"] for e in elementos if e["estado"] == "COMPLETED"}  # interrompido (exceção) não segue em frente
+        ligacoes = re.findall(r'<bpmn:sequenceFlow id="([^"]+)" sourceRef="([^"]+)" targetRef="([^"]+)"', bpmn)
+        caminho = [*dict.fromkeys(visitados), *(fid for fid, de, para in ligacoes if de in concluidos and para in visitados)]
+        atuais = [e["id"] for e in elementos if e["estado"] == "ACTIVE"]
+        return ExecucaoDetalhe(execucao=execucao, bpmn=bpmn, caminho=caminho, atuais=atuais)
+
+    async def tarefas(self, data: TarefaQuery) -> TarefaPage:
+        return await db.page(TAREFAS, data, TarefaPage)
+
+    async def responder(self, data: Resposta) -> Tarefa:
+        """Resolve uma tarefa: aprovação (dono ou admin) ou exceção (operador, com a saída do passo que parou)."""
+        row = await db.select(f"{TAREFAS}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Tarefa não encontrada.", 404)
+        tarefa = Tarefa.model_validate(row)
+        who = current()
+        pode = WRITERS if tarefa.responsavel == "cliente" else OPERADORES
+        if who is None or not (who.is_system or pode & who.roles):
+            quem = "donos e administradores" if tarefa.responsavel == "cliente" else "operadores do staff"
+            raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", f"Esta tarefa é para {quem}.", 403)
+        if tarefa.status != "aberta":
+            raise ServiceError("ERRO_PROCESSOS_TAREFA_FECHADA", "Esta tarefa já foi resolvida.", 409)
+        if tarefa.tipo == "aprovacao":
+            if data.aprovado is None:
+                raise ServiceError("ERRO_PROCESSOS_RESPOSTA", "Diga se aprova ou não.", 422)
+            resposta: dict[str, Any] = {"aprovado": data.aprovado, "comentario": data.comentario or ""}
+        else:
+            resposta = _valores_da_excecao(tarefa, data)
+        await camunda.complete_task(tarefa.chave, {tarefa.passo: resposta})
+        agora = datetime.now(UTC)
+        row = await db.merge(f"{TAREFAS}:{tarefa.id}", {"status": "concluida", "resposta": resposta,
+                                                         "concluida_por": who.sub if who else None, "concluida_em": agora})
+        await _marcar(tarefa.instancia, Marco(passo=tarefa.passo, nome=tarefa.nome, status="resolvido", em=agora, por=who.sub if who else None,
+                                              motivo=None if tarefa.tipo == "excecao" else ("aprovado" if data.aprovado else "recusado")),
+                      saida=(tarefa.passo, resposta), aguardando=None)
+        await bus.live(LIVE_TAREFAS, TarefaMudou(id=tarefa.id, action="concluida"))
+        return Tarefa.model_validate(row)
+
+    async def acompanhamento(self, data: Empty) -> Acompanhamento:
+        """O passo de acompanhamento da jornada: execuções, tarefas, atrasos e autonomia por processo e por versão."""
+        execucoes = await db.query(f"SELECT processo, titulo, versao, status, handoffs FROM {EXECUCOES} WHERE tenant = $tenant")
+        abertas = await db.query(f"SELECT responsavel, prazo FROM {TAREFAS} WHERE tenant = $tenant AND status = 'aberta'")
+        agora = datetime.now(UTC)
+        processos: dict[str, AcompanhamentoProcesso] = {}
+        for pid in dict.fromkeys(e["processo"] for e in execucoes):
+            delas = [e for e in execucoes if e["processo"] == pid]
+            versoes = sorted({e.get("versao") for e in delas if e.get("versao") is not None})
+            processos[pid] = AcompanhamentoProcesso(
+                processo=pid, titulo=delas[0]["titulo"], andamento=sum(1 for e in delas if e["status"] == "andamento"),
+                geral=_autonomia(delas), por_versao=[_autonomia([e for e in delas if e.get("versao") == v], v) for v in versoes])
+        return Acompanhamento(
+            andamento=sum(1 for e in execucoes if e["status"] == "andamento"),
+            concluidas=sum(1 for e in execucoes if e["status"] == "concluida"),
+            incidentes=sum(1 for e in execucoes if e["status"] == "incidente"),
+            tarefas_cliente=sum(1 for t in abertas if t["responsavel"] == "cliente"),
+            tarefas_staff=sum(1 for t in abertas if t["responsavel"] == "staff"),
+            atrasadas=sum(1 for t in abertas if t.get("prazo") and _quando(t["prazo"]) < agora),
+            autonomia=_autonomia(execucoes).autonomia, processos=list(processos.values()))
+
+    async def registrar_passo(self, data: PassoFeito) -> Empty:
+        """events.processos.passo: o worker de um pacote concluiu um passo, mandou ao staff ou abriu incidente."""
+        nome = await _nome_do_passo(data.processo, data.motor_versao, data.passo)
+        marco = Marco(passo=data.passo, nome=nome, status=data.status, em=data.em or datetime.now(UTC), motivo=data.motivo)
+        await _marcar(data.instancia, marco, saida=(data.passo, data.saida) if data.status == "concluido" else None,
+                      handoff=data.status == "handoff", incidente=data.status == "incidente")
+        return Empty()
+
+    # ── Jobs do motor para este serviço (core/processes.py: o BPMN os gera) ──
+
+    async def _job_inicio(self, job: Job) -> None:
+        """A execução começou (qualquer gatilho): garante o registro dela (a de agenda só se sabe aqui)."""
+        if await _execucao_por_instancia(job.instance) is None:
+            processo = await _processo_por_id(job.processo)
+            origem = "agenda" if not job.variables.get("gatilho") else "evento"
+            await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=None)
+        return None
+
+    async def _job_tarefa(self, job: Job) -> None:
+        """Uma tarefa de pessoa foi criada: aprovação do cliente ou exceção do staff, com o contexto para decidir."""
+        tarefa_motor = job.user_task or {}
+        chave = str(tarefa_motor.get("userTaskKey") or job.headers.get("io.camunda.zeebe:userTaskKey") or "")
+        if not chave or await db.query(f"SELECT id FROM {TAREFAS} WHERE tenant = $tenant AND chave = $c LIMIT 1", c=chave):
+            return None  # reentrega do mesmo job
+        processo = await _processo_por_id(job.processo)
+        versao = await _versao_do_motor(job.processo, job.version)
+        fluxo = Fluxo.model_validate(versao["fluxo"]) if versao else Fluxo()
+        catalogo = await _catalogo()
+        execucao = await _execucao_por_instancia(job.instance) or await _registrar_execucao(processo, job.instance, job.version, origem="evento", resumo=None)
+        excecao = job.element.endswith("__excecao")
+        passo_id = job.element.removesuffix("__excecao")
+        step = fluxo.step(passo_id)
+        nome = step.nome if step else passo_id
+        saidas = {k: v for k, v in job.variables.items() if isinstance(v, dict) and k not in ("parametros", "entrada", "mensagem")}
+        motivo = None
+        if excecao:
+            ultimo = next((m for m in reversed(execucao.marcos) if m.passo == passo_id and m.status == "handoff"), None)
+            motivo = ultimo.motivo if ultimo else (f"O prazo de {nome.lower()} passou." if step and step.tipo == "espera" else None)
+        dados = {**(saidas.get("gatilho") or {}), **{k: v for s in saidas.values() for k, v in s.items()}}
+        tarefa = {
+            "chave": chave, "execucao": execucao.id, "instancia": job.instance, "processo": processo.id, "titulo": processo.titulo,
+            "passo": passo_id, "nome": f"Exceção: {nome}" if excecao else nome, "tipo": "excecao" if excecao else "aprovacao",
+            "responsavel": "staff" if excecao else (step.responsavel if step and step.responsavel else "cliente"),
+            "pergunta": (f"Resolva {nome.lower()} e preencha o que o passo devolveria." if excecao else (step.pergunta if step and step.pergunta else nome)),
+            "motivo": motivo, "contexto": [i.model_dump() for i in _contexto_tarefa(dados)],
+            "campos": [c.model_dump() for c in _campos(step, catalogo, saidas.get(passo_id) or dados)] if excecao and step else [],
+            "documento_id": (saidas.get("gatilho") or {}).get("documento_id"), "prazo": _quando(tarefa_motor.get("dueDate")),
+            "status": "aberta", "resposta": {},
+        }
+        try:
+            criada = Tarefa.model_validate(await db.create(TAREFAS, tarefa))
+        except ServiceError as exc:
+            if exc.code == "ERRO_RECORD_DUPLICATE":
+                return None
+            raise
+        aguardando = "staff" if tarefa["responsavel"] == "staff" else "cliente"
+        await _marcar(job.instance, Marco(passo=passo_id, nome=tarefa["nome"], status="tarefa", em=datetime.now(UTC), motivo=motivo),
+                      aguardando=aguardando, atual=(passo_id, tarefa["nome"]))
+        await bus.live(LIVE_TAREFAS, TarefaMudou(id=criada.id, action="criada"))
+        titulo = f"{processo.titulo}: {tarefa['nome']}"
+        if aguardando == "cliente":
+            await notify.roles("owner", "admin", title=titulo, body=tarefa["pergunta"], link="/processos/tarefas", key=f"tarefa-{chave}")
+        else:
+            await notify.roles("operador", title=titulo, body=motivo or tarefa["pergunta"], link="/processos/tarefas", key=f"tarefa-{chave}")
+        return None
+
+    async def _job_espera(self, job: Job) -> None:
+        """A execução entrou numa espera (mensagem do banco, tempo)."""
+        nome = await _nome_do_passo(job.processo, job.version, job.element)
+        await _marcar(job.instance, Marco(passo=job.element, nome=nome, status="aguardando", em=datetime.now(UTC)),
+                      aguardando="evento", atual=(job.element, nome))
+        return None
+
+    async def _job_fim(self, job: Job) -> None:
+        """A execução chegou a um fim: concluída, com o resultado desse fim."""
+        versao = await _versao_do_motor(job.processo, job.version)
+        step = Fluxo.model_validate(versao["fluxo"]).step(job.element) if versao else None
+        resultado = (step.resultado or step.nome) if step else job.element
+        agora = datetime.now(UTC)
+        await _marcar(job.instance, Marco(passo=job.element, nome=step.nome if step else job.element, status="fim", em=agora),
+                      aguardando=None, atual=(None, None), final={"status": "concluida", "resultado": resultado, "concluida_em": agora})
+        return None
+
+    async def _job_agente(self, job: Job) -> dict[str, Any]:
+        """Passo de agente: o objetivo do passo, as saídas declaradas e as ferramentas de leitura. Sem segurança, o
+        agente pede ajuda e o passo vai para a exceção do staff (Handoff)."""
+        versao = await _versao_do_motor(job.processo, job.version)
+        step = Fluxo.model_validate(versao["fluxo"]).step(job.element) if versao else None
+        if step is None or step.tipo != "agente":
+            raise Handoff("Passo de agente não encontrado na versão publicada.")
+        processo = await _processo_por_id(job.processo)
+        resultado: dict[str, Any] = {}
+        ajuda: list[str] = []
+        modelo = create_model(f"saidas_{step.id}", **{campo: (_tipo_do_exemplo(step.exemplo.get(campo)) | None, None) for campo in step.saidas})
+
+        async def ler_documento(dados: LeituraDocumento) -> str:
+            """Lê o texto de um documento recebido (o id vem do gatilho: gatilho.documento_id)."""
+            try:
+                doc = await bus.request(DOCUMENTO_SUBJECT, DocumentoRef(id=dados.documento_id), DocumentoTexto, timeout=10)
+            except (NatsError, TimeoutError):
+                return "O serviço de documentos não respondeu agora."
+            if not doc.texto.strip():
+                return f"{doc.nome} ({doc.tipo}) não tem texto legível (imagem ou PDF escaneado)."
+            return f"{doc.nome} — assunto: {doc.assunto or '-'}\n\n{doc.texto[:12000]}"
+
+        async def concluir(dados: BaseModel) -> str:
+            resultado.clear()
+            resultado.update(dados.model_dump(mode="json"))
+            return "Passo concluído."
+
+        concluir.__doc__ = f"Conclui o passo com as saídas: {', '.join(step.saidas)}. Valores em reais como número; datas AAAA-MM-DD."
+        concluir.__signature__ = inspect.Signature([inspect.Parameter("dados", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=modelo)])
+
+        async def pedir_ajuda(dados: SaidaAgente) -> str:
+            """Não dá para concluir com segurança: o passo vai para uma pessoa do staff, com o motivo."""
+            ajuda.append(dados.motivo)
+            return "Pedido de ajuda registrado."
+
+        contexto = "\n".join([
+            f"Processo: {processo.titulo}. Passo: {step.nome}.", f"Objetivo: {step.objetivo or step.nome}",
+            f"Saídas: {', '.join(f'{c} (ex.: {step.exemplo.get(c)!r})' for c in step.saidas)}",
+            "Dados da execução: " + json.dumps({k: v for k, v in job.variables.items() if k != "entrada"}, ensure_ascii=False)[:4000],
+        ])
+        await llm.run_agent(settings.model, f"Execute o passo \"{step.nome}\" e conclua com as saídas.", instructions=EXECUCAO_INSTRUCOES,
+                            tools=[ler_documento, _buscar_conhecimento, concluir, pedir_ajuda], context=contexto, max_turns=6)
+        if ajuda:
+            raise Handoff(ajuda[0])
+        if not resultado:
+            raise Handoff(f"O agente não concluiu {step.nome.lower()}.")
+        faltam = [c for c in step.exemplo if c in step.saidas and resultado.get(c) in (None, "")]
+        if faltam:
+            raise Handoff(f"O agente não encontrou: {', '.join(faltam)}.")
+        return {"resultado": resultado}
 
 
 # ── Ajudantes ────────────────────────────────────────────────────────────────
@@ -420,8 +710,8 @@ def _ref(table: str, row: dict[str, Any]) -> str:
 
 
 def _motor_id(processo_id: str) -> str:
-    """Id do processo no motor: a organização entra no nome (cada organização tem os seus processos no Camunda)."""
-    return f"p_{current_tenant()}_{processo_id}"
+    """Id do processo no motor: a organização entra no nome (core/processes.py: o worker tira dele quem age)."""
+    return process_id(current_tenant(), processo_id)
 
 
 async def _processo_por_id(processo_id: str) -> Processo:
@@ -482,7 +772,7 @@ async def _desenho(processo_id: str) -> Desenho:
         versao=versao,
         versoes=[VersaoResumo(numero=v["numero"], status=v["status"], publicada_em=v.get("publicada_em"),
                               motor_versao=(v.get("motor") or {}).get("versao")) for v in versoes],
-        bpmn=to_bpmn(fluxo, process_id=_motor_id(processo_id), name=processo.titulo),
+        bpmn=to_bpmn(fluxo, process_id=_motor_id(processo_id), name=processo.titulo, actions=catalogo),
         problemas=_problemas(fluxo, catalogo),
         mensagens=[MensagemDesenho(id=_short(m["id"]), papel=m["papel"], texto=m["texto"], passos=m.get("passos") or [],
                                    created_at=m.get("created_at")) for m in await _mensagens(processo_id)],
@@ -854,3 +1144,180 @@ def _simular(fluxo: Fluxo, catalogo: dict[str, CatalogAction], cenario: Cenario)
         caminho.append(f"f_{step.id}_{seguinte}")
         proximo = seguinte
     return Simulacao(caminho=caminho, passos=passos, fim=None, problemas=["O fluxo voltou muitas vezes (laço sem saída)."])
+
+
+async def _publicados_por_evento(evento: str) -> list[tuple[Processo, dict[str, Any]]]:
+    """Os processos publicados da organização cujo gatilho é este evento, com a versão publicada."""
+    out = []
+    for processo in await _todos():
+        if processo.publicada is None:
+            continue
+        publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
+        if publicada is None:
+            continue
+        gatilho = Fluxo.model_validate(publicada["fluxo"]).gatilho
+        if gatilho.tipo == "evento" and gatilho.evento == evento:
+            out.append((processo, publicada))
+    return out
+
+
+async def _iniciar(processo: Processo, versao: dict[str, Any], *, origem: str, gatilho: dict[str, Any], resumo: str | None,
+                   chave: str | None = None) -> Execucao:
+    """Inicia no motor (com o limite do plano conferido antes) e registra a execução."""
+    if chave:
+        existente = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND gatilho_id = $g LIMIT 1", g=chave)
+        if existente:
+            return Execucao.model_validate(existente[0])  # o mesmo evento entregue de novo
+    await plans.check("execucoes")
+    iniciada = await camunda.start(_motor_id(processo.id), {"gatilho": gatilho})
+    execucao = await _registrar_execucao(processo, iniciada.instance, iniciada.version, origem=origem, resumo=resumo, gatilho_id=chave)
+    await plans.use("execucoes", 1, key=f"execucao-{iniciada.instance}")
+    return execucao
+
+
+async def _registrar_execucao(processo: Processo, instancia: str, motor_versao: int, *, origem: str, resumo: str | None,
+                              gatilho_id: str | None = None) -> Execucao:
+    versao = await _versao_do_motor(processo.id, motor_versao)
+    dados = {"instancia": instancia, "processo": processo.id, "titulo": processo.titulo, "versao": versao["numero"] if versao else None,
+             "motor_versao": motor_versao, "status": "andamento", "origem": origem, "resumo": resumo, "handoffs": 0, "saidas": {},
+             "marcos": [Marco(passo=START, nome="Início", status="iniciada", em=datetime.now(UTC), motivo=resumo).model_dump(mode="json")]}
+    if gatilho_id:
+        dados["gatilho_id"] = gatilho_id
+    try:
+        row = await db.create(EXECUCOES, dados)
+    except ServiceError as exc:  # o ouvinte do começo registrou antes: completa o que ele não sabia
+        if exc.code != "ERRO_RECORD_DUPLICATE":
+            raise
+        rows = await db.query(f"UPDATE {EXECUCOES} MERGE $m WHERE tenant = $tenant AND instancia = $i RETURN AFTER", i=instancia,
+                              m={k: v for k, v in dados.items() if k in ("origem", "resumo", "gatilho_id") and v is not None})
+        row = rows[0]
+    execucao = Execucao.model_validate(row)
+    await bus.live(LIVE_EXECUCOES, ExecucaoMudou(id=execucao.id, action="iniciada"))
+    return execucao
+
+
+async def _execucao_por_instancia(instancia: str) -> Execucao | None:
+    rows = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND instancia = $i LIMIT 1", i=instancia)
+    return Execucao.model_validate(rows[0]) if rows else None
+
+
+async def _marcar(instancia: str, marco: Marco, *, saida: tuple[str, dict[str, Any]] | None = None, aguardando: Any = ...,
+                  atual: tuple[str | None, str | None] | None = None, handoff: bool = False, incidente: bool = False,
+                  final: dict[str, Any] | None = None) -> None:
+    """Acrescenta um marco à linha do tempo (atômico no banco) e atualiza onde a execução está."""
+    sets = ["marcos += $marco", "updated_at = time::now()"]
+    params: dict[str, Any] = {"marco": marco.model_dump(mode="json"), "i": instancia}
+    if saida is not None:
+        sets.append(f"saidas.{saida[0]} = $saida")
+        params["saida"] = saida[1]
+    if aguardando is not ...:
+        sets.append("aguardando = $aguardando")
+        params["aguardando"] = aguardando
+    if atual is not None:
+        sets += ["passo_atual = $atual", "passo_nome = $atual_nome"]
+        params |= {"atual": atual[0], "atual_nome": atual[1]}
+    if handoff:
+        sets.append("handoffs += 1")
+    if incidente:
+        sets.append("status = 'incidente'")
+    for campo, valor in (final or {}).items():
+        sets.append(f"{campo} = ${campo}")
+        params[campo] = valor
+    rows = await db.query(f"UPDATE {EXECUCOES} SET {', '.join(sets)} WHERE tenant = $tenant AND instancia = $i RETURN AFTER", **params)
+    if rows:
+        execucao = Execucao.model_validate(rows[0])
+        await bus.live(LIVE_EXECUCOES, ExecucaoMudou(id=execucao.id, action="concluida" if final else "mudou"))
+
+
+async def _versao_do_motor(processo_id: str, motor_versao: int) -> dict[str, Any] | None:
+    """A nossa versão que foi implantada como esta versão do motor (a execução roda nela até o fim)."""
+    return next((v for v in await _versoes(processo_id) if (v.get("motor") or {}).get("versao") == motor_versao), None)
+
+
+async def _nome_do_passo(processo_id: str, motor_versao: int, passo: str) -> str:
+    versao = await _versao_do_motor(processo_id, motor_versao)
+    step = Fluxo.model_validate(versao["fluxo"]).step(passo) if versao else None
+    return step.nome if step else passo
+
+
+def _autonomia(execucoes: list[dict[str, Any]], versao: int | None = None) -> Autonomia:
+    concluidas = [e for e in execucoes if e["status"] == "concluida"]
+    sem = sum(1 for e in concluidas if not e.get("handoffs"))
+    return Autonomia(versao=versao, concluidas=len(concluidas), sem_handoff=sem,
+                     autonomia=round(sem / len(concluidas), 3) if concluidas else None)
+
+
+def _quando(valor: Any) -> datetime | None:
+    """Data do motor ("2026-10-04T15:17:21.164Z[GMT]") ou do banco → datetime com fuso."""
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, datetime):
+        return valor if valor.tzinfo else valor.replace(tzinfo=UTC)
+    texto = re.sub(r"\[.*\]$", "", str(valor)).replace("Z", "+00:00")
+    try:
+        data = datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    return data if data.tzinfo else data.replace(tzinfo=UTC)
+
+
+_ROTULOS = {"fornecedor": "Fornecedor", "cnpj": "CNPJ", "valor": "Valor", "vencimento": "Vencimento", "linha_digitavel": "Linha digitável",
+            "nome": "Documento", "de": "De", "assunto": "Assunto", "divergente": "Diverge do pedido", "diferenca": "Diferença",
+            "fornecedor_novo": "Fornecedor novo", "pedido": "Pedido ou contrato", "conta": "Conta", "pagamento_id": "Pagamento", "data": "Data"}
+
+
+def _contexto_tarefa(dados: dict[str, Any]) -> list[Item]:
+    """O que a pessoa precisa ver para decidir: os dados do documento e o que os passos anteriores acharam."""
+    itens = []
+    for campo, valor in dados.items():
+        if campo in _ROTULOS and valor not in (None, "", {}):
+            texto = ("Sim" if valor else "Não") if isinstance(valor, bool) else (
+                f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if campo in ("valor", "diferenca") and isinstance(valor, (int, float)) else str(valor))
+            itens.append(Item(rotulo=_ROTULOS[campo], valor=texto[:200]))
+    return itens
+
+
+def _campos(step: Step, catalogo: dict[str, CatalogAction], visto: dict[str, Any]) -> list[Campo]:
+    """Os campos que o staff preenche ao resolver a exceção: a saída que o passo devolveria."""
+    if step.tipo == "agente":
+        tipos = {c: step.exemplo.get(c) for c in step.saidas}
+    elif step.tipo == "acao" and step.acao in catalogo:
+        propriedades = catalogo[step.acao].output_schema.get("properties", {})
+        tipos = {c: {"number": 0.0, "integer": 0.0, "boolean": False}.get(_tipo_json(propriedades.get(c, {})), "") for c in step_outputs(step, catalogo)}
+    else:
+        return []
+    return [Campo(nome=c, rotulo=_ROTULOS.get(c, c.replace("_", " ").capitalize()),
+                  tipo="sim_nao" if isinstance(t, bool) else "numero" if isinstance(t, (int, float)) else "texto",
+                  valor=visto.get(c) if isinstance(visto.get(c), (str, int, float, bool)) else None) for c, t in tipos.items()]
+
+
+def _tipo_json(schema: dict[str, Any]) -> str:
+    if "type" in schema:
+        return schema["type"]
+    return next((o.get("type") for o in schema.get("anyOf", []) if o.get("type") not in (None, "null")), "string")
+
+
+def _tipo_do_exemplo(valor: Any) -> type:
+    return bool if isinstance(valor, bool) else float if isinstance(valor, (int, float)) else str
+
+
+def _valores_da_excecao(tarefa: Tarefa, data: Resposta) -> dict[str, Any]:
+    """A saída que o staff preencheu, conferida contra os campos (número é número; obrigatório o que tinha valor)."""
+    valores: dict[str, Any] = {}
+    for campo in tarefa.campos:
+        bruto = data.dados.get(campo.nome, campo.valor)
+        if bruto in (None, ""):
+            valores[campo.nome] = None
+            continue
+        if campo.tipo == "numero":
+            try:
+                valores[campo.nome] = float(str(bruto).replace(",", ".")) if isinstance(bruto, str) else float(bruto)
+            except ValueError:
+                raise ServiceError("ERRO_PROCESSOS_RESPOSTA", f"{campo.rotulo}: informe um número.", 422) from None
+        elif campo.tipo == "sim_nao":
+            valores[campo.nome] = bruto if isinstance(bruto, bool) else str(bruto).lower() in ("sim", "true", "1")
+        else:
+            valores[campo.nome] = str(bruto)[:300]
+    if data.comentario:
+        valores["comentario"] = data.comentario
+    return valores

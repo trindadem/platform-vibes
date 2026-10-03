@@ -224,6 +224,9 @@ services:
   mailpit:
     image: axllent/mailpit:v1.31.3
     ports: ["127.0.0.1:8025:8025"]  # só a tela; o SMTP (1025) fica na rede interna
+    environment:
+      # E-mail para <org>.<código>@entrada.localhost cai aqui também: o svc-integracoes é avisado e lê os anexos.
+      MP_WEBHOOK_URL: http://svc-integracoes:8000/entrada/mailpit
     healthcheck:
       test: ["CMD", "/mailpit", "readyz"]
       interval: 3s
@@ -302,7 +305,7 @@ services:
       # Modelo dos agentes de descoberta, descrição e desenho, como cadastrado no svc-ai (specs/processos.md §3).
       PROCESSOS_MODEL: ${PROCESSOS_MODEL:-cv/agente}
       PROCESSOS_DESENHO_MODEL: ${PROCESSOS_DESENHO_MODEL:-cv/desenho}  # edita o fluxo: pede um modelo mais forte
-      CAMUNDA_URL: http://camunda:8080  # só o svc-processos fala com o motor (core/processes.py)
+      CAMUNDA_URL: http://camunda:8080  # implanta e inicia; os workers dos pacotes também falam com o motor
     depends_on:
       <<: *service-deps
       camunda: { condition: service_healthy }
@@ -311,3 +314,19 @@ services:
     <<: *service
     build: { <<: *service-build, args: { SERVICE: financeiro } }
     profiles: [modules, financeiro]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      CAMUNDA_URL: http://camunda:8080  # o worker das ações financeiro.* (core/processes.py)
+    depends_on:
+      <<: *service-deps
+      camunda: { condition: service_healthy }
+
+  svc-integracoes:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: integracoes } }
+    profiles: [modules, integracoes]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      INTEGRACOES_DOMINIO: ${INTEGRACOES_DOMINIO:-entrada.localhost}  # endereços das caixas de entrada
+      # Local: o Mailpit avisa (webhook) e entrega o e-mail recebido; em produção, um provedor de entrada (spec §3).
+      INTEGRACOES_MAILPIT_URL: http://mailpit:8025

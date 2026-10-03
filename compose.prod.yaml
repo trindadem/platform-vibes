@@ -121,5 +121,9 @@ services:
     environment:
       SMTP_URL: ${SMTP_URL:?defina SMTP_URL no .env (servidor de e-mail de verdade)}
 
+  svc-integracoes:
+    environment:
+      INTEGRACOES_MAILPIT_URL: ""  # sem Mailpit em produção: a caixa de entrada usa o provedor de entrada (spec §3)
+
 volumes:
   letsencrypt:

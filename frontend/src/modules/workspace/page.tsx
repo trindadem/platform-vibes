@@ -8,14 +8,14 @@ import { Spinner } from "@/components/Spinner";
 import { Stat } from "@/components/Stat";
 import { useLive, useLiveQuery } from "@/core/api";
 import { useSession } from "@/core/auth";
-import { type ConhecimentoResumo, conhecimento, type ProcessosResumo, processos } from "@/core/contracts";
+import { type ConhecimentoResumo, conhecimento, type ProcessosAcompanhamento, type ProcessosResumo, processos } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Workspace", order: 0 };
 
 const FONTES: Record<string, string> = { briefing: "do briefing", site: "do site", documento: "de documentos", manual: "manuais" };
 
 /** A jornada do cliente (briefing.md §3): cada passo aparece aqui conforme os blocos chegam. */
-function passos(r: ConhecimentoResumo | null, p: ProcessosResumo | null): JourneyStep[] {
+function passos(r: ConhecimentoResumo | null, p: ProcessosResumo | null, a: ProcessosAcompanhamento | null): JourneyStep[] {
   const feito = Boolean(r?.concluido_em);
   const comecou = (r?.topicos_feitos ?? 0) > 0;
   const aceitos = p?.aceitos ?? 0;
@@ -56,7 +56,24 @@ function passos(r: ConhecimentoResumo | null, p: ProcessosResumo | null): Journe
       to: "/processos#aceitos",
       action: "Desenhar",
     },
-    { title: "Acompanhamento", description: "Os processos rodando, o que espera por você e quanto cada um roda sozinho.", status: "later" },
+    {
+      title: "Acompanhamento",
+      description: "Os processos rodando, o que espera por você e quanto cada um roda sozinho.",
+      status: (p?.publicados ?? 0) === 0 ? "todo" : "current",
+      detail: a
+        ? [
+            `${a.andamento} em andamento`,
+            `${a.concluidas} concluídas`,
+            a.tarefas_cliente ? `${a.tarefas_cliente} esperando você` : "",
+            a.atrasadas ? `${a.atrasadas} atrasadas` : "",
+            a.autonomia !== null ? `${Math.round(a.autonomia * 100)}% sozinhas` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")
+        : undefined,
+      to: a?.tarefas_cliente ? "/processos/tarefas" : "/processos/execucoes",
+      action: a?.tarefas_cliente ? "Ver tarefas" : "Acompanhar",
+    },
   ];
 }
 
@@ -66,16 +83,34 @@ export default function Workspace() {
   useLive("conhecimento.leituras", () => resumo.reload());
   useLive("conhecimento.itens", () => resumo.reload());
   const descoberta = useLiveQuery("processos.processos", processos.resumo);
+  const acompanhamento = useLiveQuery("processos.execucoes", processos.acompanhamento);
+  useLive("processos.tarefas", () => acompanhamento.reload());
   const r = resumo.data;
+  const a = acompanhamento.data;
+  const publicados = (descoberta.data?.publicados ?? 0) > 0;
   return (
     <Page title="Workspace" description={`A jornada da ${session?.tenant?.name ?? "sua empresa"} na Cogniventure, passo a passo.`}>
       {resumo.error && <Alert tone="warning">Não foi possível carregar o andamento: {resumo.error.message}</Alert>}
-      <Grid cols={3}>
-        <Stat label="Briefing" value={r ? `${r.topicos_feitos} de ${r.topicos_total}` : "—"} hint={r?.concluido_em ? "Concluído" : "tópicos feitos"} tone={r?.concluido_em ? "success" : "default"} />
-        <Stat label="Conhecimento" value={r ? <Quantity value={r.itens} /> : "—"} hint="itens que os agentes consultam" />
-        <Stat label="Processos aceitos" value={descoberta.data ? <Quantity value={descoberta.data.aceitos} /> : "—"} hint={descoberta.data?.sugeridos ? `${descoberta.data.sugeridos} sugestões esperando você` : "seguem para o desenho"} />
-      </Grid>
-      {resumo.loading && !r ? <Spinner label="Carregando a jornada" /> : <JourneySteps steps={passos(r, descoberta.data)} />}
+      {publicados && a ? (
+        <Grid cols={4}>
+          <Stat label="Em andamento" value={<Quantity value={a.andamento} />} hint={`${a.concluidas} concluídas`} />
+          <Stat label="Esperando você" value={<Quantity value={a.tarefas_cliente} />} hint={a.atrasadas ? `${a.atrasadas} atrasadas` : "aprovações"} tone={a.atrasadas ? "danger" : "default"} />
+          <Stat label="Com o staff" value={<Quantity value={a.tarefas_staff} />} hint="exceções sendo resolvidas" />
+          <Stat
+            label="Autonomia"
+            value={a.autonomia === null ? "—" : `${Math.round(a.autonomia * 100)}%`}
+            hint="concluídas sem exceção para o staff"
+            tone={a.autonomia !== null && a.autonomia >= 0.8 ? "success" : "default"}
+          />
+        </Grid>
+      ) : (
+        <Grid cols={3}>
+          <Stat label="Briefing" value={r ? `${r.topicos_feitos} de ${r.topicos_total}` : "—"} hint={r?.concluido_em ? "Concluído" : "tópicos feitos"} tone={r?.concluido_em ? "success" : "default"} />
+          <Stat label="Conhecimento" value={r ? <Quantity value={r.itens} /> : "—"} hint="itens que os agentes consultam" />
+          <Stat label="Processos aceitos" value={descoberta.data ? <Quantity value={descoberta.data.aceitos} /> : "—"} hint={descoberta.data?.sugeridos ? `${descoberta.data.sugeridos} sugestões esperando você` : "seguem para o desenho"} />
+        </Grid>
+      )}
+      {resumo.loading && !r ? <Spinner label="Carregando a jornada" /> : <JourneySteps steps={passos(r, descoberta.data, a)} />}
     </Page>
   );
 }

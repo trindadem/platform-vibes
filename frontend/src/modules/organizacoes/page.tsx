@@ -15,7 +15,7 @@ import { identity } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Organizações", order: 4, module: "identity" };
 
-const PAPEL = { owner: "Dono", admin: "Administrador", member: "Membro" };
+const PAPEL = { owner: "Dono", admin: "Administrador", member: "Membro", operador: "Operador" };
 
 export default function Organizacoes() {
   const session = useSession();

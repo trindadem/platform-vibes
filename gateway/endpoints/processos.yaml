@@ -7,6 +7,10 @@ live:
     model: ProcessoMudou
   - topic: desenho                  # o rascunho mudou, chegou mensagem, publicou, ajustou ou descartou
     model: DesenhoMudou
+  - topic: execucoes                # uma execução começou, andou ou terminou
+    model: ExecucaoMudou
+  - topic: tarefas                  # uma tarefa de pessoa foi criada ou resolvida
+    model: TarefaMudou
 
 endpoints:
   - path: /biblioteca
@@ -142,3 +146,55 @@ endpoints:
     response: Desenho
     target_type: http
     target_url: http://svc-processos:8000/desenho/descartar
+
+  - path: /execucoes
+    method: GET
+    auth: client_jwt
+    query: ExecucaoQuery
+    response: ExecucaoPage
+    target_type: http
+    target_url: http://svc-processos:8000/execucoes
+
+  - path: /execucoes/item
+    name: execucao
+    method: GET
+    auth: client_jwt
+    query: ExecucaoRef
+    response: ExecucaoDetalhe
+    target_type: http
+    target_url: http://svc-processos:8000/execucoes/item
+
+  - path: /execucoes/iniciar
+    name: iniciar
+    method: POST
+    auth: client_jwt
+    request: Iniciar
+    response: Execucao
+    target_type: http
+    target_url: http://svc-processos:8000/execucoes/iniciar
+    timeout: 30
+
+  - path: /tarefas
+    method: GET
+    auth: client_jwt
+    query: TarefaQuery
+    response: TarefaPage
+    target_type: http
+    target_url: http://svc-processos:8000/tarefas
+
+  - path: /tarefas/responder
+    name: responder
+    method: POST
+    auth: client_jwt
+    request: Resposta
+    response: Tarefa
+    target_type: http
+    target_url: http://svc-processos:8000/tarefas/responder
+    timeout: 30
+
+  - path: /acompanhamento
+    method: GET
+    auth: client_jwt
+    response: Acompanhamento
+    target_type: http
+    target_url: http://svc-processos:8000/acompanhamento

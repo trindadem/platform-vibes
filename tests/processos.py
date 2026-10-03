@@ -178,7 +178,7 @@ def test_modelos_de_entrada_recusam_o_que_nao_e_da_biblioteca_ou_nao_declarado()
 
 # ── Desenho: catálogo, rascunho, simulação, agente de desenho, versões e publicação ─
 
-from core.processes import ActionCatalog, CatalogAction, Deployed, camunda  # noqa: E402
+from core.processes import ActionCatalog, CatalogAction  # noqa: E402
 from core.security import Principal, acting_as  # noqa: E402
 from core.surreal import db  # noqa: E402
 
@@ -203,19 +203,6 @@ async def _aceito(app, modelo="contas-a-pagar", status="aceito") -> str:
         row = await db.create(PROCESSOS, {"modelo": modelo, "area": "financeiro", "titulo": "Contas a pagar",
                                           "descricao": "Boletos viram pagamentos", "origem": "sugestao", "status": status, "prioridade": "alta"})
     return str(row["id"]).partition(":")[2]
-
-
-@pytest.fixture
-def motor(monkeypatch):
-    """Camunda de mentira: cada implantação do mesmo processo é a versão seguinte."""
-    implantados = []
-
-    async def deploy(xml, process_id):
-        implantados.append((process_id, xml))
-        return Deployed(process_id=process_id, key=str(1000 + len(implantados)), version=len(implantados))
-
-    monkeypatch.setattr(camunda, "deploy", deploy)
-    return implantados
 
 
 def test_desenho_abre_o_fluxo_de_partida_e_simula_os_caminhos():
@@ -353,7 +340,7 @@ def test_ligar_recusa_o_que_viraria_erro_e_erros_novos_sao_cobrados_do_agente(pr
     assert final["mensagens"][-1]["texto"] == "Tirei o fim."
 
 
-def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva(motor):
+def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva():
     async def cenario(app):
         ana = app.user(*OWNER)
         pid = await _aceito(app)
@@ -369,9 +356,9 @@ def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva(
         descartado = (await ana.post("/desenho/descartar", json={"processo": pid})).json()["data"]
         processo = (await ana.get("/processos")).json()["data"]["items"][0]
         membro = await app.user("mel", "acme", "member").post("/desenho/ajustar", json={"processo": pid})
-        return pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro
+        return pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro, app.motor.deployed
 
-    pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro = service_app(cenario)
+    pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro, motor = service_app(cenario)
     assert igual.status_code == 409 and igual.json()["error"]["code"] == "ERRO_PROCESSOS_SEM_MUDANCA"
     assert (primeira["versao"]["status"], primeira["versao"]["motor"]["versao"]) == ("publicada", 1)
     assert motor[0][0] == f"p_acme_{pid}" and 'name="Contas a pagar"' in motor[0][1]
@@ -383,7 +370,7 @@ def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva(
     assert processo["publicada"] == 2 and membro.status_code == 403
 
 
-def test_fluxo_com_erro_nao_publica_e_os_problemas_dizem_o_que_falta(motor):
+def test_fluxo_com_erro_nao_publica_e_os_problemas_dizem_o_que_falta():
     from core.processes import Flow, Fluxo, Step
 
     from service import _problemas
@@ -406,9 +393,157 @@ def test_fluxo_com_erro_nao_publica_e_os_problemas_dizem_o_que_falta(motor):
         with acting_as(ACME):
             await db.query("UPDATE processos_versoes SET fluxo.passos[1].tipo = 'tarefa' WHERE tenant = $tenant")
         recusado = await ana.post("/desenho/publicar", json={"processo": pid})
-        return aberto, recusado
+        return aberto, recusado, app.motor.deployed
 
-    aberto, recusado = service_app(cenario)
+    aberto, recusado, motor = service_app(cenario)
     assert [p["tipo"] for p in aberto["versao"]["fluxo"]["passos"]] == ["agente", "fim"]
     assert recusado.status_code == 409 and recusado.json()["error"]["code"] == "ERRO_PROCESSOS_FLUXO_INVALIDO"
     assert motor == []
+
+
+# ── Execução: gatilhos, tarefas, linha do tempo, autonomia e o agente de passo ─
+
+from core.processes import JOB_AGENT, JOB_END, JOB_START, JOB_TASK, JOB_WAIT  # noqa: E402
+from core.security import Principal  # noqa: E402
+
+from schemas import DOCUMENTO_SUBJECT, EVENT_SUBJECT, STEP_SUBJECT, EventoExterno, PassoFeito  # noqa: E402
+
+SISTEMA = Principal(sub="system:svc-integracoes", tenant="acme", roles=frozenset({"system"}))
+GATILHO = {"documento_id": "doc1", "origem": "email", "nome": "boleto-outubro.pdf", "assunto": "Boleto"}
+LIDO = {"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 7200.0, "vencimento": "2026-10-15"}
+
+
+async def _publicado(app) -> str:
+    ana = app.user(*OWNER)
+    pid = await _aceito(app)
+    await ana.post("/desenho/abrir", json={"processo": pid})
+    await ana.post("/desenho/publicar", json={"processo": pid})
+    return pid
+
+
+def test_documento_recebido_inicia_o_processo_publicado_uma_vez_e_o_banco_acorda_a_espera():
+    async def cenario(app):
+        pid = await _publicado(app)
+        rascunho = await _aceito(app)  # aceito mas não publicado: o evento não o inicia
+        await app.user(*OWNER).post("/desenho/abrir", json={"processo": rascunho})
+        evento = EventoExterno(nome="documento.recebido", dados=GATILHO)
+        await app.deliver(EVENT_SUBJECT, evento, who=SISTEMA, msg_id="m-1")
+        await app.deliver(EVENT_SUBJECT, evento, who=SISTEMA, msg_id="m-1")  # reentrega do NATS: não inicia de novo
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="banco.pago", chave="PG-1", dados={"valor": 7200.0}), who=SISTEMA, msg_id="m-2")
+        import service  # o ouvinte do começo chegou depois e também tentou registrar: não apaga o que o evento sabia
+        with acting_as(ACME):
+            processo = await service._processo_por_id(pid)
+            await service._registrar_execucao(processo, app.motor.started[0][0] and str(app.motor._seq), 1, origem="evento", resumo=None)
+        lista = (await app.user("mel", "acme", "member").get("/execucoes")).json()["data"]
+        manual = await app.user(*OWNER).post("/execucoes/iniciar", json={"processo": pid, "dados": {"documento_id": "doc2"}})
+        membro = await app.user("mel", "acme", "member").post("/execucoes/iniciar", json={"processo": pid})
+        sem_publicar = await app.user(*OWNER).post("/execucoes/iniciar", json={"processo": rascunho})
+        return pid, lista, manual.json()["data"], membro, sem_publicar, app.motor.started, app.motor.messages
+
+    pid, lista, manual, membro, sem_publicar, iniciadas, mensagens = service_app(cenario)
+    assert [(p, v["gatilho"]["documento_id"]) for p, v in iniciadas] == [(f"p_acme_{pid}", "doc1"), (f"p_acme_{pid}", "doc2")]
+    assert lista["total"] == 1 and lista["items"][0]["resumo"] == "boleto-outubro.pdf" and lista["items"][0]["versao"] == 1
+    assert lista["items"][0]["status"] == "andamento" and lista["items"][0]["origem"] == "evento"
+    assert manual["origem"] == "manual" and membro.status_code == 403
+    assert sem_publicar.json()["error"]["code"] == "ERRO_PROCESSOS_SEM_PUBLICADA"
+    assert mensagens == [("acme.banco.pago", "PG-1", {"mensagem": {"valor": 7200.0}})]  # só a execução da acme acorda
+
+
+def test_tarefas_do_cliente_e_do_staff_linha_do_tempo_e_autonomia():
+    async def cenario(app):
+        pid = await _publicado(app)
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-1")
+        instancia = app.motor.started[0][1] and str(app.motor._seq)
+        comum = {"processo": pid, "instance": instancia}
+        await app.job(JOB_START, kind="EXECUTION_LISTENER", listener="START", element=f"p_acme_{pid}", variables={"gatilho": GATILHO}, **comum)
+        # O agente pediu ajuda (core: handoff) e o staff resolve a leitura.
+        await app.deliver(STEP_SUBJECT, PassoFeito(instancia=instancia, processo=pid, motor_versao=1, passo="ler_documento",
+                                                   tipo=JOB_AGENT, status="handoff", motivo="Documento ilegível"), who=SISTEMA)
+        await app.job(JOB_TASK, element="ler_documento__excecao", kind="TASK_LISTENER", listener="CREATING", variables={"gatilho": GATILHO},
+                      user_task={"userTaskKey": "71", "dueDate": "2026-10-04T15:17:21.164Z[GMT]"}, **comum)
+        staff = (await app.user("otto", "acme", "operador").get("/tarefas", params={"responsavel": "staff"})).json()["data"]["items"][0]
+        dono_na_excecao = await app.user(*OWNER).post("/tarefas/responder", json={"id": staff["id"], "dados": LIDO})
+        texto_no_numero = await app.user("otto", "acme", "operador").post("/tarefas/responder", json={"id": staff["id"], "dados": {**LIDO, "valor": "sete mil"}})
+        resolvida = (await app.user("otto", "acme", "operador").post("/tarefas/responder", json={"id": staff["id"], "dados": LIDO})).json()["data"]
+        # A conferência passou e o valor pede aprovação do cliente.
+        await app.deliver(STEP_SUBJECT, PassoFeito(instancia=instancia, processo=pid, motor_versao=1, passo="conferir", tipo="financeiro.conferir_pedido",
+                                                   status="concluido", saida={"divergente": False, "fornecedor_novo": True}), who=SISTEMA)
+        await app.job(JOB_TASK, element="aprovar", kind="TASK_LISTENER", listener="CREATING",
+                      variables={"gatilho": GATILHO, "ler_documento": LIDO, "conferir": {"divergente": False, "fornecedor_novo": True}},
+                      user_task={"userTaskKey": "72", "dueDate": "2020-01-01T00:00:00Z"}, **comum)
+        await app.job(JOB_TASK, element="aprovar", kind="TASK_LISTENER", listener="CREATING", variables={"gatilho": GATILHO},
+                      user_task={"userTaskKey": "72"}, **comum)  # reentrega do ouvinte: uma tarefa só
+        resumo_antes = (await app.user(*OWNER).get("/acompanhamento")).json()["data"]
+        cliente = (await app.user(*OWNER).get("/tarefas", params={"responsavel": "cliente", "status": "aberta"})).json()["data"]["items"]
+        operador_aprova = await app.user("otto", "acme", "operador").post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": True})
+        sem_decidir = await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"]})
+        aprovada = (await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": True, "comentario": "ok"})).json()["data"]
+        de_novo = await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": False})
+        await app.job(JOB_WAIT, element="aguardar", kind="EXECUTION_LISTENER", listener="START", **comum)
+        await app.job(JOB_END, element="pago", kind="EXECUTION_LISTENER", listener="START", **comum)
+        app.motor.paths[instancia] = [{"id": "inicio", "estado": "COMPLETED"}, {"id": "ler_documento", "estado": "TERMINATED"},
+                                      {"id": "ler_documento__excecao", "estado": "COMPLETED"}, {"id": "conferir", "estado": "COMPLETED"}]
+        execucao = (await app.user(*OWNER).get("/execucoes")).json()["data"]["items"][0]
+        detalhe = (await app.user(*OWNER).get("/execucoes/item", params={"id": execucao["id"]})).json()["data"]
+        resumo = (await app.user(*OWNER).get("/acompanhamento")).json()["data"]
+        return (staff, dono_na_excecao, texto_no_numero, resolvida, resumo_antes, cliente, operador_aprova, sem_decidir, aprovada,
+                de_novo, execucao, detalhe, resumo, app.motor.completed)
+
+    (staff, dono_na_excecao, texto_no_numero, resolvida, resumo_antes, cliente, operador_aprova, sem_decidir, aprovada,
+     de_novo, execucao, detalhe, resumo, concluidas) = service_app(cenario)
+    assert (staff["tipo"], staff["responsavel"], staff["motivo"]) == ("excecao", "staff", "Documento ilegível")
+    assert [c["nome"] for c in staff["campos"]] == ["fornecedor", "cnpj", "valor", "vencimento", "linha_digitavel"]
+    assert {"rotulo": "Documento", "valor": "boleto-outubro.pdf"} in staff["contexto"] and staff["documento_id"] == "doc1"
+    assert dono_na_excecao.status_code == 403  # exceção é do staff
+    assert texto_no_numero.json()["error"]["code"] == "ERRO_PROCESSOS_RESPOSTA"
+    assert resolvida["status"] == "concluida" and resolvida["concluida_por"] == "otto"
+    assert concluidas[0] == ("71", {"ler_documento": {**LIDO, "linha_digitavel": None}})  # a saída do passo, no motor
+    assert resumo_antes["tarefas_cliente"] == 1 and resumo_antes["atrasadas"] == 1 and resumo_antes["andamento"] == 1
+    assert len(cliente) == 1 and cliente[0]["pergunta"] == "Aprovar o pagamento?"
+    assert {"rotulo": "Valor", "valor": "R$ 7.200,00"} in cliente[0]["contexto"] and {"rotulo": "Fornecedor novo", "valor": "Sim"} in cliente[0]["contexto"]
+    assert operador_aprova.status_code == 403 and sem_decidir.json()["error"]["code"] == "ERRO_PROCESSOS_RESPOSTA"
+    assert aprovada["resposta"] == {"aprovado": True, "comentario": "ok"} and de_novo.json()["error"]["code"] == "ERRO_PROCESSOS_TAREFA_FECHADA"
+    assert concluidas[1] == ("72", {"aprovar": {"aprovado": True, "comentario": "ok"}})
+    assert (execucao["status"], execucao["resultado"], execucao["handoffs"]) == ("concluida", "pago", 1)
+    assert [m["status"] for m in execucao["marcos"]] == ["iniciada", "handoff", "tarefa", "resolvido", "concluido", "tarefa", "resolvido", "aguardando", "fim"]
+    assert execucao["saidas"]["ler_documento"]["valor"] == 7200.0 and execucao["saidas"]["aprovar"]["aprovado"] is True
+    assert "f_ler_documento_conferir" not in detalhe["caminho"] and "f_inicio_ler_documento" in detalhe["caminho"]
+    assert detalhe["atuais"] == [] and 'id="p_acme_' in detalhe["bpmn"]
+    assert resumo["concluidas"] == 1 and resumo["autonomia"] == 0.0  # teve handoff: não conta como sozinha
+    assert resumo["processos"][0]["por_versao"] == [{"versao": 1, "concluidas": 1, "sem_handoff": 0, "autonomia": 0.0}]
+
+
+def test_passo_de_agente_le_o_documento_conclui_ou_pede_ajuda(provedor):
+    roteiro = {"pede_ajuda": False}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        provedor["pedidos"].append(body)
+        ultimas = [m for m in body["messages"] if m["role"] == "tool"]
+        if not ultimas:
+            return _resposta(body["model"], _chamadas(("ler_documento", {"documento_id": "doc1"})), "tool_calls")
+        if len(ultimas) == 1:
+            if roteiro["pede_ajuda"]:
+                return _resposta(body["model"], _chamadas(("pedir_ajuda", {"motivo": "Boleto sem valor legível"})), "tool_calls")
+            return _resposta(body["model"], _chamadas(("concluir", {**LIDO, "linha_digitavel": None})), "tool_calls")
+        return _resposta(body["model"], {"role": "assistant", "content": "Feito."}, "stop")
+
+    llm._transport = httpx.MockTransport(responder)
+
+    async def cenario(app):
+        _servicos(app)
+        pid = await _publicado(app)
+        app.respond(DOCUMENTO_SUBJECT, lambda ref: {"id": ref.id, "nome": "boleto.pdf", "tipo": "application/pdf",
+                                                    "texto": "Moinho Sul CNPJ 12.345.678/0001-90 R$ 7.200,00 venc. 15/10/2026"})
+        lido = await app.job(JOB_AGENT, processo=pid, element="ler_documento", variables={"gatilho": GATILHO}, headers={"excecao": "sim"})
+        roteiro["pede_ajuda"] = True
+        ajuda = await app.job(JOB_AGENT, processo=pid, element="ler_documento", variables={"gatilho": GATILHO}, headers={"excecao": "sim"})
+        return lido, ajuda, [m for s, m in app.published if s == STEP_SUBJECT]
+
+    lido, ajuda, passos = service_app(cenario)
+    assert lido.status == "concluido" and lido.variables["resultado"]["valor"] == 7200.0
+    assert (ajuda.status, ajuda.message) == ("handoff", "Boleto sem valor legível")
+    assert [(p.passo, p.status) for p in passos] == [("ler_documento", "concluido"), ("ler_documento", "handoff")]
+    ferramentas = {t["function"]["name"] for t in provedor["pedidos"][0]["tools"]}
+    assert ferramentas == {"ler_documento", "buscar_conhecimento", "concluir", "pedir_ajuda"}
+    assert "valor" in json.dumps(next(t for t in provedor["pedidos"][0]["tools"] if t["function"]["name"] == "concluir"))

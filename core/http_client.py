@@ -54,7 +54,9 @@ class HttpClient:
                 body.extend(chunk)
                 if len(body) > max_bytes:
                     raise ServiceError("ERRO_HTTP_TOO_LARGE", "A resposta passou do tamanho permitido.", status=422)
-        return httpx.Response(response.status_code, headers=response.headers, content=bytes(body), request=response.request)
+        # O corpo já veio decodificado (gzip, deflate): sem estes cabeçalhos, a resposta não é decodificada de novo.
+        headers = [(k, v) for k, v in response.headers.multi_items() if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+        return httpx.Response(response.status_code, headers=headers, content=bytes(body), request=response.request)
 
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)

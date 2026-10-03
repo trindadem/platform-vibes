@@ -19,17 +19,26 @@ CONTEXTO_SUBJECT = "rpc.conhecimento.contexto"  # do svc-conhecimento: perfil e 
 BUSCA_SUBJECT = "rpc.conhecimento.busca"  # do svc-conhecimento: busca no conhecimento
 
 LIVE_DESENHO = "processos.desenho"
+LIVE_EXECUCOES = "processos.execucoes"
+LIVE_TAREFAS = "processos.tarefas"
 CATALOG_SUBJECT = "events.processos.catalogo"  # core/processes.py: os pacotes declaram as ações no boot
+STEP_SUBJECT = "events.processos.passo"  # core/processes.py: o que o worker de um pacote fez num passo
+EVENT_SUBJECT = "events.integracoes.evento"  # do svc-integracoes: documento recebido, pagamento confirmado
+DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # do svc-integracoes: o texto de um documento recebido
 
 PROCESSOS = "processos_processos"
 VERSOES = "processos_versoes"
 MENSAGENS = "processos_mensagens"
 ACOES = "processos_acoes"  # catálogo de ações dos pacotes (o mesmo para toda organização)
-TABLES = [PROCESSOS, VERSOES, MENSAGENS]
+EXECUCOES = "processos_execucoes"
+TAREFAS = "processos_tarefas"
+TABLES = [PROCESSOS, VERSOES, MENSAGENS, EXECUCOES, TAREFAS]
 SHARED = [ACOES]
-UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"]}
+UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"], EXECUCOES: ["instancia"], TAREFAS: ["chave"]}
 SEARCH = {PROCESSOS: ["titulo", "descricao"]}
 WRITERS = frozenset({"owner", "admin"})
+OPERADORES = frozenset({"operador"})  # o staff da Cogniventure na organização: resolve as exceções (briefing.md §8)
+STARTERS = WRITERS | OPERADORES  # quem inicia uma execução à mão
 UNDO = 20  # quantas alterações do rascunho dá para desfazer
 HISTORY = 20  # mensagens da conversa de desenho no contexto do agente
 
@@ -37,7 +46,8 @@ MODULE = Module(
     "Processos",
     "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados",
     category="Sua empresa",
-    limits=[Limit("ativos", "Processos publicados, rodando de forma contínua", unit="processos")],
+    limits=[Limit("ativos", "Processos publicados, rodando de forma contínua", unit="processos"),
+            Limit("execucoes", "Execuções iniciadas no mês", default=2000, monthly=True, unit="execuções")],
 )
 
 
@@ -245,6 +255,7 @@ class Motor(BaseModel):
     processo: str = Field(..., description="Id do processo BPMN no motor")
     chave: str
     versao: int
+    hash: str | None = Field(None, description="Impressão do BPMN implantado (publicar o mesmo BPMN não muda nada)")
 
 
 class Versao(BaseModel):
@@ -408,7 +419,8 @@ O fluxo tem um gatilho (evento, agenda ou manual) e passos ligados:
 Condições usam a saída de um passo anterior (<passo>.<campo>) ou um parâmetro (parametros.<nome>), e o valor pode ser outro parâmetro (ex.: valor = parametros.limite_aprovacao). Para "isto OU aquilo" no mesmo caminho, use o campo ou da condição (lista de outras condições); nunca duas ligações entre os mesmos passos.
 
 Como trabalhar:
-- Entenda o que o cliente quer mudar e faça as operações necessárias, poucas e certas. Valores que são regras do cliente (limites, prazos) viram parâmetros.
+- Entenda o que o cliente quer mudar e faça as operações necessárias, poucas e certas. Valores que são regras do cliente (limites, prazos) viram parâmetros: mudar um limite que já existe é só definir_parametro.
+- Faça só o que o cliente pediu. Não acrescente passos, aprovações ou caminhos que ele não pediu; se achar que falta algo, sugira na resposta e espere ele confirmar.
 - Depois de mudar, confira os problemas que as ferramentas devolvem e corrija os erros antes de responder.
 - Depois de mudar uma regra de caminho, chame simular com um cenário que a teste (ex.: valores {"ler_documento.valor": 4200}) e confira que o caminho passa por onde o cliente quer; se não passar, corrija.
 - Ação irreversível (pagar, enviar, assinar) deve ter aprovação antes quando o cliente pedir controle.
@@ -505,3 +517,229 @@ FLUXOS: dict[str, Fluxo] = {
         ],
     ),
 }
+
+
+# ── Execução: gatilhos, acompanhamento, tarefas de pessoas e autonomia ───────
+
+# Do svc-integracoes (events.integracoes.evento e rpc.integracoes.documento): o contrato repetido aqui, de quem consome.
+class EventoExterno(BaseModel):
+    nome: str
+    chave: str | None = None
+    dados: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentoRef(BaseModel):
+    id: str
+
+
+class DocumentoTexto(BaseModel):
+    id: str
+    nome: str
+    tipo: str
+    de: str | None = None
+    assunto: str | None = None
+    texto: str
+
+
+# Do core/processes.py (events.processos.passo).
+class PassoFeito(BaseModel):
+    instancia: str
+    processo: str
+    motor_versao: int
+    passo: str
+    tipo: str
+    status: Literal["concluido", "handoff", "incidente", "tentando"]
+    motivo: str | None = None
+    saida: dict[str, Any] = Field(default_factory=dict)
+    em: datetime | None = None
+
+
+StatusExecucao = Literal["andamento", "concluida", "incidente", "cancelada"]
+
+
+class Marco(BaseModel):
+    """Um acontecimento na linha do tempo da execução."""
+
+    passo: str
+    nome: str
+    status: Literal["iniciada", "concluido", "handoff", "incidente", "tentando", "tarefa", "resolvido", "aguardando", "fim"]
+    em: datetime
+    motivo: str | None = None
+    por: str | None = Field(None, description="Quem resolveu (tarefa de pessoa)")
+
+
+class Execucao(BaseModel):
+    id: str
+    instancia: str = Field(..., description="Execução no motor")
+    processo: str
+    titulo: str
+    versao: int | None = Field(None, description="Versão nossa (a que estava publicada quando começou)")
+    motor_versao: int
+    status: StatusExecucao
+    resultado: str | None = Field(None, description="Como terminou (o fim alcançado: pago, recusado...)")
+    origem: Literal["evento", "manual", "agenda"] = "evento"
+    resumo: str | None = Field(None, description="O que iniciou (ex.: o documento recebido)")
+    passo_atual: str | None = None
+    passo_nome: str | None = None
+    aguardando: Literal["cliente", "staff", "evento"] | None = None
+    handoffs: int = Field(0, description="Exceções que foram para o staff (execução com handoff não conta na autonomia)")
+    marcos: list[Marco] = Field(default_factory=list)
+    saidas: dict[str, dict[str, Any]] = Field(default_factory=dict, description="O que cada passo devolveu")
+    concluida_em: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
+
+    @field_validator("marcos")
+    @classmethod
+    def _em_ordem(cls, value: list[Marco]) -> list[Marco]:
+        """Os marcos chegam por caminhos diferentes (evento do worker, ouvinte do motor): a ordem é a da hora."""
+        return sorted(value, key=lambda m: m.em)
+
+
+class ExecucaoQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("created_at",)
+    default_sort: ClassVar[str | None] = "-created_at"
+    status: StatusExecucao | None = None
+    processo: str | None = None
+
+
+class ExecucaoPage(Page[Execucao]):
+    pass
+
+
+class ExecucaoRef(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class ExecucaoDetalhe(BaseModel):
+    execucao: Execucao
+    bpmn: str = Field(..., description="O BPMN da versão em que a execução roda")
+    caminho: list[str] = Field(..., description="Elementos e ligações por onde passou (para pintar no diagrama)")
+    atuais: list[str] = Field(..., description="Onde está agora")
+
+
+class Iniciar(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    dados: dict[str, str | float | bool] = Field(default_factory=dict, description="O que o gatilho traria (ex.: documento_id)")
+
+
+class ExecucaoMudou(BaseModel):
+    id: str
+    action: Literal["iniciada", "mudou", "concluida"]
+
+
+class Campo(BaseModel):
+    """Um campo que a pessoa preenche ao resolver uma exceção (a saída do passo que parou)."""
+
+    nome: str
+    rotulo: str
+    tipo: Literal["texto", "numero", "sim_nao"]
+    valor: str | float | bool | None = Field(None, description="O que o agente ou a ação chegou a ver")
+
+
+class Item(BaseModel):
+    rotulo: str
+    valor: str
+
+
+class Tarefa(BaseModel):
+    id: str
+    chave: str = Field(..., description="Tarefa no motor")
+    execucao: str = Field(..., description="Id da execução")
+    instancia: str
+    processo: str
+    titulo: str = Field(..., description="Título do processo")
+    passo: str = Field(..., description="Passo do fluxo a que a resposta pertence")
+    nome: str
+    tipo: Literal["aprovacao", "excecao"]
+    responsavel: Literal["cliente", "staff"]
+    pergunta: str
+    motivo: str | None = Field(None, description="Exceção: por que o passo parou")
+    contexto: list[Item] = Field(default_factory=list)
+    campos: list[Campo] = Field(default_factory=list)
+    documento_id: str | None = None
+    prazo: datetime | None = None
+    status: Literal["aberta", "concluida"]
+    resposta: dict[str, Any] = Field(default_factory=dict)
+    concluida_por: str | None = None
+    concluida_em: datetime | None = None
+    created_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
+
+
+class TarefaQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("created_at", "prazo")
+    default_sort: ClassVar[str | None] = "prazo"
+    status: Literal["aberta", "concluida"] | None = None
+    responsavel: Literal["cliente", "staff"] | None = None
+    execucao: str | None = None
+
+
+class TarefaPage(Page[Tarefa]):
+    pass
+
+
+class Resposta(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    aprovado: bool | None = Field(None, description="Aprovação: sim ou não")
+    comentario: str | None = Field(None, max_length=500)
+    dados: dict[str, str | float | bool | None] = Field(default_factory=dict, description="Exceção: a saída do passo")
+
+
+class TarefaMudou(BaseModel):
+    id: str
+    action: Literal["criada", "concluida"]
+
+
+class Autonomia(BaseModel):
+    versao: int | None = None
+    concluidas: int
+    sem_handoff: int
+    autonomia: float | None = Field(None, description="Execuções sem handoff ÷ concluídas (0 a 1)")
+
+
+class AcompanhamentoProcesso(BaseModel):
+    processo: str
+    titulo: str
+    andamento: int
+    geral: Autonomia
+    por_versao: list[Autonomia]
+
+
+class Acompanhamento(BaseModel):
+    andamento: int
+    concluidas: int
+    incidentes: int
+    tarefas_cliente: int
+    tarefas_staff: int
+    atrasadas: int
+    autonomia: float | None
+    processos: list[AcompanhamentoProcesso]
+
+
+class SaidaAgente(BaseModel):
+    """Por que o agente não pode seguir: vira a exceção do staff com este motivo."""
+
+    motivo: str = Field(..., min_length=3, max_length=400)
+
+
+class LeituraDocumento(BaseModel):
+    documento_id: str = Field(..., description="O id do documento (gatilho.documento_id)")
+
+
+EXECUCAO_INSTRUCOES = """Você executa um passo de um processo de BPO da Cogniventure para a empresa cliente. O passo tem um objetivo e as saídas que você precisa devolver.
+
+Como trabalhar:
+- Leia o que o passo precisa (o documento do gatilho com ler_documento, o conhecimento da empresa com buscar_conhecimento quando ajudar).
+- Quando tiver certeza, chame concluir com as saídas. Valores em reais são números (1250.5), datas no formato AAAA-MM-DD.
+- Se não der para decidir com segurança (documento ilegível ou sem texto, dado que falta, valor duvidoso, pedido fora da política), não chute: chame pedir_ajuda com o motivo em uma frase. Uma pessoa do staff resolve o passo.
+- Chame concluir ou pedir_ajuda uma única vez e termine."""

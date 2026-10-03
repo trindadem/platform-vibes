@@ -13,7 +13,7 @@ import { identity } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Criar conta", access: "guest" };
 
-const PAPEL = { owner: "dono", admin: "administrador", member: "membro" };
+const PAPEL = { owner: "dono", admin: "administrador", member: "membro", operador: "operador" };
 
 export default function Cadastro() {
   const [params] = useSearchParams();

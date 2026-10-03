@@ -1,0 +1,78 @@
+# svc-integracoes · rotas públicas no Gateway. Fonte da verdade: specs/integracoes.md §2
+service: integracoes
+base_path: /api/v1/integracoes
+
+live:
+  - topic: conexoes                 # uma conexão foi feita ou removida
+    model: ConexaoMudou
+  - topic: documentos               # chegou um documento na caixa de entrada
+    model: DocumentoMudou
+  - topic: pagamentos               # o banco agendou ou confirmou um pagamento
+    model: PagamentoMudou
+
+endpoints:
+  - path: /conexoes
+    method: GET
+    auth: client_jwt
+    response: Conexoes
+    target_type: http
+    target_url: http://svc-integracoes:8000/conexoes
+
+  - path: /conexoes
+    name: conectar
+    method: POST
+    auth: client_jwt
+    request: NovaConexao
+    response: Conexao
+    target_type: http
+    target_url: http://svc-integracoes:8000/conexoes
+
+  - path: /conexoes/remover
+    name: desconectar
+    method: POST
+    auth: client_jwt
+    request: ConexaoRef
+    response: Conexao
+    target_type: http
+    target_url: http://svc-integracoes:8000/conexoes/remover
+
+  - path: /resumo
+    method: GET
+    auth: client_jwt
+    response: Resumo
+    target_type: http
+    target_url: http://svc-integracoes:8000/resumo
+
+  - path: /documentos
+    method: GET
+    auth: client_jwt
+    query: DocumentoQuery
+    response: DocumentoPage
+    target_type: http
+    target_url: http://svc-integracoes:8000/documentos
+
+  - path: /documentos/arquivo
+    name: arquivo
+    method: GET
+    auth: client_jwt
+    query: DocumentoRef
+    response: Link
+    target_type: http
+    target_url: http://svc-integracoes:8000/documentos/arquivo
+
+  - path: /pagamentos
+    method: GET
+    auth: client_jwt
+    query: PagamentoQuery
+    response: PagamentoPage
+    target_type: http
+    target_url: http://svc-integracoes:8000/pagamentos
+
+  - path: /pagamentos/confirmar
+    name: confirmarPagamento
+    method: POST
+    auth: client_jwt
+    request: PagamentoRef
+    response: Pagamento
+    target_type: http
+    target_url: http://svc-integracoes:8000/pagamentos/confirmar

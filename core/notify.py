@@ -30,7 +30,7 @@ CONTACTS_SUBJECT = "rpc.identity.contacts"  # o svc-notify pergunta ao svc-ident
 MAX_USERS = 100
 _KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 
-Role = Literal["owner", "admin", "member"]
+Role = Literal["owner", "admin", "member", "operador"]
 Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120, pattern=r"^[^\r\n]+$")]
 Body = Annotated[str, StringConstraints(strip_whitespace=True, max_length=2000)]
 Link = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500, pattern=r"^/([^/\\\s]\S*)?$")]

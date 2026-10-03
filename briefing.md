@@ -103,7 +103,8 @@ execução e não exportamos BPMN: o processo publicado **é** um BPMN implantad
 - **Variável de processo leva id e decisão, não documento nem dado pessoal.** O Camunda guarda variáveis em claro no
   estado e no armazenamento secundário. O documento, o CPF e o extrato ficam no nosso serviço (SurrealDB e
   armazenamento, isolados por organização); a variável leva `documento_id`, `valor`, `aprovado`.
-- **Python:** os workers usam o SDK oficial (`camunda-orchestration-sdk`, assíncrono, API REST do 8.8+).
+- **Python:** os workers falam direto com a API REST v2 do Orchestration Cluster, pelo `core/processes.py` (no N4 o SDK
+  oficial ficou de fora: um cliente a menos, e o worker segue os trilhos do core de organização, trace e erros).
 - **Local:** Camunda no `compose.yaml` com armazenamento secundário em banco relacional (H2 embutido; sem
   Elasticsearch).
 
@@ -191,6 +192,8 @@ modelo da biblioteca pedir.
   espírito do `@activities` do README §5.2).
 - O worker age como a organização do job, confere o plano antes (módulo desligado vira handoff, não falha muda),
   registra trace e métricas (README §5.18) e devolve só o que a saída declara.
+- **De onde vem a entrada (N4):** cada campo da entrada da ação vem do passo mais perto antes dela que devolve um campo
+  com esse nome (senão, do gatilho), ligado na compilação para BPMN. Dado faltando vira handoff, não erro mudo.
 - Integração com terceiros é sempre uma ação nossa, com a credencial guardada no `svc-integracoes` (como as chaves de
   IA no `svc-ai`) e chamada pelo `core/http_client.py` com a proteção de SSRF. O BPMN só leva o id da conexão. Na v1
   não usamos o runtime de Connectors do Camunda: credencial e isolamento por organização ficam nos nossos trilhos.
@@ -204,7 +207,11 @@ modelo da biblioteca pedir.
   por que parou).
 - **Ação irreversível que a política manda perguntar** também vira tarefa humana (de aprovação do cliente ou do
   staff), não uma decisão do agente.
-- **Handoff tem prazo.** Não assumido dentro do prazo, sobe para o responsável pela carteira.
+- **Handoff tem prazo.** Não assumido dentro do prazo, sobe para o responsável pela carteira. No N4 a exceção nasce
+  com prazo de 4 horas e aparece atrasada; o escalonamento entra com a carteira, no N5.
+- **No N4, o passo de agente roda no `svc-processos`** (`agentes.executar`) com ferramentas fixas: ler o documento do
+  gatilho, consultar o conhecimento, concluir com as saídas ou pedir ajuda. Os agentes da organização (seção 7) entram
+  no N6. Achado do N4: com a foto de um boleto (sem texto, sem OCR) o agente pede ajuda em vez de inventar valores.
 - **Aprender com o handoff.** Ao resolver, o staff registra o que fez e por quê, e pode marcar "virar regra". A regra
   ou o exemplo entra na especialização do agente daquele passo, depois de passar na avaliação dele (seção 7).
 - **Autonomia por processo** = execuções sem handoff ÷ execuções concluídas, por versão. Aparece no workspace do
@@ -214,7 +221,9 @@ modelo da biblioteca pedir.
 
 - **Agenda:** "todo dia às 8h", "dia 1 de cada mês" (temporizador do Camunda).
 - **Evento:** documento chegou na caixa de entrada ou no WhatsApp, webhook de um sistema do cliente, pagamento
-  confirmado pelo banco. O serviço que recebe publica a mensagem no Camunda com a chave de correlação.
+  confirmado pelo banco. O serviço que recebe publica `events.integracoes.evento`; o `svc-processos` inicia pela API
+  cada processo publicado daquele gatilho na organização e, quando o evento tem chave (o id do pagamento), entrega a
+  mensagem à execução que espera. As mensagens no motor levam a organização no nome: uma não acorda a outra.
 - **Manual:** o cliente ou o staff inicia pela tela.
 - **Outro processo:** uma proposta aceita em Vendas inicia a gestão de contratos no Jurídico e o faturamento no
   Financeiro. O workspace mostra a cadeia como um projeto.
@@ -284,7 +293,8 @@ No console Electron (seção 11) o AgentExo encaixa como está: local, um usuár
 
 - **O staff pertence à organização Cogniventure.** A carteira é a lista de organizações clientes de cada pessoa do
   staff, mantida pelo `svc-staff`.
-- **Entrar na carteira dá o papel `operador` na organização do cliente**; sair tira. O staff age dentro do cliente
+- **Entrar na carteira dá o papel `operador` na organização do cliente**; sair tira. No N4 o papel já existe e entra
+  por convite (o operador resolve as exceções na tela de tarefas); a carteira, que dá e tira o papel sozinha, é do N5. O staff age dentro do cliente
   com o nome dele (o cliente vê quem fez o quê) e sem nenhum poder entre organizações além do papel. Reusa o
   isolamento que já existe (README §5.7 e §5.9).
 - **A área do staff junta a carteira:** fila de handoffs de todos os clientes dela, ordenada pelo prazo; revisões de
@@ -443,5 +453,6 @@ descoberto no N2 e desenhado no N3.
 4. **Staff como `operador` na organização do cliente** (seção 8): confirmar o modelo.
 5. **AgentExo no lugar do Agno** (seção 7.2): o spike do N1 passou; falta decidir quando tirar o Agno de vez.
 6. **Fornecedores de integração:** WhatsApp, banco (Open Finance ou API do banco), NFS-e, certidões e tribunais;
-   escolhidos pelo cliente piloto.
+   escolhidos pelo cliente piloto. Inclui o provedor de e-mail de entrada da caixa de entrada em produção (no N4, o
+   Mailpit faz esse papel no ambiente local) e o banco de verdade (no N4, o banco simulado).
 7. **Cluster:** armazenamento distribuído e alta disponibilidade do SurrealDB.
