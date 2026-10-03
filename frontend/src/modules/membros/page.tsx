@@ -46,7 +46,6 @@ export default function Membros() {
                 options: [
                   { value: "member", label: "Membro" },
                   { value: "admin", label: "Administrador" },
-                  { value: "operador", label: "Operador (staff da Cogniventure)" },
                 ],
               },
             ]}

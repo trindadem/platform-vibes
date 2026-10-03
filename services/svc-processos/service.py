@@ -9,12 +9,13 @@ import hashlib
 import inspect
 import json
 import re
+import unicodedata
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 from nats.errors import Error as NatsError
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, Field, create_model
 
 from core.envelope import ServiceError
 from core.llm import AgentStep, llm
@@ -37,26 +38,65 @@ from core.processes import (
     step_outputs,
     to_bpmn,
 )
-from core.security import current, current_tenant
+from core.security import acting_as, current, current_tenant, system
 from core.surreal import Migration, db
-from core.temporal_runner import activities
+from core.temporal_runner import activities, runner
 
 from schemas import (
     ACOES,
+    BIBLIOTECA,
+    BUSCA_SUBJECT,
+    CONTEXTO_SUBJECT,
+    DESCOBERTA_INSTRUCOES,
+    DESCRICAO_INSTRUCOES,
+    DESENHO_INSTRUCOES,
+    DESIGNERS,
     DOCUMENTO_SUBJECT,
     EXECUCAO_INSTRUCOES,
     EXECUCOES,
+    FLUXOS,
+    HISTORY,
+    LIVE_DESENHO,
     LIVE_EXECUCOES,
+    LIVE_PROCESSOS,
+    LIVE_REGRAS,
     LIVE_TAREFAS,
+    MENSAGENS,
     OPERADORES,
+    PASSOS,
+    PROCESSOS,
+    REGRAS,
+    SERVICE,
+    STAFF_SUBJECT,
     STARTERS,
     TAREFAS,
+    TASK_QUEUE,
+    UNDO,
+    VERSOES,
+    WRITERS,
+    Achados,
     Acompanhamento,
     AcompanhamentoProcesso,
+    AjudaIn,
+    AlteracaoPasso,
     Autonomia,
+    Avaliacao,
+    Biblioteca,
+    BuscaQuery,
     Campo,
+    CatalogoAcoes,
+    Cenario,
+    ContextoEmpresa,
+    Descoberta,
+    Descricao,
+    Desenho,
+    DesenhoMudou,
+    DesenhoRef,
+    Desligamento,
+    Devolucao,
     DocumentoRef,
     DocumentoTexto,
+    Empty,
     EventoExterno,
     Execucao,
     ExecucaoDetalhe,
@@ -66,52 +106,17 @@ from schemas import (
     ExecucaoRef,
     Iniciar,
     Item,
+    ItemStaff,
     LeituraDocumento,
-    Marco,
-    PassoFeito,
-    Resposta,
-    SaidaAgente,
-    Tarefa,
-    TarefaMudou,
-    TarefaPage,
-    TarefaQuery,
-    BIBLIOTECA,
-    BUSCA_SUBJECT,
-    CONTEXTO_SUBJECT,
-    DESCOBERTA_INSTRUCOES,
-    DESCRICAO_INSTRUCOES,
-    DESENHO_INSTRUCOES,
-    FLUXOS,
-    HISTORY,
-    LIVE_DESENHO,
-    LIVE_PROCESSOS,
-    MENSAGENS,
-    PASSOS,
-    PROCESSOS,
-    UNDO,
-    VERSOES,
-    WRITERS,
-    Achados,
-    AlteracaoPasso,
-    Biblioteca,
-    BuscaQuery,
-    CatalogoAcoes,
-    Cenario,
-    ContextoEmpresa,
-    Desenho,
-    DesenhoMudou,
-    DesenhoRef,
-    Desligamento,
-    Descoberta,
-    Descricao,
-    Empty,
     Ligacao,
+    Marco,
     MensagemDesenho,
     MensagemDesenhoIn,
     Motor,
     NovoPasso,
     Parametro,
     PassoAgente,
+    PassoFeito,
     PassoSimulado,
     Problema,
     Processo,
@@ -121,11 +126,23 @@ from schemas import (
     ProcessoQuery,
     ProcessoRef,
     ProcessosSettings,
+    Regra,
+    RegraMudou,
+    RegraQuery,
+    RegraRef,
+    Regras,
     RemocaoPasso,
+    Resposta,
     Resumo,
+    RevisaoIn,
+    SaidaAgente,
     Simulacao,
     SimulacaoIn,
     Sugestao,
+    Tarefa,
+    TarefaMudou,
+    TarefaPage,
+    TarefaQuery,
     Versao,
     VersaoResumo,
 )
@@ -229,7 +246,7 @@ class ProcessosService:
         if processo.status != "aceito":
             raise ServiceError("ERRO_PROCESSOS_NAO_ACEITO", "Aceite o processo antes de desenhá-lo.", 409)
         if not await _versoes(processo.id):
-            _writer()
+            _desenhista()
             try:
                 await db.create(VERSOES, {"processo": processo.id, "numero": 1, "status": "rascunho",
                                           "fluxo": _partida(processo).model_dump(mode="json"), "anteriores": [], "alteracoes": 0})
@@ -239,8 +256,9 @@ class ProcessosService:
         return await _desenho(processo.id)
 
     async def conversar(self, data: MensagemDesenhoIn) -> AsyncIterator[PassoAgente | Desenho]:
-        """Uma mensagem do cliente no desenho: o agente edita o rascunho pelas operações; cada uma é um passo."""
-        _writer()
+        """Uma mensagem no desenho (da empresa ou do staff, no setup): o agente edita o rascunho pelas operações;
+        cada uma é um passo."""
+        who = _desenhista()
         processo = await _processo_por_id(data.processo)
         rascunho = await _rascunho(processo.id)
         historico = await _mensagens(processo.id)
@@ -248,7 +266,7 @@ class ProcessosService:
             empresa = await _contexto_da_empresa()
         except ServiceError:
             empresa = None
-        await db.create(MENSAGENS, {"processo": processo.id, "papel": "cliente", "texto": data.texto, "passos": []})
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": _papel(who), "autor": who.sub, "texto": data.texto, "passos": []})
         await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="mensagem"))
         catalogo = await _catalogo()
         fila: asyncio.Queue[AgentStep | None] = asyncio.Queue()
@@ -289,7 +307,7 @@ class ProcessosService:
             return None, mudou, novos
 
         async def responder() -> None:
-            pedido = f"Mensagem do cliente:\n{data.texto}\n\n"
+            pedido = f"Mensagem {'do staff da Cogniventure' if _papel(who) == 'staff' else 'do cliente'}:\n{data.texto}\n\n"
             texto = await rodar(pedido + "Faça as mudanças no fluxo e responda ao cliente.")
             aviso, mudou, novos = await pendencia(texto)
             if aviso:  # uma segunda chance, com o que faltou dito; se ainda faltar, a resposta diz a verdade
@@ -319,7 +337,7 @@ class ProcessosService:
         return _simular(Fluxo.model_validate(versao["fluxo"]), await _catalogo(), data)
 
     async def desfazer(self, data: DesenhoRef) -> Desenho:
-        _writer()
+        _desenhista()
         rascunho = await _rascunho(data.processo)
         anteriores = list(rascunho.get("anteriores") or [])
         if not anteriores:
@@ -330,45 +348,85 @@ class ProcessosService:
         return await _desenho(data.processo)
 
     async def publicar(self, data: DesenhoRef) -> Desenho:
-        """Publica o rascunho: implanta no Camunda (a versão seguinte do processo no motor) e arquiva a anterior."""
-        _writer()
+        """Publica o rascunho: implanta no Camunda (a versão seguinte do processo no motor) e arquiva a anterior. Com
+        ação irreversível ou conexão que a publicada não tinha, só o staff publica (a empresa pede a revisão)."""
+        who = _desenhista()
         processo = await _processo_por_id(data.processo)
         rascunho = await _rascunho(processo.id)
-        fluxo = Fluxo.model_validate(rascunho["fluxo"])
-        catalogo = await _catalogo()
-        erros = [p for p in _problemas(fluxo, catalogo) if p.nivel == "erro"]
+        if not (who.is_system or OPERADORES & who.roles) and await _precisa_revisao(processo.id, rascunho):
+            raise ServiceError("ERRO_PROCESSOS_REVISAO", "Esta versão traz ação irreversível ou conexão nova: peça a revisão do staff da Cogniventure.", 409)
+        return await _publicar(processo, rascunho)
+
+    async def pedir_revisao(self, data: RevisaoIn) -> Desenho:
+        """A empresa pede a revisão do staff: o rascunho fica em revisão (ninguém edita) até o staff publicar ou devolver."""
+        who = _desenhista()
+        processo = await _processo_por_id(data.processo)
+        rascunho = await _rascunho(processo.id)
+        erros = [p for p in _problemas(Fluxo.model_validate(rascunho["fluxo"]), await _catalogo()) if p.nivel == "erro"]
         if erros:
             raise ServiceError("ERRO_PROCESSOS_FLUXO_INVALIDO", "O fluxo tem problemas: " + "; ".join(e.texto for e in erros[:3]), 409)
-        motor_id = _motor_id(processo.id)
-        xml = to_bpmn(fluxo, process_id=motor_id, name=processo.titulo, actions=catalogo)
-        digest = hashlib.sha256(xml.encode()).hexdigest()[:24]
-        publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
-        if publicada is not None:
-            hash_publicado = (publicada.get("motor") or {}).get("hash")
-            # O mesmo BPMN de novo daria a mesma versão no motor. Mudou só o compilador (ou o catálogo)? Aí publica.
-            if hash_publicado == digest or (hash_publicado is None and Fluxo.model_validate(publicada["fluxo"]) == fluxo):
-                raise ServiceError("ERRO_PROCESSOS_SEM_MUDANCA", "O rascunho está igual à versão publicada: mude o fluxo ou descarte o rascunho.", 409)
-        if processo.publicada is None:
-            ativos = await db.query(f"SELECT count() AS total FROM (SELECT id FROM {PROCESSOS} WHERE tenant = $tenant "
-                                    "AND publicada != NONE AND publicada != NULL) GROUP ALL")
-            await plans.check("ativos", used=ativos[0]["total"] if ativos else 0)
-        implantado = await camunda.deploy(xml, motor_id)
-        for versao in await _versoes(processo.id):
-            if versao["status"] == "publicada":
-                await db.merge(_ref(VERSOES, versao), {"status": "arquivada"})
-        await db.merge(_ref(VERSOES, rascunho), {
-            "status": "publicada", "publicada_em": datetime.now(UTC), "anteriores": [],
-            "motor": Motor(processo=motor_id, chave=implantado.key, versao=implantado.version, hash=digest).model_dump()})
-        await db.merge(f"{PROCESSOS}:{processo.id}", {"publicada": int(rascunho["numero"])})
-        await plans.count("ativos", await _publicados())
-        await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="publicado"))
+        await db.merge(_ref(VERSOES, rascunho), {"status": "revisao"})
+        texto = "Pedi a revisão do staff" + (f": {data.mensagem}" if data.mensagem else ".")
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": _papel(who), "autor": who.sub, "texto": texto, "passos": []})
+        await _ao_staff(ItemStaff(tipo="revisao", ref=processo.id, titulo=f"{processo.titulo}: revisão da versão {rascunho['numero']}",
+                                  detalhe=data.mensagem, status="aberta", link=f"/processos/{processo.id}", em=datetime.now(UTC)))
+        await notify.roles("operador", title=f"Revisão pedida: {processo.titulo}", body=data.mensagem or "", link=f"/processos/{processo.id}",
+                           key=f"revisao-{processo.id}-{rascunho['numero']}")
+        await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="alterado"))
+        return await _desenho(processo.id)
+
+    async def aprovar_revisao(self, data: DesenhoRef) -> Desenho:
+        """O staff revisou: publica a versão em revisão."""
+        who = _operador()
+        processo = await _processo_por_id(data.processo)
+        revisao = await _em_revisao(processo.id)
+        await _publicar(processo, revisao)
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": "staff", "autor": who.sub,
+                                    "texto": f"Revisei e publiquei a versão {revisao['numero']}.", "passos": []})
+        return await _desenho(processo.id)
+
+    async def devolver(self, data: Devolucao) -> Desenho:
+        """O staff devolve a versão em revisão para a empresa, com o que precisa mudar."""
+        who = _operador()
+        processo = await _processo_por_id(data.processo)
+        revisao = await _em_revisao(processo.id)
+        await db.merge(_ref(VERSOES, revisao), {"status": "rascunho"})
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": "staff", "autor": who.sub,
+                                    "texto": f"Devolvi para ajuste: {data.motivo}", "passos": []})
+        await _ao_staff(ItemStaff(tipo="revisao", ref=processo.id, titulo=f"{processo.titulo}: revisão da versão {revisao['numero']}",
+                                  status="concluida", link=f"/processos/{processo.id}", em=datetime.now(UTC)))
+        await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="alterado"))
+        return await _desenho(processo.id)
+
+    async def pedir_ajuda(self, data: AjudaIn) -> Desenho:
+        """A empresa pede ajuda ao staff no setup: o pedido vai para a fila da carteira; o staff entra na conversa."""
+        who = _desenhista()
+        processo = await _processo_por_id(data.processo)
+        if not await _versoes(processo.id):
+            raise ServiceError("ERRO_PROCESSOS_SEM_DESENHO", "Abra o desenho do processo primeiro.", status=409)
+        agora = datetime.now(UTC)
+        await db.merge(f"{PROCESSOS}:{processo.id}", {"ajuda": {"texto": data.texto, "por": who.sub, "em": agora}})
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": _papel(who), "autor": who.sub,
+                                    "texto": f"Pedi ajuda ao staff: {data.texto}", "passos": []})
+        await _ao_staff(ItemStaff(tipo="ajuda", ref=processo.id, titulo=f"{processo.titulo}: ajuda no desenho", detalhe=data.texto,
+                                  status="aberta", link=f"/processos/{processo.id}", em=agora))
+        await notify.roles("operador", title=f"Pedido de ajuda: {processo.titulo}", body=data.texto, link=f"/processos/{processo.id}",
+                           key=f"ajuda-{processo.id}-{int(agora.timestamp())}")
+        await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="mensagem"))
+        return await _desenho(processo.id)
+
+    async def concluir_ajuda(self, data: DesenhoRef) -> Desenho:
+        _desenhista()
+        processo = await _processo_por_id(data.processo)
+        await _fechar_ajuda(processo)
+        await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="alterado"))
         return await _desenho(processo.id)
 
     async def ajustar(self, data: DesenhoRef) -> Desenho:
         """Abre um rascunho novo a partir da versão publicada (as execuções em andamento seguem na versão delas)."""
-        _writer()
+        _desenhista()
         versoes = await _versoes(data.processo)
-        if any(v["status"] == "rascunho" for v in versoes):
+        if any(v["status"] in ("rascunho", "revisao") for v in versoes):
             return await _desenho(data.processo)
         publicada = next((v for v in versoes if v["status"] == "publicada"), None)
         if publicada is None:
@@ -380,7 +438,7 @@ class ProcessosService:
 
     async def descartar(self, data: DesenhoRef) -> Desenho:
         """Descarta o rascunho de um processo que já tem versão publicada (volta para ela)."""
-        _writer()
+        _desenhista()
         rascunho = await _rascunho(data.processo)
         if not any(v["status"] == "publicada" for v in await _versoes(data.processo)):
             raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", "O primeiro rascunho não se descarta: ajuste-o ou recuse o processo.", 409)
@@ -450,6 +508,8 @@ class ProcessosService:
             raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", f"Esta tarefa é para {quem}.", 403)
         if tarefa.status != "aberta":
             raise ServiceError("ERRO_PROCESSOS_TAREFA_FECHADA", "Esta tarefa já foi resolvida.", 409)
+        if data.regra and not tarefa.aprende:
+            raise ServiceError("ERRO_PROCESSOS_REGRA", "Só a exceção de um passo de agente vira regra.", 422)
         if tarefa.tipo == "aprovacao":
             if data.aprovado is None:
                 raise ServiceError("ERRO_PROCESSOS_RESPOSTA", "Diga se aprova ou não.", 422)
@@ -464,6 +524,11 @@ class ProcessosService:
                                               motivo=None if tarefa.tipo == "excecao" else ("aprovado" if data.aprovado else "recusado")),
                       saida=(tarefa.passo, resposta), aguardando=None)
         await bus.live(LIVE_TAREFAS, TarefaMudou(id=tarefa.id, action="concluida"))
+        if tarefa.responsavel == "staff":
+            await _ao_staff(ItemStaff(tipo="excecao", ref=tarefa.id, titulo=f"{tarefa.titulo}: {tarefa.nome}", status="concluida",
+                                      link="/processos/tarefas", em=agora))
+        if data.regra:
+            await _nova_regra(tarefa, row, data.regra, resposta, who.sub if who else None)
         return Tarefa.model_validate(row)
 
     async def acompanhamento(self, data: Empty) -> Acompanhamento:
@@ -494,6 +559,50 @@ class ProcessosService:
         await _marcar(data.instancia, marco, saida=(data.passo, data.saida) if data.status == "concluido" else None,
                       handoff=data.status == "handoff", incidente=data.status == "incidente")
         return Empty()
+
+    # ── Regras aprendidas com o handoff (briefing.md §5.7) ──────────────────
+
+    async def regras(self, data: RegraQuery) -> Regras:
+        return Regras(itens=await _regras(data.processo))
+
+    async def desativar_regra(self, data: RegraRef) -> Regra:
+        _desenhista()
+        row = await db.select(f"{REGRAS}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Regra não encontrada.", 404)
+        regra = Regra.model_validate(await db.merge(f"{REGRAS}:{data.id}", {"status": "desativada"}))
+        await bus.live(LIVE_REGRAS, RegraMudou(id=regra.id, action="desativada"))
+        return regra
+
+    async def avaliar_regra(self, data: RegraRef) -> Regra:
+        """A regra só entra no agente se, com ela, o agente refaz o caso que a gerou e chega no que o staff fez."""
+        row = await db.select(f"{REGRAS}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Regra não encontrada.", 404)
+        regra = Regra.model_validate(row)
+        if regra.status != "avaliando":
+            return regra
+        processo = await _processo_por_id(regra.processo)
+        versao = await _versao_do_motor(regra.processo, int(row.get("versao") or 0)) or next(
+            (v for v in await _versoes(regra.processo) if v["status"] == "publicada"), None)
+        step = Fluxo.model_validate(versao["fluxo"]).step(regra.passo) if versao else None
+        if step is None or step.tipo != "agente":
+            avaliacao = Avaliacao(ok=False, detalhes=["O passo não existe mais ou não é de agente."])
+        else:
+            ativas = [r for r in await _regras(regra.processo) if r.passo == regra.passo and r.status == "ativa"]
+            try:
+                saida = await _executar_agente(processo, step, row.get("caso") or {}, [*ativas, regra])
+                avaliacao = _comparar(regra.esperado, saida)
+            except Handoff as exc:
+                avaliacao = Avaliacao(ok=False, detalhes=[f"Com a regra, o agente ainda pediu ajuda: {exc.motivo}"])
+        regra = Regra.model_validate(await db.merge(f"{REGRAS}:{regra.id}", {
+            "status": "ativa" if avaliacao.ok else "reprovada", "avaliacao": avaliacao.model_dump()}))
+        await bus.live(LIVE_REGRAS, RegraMudou(id=regra.id, action="avaliada"))
+        if regra.autor:
+            texto = "entrou no agente" if avaliacao.ok else "não passou na avaliação: " + "; ".join(avaliacao.detalhes)[:300]
+            await notify.user(regra.autor, title=f"Regra de {processo.titulo} {texto.split(':')[0]}", body=f"{regra.texto} — {texto}",
+                              link=f"/processos/{processo.id}", send_email=False, key=f"regra-{regra.id}")
+        return regra
 
     # ── Jobs do motor para este serviço (core/processes.py: o BPMN os gera) ──
 
@@ -526,6 +635,11 @@ class ProcessosService:
             ultimo = next((m for m in reversed(execucao.marcos) if m.passo == passo_id and m.status == "handoff"), None)
             motivo = ultimo.motivo if ultimo else (f"O prazo de {nome.lower()} passou." if step and step.tipo == "espera" else None)
         dados = {**(saidas.get("gatilho") or {}), **{k: v for s in saidas.values() for k, v in s.items()}}
+        if excecao and not saidas.get(passo_id):  # o que o agente leu antes de ir para a exceção
+            rows = await db.query(f"SELECT parciais FROM {EXECUCOES} WHERE tenant = $tenant AND instancia = $i LIMIT 1", i=job.instance)
+            parcial = ((rows[0].get("parciais") if rows else None) or {}).get(passo_id)
+            if parcial:
+                saidas[passo_id] = parcial
         tarefa = {
             "chave": chave, "execucao": execucao.id, "instancia": job.instance, "processo": processo.id, "titulo": processo.titulo,
             "passo": passo_id, "nome": f"Exceção: {nome}" if excecao else nome, "tipo": "excecao" if excecao else "aprovacao",
@@ -534,7 +648,10 @@ class ProcessosService:
             "motivo": motivo, "contexto": [i.model_dump() for i in _contexto_tarefa(dados)],
             "campos": [c.model_dump() for c in _campos(step, catalogo, saidas.get(passo_id) or dados)] if excecao and step else [],
             "documento_id": (saidas.get("gatilho") or {}).get("documento_id"), "prazo": _quando(tarefa_motor.get("dueDate")),
-            "status": "aberta", "resposta": {},
+            "aprende": bool(excecao and step and step.tipo == "agente"), "status": "aberta", "resposta": {},
+            # O caso da exceção (o que o passo tinha à mão): se o staff ensinar uma regra, a avaliação refaz este caso.
+            "caso": {k: v for k, v in job.variables.items() if k != "entrada"} if excecao else None,
+            "versao": job.version,
         }
         try:
             criada = Tarefa.model_validate(await db.create(TAREFAS, tarefa))
@@ -547,6 +664,9 @@ class ProcessosService:
                       aguardando=aguardando, atual=(passo_id, tarefa["nome"]))
         await bus.live(LIVE_TAREFAS, TarefaMudou(id=criada.id, action="criada"))
         titulo = f"{processo.titulo}: {tarefa['nome']}"
+        if aguardando == "staff":
+            await _ao_staff(ItemStaff(tipo="excecao", ref=criada.id, titulo=titulo, detalhe=motivo, prazo=criada.prazo, status="aberta",
+                                      link="/processos/tarefas", em=datetime.now(UTC)))
         if aguardando == "cliente":
             await notify.roles("owner", "admin", title=titulo, body=tarefa["pergunta"], link="/processos/tarefas", key=f"tarefa-{chave}")
         else:
@@ -571,58 +691,181 @@ class ProcessosService:
         return None
 
     async def _job_agente(self, job: Job) -> dict[str, Any]:
-        """Passo de agente: o objetivo do passo, as saídas declaradas e as ferramentas de leitura. Sem segurança, o
-        agente pede ajuda e o passo vai para a exceção do staff (Handoff)."""
+        """Passo de agente: o objetivo do passo, as saídas declaradas, as regras que o staff ensinou e as ferramentas de
+        leitura. Sem segurança, o agente pede ajuda e o passo vai para a exceção do staff (Handoff)."""
         versao = await _versao_do_motor(job.processo, job.version)
         step = Fluxo.model_validate(versao["fluxo"]).step(job.element) if versao else None
         if step is None or step.tipo != "agente":
             raise Handoff("Passo de agente não encontrado na versão publicada.")
         processo = await _processo_por_id(job.processo)
-        resultado: dict[str, Any] = {}
-        ajuda: list[str] = []
-        modelo = create_model(f"saidas_{step.id}", **{campo: (_tipo_do_exemplo(step.exemplo.get(campo)) | None, None) for campo in step.saidas})
-
-        async def ler_documento(dados: LeituraDocumento) -> str:
-            """Lê o texto de um documento recebido (o id vem do gatilho: gatilho.documento_id)."""
-            try:
-                doc = await bus.request(DOCUMENTO_SUBJECT, DocumentoRef(id=dados.documento_id), DocumentoTexto, timeout=10)
-            except (NatsError, TimeoutError):
-                return "O serviço de documentos não respondeu agora."
-            if not doc.texto.strip():
-                return f"{doc.nome} ({doc.tipo}) não tem texto legível (imagem ou PDF escaneado)."
-            return f"{doc.nome} — assunto: {doc.assunto or '-'}\n\n{doc.texto[:12000]}"
-
-        async def concluir(dados: BaseModel) -> str:
-            resultado.clear()
-            resultado.update(dados.model_dump(mode="json"))
-            return "Passo concluído."
-
-        concluir.__doc__ = f"Conclui o passo com as saídas: {', '.join(step.saidas)}. Valores em reais como número; datas AAAA-MM-DD."
-        concluir.__signature__ = inspect.Signature([inspect.Parameter("dados", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=modelo)])
-
-        async def pedir_ajuda(dados: SaidaAgente) -> str:
-            """Não dá para concluir com segurança: o passo vai para uma pessoa do staff, com o motivo."""
-            ajuda.append(dados.motivo)
-            return "Pedido de ajuda registrado."
-
-        contexto = "\n".join([
-            f"Processo: {processo.titulo}. Passo: {step.nome}.", f"Objetivo: {step.objetivo or step.nome}",
-            f"Saídas: {', '.join(f'{c} (ex.: {step.exemplo.get(c)!r})' for c in step.saidas)}",
-            "Dados da execução: " + json.dumps({k: v for k, v in job.variables.items() if k != "entrada"}, ensure_ascii=False)[:4000],
-        ])
-        await llm.run_agent(settings.model, f"Execute o passo \"{step.nome}\" e conclua com as saídas.", instructions=EXECUCAO_INSTRUCOES,
-                            tools=[ler_documento, _buscar_conhecimento, concluir, pedir_ajuda], context=contexto, max_turns=6)
-        if ajuda:
-            raise Handoff(ajuda[0])
-        if not resultado:
-            raise Handoff(f"O agente não concluiu {step.nome.lower()}.")
-        faltam = [c for c in step.exemplo if c in step.saidas and resultado.get(c) in (None, "")]
-        if faltam:
-            raise Handoff(f"O agente não encontrou: {', '.join(faltam)}.")
-        return {"resultado": resultado}
+        regras = [r for r in await _regras(processo.id) if r.passo == step.id and r.status == "ativa"]
+        try:
+            return {"resultado": await _executar_agente(processo, step, job.variables, regras)}
+        except Handoff as handoff:
+            if handoff.parcial:  # a tarefa de exceção (criada pelo motor logo depois) já vem com o que o agente leu
+                await db.query(f"UPDATE {EXECUCOES} SET parciais.{step.id} = $parcial WHERE tenant = $tenant AND instancia = $i",
+                               parcial=handoff.parcial, i=job.instance)
+            raise
 
 
 # ── Ajudantes ────────────────────────────────────────────────────────────────
+
+async def _executar_agente(processo: Processo, step: Step, variaveis: dict[str, Any], regras: list[Regra]) -> dict[str, Any]:
+    """Roda o agente de um passo com os dados da execução e as regras ativas; devolve as saídas ou levanta Handoff."""
+    resultado: dict[str, Any] = {}
+    ajuda: list[str] = []
+    lidos = [json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)]  # onde as saídas podem estar
+    campos: dict[str, Any] = {campo: (_tipo_do_exemplo(step.exemplo.get(campo)) | None, None) for campo in step.saidas}
+    if step.leitura:
+        campos["fontes"] = (dict[str, str], Field(default_factory=dict, description=(
+            "Para cada saída, o trecho do documento copiado igual, de onde ela saiu (ex.: \"Vencimento: 15/10/2026\"); "
+            "para a que veio de uma regra do staff, escreva regra")))
+    modelo = create_model(f"saidas_{step.id}", **campos)
+
+    async def ler_documento(dados: LeituraDocumento) -> str:
+        """Lê o texto de um documento recebido (o id vem do gatilho: gatilho.documento_id)."""
+        try:
+            doc = await bus.request(DOCUMENTO_SUBJECT, DocumentoRef(id=dados.documento_id), DocumentoTexto, timeout=10)
+        except (NatsError, TimeoutError):
+            return "O serviço de documentos não respondeu agora."
+        if not doc.texto.strip():
+            return f"{doc.nome} ({doc.tipo}) não tem texto legível (imagem ou PDF escaneado)."
+        lidos.append(f"{doc.nome} {doc.assunto or ''} {doc.texto}")
+        return f"{doc.nome} — assunto: {doc.assunto or '-'}\n\n{doc.texto[:12000]}"
+
+    async def concluir(dados: BaseModel) -> str:
+        resultado.clear()
+        resultado.update(dados.model_dump(mode="json"))
+        return "Passo concluído."
+
+    concluir.__doc__ = f"Conclui o passo com as saídas: {', '.join(step.saidas)}. Valores em reais como número; datas AAAA-MM-DD." + (
+        " Em fontes, o trecho do documento de onde saiu cada uma: o que não está escrito no documento não se conclui (peça ajuda)."
+        if step.leitura else "")
+    concluir.__signature__ = inspect.Signature([inspect.Parameter("dados", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=modelo)])
+
+    async def pedir_ajuda(dados: SaidaAgente) -> str:
+        """Não dá para concluir com segurança: o passo vai para uma pessoa do staff, com o motivo."""
+        ajuda.append(dados.motivo)
+        return "Pedido de ajuda registrado."
+
+    contexto = "\n".join([
+        f"Processo: {processo.titulo}. Passo: {step.nome}.", f"Objetivo: {step.objetivo or step.nome}",
+        f"Saídas: {', '.join(f'{c} (ex.: {step.exemplo.get(c)!r})' for c in step.saidas)}",
+        "Dados da execução: " + json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)[:4000],
+    ])
+    if regras:
+        contexto += "\n\nRegras que o staff da Cogniventure ensinou para este passo (siga-as):\n" + "\n".join(
+            f"- {r.texto} (no caso que gerou a regra, a saída certa foi: {json.dumps(r.esperado, ensure_ascii=False)})" for r in regras)
+    await llm.run_agent(settings.model, f"Execute o passo \"{step.nome}\" e conclua com as saídas.", instructions=EXECUCAO_INSTRUCOES,
+                        tools=[ler_documento, _buscar_conhecimento, concluir, pedir_ajuda], context=contexto, max_turns=6)
+    if ajuda:
+        raise Handoff(ajuda[0])
+    if not resultado:
+        raise Handoff(f"O agente não concluiu {step.nome.lower()}.")
+    fontes = resultado.pop("fontes", None) or {}
+    if step.leitura:  # não chuta: cada saída lida aponta o trecho de onde saiu, e o trecho está no que ele leu e diz o mesmo
+        sem_fonte = [c for c, v in resultado.items() if v not in (None, "") and not _tem_fonte(v, str(fontes.get(c) or ""), lidos, bool(regras))]
+        if sem_fonte:
+            parcial = {c: v for c, v in resultado.items() if c not in sem_fonte and v not in (None, "")}
+            raise Handoff(f"O agente não mostrou no documento de onde tirou: {', '.join(sem_fonte)}.", parcial=parcial)
+    faltam = [c for c in step.exemplo if c in step.saidas and resultado.get(c) in (None, "")]
+    if faltam:
+        raise Handoff(f"O agente não encontrou: {', '.join(faltam)}.", parcial={c: v for c, v in resultado.items() if v not in (None, "")})
+    return resultado
+
+
+def _tem_fonte(valor: Any, trecho: str, lidos: list[str], tem_regra: bool) -> bool:
+    """A saída se sustenta: veio de uma regra do staff, ou o trecho citado está no que o agente leu e traz o valor."""
+    if trecho.strip().lower() == "regra":
+        return tem_regra
+    alvo = _normal(trecho)
+    if len(alvo) < 3 or not any(alvo in _normal(texto) for texto in lidos):
+        return False
+    if isinstance(valor, bool):
+        return True
+    if isinstance(valor, int | float):
+        return any(abs(n - float(valor)) < 0.01 for n in _numeros(trecho))
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(valor)):
+        return str(valor) in _datas(trecho)
+    return _normal(valor) in alvo
+
+
+def _numeros(texto: str) -> set[float]:
+    """Números escritos no trecho, em pt-BR (1.850,00) ou não (1850.5)."""
+    achados: set[float] = set()
+    for bruto in re.findall(r"\d[\d.,]*\d|\d", texto):
+        for candidato in (bruto.replace(".", "").replace(",", "."), bruto.replace(",", "")):
+            try:
+                achados.add(float(candidato))
+            except ValueError:
+                pass
+    return achados
+
+
+def _datas(texto: str) -> set[str]:
+    """Datas escritas no trecho (15/10/2026, 15-10-26, 2026-10-15), como AAAA-MM-DD."""
+    datas = {f"{a}-{m}-{d}" for a, m, d in re.findall(r"(\d{4})-(\d{2})-(\d{2})", texto)}
+    for d, m, a in re.findall(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})(?!\d)", texto):
+        datas.add(f"{a if len(a) == 4 else '20' + a}-{int(m):02d}-{int(d):02d}")
+    return datas
+
+
+async def _publicar(processo: Processo, rascunho: dict[str, Any]) -> Desenho:
+    """Implanta a versão no Camunda (a versão seguinte do processo no motor), arquiva a anterior e fecha o que o staff
+    tinha aberto para este desenho (revisão, ajuda)."""
+    fluxo = Fluxo.model_validate(rascunho["fluxo"])
+    catalogo = await _catalogo()
+    erros = [p for p in _problemas(fluxo, catalogo) if p.nivel == "erro"]
+    if erros:
+        raise ServiceError("ERRO_PROCESSOS_FLUXO_INVALIDO", "O fluxo tem problemas: " + "; ".join(e.texto for e in erros[:3]), 409)
+    motor_id = _motor_id(processo.id)
+    xml = to_bpmn(fluxo, process_id=motor_id, name=processo.titulo, actions=catalogo)
+    digest = hashlib.sha256(xml.encode()).hexdigest()[:24]
+    publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
+    if publicada is not None:
+        hash_publicado = (publicada.get("motor") or {}).get("hash")
+        # O mesmo BPMN de novo daria a mesma versão no motor. Mudou só o compilador (ou o catálogo)? Aí publica.
+        if hash_publicado == digest or (hash_publicado is None and Fluxo.model_validate(publicada["fluxo"]) == fluxo):
+            raise ServiceError("ERRO_PROCESSOS_SEM_MUDANCA", "O rascunho está igual à versão publicada: mude o fluxo ou descarte o rascunho.", 409)
+    if processo.publicada is None:
+        ativos = await db.query(f"SELECT count() AS total FROM (SELECT id FROM {PROCESSOS} WHERE tenant = $tenant "
+                                "AND publicada != NONE AND publicada != NULL) GROUP ALL")
+        await plans.check("ativos", used=ativos[0]["total"] if ativos else 0)
+    implantado = await camunda.deploy(xml, motor_id)
+    for versao in await _versoes(processo.id):
+        if versao["status"] == "publicada":
+            await db.merge(_ref(VERSOES, versao), {"status": "arquivada"})
+    await db.merge(_ref(VERSOES, rascunho), {
+        "status": "publicada", "publicada_em": datetime.now(UTC), "anteriores": [],
+        "motor": Motor(processo=motor_id, chave=implantado.key, versao=implantado.version, hash=digest).model_dump()})
+    await db.merge(f"{PROCESSOS}:{processo.id}", {"publicada": int(rascunho["numero"])})
+    await plans.count("ativos", await _publicados())
+    if rascunho["status"] == "revisao":
+        await _ao_staff(ItemStaff(tipo="revisao", ref=processo.id, titulo=f"{processo.titulo}: revisão da versão {rascunho['numero']}",
+                                  status="concluida", link=f"/processos/{processo.id}", em=datetime.now(UTC)))
+    await _fechar_ajuda(processo)
+    await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="publicado"))
+    return await _desenho(processo.id)
+
+
+def _desenhista() -> Any:
+    """Quem desenha: dono e admin da empresa, e o staff da Cogniventure (operador) no setup."""
+    who = current()
+    if who is None or not (who.is_system or DESIGNERS & who.roles):
+        raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só donos, administradores e o staff mexem no desenho.", 403)
+    return who
+
+
+def _operador() -> Any:
+    who = current()
+    if who is None or not (who.is_system or OPERADORES & who.roles):
+        raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só o staff da Cogniventure faz isso.", 403)
+    return who
+
+
+def _papel(who: Any) -> str:
+    return "staff" if OPERADORES & who.roles and not WRITERS & who.roles else "cliente"
+
 
 def _writer() -> None:
     who = current()
@@ -726,10 +969,93 @@ async def _versoes(processo_id: str) -> list[dict[str, Any]]:
 
 
 async def _rascunho(processo_id: str) -> dict[str, Any]:
-    rascunho = next((v for v in await _versoes(processo_id) if v["status"] == "rascunho"), None)
+    versoes = await _versoes(processo_id)
+    rascunho = next((v for v in versoes if v["status"] == "rascunho"), None)
+    if rascunho is None and any(v["status"] == "revisao" for v in versoes):
+        raise ServiceError("ERRO_PROCESSOS_EM_REVISAO", "A versão está em revisão pelo staff: espere a publicação ou a devolução.", 409)
     if rascunho is None:
         raise ServiceError("ERRO_PROCESSOS_SEM_RASCUNHO", "Não há rascunho aberto: clique em Ajustar para abrir um.", 409)
     return rascunho
+
+
+async def _em_revisao(processo_id: str) -> dict[str, Any]:
+    revisao = next((v for v in await _versoes(processo_id) if v["status"] == "revisao"), None)
+    if revisao is None:
+        raise ServiceError("ERRO_PROCESSOS_SEM_REVISAO", "Não há versão em revisão.", 409)
+    return revisao
+
+
+async def _precisa_revisao(processo_id: str, versao: dict[str, Any]) -> bool:
+    publicada = next((v for v in await _versoes(processo_id) if v["status"] == "publicada"), None)
+    return _exige_revisao(Fluxo.model_validate(versao["fluxo"]), await _catalogo(),
+                          Fluxo.model_validate(publicada["fluxo"]) if publicada else None)
+
+
+async def _regras(processo_id: str | None) -> list[Regra]:
+    if processo_id:
+        rows = await db.query(f"SELECT * FROM {REGRAS} WHERE tenant = $tenant AND processo = $p ORDER BY created_at", p=processo_id)
+    else:
+        rows = await db.query(f"SELECT * FROM {REGRAS} WHERE tenant = $tenant ORDER BY created_at")
+    return [Regra.model_validate(r) for r in rows]
+
+
+async def _nova_regra(tarefa: Tarefa, row: dict[str, Any], texto: str, resposta: dict[str, Any], autor: str | None) -> None:
+    """O staff resolveu a exceção de um agente e ensinou o que fazer: a regra nasce em avaliação (workflow)."""
+    processo = await _processo_por_id(tarefa.processo)
+    versao = await _versao_do_motor(tarefa.processo, int(row.get("versao") or 0))
+    step = Fluxo.model_validate(versao["fluxo"]).step(tarefa.passo) if versao else None
+    if step is None or step.tipo != "agente":
+        raise ServiceError("ERRO_PROCESSOS_REGRA", "Só a exceção de um passo de agente vira regra.", 422)
+    esperado = {k: v for k, v in resposta.items() if k in step.saidas and v not in (None, "")}
+    criada = await db.create(REGRAS, {"processo": processo.id, "passo": step.id, "passo_nome": step.nome, "texto": texto,
+                                      "esperado": esperado, "caso": row.get("caso") or {}, "versao": row.get("versao"),
+                                      "status": "avaliando", "avaliacao": None, "autor": autor, "tarefa": tarefa.id})
+    regra = Regra.model_validate(criada)
+    await bus.live(LIVE_REGRAS, RegraMudou(id=regra.id, action="criada"))
+    await runner.start_workflow(_workflow_regra(), RegraRef(id=regra.id), task_queue=TASK_QUEUE, id=f"regra-{current_tenant()}-{regra.id}")
+
+
+def _workflow_regra() -> Any:
+    from workflows import AvaliarRegraWorkflow  # o workflow importa este arquivo: a referência é resolvida na hora
+
+    return AvaliarRegraWorkflow.run
+
+
+def _normal(valor: Any) -> str:
+    texto = unicodedata.normalize("NFKD", str(valor)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", texto)
+
+
+def _comparar(esperado: dict[str, Any], saida: dict[str, Any]) -> Avaliacao:
+    """O agente chegou no que o staff fez? Número igual (centavos), texto igual sem acento e pontuação (ou um contém o outro)."""
+    detalhes = []
+    for campo, certo in esperado.items():
+        obtido = saida.get(campo)
+        if isinstance(certo, (int, float)) and not isinstance(certo, bool):
+            try:
+                igual = obtido is not None and abs(float(obtido) - float(certo)) < 0.01
+            except (TypeError, ValueError):
+                igual = False
+        else:
+            a, b = _normal(certo), _normal(obtido if obtido is not None else "")
+            igual = bool(b) and (a == b or a in b or b in a)
+        if not igual:
+            detalhes.append(f"{campo}: esperado {certo!r}, o agente deu {obtido!r}")
+    return Avaliacao(ok=not detalhes, detalhes=detalhes)
+
+
+async def _ao_staff(item: ItemStaff) -> None:
+    """Publica para a fila da carteira (svc-staff) como a plataforma: o módulo do staff não é da organização."""
+    with acting_as(system(SERVICE, current_tenant())):
+        await bus.publish(STAFF_SUBJECT, item, msg_id=f"staff-{current_tenant()}-{item.tipo}-{item.ref}-{item.status}-{int(item.em.timestamp())}")
+
+
+async def _fechar_ajuda(processo: Processo) -> None:
+    row = await db.select(f"{PROCESSOS}:{processo.id}")
+    if row and row.get("ajuda"):
+        await db.merge(f"{PROCESSOS}:{processo.id}", {"ajuda": None})
+        await _ao_staff(ItemStaff(tipo="ajuda", ref=processo.id, titulo=f"{processo.titulo}: ajuda no desenho", status="concluida",
+                                  link=f"/processos/{processo.id}", em=datetime.now(UTC)))
 
 
 async def _aberta(processo_id: str) -> dict[str, Any]:
@@ -767,6 +1093,7 @@ async def _desenho(processo_id: str) -> Desenho:
     fluxo = Fluxo.model_validate(aberta["fluxo"])
     catalogo = await _catalogo()
     versao = Versao.model_validate({**aberta, "pode_desfazer": bool(aberta.get("anteriores"))})
+    publicada = next((Fluxo.model_validate(v["fluxo"]) for v in versoes if v["status"] == "publicada"), None)
     return Desenho(
         processo=processo,
         versao=versao,
@@ -774,9 +1101,11 @@ async def _desenho(processo_id: str) -> Desenho:
                               motor_versao=(v.get("motor") or {}).get("versao")) for v in versoes],
         bpmn=to_bpmn(fluxo, process_id=_motor_id(processo_id), name=processo.titulo, actions=catalogo),
         problemas=_problemas(fluxo, catalogo),
-        mensagens=[MensagemDesenho(id=_short(m["id"]), papel=m["papel"], texto=m["texto"], passos=m.get("passos") or [],
-                                   created_at=m.get("created_at")) for m in await _mensagens(processo_id)],
-        exige_revisao=_exige_revisao(fluxo, catalogo),
+        mensagens=[MensagemDesenho(id=_short(m["id"]), papel=m["papel"], autor=m.get("autor"), texto=m["texto"],
+                                   passos=m.get("passos") or [], created_at=m.get("created_at")) for m in await _mensagens(processo_id)],
+        exige_revisao=aberta["status"] != "publicada" and _exige_revisao(fluxo, catalogo, publicada),
+        mudancas=_mudancas(publicada or _partida(processo), fluxo) if aberta["status"] != "publicada" else [],
+        regras=await _regras(processo_id),
     )
 
 
@@ -852,6 +1181,9 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> list[Problem
                 erro(f"A decisão {s.nome} precisa de pelo menos dois caminhos.", s.id)
             if len(padroes) != 1:
                 erro(f"A decisão {s.nome} precisa de exatamente um caminho padrão (sem condição).", s.id)
+            condicoes = [_condicao(f) for f in saindo if f.condicao is not None]
+            for repetida in sorted({c for c in condicoes if condicoes.count(c) > 1}):  # o motor seguiria só o primeiro
+                erro(f"A decisão {s.nome} tem dois caminhos com a mesma condição ({repetida.removeprefix(' se ')}).", s.id)
         elif len(saindo) > 1 or any(f.condicao for f in saindo):
             erro(f"{s.nome} tem mais de um caminho ou condição; condições só saem de decisões.", s.id)
         if s.tipo == "acao":
@@ -888,7 +1220,42 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> list[Problem
         for campo in campos:
             if not _campo_existe(fluxo, catalogo, campo):
                 erro(f"A condição de {f.de} → {f.para} usa {campo}, que não existe.", f.de)
+        for alt in f.condicao.alternatives():  # o motor recusa comparar tipos diferentes: viraria incidente na execução
+            tipo = _tipo_do_campo(fluxo, catalogo, alt.campo)
+            if alt.operador in ("verdadeiro", "falso") and tipo not in (None, "sim_nao"):
+                erro(f"A condição de {f.de} → {f.para} pergunta se {alt.campo} é {alt.operador}, mas ele é {tipo}, não sim/não.", f.de)
+            elif alt.operador in (">", ">=", "<", "<=") and tipo not in (None, "numero"):
+                erro(f"A condição de {f.de} → {f.para} compara {alt.campo} com {alt.operador}, mas ele é {tipo}, não número.", f.de)
+            elif alt.operador not in ("verdadeiro", "falso") and alt.valor is not None:
+                referencia = isinstance(alt.valor, str) and alt.valor.startswith("parametros.")
+                outro = _tipo_do_campo(fluxo, catalogo, alt.valor) if referencia else _tipo_do_valor(alt.valor)
+                if tipo and outro and tipo != outro:
+                    erro(f"A condição de {f.de} → {f.para} compara {alt.campo} ({tipo}) com {alt.valor!r} ({outro}).", f.de)
     return out
+
+
+def _tipo_do_valor(valor: Any) -> str:
+    return "sim_nao" if isinstance(valor, bool) else "numero" if isinstance(valor, int | float) else "texto"
+
+
+def _tipo_do_campo(fluxo: Fluxo, catalogo: dict[str, CatalogAction], campo: str) -> str | None:
+    """numero, texto ou sim_nao; None quando não dá para saber (o campo não existe ou o agente não deu exemplo)."""
+    passo, _, nome = campo.partition(".")
+    if passo == "parametros":
+        exemplo: Any = fluxo.parametros.get(nome)
+    else:
+        step = fluxo.step(passo)
+        if step is None:
+            return None
+        if step.tipo == "tarefa":
+            exemplo = {"aprovado": True, "comentario": ""}.get(nome)
+        elif step.tipo == "acao" and step.acao in catalogo:
+            propriedades = catalogo[step.acao].output_schema.get("properties", {})
+            exemplo = ({"number": 0.0, "integer": 0.0, "boolean": False}.get(_tipo_json(propriedades[nome]), "") if nome in propriedades
+                       else catalogo[step.acao].example.get(nome))
+        else:
+            exemplo = step.exemplo.get(nome)
+    return None if exemplo is None else _tipo_do_valor(exemplo)
 
 
 def _campo_existe(fluxo: Fluxo, catalogo: dict[str, CatalogAction], campo: str) -> bool:
@@ -912,9 +1279,14 @@ def _aprovado_antes(fluxo: Fluxo, alvo: str) -> bool:
     return not sem_aprovacao(START, frozenset())
 
 
-def _exige_revisao(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> bool:
-    acoes = [catalogo.get(s.acao or "") for s in fluxo.passos if s.tipo == "acao"]
-    return any(a is not None and (a.risk == "irreversivel" or a.connections) for a in acoes)
+def _sensiveis(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> set[str]:
+    """As ações do fluxo que pedem revisão: irreversíveis ou com conexão a sistemas de fora."""
+    return {s.acao for s in fluxo.passos if s.tipo == "acao" and (a := catalogo.get(s.acao or "")) and (a.risk == "irreversivel" or a.connections)}
+
+
+def _exige_revisao(fluxo: Fluxo, catalogo: dict[str, CatalogAction], publicada: Fluxo | None = None) -> bool:
+    """Revisão do staff obrigatória (briefing.md §5.5): ação irreversível ou conexão que a publicada não tinha."""
+    return bool(_sensiveis(fluxo, catalogo) - (_sensiveis(publicada, catalogo) if publicada else set()))
 
 
 def _resumo_fluxo(fluxo: Fluxo) -> str:
@@ -929,10 +1301,37 @@ def _resumo_fluxo(fluxo: Fluxo) -> str:
         linhas.append(f"- {s.id} [{s.tipo}] {s.nome}" + (f" ({extra})" if extra else "") + (" [exceção]" if s.excecao else ""))
     linhas.append("Ligações:")
     for f in fluxo.ligacoes:
-        cond = (" se " + " ou ".join(f"{a.campo} {a.operador} {a.valor if a.valor is not None else ''}".rstrip()
-                                    for a in f.condicao.alternatives())) if f.condicao else ""
-        linhas.append(f"- {f.de} → {f.para}{cond}")
+        linhas.append(f"- {f.de} → {f.para}{_condicao(f)}")
     return "\n".join(linhas)
+
+
+def _condicao(f: Flow) -> str:
+    """" se ler_documento.valor > parametros.limite" (vazio sem condição)."""
+    return (" se " + " ou ".join(f"{a.campo} {a.operador} {a.valor if a.valor is not None else ''}".rstrip()
+                                 for a in f.condicao.alternatives())) if f.condicao else ""
+
+
+def _mudancas(antes: Fluxo, depois: Fluxo) -> list[str]:
+    """O que mudou entre dois fluxos, em frases curtas: o que o staff confere na revisão e o cliente antes de pedi-la."""
+    out: list[str] = []
+    if antes.gatilho != depois.gatilho:
+        out.append(f"Gatilho: {depois.gatilho.descricao or depois.gatilho.tipo}")
+    for nome in sorted(antes.parametros.keys() | depois.parametros.keys()):
+        de, para = antes.parametros.get(nome), depois.parametros.get(nome)
+        if de != para:
+            mostra = lambda v: int(v) if isinstance(v, float) and v.is_integer() else v  # noqa: E731 - 5000.0 → 5000
+            out.append(f"Parâmetro {nome.replace('_', ' ')}: {'—' if de is None else mostra(de)} → {'removido' if para is None else mostra(para)}")
+    passos_antes = {p.id: p for p in antes.passos}
+    passos_depois = {p.id: p for p in depois.passos}
+    out += [f"Passo novo: {p.nome}" for i, p in passos_depois.items() if i not in passos_antes]
+    out += [f"Passo removido: {p.nome}" for i, p in passos_antes.items() if i not in passos_depois]
+    out += [f"Passo alterado: {p.nome}" for i, p in passos_depois.items() if i in passos_antes and passos_antes[i] != p]
+    ligacoes_antes = {(f.de, f.para, _condicao(f)) for f in antes.ligacoes}
+    ligacoes_depois = {(f.de, f.para, _condicao(f)) for f in depois.ligacoes}
+    nome = lambda i: passos_depois.get(i, passos_antes.get(i)).nome if i in passos_depois or i in passos_antes else "início"  # noqa: E731
+    out += [f"Caminho novo: {nome(de)} → {nome(para)}{cond}" for de, para, cond in sorted(ligacoes_depois - ligacoes_antes)]
+    out += [f"Caminho removido: {nome(de)} → {nome(para)}{cond}" for de, para, cond in sorted(ligacoes_antes - ligacoes_depois)]
+    return out
 
 
 def _contexto_desenho(processo: Processo, fluxo: Fluxo, catalogo: dict[str, CatalogAction], empresa: ContextoEmpresa | None,
@@ -947,7 +1346,8 @@ def _contexto_desenho(processo: Processo, fluxo: Fluxo, catalogo: dict[str, Cata
                + (f"; conexões: {', '.join(a.connections)}" if a.connections else "") for a in catalogo.values()] or ["- (vazio)"]
     linhas += ["", "Fluxo atual:", _resumo_fluxo(fluxo), "", "Problemas agora:"]
     linhas += [f"- {p.nivel}: {p.texto}" for p in _problemas(fluxo, catalogo)] or ["- nenhum"]
-    linhas += ["", "Conversa até aqui:"] + [f"{'Cliente' if m['papel'] == 'cliente' else 'Agente'}: {m['texto']}" for m in historico]
+    quem = {"cliente": "Cliente", "staff": "Staff da Cogniventure", "agente": "Agente"}
+    linhas += ["", "Conversa até aqui:"] + [f"{quem.get(m['papel'], 'Agente')}: {m['texto']}" for m in historico]
     return "\n".join(linhas)
 
 

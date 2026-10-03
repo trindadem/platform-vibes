@@ -6,6 +6,8 @@ HTTP POST /descrever             → o agente organiza um processo descrito pelo
 HTTP /desenho...                 → desenho do processo aceito: abrir, conversar com o agente (em pedaços), simular,
                                    desfazer, publicar no Camunda, ajustar a publicada e descartar o rascunho.
 HTTP /execucoes..., /tarefas..., /acompanhamento → execuções no motor, tarefas de pessoas e autonomia.
+HTTP /desenho/revisao, /aprovar, /devolver, /ajuda... e /regras... → o staff no setup (revisão, ajuda) e o que ele ensina.
+NATS rpc.processos.acompanhamento → a saúde da organização para a carteira do staff (svc-staff).
 NATS events.processos.catalogo   → os pacotes declaram as ações (core/processes.py); o catálogo fica aqui.
 NATS events.integracoes.evento   → inicia os processos daquele gatilho e entrega mensagens às execuções que esperam.
 NATS events.processos.passo      → o que o worker de cada pacote fez num passo (a linha do tempo da execução).
@@ -28,6 +30,7 @@ from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    ACOMPANHAMENTO_SUBJECT,
     CATALOG_SUBJECT,
     EVENT_SUBJECT,
     STEP_SUBJECT,
@@ -42,6 +45,8 @@ from schemas import (
     Descricao,
     Desenho,
     DesenhoRef,
+    AjudaIn,
+    Devolucao,
     Empty,
     EventoExterno,
     ExecucaoQuery,
@@ -49,14 +54,17 @@ from schemas import (
     Iniciar,
     MensagemDesenhoIn,
     PassoFeito,
+    RegraQuery,
+    RegraRef,
     Resposta,
+    RevisaoIn,
     TarefaQuery,
     ProcessoQuery,
     ProcessoRef,
     SimulacaoIn,
 )
 from service import MIGRATIONS, ProcessosService
-from workflows import SCHEDULES
+from workflows import SCHEDULES, AvaliarRegraWorkflow
 
 svc = ProcessosService()
 
@@ -66,13 +74,14 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TABLES, shared=SHARED, unique=UNIQUE, search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
-        runner.worker(TASK_QUEUE, workflows=[], service=svc, schedules=SCHEDULES),
+        runner.worker(TASK_QUEUE, workflows=[AvaliarRegraWorkflow], service=svc, schedules=SCHEDULES),
         processes.worker(SERVICE, jobs={JOB_AGENT: svc._job_agente, JOB_START: svc._job_inicio, JOB_TASK: svc._job_tarefa,
                                         JOB_WAIT: svc._job_espera, JOB_END: svc._job_fim}, lock_seconds=600),
     ):
         await bus.subscribe(CATALOG_SUBJECT, svc.registrar_catalogo, model=ActionCatalog)
         await bus.subscribe(EVENT_SUBJECT, svc.receber_evento, model=EventoExterno)
         await bus.subscribe(STEP_SUBJECT, svc.registrar_passo, model=PassoFeito)
+        await bus.respond(ACOMPANHAMENTO_SUBJECT, svc.acompanhamento, model=Empty)  # svc-staff: a saúde da carteira
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
     await camunda.close()
@@ -191,3 +200,38 @@ async def responder(data: Resposta) -> ResponseEnvelope:
 @app.get("/acompanhamento", response_model=ResponseEnvelope)
 async def acompanhamento() -> ResponseEnvelope:
     return _ok(await svc.acompanhamento(Empty()))
+
+
+@app.post("/desenho/revisao", response_model=ResponseEnvelope)
+async def pedir_revisao(data: RevisaoIn) -> ResponseEnvelope:
+    return _ok(await svc.pedir_revisao(data))
+
+
+@app.post("/desenho/aprovar", response_model=ResponseEnvelope)
+async def aprovar_revisao(data: DesenhoRef) -> ResponseEnvelope:
+    return _ok(await svc.aprovar_revisao(data))
+
+
+@app.post("/desenho/devolver", response_model=ResponseEnvelope)
+async def devolver(data: Devolucao) -> ResponseEnvelope:
+    return _ok(await svc.devolver(data))
+
+
+@app.post("/desenho/ajuda", response_model=ResponseEnvelope)
+async def pedir_ajuda(data: AjudaIn) -> ResponseEnvelope:
+    return _ok(await svc.pedir_ajuda(data))
+
+
+@app.post("/desenho/ajuda/concluir", response_model=ResponseEnvelope)
+async def concluir_ajuda(data: DesenhoRef) -> ResponseEnvelope:
+    return _ok(await svc.concluir_ajuda(data))
+
+
+@app.get("/regras", response_model=ResponseEnvelope)
+async def regras(data: Annotated[RegraQuery, Query()]) -> ResponseEnvelope:
+    return _ok(await svc.regras(data))
+
+
+@app.post("/regras/desativar", response_model=ResponseEnvelope)
+async def desativar_regra(data: RegraRef) -> ResponseEnvelope:
+    return _ok(await svc.desativar_regra(data))

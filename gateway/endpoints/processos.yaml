@@ -11,6 +11,8 @@ live:
     model: ExecucaoMudou
   - topic: tarefas                  # uma tarefa de pessoa foi criada ou resolvida
     model: TarefaMudou
+  - topic: regras                   # o staff ensinou uma regra a um passo, ou ela foi avaliada
+    model: RegraMudou
 
 endpoints:
   - path: /biblioteca
@@ -198,3 +200,66 @@ endpoints:
     response: Acompanhamento
     target_type: http
     target_url: http://svc-processos:8000/acompanhamento
+
+  - path: /desenho/revisao
+    name: pedirRevisao
+    method: POST
+    auth: client_jwt
+    request: RevisaoIn
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/revisao
+
+  - path: /desenho/aprovar
+    name: aprovarRevisao
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/aprovar
+    timeout: 60
+
+  - path: /desenho/devolver
+    name: devolver
+    method: POST
+    auth: client_jwt
+    request: Devolucao
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/devolver
+
+  - path: /desenho/ajuda
+    name: pedirAjuda
+    method: POST
+    auth: client_jwt
+    request: AjudaIn
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/ajuda
+
+  - path: /desenho/ajuda/concluir
+    name: concluirAjuda
+    method: POST
+    auth: client_jwt
+    request: DesenhoRef
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/ajuda/concluir
+
+  - path: /regras
+    method: GET
+    auth: client_jwt
+    query: RegraQuery
+    response: Regras
+    target_type: http
+    target_url: http://svc-processos:8000/regras
+
+  - path: /regras/desativar
+    name: desativarRegra
+    method: POST
+    auth: client_jwt
+    request: RegraRef
+    response: Regra
+    target_type: http
+    target_url: http://svc-processos:8000/regras/desativar

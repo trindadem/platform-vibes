@@ -712,8 +712,8 @@ export interface IdentityTenantInput {
 }
 
 export interface IdentityInviteInput {
-  /** Papel de quem aceitar o convite (operador: o staff da Cogniventure) */
-  role?: "admin" | "member" | "operador";
+  /** Papel de quem aceitar o convite (o operador vem só da carteira do staff) */
+  role?: "admin" | "member";
   /** Se informado, o convite também vai por e-mail para este endereço */
   email?: string | null;
 }
@@ -1311,6 +1311,12 @@ export interface ProcessosBiblioteca {
   itens: ProcessosModeloProcesso[];
 }
 
+export interface ProcessosPedidoAjuda {
+  texto: string;
+  por: string | null;
+  em: string | null;
+}
+
 export interface ProcessosProcesso {
   id: string;
   /** Modelo da biblioteca; vazio num processo só da empresa */
@@ -1325,6 +1331,8 @@ export interface ProcessosProcesso {
   prioridade: "alta" | "media" | "baixa";
   /** Número da versão publicada (a que roda) */
   publicada: number | null;
+  /** Pedido de ajuda ao staff em aberto no desenho */
+  ajuda: ProcessosPedidoAjuda | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -1417,6 +1425,11 @@ export interface ProcessosAlternative {
   valor: string | number | boolean | null;
 }
 
+export interface ProcessosAvaliacao {
+  ok: boolean;
+  detalhes: string[];
+}
+
 /** Condição de um caminho que sai de uma decisão: campo, operador e valor (ou parametros.<nome>); com ou, basta uma delas valer (ex.: valor acima do limite ou fornecedor novo). */
 export interface ProcessosCondition {
   /** <passo>.<campo> ou parametros.<nome> */
@@ -1444,7 +1457,9 @@ export interface ProcessosFluxo {
 
 export interface ProcessosMensagemDesenho {
   id: string;
-  papel: "cliente" | "agente";
+  papel: "cliente" | "agente" | "staff";
+  /** Quem escreveu (cliente ou staff) */
+  autor: string | null;
   texto: string;
   passos: string[];
   created_at: string | null;
@@ -1464,6 +1479,21 @@ export interface ProcessosProblema {
   nivel: "erro" | "aviso";
   passo: string | null;
   texto: string;
+}
+
+/** Algo que o staff ensinou ao agente de um passo, ao resolver uma exceção. Entra no agente só depois de avaliada: com ela, o agente refaz o caso que a gerou e chega no que o staff fez. */
+export interface ProcessosRegra {
+  id: string;
+  processo: string;
+  passo: string;
+  passo_nome: string;
+  texto: string;
+  /** A saída que o staff preencheu no caso que a gerou */
+  esperado: Record<string, unknown>;
+  status: "avaliando" | "ativa" | "reprovada" | "desativada";
+  avaliacao: ProcessosAvaliacao | null;
+  autor: string | null;
+  created_at: string | null;
 }
 
 export interface ProcessosStep {
@@ -1492,6 +1522,8 @@ export interface ProcessosStep {
   horas: number | null;
   /** acao e agente: caminho de handoff para o staff */
   excecao: boolean;
+  /** agente: as saídas são lidas de um documento; cada uma precisa do trecho de onde saiu (ou de uma regra do staff), senão o passo vai para o staff */
+  leitura: boolean;
   /** fim: como termina (ex.: pago, recusado) */
   resultado: string | null;
 }
@@ -1536,8 +1568,12 @@ export interface ProcessosDesenho {
   bpmn: string;
   problemas: ProcessosProblema[];
   mensagens: ProcessosMensagemDesenho[];
-  /** A versão traz ação irreversível ou conexão nova */
+  /** Ação irreversível ou conexão que a publicada não tinha: o staff revisa antes */
   exige_revisao: boolean;
+  /** O que o rascunho muda na publicada (ou no fluxo de partida) */
+  mudancas: string[];
+  /** O que o staff ensinou aos passos deste processo */
+  regras: ProcessosRegra[];
 }
 
 export interface ProcessosMensagemDesenhoIn {
@@ -1690,6 +1726,8 @@ export interface ProcessosTarefa {
   campos: ProcessosCampo[];
   documento_id: string | null;
   prazo: string | null;
+  /** Exceção de agente: ao resolver, o staff pode ensinar uma regra */
+  aprende: boolean;
   status: "aberta" | "concluida";
   resposta: Record<string, unknown>;
   concluida_por: string | null;
@@ -1728,6 +1766,8 @@ export interface ProcessosResposta {
   comentario?: string | null;
   /** Exceção: a saída do passo */
   dados?: Record<string, string | number | boolean | null>;
+  /** Exceção de agente: o que o agente deve fazer da próxima vez (vira regra depois de avaliada) */
+  regra?: string | null;
 }
 
 export interface ProcessosAcompanhamentoProcesso {
@@ -1757,6 +1797,34 @@ export interface ProcessosAcompanhamento {
   processos: ProcessosAcompanhamentoProcesso[];
 }
 
+export interface ProcessosRevisaoIn {
+  processo: string;
+  /** O que o staff deve olhar */
+  mensagem?: string | null;
+}
+
+export interface ProcessosDevolucao {
+  processo: string;
+  motivo: string;
+}
+
+export interface ProcessosAjudaIn {
+  processo: string;
+  texto: string;
+}
+
+export interface ProcessosRegras {
+  itens: ProcessosRegra[];
+}
+
+export interface ProcessosRegraQuery {
+  processo?: string | null;
+}
+
+export interface ProcessosRegraRef {
+  id: string;
+}
+
 export interface ProcessosProcessoMudou {
   id: string;
   action: "sugerido" | "aceito" | "recusado" | "descrito";
@@ -1775,6 +1843,11 @@ export interface ProcessosExecucaoMudou {
 export interface ProcessosTarefaMudou {
   id: string;
   action: "criada" | "concluida";
+}
+
+export interface ProcessosRegraMudou {
+  id: string;
+  action: "criada" | "avaliada" | "desativada";
 }
 
 /** svc-processos · /api/v1/processos */
@@ -1842,6 +1915,188 @@ export const processos = {
   /** GET /api/v1/processos/acompanhamento · http · exige token */
   acompanhamento: (options?: RequestOptions) =>
     request<ProcessosAcompanhamento>("GET", "/api/v1/processos/acompanhamento", undefined, options),
+  /** POST /api/v1/processos/desenho/revisao · http · exige token */
+  pedirRevisao: (body: ProcessosRevisaoIn, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/revisao", body, options),
+  /** POST /api/v1/processos/desenho/aprovar · http · exige token */
+  aprovarRevisao: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/aprovar", body, options),
+  /** POST /api/v1/processos/desenho/devolver · http · exige token */
+  devolver: (body: ProcessosDevolucao, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/devolver", body, options),
+  /** POST /api/v1/processos/desenho/ajuda · http · exige token */
+  pedirAjuda: (body: ProcessosAjudaIn, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/ajuda", body, options),
+  /** POST /api/v1/processos/desenho/ajuda/concluir · http · exige token */
+  concluirAjuda: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/ajuda/concluir", body, options),
+  /** GET /api/v1/processos/regras · http · exige token */
+  regras: (query?: ProcessosRegraQuery, options?: RequestOptions) =>
+    request<ProcessosRegras>("GET", withQuery("/api/v1/processos/regras", query), undefined, options),
+  /** POST /api/v1/processos/regras/desativar · http · exige token */
+  desativarRegra: (body: ProcessosRegraRef, options?: RequestOptions) =>
+    request<ProcessosRegra>("POST", "/api/v1/processos/regras/desativar", body, options),
+};
+
+export interface StaffResumo {
+  /** Quem pergunta é da equipe da Cogniventure */
+  staff: boolean;
+  gestor: boolean;
+  excecoes: number;
+  atrasadas: number;
+  escaladas: number;
+  revisoes: number;
+  ajudas: number;
+  organizacoes: number;
+}
+
+export interface StaffOrganizacao {
+  id: string;
+  name: string;
+  created_at: string | null;
+}
+
+export interface StaffOrganizacoes {
+  items: StaffOrganizacao[];
+}
+
+export interface StaffCarteira {
+  id: string;
+  /** Id da pessoa do staff */
+  pessoa: string;
+  organizacao: string;
+  organizacao_nome: string;
+  created_at: string | null;
+}
+
+export interface StaffCarteiras {
+  itens: StaffCarteira[];
+}
+
+export interface StaffNovaCarteira {
+  pessoa: string;
+  organizacao: string;
+}
+
+export interface StaffCarteiraRef {
+  id: string;
+}
+
+export interface StaffSaude {
+  organizacao: string;
+  nome: string;
+  andamento: number | null;
+  concluidas: number | null;
+  incidentes: number | null;
+  autonomia: number | null;
+  /** Exceções abertas na fila */
+  excecoes: number;
+  revisoes: number;
+  ajudas: number;
+  /** Falso quando a organização não respondeu agora */
+  disponivel: boolean;
+}
+
+export interface StaffMinhaCarteira {
+  gestor: boolean;
+  itens: StaffSaude[];
+}
+
+export interface StaffItemFila {
+  id: string;
+  organizacao: string;
+  organizacao_nome: string;
+  tipo: "excecao" | "revisao" | "ajuda";
+  ref: string;
+  titulo: string;
+  detalhe: string | null;
+  prazo: string | null;
+  status: "aberta" | "concluida";
+  /** Onde resolver, na tela da organização (entre nela antes) */
+  link: string;
+  assumida_por: string | null;
+  atribuida_a: string | null;
+  /** Passou do prazo sem ninguém assumir: subiu para o gestor da carteira */
+  escalada: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface StaffFilaPage {
+  items: StaffItemFila[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface StaffFilaQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "prazo" | "-prazo" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  tipo?: "excecao" | "revisao" | "ajuda" | null;
+  status?: "aberta" | "concluida" | null;
+  escalada?: boolean | null;
+  /** Gestor: a fila de todas as carteiras (não é filtro do banco) */
+  todas?: boolean | null;
+  organizacao?: string[] | null;
+}
+
+export interface StaffItemRef {
+  id: string;
+}
+
+export interface StaffAtribuicao {
+  id: string;
+  pessoa: string;
+}
+
+export interface StaffFilaMudou {
+  id: string;
+  action: "chegou" | "mudou" | "escalada";
+}
+
+export interface StaffCarteiraMudou {
+  id: string;
+  action: "atribuida" | "removida";
+}
+
+/** svc-staff · /api/v1/staff */
+export const staff = {
+  /** GET /api/v1/staff/resumo · http · exige token */
+  resumo: (options?: RequestOptions) =>
+    request<StaffResumo>("GET", "/api/v1/staff/resumo", undefined, options),
+  /** GET /api/v1/staff/organizacoes · http · exige token */
+  organizacoes: (options?: RequestOptions) =>
+    request<StaffOrganizacoes>("GET", "/api/v1/staff/organizacoes", undefined, options),
+  /** GET /api/v1/staff/carteiras · http · exige token */
+  carteiras: (options?: RequestOptions) =>
+    request<StaffCarteiras>("GET", "/api/v1/staff/carteiras", undefined, options),
+  /** POST /api/v1/staff/carteiras · http · exige token */
+  atribuirCarteira: (body: StaffNovaCarteira, options?: RequestOptions) =>
+    request<StaffCarteira>("POST", "/api/v1/staff/carteiras", body, options),
+  /** POST /api/v1/staff/carteiras/remover · http · exige token */
+  removerCarteira: (body: StaffCarteiraRef, options?: RequestOptions) =>
+    request<StaffCarteira>("POST", "/api/v1/staff/carteiras/remover", body, options),
+  /** GET /api/v1/staff/carteira · http · exige token */
+  carteira: (options?: RequestOptions) =>
+    request<StaffMinhaCarteira>("GET", "/api/v1/staff/carteira", undefined, options),
+  /** GET /api/v1/staff/fila · http · exige token */
+  fila: (query?: StaffFilaQuery, options?: RequestOptions) =>
+    request<StaffFilaPage>("GET", withQuery("/api/v1/staff/fila", query), undefined, options),
+  /** POST /api/v1/staff/fila/assumir · http · exige token */
+  assumir: (body: StaffItemRef, options?: RequestOptions) =>
+    request<StaffItemFila>("POST", "/api/v1/staff/fila/assumir", body, options),
+  /** POST /api/v1/staff/fila/atribuir · http · exige token */
+  atribuir: (body: StaffAtribuicao, options?: RequestOptions) =>
+    request<StaffItemFila>("POST", "/api/v1/staff/fila/atribuir", body, options),
 };
 
 export interface WebhooksEndpoint {
@@ -2015,6 +2270,12 @@ export interface LiveTopics {
   "processos.execucoes": ProcessosExecucaoMudou;
   /** svc-processos · bus.live("processos.tarefas", ...) */
   "processos.tarefas": ProcessosTarefaMudou;
+  /** svc-processos · bus.live("processos.regras", ...) */
+  "processos.regras": ProcessosRegraMudou;
+  /** svc-staff · bus.live("staff.fila", ...) */
+  "staff.fila": StaffFilaMudou;
+  /** svc-staff · bus.live("staff.carteiras", ...) */
+  "staff.carteiras": StaffCarteiraMudou;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
@@ -2029,6 +2290,7 @@ export const appModules = {
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
   processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados", category: "Sua empresa", core: false },
+  staff: { title: "Staff", description: "Área da equipe da Cogniventure: carteira de clientes, exceções, revisões e pedidos de ajuda", category: "Cogniventure", core: false },
   webhooks: { title: "Webhooks", description: "Eventos para os sistemas da organização", category: "Integrações", core: true },
 } as const;
 

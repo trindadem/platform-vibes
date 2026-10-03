@@ -27,6 +27,8 @@ from schemas import (
     CONTACTS_SUBJECT,
     COOKIE_PATH,
     MODULE,
+    OPERADOR_SUBJECT,
+    ORGANIZACOES_SUBJECT,
     PUBLIC_PATHS,
     REFRESH_COOKIE,
     SERVICE,
@@ -45,6 +47,7 @@ from schemas import (
     KeepRequest,
     LoginInput,
     MemberRef,
+    OperadorAcesso,
     RefreshInput,
     ResetInput,
     Session,
@@ -77,6 +80,8 @@ async def lifespan(app: FastAPI):
         await storage.connected(SERVICE)  # logo da organização (README §5.14)
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=Empty)
         await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
+        await bus.respond(OPERADOR_SUBJECT, svc.operador, model=OperadorAcesso)  # svc-staff: a carteira
+        await bus.respond(ORGANIZACOES_SUBJECT, svc.organizacoes, model=Empty)  # svc-staff: as organizações clientes
         await webhooks.declare(WEBHOOKS)  # membro-entrou e membro-saiu no catálogo (README §5.16)
         await plans.declare(MODULE)  # o módulo, com pessoas por organização, no catálogo dos planos (README §5.17)
         yield

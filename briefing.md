@@ -166,7 +166,8 @@ modelo da biblioteca pedir.
   - ação irreversível (pagar, enviar, assinar) sem aprovação antes, quando a política da organização pede.
 - **O agente sabe do que está falando:** consulta o conhecimento da empresa, o catálogo de ações, integrações e
   agentes, e os modelos da biblioteca. Sugere passos ("seu fornecedor manda NF por e-mail; ligo a caixa de entrada?").
-- **Cada operação fica no histórico do rascunho** (desfazer, até 20; quem mudou o quê entra com o staff no N5).
+- **Cada operação fica no histórico do rascunho** (desfazer, até 20); cada mensagem da conversa guarda quem escreveu
+  (o cliente ou alguém do staff), e as operações seguem a mensagem que as pediu.
 - **O agente não pode dizer que mudou sem mudar:** se a resposta afirma uma mudança e nenhuma operação foi aplicada,
   ou se ficaram erros novos, o serviço pede de novo uma vez com o que faltou; se ainda faltar, a resposta ao cliente
   diz a verdade. Achado do N3 com o modelo real.
@@ -177,8 +178,8 @@ modelo da biblioteca pedir.
 ### 5.5 Versões
 
 - **Rascunho → revisão pelo staff (opcional) → publicada.** A revisão é obrigatória quando a versão traz ação
-  irreversível nova ou integração nova, ou quando o cliente pede. No N3 o serviço já marca a versão que exigiria
-  revisão; o passo de revisão entra com o staff, no N5.
+  irreversível nova ou integração nova (em relação à publicada), ou quando o cliente pede. No N5: a empresa pede a
+  revisão (a conversa trava), e o staff aprova, o que publica, ou devolve com o motivo, que aparece na conversa.
 - **Publicar implanta no Camunda** e grava o número da versão do Camunda na nossa versão.
 - **Ajustar no setup cria um rascunho novo** a partir da publicada. As execuções em andamento terminam na versão em
   que começaram (comportamento nativo do Camunda); as novas usam a última publicada.
@@ -207,13 +208,19 @@ modelo da biblioteca pedir.
   por que parou).
 - **Ação irreversível que a política manda perguntar** também vira tarefa humana (de aprovação do cliente ou do
   staff), não uma decisão do agente.
-- **Handoff tem prazo.** Não assumido dentro do prazo, sobe para o responsável pela carteira. No N4 a exceção nasce
-  com prazo de 4 horas e aparece atrasada; o escalonamento entra com a carteira, no N5.
+- **Handoff tem prazo.** Não assumido dentro do prazo, sobe para o responsável pela carteira. A exceção nasce com
+  prazo de 4 horas; no N5, a que passa do prazo sem ninguém assumir sobe para os gestores da carteira, que a passam
+  para alguém do staff.
 - **No N4, o passo de agente roda no `svc-processos`** (`agentes.executar`) com ferramentas fixas: ler o documento do
   gatilho, consultar o conhecimento, concluir com as saídas ou pedir ajuda. Os agentes da organização (seção 7) entram
   no N6. Achado do N4: com a foto de um boleto (sem texto, sem OCR) o agente pede ajuda em vez de inventar valores.
 - **Aprender com o handoff.** Ao resolver, o staff registra o que fez e por quê, e pode marcar "virar regra". A regra
-  ou o exemplo entra na especialização do agente daquele passo, depois de passar na avaliação dele (seção 7).
+  ou o exemplo entra na especialização do agente daquele passo, depois de passar na avaliação dele (seção 7). No N5
+  a avaliação é refazer o caso que gerou a regra: com ela, o agente precisa chegar ao que o staff preencheu; só então
+  a regra fica ativa e entra no contexto do agente do passo. A suíte de avaliação completa vem com os agentes, no N6.
+- **Achado do N5:** com o boleto sem vencimento, o modelo inventava a data (o dia 1º ou 15 do mês de referência) mesmo
+  instruído a não chutar. O passo de leitura passou a exigir o trecho do documento de cada saída, conferido pelo
+  serviço; sem trecho, vai para o staff, que vê o que o agente já leu e completa só o que faltou.
 - **Autonomia por processo** = execuções sem handoff ÷ execuções concluídas, por versão. Aparece no workspace do
   cliente e na carteira do staff; é como sabemos se uma versão nova melhorou o processo.
 
@@ -293,13 +300,15 @@ No console Electron (seção 11) o AgentExo encaixa como está: local, um usuár
 
 - **O staff pertence à organização Cogniventure.** A carteira é a lista de organizações clientes de cada pessoa do
   staff, mantida pelo `svc-staff`.
-- **Entrar na carteira dá o papel `operador` na organização do cliente**; sair tira. No N4 o papel já existe e entra
-  por convite (o operador resolve as exceções na tela de tarefas); a carteira, que dá e tira o papel sozinha, é do N5. O staff age dentro do cliente
+- **Entrar na carteira dá o papel `operador` na organização do cliente**; sair tira (sem outro papel, a pessoa deixa a
+  organização). Quem monta as carteiras é o gestor; só quem é da Cogniventure entra numa. O staff age dentro do cliente
   com o nome dele (o cliente vê quem fez o quê) e sem nenhum poder entre organizações além do papel. Reusa o
   isolamento que já existe (README §5.7 e §5.9).
 - **A área do staff junta a carteira:** fila de handoffs de todos os clientes dela, ordenada pelo prazo; revisões de
-  versão pendentes; pedidos de ajuda do setup; saúde de cada cliente (autonomia, atrasos, consumo do plano).
-- **Ajuda no setup:** o staff entra na conversa de desenho do cliente, propõe operações e revisa o rascunho.
+  versão pendentes; pedidos de ajuda do setup; saúde de cada cliente (execuções, incidentes, autonomia; o consumo do
+  plano fica para depois). Abrir um item entra na organização do cliente, na tela onde resolver.
+- **Ajuda no setup:** o cliente pede ajuda na tela de desenho; o staff entra na mesma conversa (as mensagens dele
+  aparecem como do staff, com o nome), ajusta o rascunho com o agente junto com o cliente e publica.
 - **Gestor da carteira** recebe o que passou do prazo e redistribui.
 
 ## 9. O plano do BPO

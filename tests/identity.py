@@ -316,6 +316,24 @@ def test_nova_organizacao_e_troca_de_sessao(events):
     _error(old, "ERRO_IDENTITY_SESSION_ROTATED", 401)  # trocado há menos de 30 s: não vale, mas não derruba
 
 
+def test_troca_de_organizacao_vence_o_refresh_que_chegou_atrasado(events):
+    """Corrida no navegador: um refresh sai com o cookie antigo, gira antes da troca e a resposta dele chega depois.
+    O cookie fica com a sessão girada por ele, mas a renovação seguinte já vem na organização escolhida."""
+    async def scenario(svc):
+        ana = await signup(svc)
+        with as_user(ana):
+            nova = await svc.create_tenant(TenantRequest(name="Nova", refresh_token=ana.refresh_token))
+        with as_user(nova):
+            atrasado = await svc.refresh(RefreshInput(refresh_token=nova.refresh_token))  # girou primeiro, ainda na Nova
+            trocada = await svc.switch_tenant(SwitchRequest(tenant=ana.auth.tenant.id, refresh_token=nova.refresh_token))
+        depois = await svc.refresh(RefreshInput(refresh_token=atrasado.refresh_token))  # o cookie que ficou no navegador
+        return atrasado, trocada, depois
+
+    atrasado, trocada, depois = run(scenario)
+    assert (atrasado.auth.tenant.name, trocada.auth.tenant.name) == ("Nova", "Acme")
+    assert depois.auth.tenant.name == "Acme"
+
+
 def test_remocao_de_membros(events):
     async def scenario(svc):
         ana = await signup(svc)
@@ -578,3 +596,44 @@ def test_limite_de_pessoas_do_plano_vale_ao_convidar_e_ao_aceitar(events):
     assert [(nome, total) for nome, total, org in PLANO["contagens"] if org == acme] == [
         ("identity.membros", 1), ("identity.membros", 2), ("identity.membros", 1)]  # a tela Plano mostra "x de 2"
 
+
+
+# ── Staff (svc-staff): a carteira dá e tira o papel operador; lista as organizações ──
+
+def test_carteira_do_staff_da_e_tira_o_papel_operador_so_pelo_svc_staff(events):
+    from core.security import Principal
+
+    from schemas import OperadorAcesso
+
+    async def scenario(svc):
+        ana = await signup(svc)  # dona da Acme
+        otto = await signup(svc, email="otto@cogniventure.com", organization="Cogniventure", name="Otto")
+        acme, user = ana.auth.tenant.id, otto.auth.user.id
+        staff = Principal(sub="system:svc-staff", tenant=otto.auth.tenant.id, roles=frozenset({"system"}))
+        with acting_as(Principal(sub=ana.auth.user.id, tenant=acme, roles=frozenset({"owner"}))):
+            with pytest.raises(ServiceError) as cliente:
+                await svc.operador(OperadorAcesso(user=user, tenant=acme, ativo=True))  # só o svc-staff
+        with acting_as(staff):
+            with pytest.raises(ServiceError) as de_fora:
+                await svc.operador(OperadorAcesso(user=ana.auth.user.id, tenant=otto.auth.tenant.id, ativo=True))
+            entrou = await svc.operador(OperadorAcesso(user=user, tenant=acme, ativo=True))
+            de_novo = await svc.operador(OperadorAcesso(user=user, tenant=acme, ativo=True))
+            orgs = await svc.organizacoes(Empty())
+        with as_user(ana):
+            membros = await svc.list_members(Empty())
+        with acting_as(staff):
+            saiu = await svc.operador(OperadorAcesso(user=user, tenant=acme, ativo=False))
+        with as_user(ana):
+            depois = await svc.list_members(Empty())
+        return cliente.value, de_fora.value, entrou, de_novo, orgs, membros, saiu, depois, user, acme
+
+    cliente, de_fora, entrou, de_novo, orgs, membros, saiu, depois, user, acme = run(scenario)
+    assert (cliente.code, cliente.status) == ("ERRO_IDENTITY_FORBIDDEN", 403)
+    assert de_fora.status == 404  # quem não é da Cogniventure não vira operador
+    assert entrou.roles == ["operador"] and de_novo.roles == ["operador"]  # entrar de novo não duplica
+    assert {o.name for o in orgs.items} == {"Acme", "Cogniventure"}
+    assert any(m.id == user and m.roles == ["operador"] for m in membros.items)
+    assert saiu.roles == [] and not any(m.id == user for m in depois.items)  # sem outro papel, deixa a organização
+    vivos = [(s, getattr(m, "change", None), w.tenant) for s, m, w in events if s.startswith("live:identity")]
+    assert ("live:identity.membros", "joined", acme) in vivos and ("live:identity.membros", "removed", acme) in vivos
+    assert ("live:identity.acesso:" + user, "removed", acme) in vivos  # a pessoa perde o acesso na hora

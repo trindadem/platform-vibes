@@ -11,6 +11,8 @@ export interface ChatMessage {
   /** assistant: quem responde (o agente); user: a pessoa. */
   role: "assistant" | "user";
   text: string;
+  /** Quem escreveu, quando há mais de uma pessoa na conversa (ex.: "Staff da Cogniventure · Otto"), acima do balão. */
+  author?: string;
   /** O que o agente fez para responder (ex.: "Anotando no perfil"), mostrado abaixo da mensagem. */
   steps?: string[];
 }
@@ -48,7 +50,11 @@ const MARK = { running: "…", done: "✓", failed: "✗" };
  * @category Receitas
  * @example
  * <ChatThread
- *   messages={[{ id: "1", role: "assistant", text: "Olá! O que a sua empresa faz?" }, { id: "2", role: "user", text: "Somos uma padaria." }]}
+ *   messages={[
+ *     { id: "1", role: "assistant", text: "Olá! O que a sua empresa faz?" },
+ *     { id: "2", role: "user", text: "Somos uma padaria." },
+ *     { id: "3", role: "user", author: "Staff da Cogniventure · Otto", text: "Ajustei o limite para 3 mil." },
+ *   ]}
  *   onSend={(texto) => setNome(texto)}
  *   sending={false}
  *   progress={[{ label: "Anotando no perfil", status: "done" }]}
@@ -78,7 +84,11 @@ export function ChatThread({ messages, onSend, sending = false, progress = [], e
       <div role="log" aria-live="polite" className="flex max-h-[60vh] min-h-72 flex-col gap-3 overflow-y-auto p-4">
         {messages.map((m) => (
           <div key={m.id} className={`flex flex-col gap-1 ${m.role === "user" ? "items-end" : "items-start"}`}>
-            <span className="sr-only">{m.role === "user" ? "Você" : assistant}:</span>
+            {m.author ? (
+              <span className="px-1 text-xs text-muted-foreground">{m.author}</span>
+            ) : (
+              <span className="sr-only">{m.role === "user" ? "Você" : assistant}:</span>
+            )}
             <div
               className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed ${
                 m.role === "user" ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"

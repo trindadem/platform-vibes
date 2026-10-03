@@ -269,6 +269,10 @@ def test_conversa_de_desenho_muda_o_rascunho_por_operacoes_e_desfaz(provedor):
     assert {"de": "avisar_fornecedor", "para": "divergente", "condicao": None} in fluxo["ligacoes"]  # entrou no meio
     assert [m["papel"] for m in final["mensagens"]] == ["cliente", "agente"] and final["mensagens"][1]["passos"]
     assert not any(p["passo"] == "avisar_fornecedor" and p["nivel"] == "erro" for p in final["problemas"])
+    novo = next(p["nome"] for p in fluxo["passos"] if p["id"] == "avisar_fornecedor")
+    assert final["mudancas"][:2] == ["Parâmetro limite aprovacao: 5000 → 2000", f"Passo novo: {novo}"]  # contra o fluxo de partida
+    assert f"Caminho novo: Conferir com o pedido → {novo}" in final["mudancas"]
+    assert f"Caminho removido: Conferir com o pedido → Confere com o pedido?" in final["mudancas"]
     contexto = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
     assert "financeiro.agendar_pagamento" in contexto and "precisa_aprovacao → aprovar se ler_documento.valor >" in contexto
     assert desfeito["versao"]["alteracoes"] == 1 and "avisar_fornecedor" not in json.dumps(desfeito["versao"]["fluxo"])
@@ -345,7 +349,12 @@ def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva(
         ana = app.user(*OWNER)
         pid = await _aceito(app)
         await ana.post("/desenho/abrir", json={"processo": pid})
-        primeira = (await ana.post("/desenho/publicar", json={"processo": pid})).json()["data"]
+        # O v1 traz ação irreversível (agendar no banco): a empresa pede a revisão e o staff publica.
+        direto = await ana.post("/desenho/publicar", json={"processo": pid})
+        em_revisao = (await ana.post("/desenho/revisao", json={"processo": pid, "mensagem": "Olhem o agendamento"})).json()["data"]
+        conversa_travada = await ana.post("/desenho/mensagem", json={"processo": pid, "texto": "oi"})
+        dono_aprova = await ana.post("/desenho/aprovar", json={"processo": pid})
+        primeira = (await app.user("otto", "acme", "operador").post("/desenho/aprovar", json={"processo": pid})).json()["data"]
         sem_rascunho = await ana.post("/desenho/publicar", json={"processo": pid})
         ajustado = (await ana.post("/desenho/ajustar", json={"processo": pid})).json()["data"]
         igual = await ana.post("/desenho/publicar", json={"processo": pid})
@@ -356,9 +365,18 @@ def test_publicar_implanta_no_motor_ajustar_abre_rascunho_e_a_publicada_arquiva(
         descartado = (await ana.post("/desenho/descartar", json={"processo": pid})).json()["data"]
         processo = (await ana.get("/processos")).json()["data"]["items"][0]
         membro = await app.user("mel", "acme", "member").post("/desenho/ajustar", json={"processo": pid})
-        return pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro, app.motor.deployed
+        revisoes = [(m.tipo, m.status) for s, m in app.published if s == "events.processos.staff"]
+        return (pid, direto, em_revisao, conversa_travada, dono_aprova, primeira, sem_rascunho, ajustado, igual, segunda, descartado,
+                processo, membro, app.motor.deployed, revisoes)
 
-    pid, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo, membro, motor = service_app(cenario)
+    (pid, direto, em_revisao, conversa_travada, dono_aprova, primeira, sem_rascunho, ajustado, igual, segunda, descartado, processo,
+     membro, motor, revisoes) = service_app(cenario)
+    assert direto.json()["error"]["code"] == "ERRO_PROCESSOS_REVISAO"
+    assert em_revisao["versao"]["status"] == "revisao" and em_revisao["exige_revisao"] is True
+    assert _sse(conversa_travada.text)[-1][1]["error"]["code"] == "ERRO_PROCESSOS_EM_REVISAO"
+    assert dono_aprova.status_code == 403  # quem revisa é o staff
+    assert revisoes == [("revisao", "aberta"), ("revisao", "concluida")]
+    assert [m["papel"] for m in primeira["mensagens"]] == ["cliente", "staff"]
     assert igual.status_code == 409 and igual.json()["error"]["code"] == "ERRO_PROCESSOS_SEM_MUDANCA"
     assert (primeira["versao"]["status"], primeira["versao"]["motor"]["versao"]) == ("publicada", 1)
     assert motor[0][0] == f"p_acme_{pid}" and 'name="Contas a pagar"' in motor[0][1]
@@ -386,6 +404,35 @@ def test_fluxo_com_erro_nao_publica_e_os_problemas_dizem_o_que_falta():
                      "banco.inexistente não está no catálogo", "Solto não é alcançado", "Solto precisa de um responsável"):
         assert any(esperado in t for t in textos), (esperado, textos)
 
+    # Condição que o motor não consegue avaliar (achado na stack: "agendar.pagamento_id é verdadeiro" virou incidente).
+    from core.processes import Condition
+
+    from schemas import FLUXOS
+
+    catalogo = {a.name: a for a in ACOES.actions}
+    partida = FLUXOS["contas-a-pagar"]
+    assert not [p for p in _problemas(partida, catalogo) if p.nivel == "erro"]
+    tipos_errados = partida.model_copy(deep=True)
+    condicionais = [f for f in tipos_errados.ligacoes if f.condicao is not None]
+    condicionais[0].condicao = Condition(campo="agendar.pagamento_id", operador="verdadeiro")
+    condicionais[1].condicao = Condition(campo="ler_documento.fornecedor", operador=">", valor=3,
+                                         ou=[{"campo": "parametros.limite_aprovacao", "operador": "falso"}])
+    textos = [p.texto for p in _problemas(tipos_errados, catalogo) if p.nivel == "erro"]
+    assert any("agendar.pagamento_id é verdadeiro, mas ele é texto" in t for t in textos), textos
+    assert any("ler_documento.fornecedor com >, mas ele é texto" in t for t in textos), textos
+    assert any("parametros.limite_aprovacao é falso, mas ele é numero" in t for t in textos), textos
+    condicionais[0].condicao = Condition(campo="ler_documento.valor", operador="=", valor="3000")
+    condicionais[1].condicao = Condition(campo="ler_documento.fornecedor", operador="!=", valor="parametros.limite_aprovacao")
+    textos = [p.texto for p in _problemas(tipos_errados, catalogo) if p.nivel == "erro"]
+    assert any("compara ler_documento.valor (numero) com '3000' (texto)" in t for t in textos), textos
+    assert any("compara ler_documento.fornecedor (texto) com 'parametros.limite_aprovacao' (numero)" in t for t in textos), textos
+    # Dois caminhos da mesma decisão com a mesma condição (achado na stack): o motor seguiria só o primeiro.
+    repetido = partida.model_copy(deep=True)
+    aprovado = next(f for f in repetido.ligacoes if f.de == "aprovado" and f.condicao is not None)
+    repetido.ligacoes.append(Flow(de="aprovado", para="agendar", condicao=aprovado.condicao))
+    textos = [p.texto for p in _problemas(repetido, catalogo) if p.nivel == "erro"]
+    assert any("dois caminhos com a mesma condição (aprovar.aprovado verdadeiro)" in t for t in textos), textos
+
     async def cenario(app):
         ana = app.user(*OWNER)
         pid = await _aceito(app, modelo=None)  # processo sem fluxo desenhado: parte de um agente que faz tudo
@@ -411,13 +458,14 @@ from schemas import DOCUMENTO_SUBJECT, EVENT_SUBJECT, STEP_SUBJECT, EventoExtern
 SISTEMA = Principal(sub="system:svc-integracoes", tenant="acme", roles=frozenset({"system"}))
 GATILHO = {"documento_id": "doc1", "origem": "email", "nome": "boleto-outubro.pdf", "assunto": "Boleto"}
 LIDO = {"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 7200.0, "vencimento": "2026-10-15"}
+FONTES = {"fornecedor": "Moinho Sul", "cnpj": "CNPJ 12.345.678/0001-90", "valor": "R$ 7.200,00", "vencimento": "venc. 15/10/2026"}
 
 
 async def _publicado(app) -> str:
     ana = app.user(*OWNER)
     pid = await _aceito(app)
     await ana.post("/desenho/abrir", json={"processo": pid})
-    await ana.post("/desenho/publicar", json={"processo": pid})
+    await app.user("otto", "acme", "operador").post("/desenho/publicar", json={"processo": pid})  # o staff publica o v1
     return pid
 
 
@@ -477,6 +525,8 @@ def test_tarefas_do_cliente_e_do_staff_linha_do_tempo_e_autonomia():
         cliente = (await app.user(*OWNER).get("/tarefas", params={"responsavel": "cliente", "status": "aberta"})).json()["data"]["items"]
         operador_aprova = await app.user("otto", "acme", "operador").post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": True})
         sem_decidir = await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"]})
+        regra_na_aprovacao = await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": True,
+                                                                                    "regra": "Aprovar sempre a Leite Bom."})
         aprovada = (await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": True, "comentario": "ok"})).json()["data"]
         de_novo = await app.user(*OWNER).post("/tarefas/responder", json={"id": cliente[0]["id"], "aprovado": False})
         await app.job(JOB_WAIT, element="aguardar", kind="EXECUTION_LISTENER", listener="START", **comum)
@@ -487,10 +537,11 @@ def test_tarefas_do_cliente_e_do_staff_linha_do_tempo_e_autonomia():
         detalhe = (await app.user(*OWNER).get("/execucoes/item", params={"id": execucao["id"]})).json()["data"]
         resumo = (await app.user(*OWNER).get("/acompanhamento")).json()["data"]
         return (staff, dono_na_excecao, texto_no_numero, resolvida, resumo_antes, cliente, operador_aprova, sem_decidir, aprovada,
-                de_novo, execucao, detalhe, resumo, app.motor.completed)
+                de_novo, execucao, detalhe, resumo, app.motor.completed, regra_na_aprovacao)
 
     (staff, dono_na_excecao, texto_no_numero, resolvida, resumo_antes, cliente, operador_aprova, sem_decidir, aprovada,
-     de_novo, execucao, detalhe, resumo, concluidas) = service_app(cenario)
+     de_novo, execucao, detalhe, resumo, concluidas, regra_na_aprovacao) = service_app(cenario)
+    assert regra_na_aprovacao.json()["error"]["code"] == "ERRO_PROCESSOS_REGRA"  # só exceção de agente ensina
     assert (staff["tipo"], staff["responsavel"], staff["motivo"]) == ("excecao", "staff", "Documento ilegível")
     assert [c["nome"] for c in staff["campos"]] == ["fornecedor", "cnpj", "valor", "vencimento", "linha_digitavel"]
     assert {"rotulo": "Documento", "valor": "boleto-outubro.pdf"} in staff["contexto"] and staff["documento_id"] == "doc1"
@@ -514,7 +565,7 @@ def test_tarefas_do_cliente_e_do_staff_linha_do_tempo_e_autonomia():
 
 
 def test_passo_de_agente_le_o_documento_conclui_ou_pede_ajuda(provedor):
-    roteiro = {"pede_ajuda": False}
+    roteiro = {"pede_ajuda": False, "saida": {**LIDO, "linha_digitavel": None, "fontes": FONTES}}
 
     def responder(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -525,7 +576,7 @@ def test_passo_de_agente_le_o_documento_conclui_ou_pede_ajuda(provedor):
         if len(ultimas) == 1:
             if roteiro["pede_ajuda"]:
                 return _resposta(body["model"], _chamadas(("pedir_ajuda", {"motivo": "Boleto sem valor legível"})), "tool_calls")
-            return _resposta(body["model"], _chamadas(("concluir", {**LIDO, "linha_digitavel": None})), "tool_calls")
+            return _resposta(body["model"], _chamadas(("concluir", roteiro["saida"])), "tool_calls")
         return _resposta(body["model"], {"role": "assistant", "content": "Feito."}, "stop")
 
     llm._transport = httpx.MockTransport(responder)
@@ -533,17 +584,137 @@ def test_passo_de_agente_le_o_documento_conclui_ou_pede_ajuda(provedor):
     async def cenario(app):
         _servicos(app)
         pid = await _publicado(app)
+        agente = {"processo": pid, "element": "ler_documento", "variables": {"gatilho": GATILHO}, "headers": {"excecao": "sim"}}
         app.respond(DOCUMENTO_SUBJECT, lambda ref: {"id": ref.id, "nome": "boleto.pdf", "tipo": "application/pdf",
                                                     "texto": "Moinho Sul CNPJ 12.345.678/0001-90 R$ 7.200,00 venc. 15/10/2026"})
-        lido = await app.job(JOB_AGENT, processo=pid, element="ler_documento", variables={"gatilho": GATILHO}, headers={"excecao": "sim"})
+        lido = await app.job(JOB_AGENT, **agente)
+        # Não chuta: a data citada não é a que o documento traz, ou o trecho citado não está no documento.
+        roteiro["saida"] = {**LIDO, "vencimento": "2026-10-20", "fontes": FONTES}
+        outra_data = await app.job(JOB_AGENT, **agente)
+        roteiro["saida"] = {**LIDO, "fontes": {**FONTES, "vencimento": "Vencimento: 15/10/2026"}}
+        inventado = await app.job(JOB_AGENT, **agente)
+        roteiro["saida"] = {**LIDO, "fontes": {**FONTES, "vencimento": "regra"}}
+        regra_que_nao_existe = await app.job(JOB_AGENT, **agente)
         roteiro["pede_ajuda"] = True
-        ajuda = await app.job(JOB_AGENT, processo=pid, element="ler_documento", variables={"gatilho": GATILHO}, headers={"excecao": "sim"})
-        return lido, ajuda, [m for s, m in app.published if s == STEP_SUBJECT]
+        ajuda = await app.job(JOB_AGENT, **agente)
+        return lido, outra_data, inventado, regra_que_nao_existe, ajuda, [m for s, m in app.published if s == STEP_SUBJECT]
 
-    lido, ajuda, passos = service_app(cenario)
-    assert lido.status == "concluido" and lido.variables["resultado"]["valor"] == 7200.0
+    lido, outra_data, inventado, regra_que_nao_existe, ajuda, passos = service_app(cenario)
+    assert lido.status == "concluido" and lido.variables["resultado"]["valor"] == 7200.0 and "fontes" not in lido.variables["resultado"]
+    for chute in (outra_data, inventado, regra_que_nao_existe):
+        assert (chute.status, chute.message) == ("handoff", "O agente não mostrou no documento de onde tirou: vencimento.")
     assert (ajuda.status, ajuda.message) == ("handoff", "Boleto sem valor legível")
-    assert [(p.passo, p.status) for p in passos] == [("ler_documento", "concluido"), ("ler_documento", "handoff")]
+    assert [(p.passo, p.status) for p in passos] == [("ler_documento", "concluido")] + [("ler_documento", "handoff")] * 4
     ferramentas = {t["function"]["name"] for t in provedor["pedidos"][0]["tools"]}
     assert ferramentas == {"ler_documento", "buscar_conhecimento", "concluir", "pedir_ajuda"}
-    assert "valor" in json.dumps(next(t for t in provedor["pedidos"][0]["tools"] if t["function"]["name"] == "concluir"))
+    concluir = json.dumps(next(t for t in provedor["pedidos"][0]["tools"] if t["function"]["name"] == "concluir"))
+    assert "valor" in concluir and "fontes" in concluir
+
+
+# ── Staff (N5): ajuda no setup, conversa do staff, regras aprendidas com o handoff ──
+
+from schemas import ACOMPANHAMENTO_SUBJECT, STAFF_SUBJECT, Empty, RegraRef  # noqa: E402
+
+OPERADOR = ("otto", "acme", "operador")
+
+
+def test_empresa_pede_ajuda_e_o_staff_ajusta_na_conversa_e_publica(provedor):
+    provedor["chamadas"] = [("definir_parametro", {"nome": "limite_aprovacao", "valor": 3000})]
+
+    async def cenario(app):
+        _servicos(app)
+        ana, otto = app.user(*OWNER), app.user(*OPERADOR)
+        pid = await _aceito(app)
+        await ana.post("/desenho/abrir", json={"processo": pid})
+        membro = await app.user("mel", "acme", "member").post("/desenho/ajuda", json={"processo": pid, "texto": "socorro"})
+        pedido = (await ana.post("/desenho/ajuda", json={"processo": pid, "texto": "Acima de 3 mil eu quero aprovar"})).json()["data"]
+        conversa = await otto.post("/desenho/mensagem", json={"processo": pid, "texto": "Ajustando o limite pedido pela Ana para 3 mil."})
+        publicado = (await otto.post("/desenho/publicar", json={"processo": pid})).json()["data"]
+        itens = [(m.tipo, m.status, m.link) for s, m in app.published if s == STAFF_SUBJECT]
+        with acting_as(ACME):
+            saude = await app.handlers[ACOMPANHAMENTO_SUBJECT](Empty())  # a carteira do staff (svc-staff) pergunta
+        return membro, pedido, _sse(conversa.text)[-1][1]["data"], publicado, itens, saude, pid
+
+    membro, pedido, depois, publicado, itens, saude, pid = service_app(cenario)
+    assert saude.andamento == 0 and saude.processos == []
+    assert membro.status_code == 403
+    assert pedido["processo"]["ajuda"]["texto"] == "Acima de 3 mil eu quero aprovar"
+    assert pedido["mensagens"][-1]["papel"] == "cliente" and pedido["mensagens"][-1]["texto"].startswith("Pedi ajuda ao staff")
+    staff = next(m for m in depois["mensagens"] if m["papel"] == "staff")
+    assert staff["autor"] == "otto" and depois["versao"]["fluxo"]["parametros"]["limite_aprovacao"] == 3000
+    enviado = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
+    assert "Mensagem do staff da Cogniventure:\\nAjustando" in enviado and "Cliente: Pedi ajuda ao staff" in enviado
+    assert publicado["versao"]["status"] == "publicada" and publicado["processo"]["ajuda"] is None
+    assert itens == [("ajuda", "aberta", f"/processos/{pid}"), ("ajuda", "concluida", f"/processos/{pid}")]
+
+
+def test_excecao_de_agente_vira_regra_avaliada_que_entra_no_agente(provedor):
+    roteiro = {"vencimento": "2026-11-15"}
+    caso = {"gatilho": GATILHO}
+    leite = {"fornecedor": "Leite Bom", "cnpj": "45.678.901/0001-23", "valor": 7200.0}
+    fontes = {"fornecedor": "Leite Bom", "cnpj": "CNPJ 45.678.901/0001-23", "valor": "R$ 7.200,00", "vencimento": "regra"}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        provedor["pedidos"].append(body)
+        ferramentas = [m for m in body["messages"] if m["role"] == "tool"]
+        if not ferramentas:
+            return _resposta(body["model"], _chamadas(("ler_documento", {"documento_id": "doc1"})), "tool_calls")
+        if len(ferramentas) == 1:
+            return _resposta(body["model"], _chamadas(("concluir", {**leite, "vencimento": roteiro["vencimento"], "fontes": fontes})), "tool_calls")
+        return _resposta(body["model"], {"role": "assistant", "content": "Feito."}, "stop")
+
+    llm._transport = httpx.MockTransport(responder)
+
+    async def cenario(app):
+        import service
+
+        _servicos(app)
+        app.respond(DOCUMENTO_SUBJECT, lambda ref: {"id": ref.id, "nome": "boleto.pdf", "tipo": "application/pdf",
+                                                    "texto": "Leite Bom CNPJ 45.678.901/0001-23 R$ 7.200,00 referência outubro/2026"})
+        pid = await _publicado(app)
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-1")
+        comum = {"processo": pid, "instance": str(app.motor._seq)}
+        # Sem regra, o vencimento que o boleto não traz não se conclui: vai para o staff, com o que o agente leu.
+        sem_regra = await app.job(JOB_AGENT, element="ler_documento", variables=caso, headers={"excecao": "sim"}, **comum)
+        await app.job(JOB_TASK, element="ler_documento__excecao", kind="TASK_LISTENER", listener="CREATING", variables=caso,
+                      user_task={"userTaskKey": "81"}, **comum)
+        otto = app.user(*OPERADOR)
+        tarefa = (await otto.get("/tarefas", params={"responsavel": "staff"})).json()["data"]["items"][0]
+        regra_curta = await otto.post("/tarefas/responder", json={"id": tarefa["id"], "dados": {**leite, "vencimento": "2026-11-15"}, "regra": "curta"})
+        await otto.post("/tarefas/responder", json={"id": tarefa["id"], "dados": {**leite, "vencimento": "2026-11-15"},
+                                                    "regra": "A Leite Bom não põe vencimento: é o dia 15 do mês seguinte ao da referência."})
+        regras = (await otto.get("/regras", params={"processo": pid})).json()["data"]["itens"]
+        with acting_as(ACME):
+            aprovada = await service.ProcessosService().avaliar_regra(RegraRef(id=regras[0]["id"]))
+        contexto_avaliacao = json.dumps(provedor["pedidos"][-3]["messages"], ensure_ascii=False)
+        # Outra regra, que leva o agente a outra resposta: reprovada, não entra.
+        await app.job(JOB_TASK, element="ler_documento__excecao", kind="TASK_LISTENER", listener="CREATING", variables=caso,
+                      user_task={"userTaskKey": "82"}, **comum)
+        segunda = (await otto.get("/tarefas", params={"responsavel": "staff", "status": "aberta"})).json()["data"]["items"][0]
+        await otto.post("/tarefas/responder", json={"id": segunda["id"], "dados": {**leite, "vencimento": "2026-12-01"},
+                                                    "regra": "A Leite Bom vence sempre no primeiro dia do mês seguinte."})
+        regras = (await otto.get("/regras", params={"processo": pid})).json()["data"]["itens"]
+        with acting_as(ACME):
+            reprovada = await service.ProcessosService().avaliar_regra(RegraRef(id=regras[1]["id"]))
+        # A execução seguinte: o agente do passo recebe a regra ativa (e não a reprovada).
+        provedor["pedidos"].clear()
+        lido = await app.job(JOB_AGENT, processo=pid, element="ler_documento", variables=caso, headers={"excecao": "sim"})
+        contexto_execucao = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
+        desligada = (await otto.post("/regras/desativar", json={"id": aprovada.id})).json()["data"]
+        desenho = (await app.user(*OWNER).post("/desenho/abrir", json={"processo": pid})).json()["data"]
+        return (sem_regra, tarefa, regra_curta, aprovada, reprovada, contexto_avaliacao, lido, contexto_execucao, desligada, desenho,
+                app.workflows, [(m.tipo, m.status) for s, m in app.published if s == STAFF_SUBJECT])
+
+    (sem_regra, tarefa, regra_curta, aprovada, reprovada, contexto_avaliacao, lido, contexto_execucao, desligada, desenho,
+     workflows, itens) = service_app(cenario)
+    assert (sem_regra.status, sem_regra.message) == ("handoff", "O agente não mostrou no documento de onde tirou: vencimento.")
+    assert {c["nome"]: c["valor"] for c in tarefa["campos"]} == {**leite, "vencimento": None, "linha_digitavel": None}  # só falta o que ele não achou
+    assert tarefa["aprende"] is True and regra_curta.status_code == 422  # exceção de agente ensina; regra sem conteúdo não entra
+    assert [w[0] for w in workflows] == ["AvaliarRegraWorkflow.run"] * 2  # a avaliação roda em segundo plano, durável
+    assert aprovada.status == "ativa" and aprovada.avaliacao.ok and aprovada.esperado["vencimento"] == "2026-11-15"
+    assert "dia 15 do mês seguinte" in contexto_avaliacao  # a avaliação refaz o caso com a regra
+    assert reprovada.status == "reprovada" and "vencimento" in reprovada.avaliacao.detalhes[0]
+    assert lido.status == "concluido" and "dia 15 do mês seguinte" in contexto_execucao and "primeiro dia" not in contexto_execucao
+    assert desligada["status"] == "desativada" and [r["status"] for r in desenho["regras"]] == ["desativada", "reprovada"]
+    assert itens.count(("excecao", "aberta")) == 2 and itens.count(("excecao", "concluida")) == 2

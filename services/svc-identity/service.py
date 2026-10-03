@@ -48,6 +48,7 @@ from schemas import (
     MEMBER_JOINED_SUBJECT,
     MEMBERS_LIVE,
     MEMBERSHIPS,
+    STAFF_SERVICE,
     RESETS,
     RESET_MINUTES,
     REUSE_GRACE_SECONDS,
@@ -81,6 +82,10 @@ from schemas import (
     MemberList,
     MemberRef,
     MembersChanged,
+    OperadorAcesso,
+    OperadorResultado,
+    OrganizacaoResumo,
+    Organizacoes,
     Organization,
     RefreshInput,
     ResetInput,
@@ -201,7 +206,10 @@ class IdentityService:
         )
         if not claimed:
             raise _rotated()  # outra aba girou o mesmo refresh no mesmo instante
-        tenant = _key(session["tenant"]) if session.get("tenant") else None
+        # A sessão segue a última organização escolhida (troca em qualquer aba vale para todas): um refresh que
+        # chegou atrasado, girado antes de uma troca, não leva a pessoa de volta para a organização anterior.
+        user = await db.select(f"{USERS}:{_key(session['user'])}")
+        tenant = (user or {}).get("last_tenant") or (_key(session["tenant"]) if session.get("tenant") else None)
         return await self._issue(_key(session["user"]), tenant, family=session["family"])
 
     async def logout(self, data: RefreshInput) -> Empty:
@@ -397,6 +405,45 @@ class IdentityService:
             tenant_name=organization["name"] if organization else "",
             items=[Contact(id=_key(row["id"]), name=row["name"], email=row["email"]) for row in rows],
         )
+
+    async def operador(self, data: OperadorAcesso) -> OperadorResultado:
+        """rpc.identity.operador (só o svc-staff): entrar na carteira dá o papel operador na organização do cliente;
+        sair tira (sem outro papel, a pessoa deixa a organização e perde as sessões nela)."""
+        staff = _from_staff()
+        if await db.select(f"{TENANTS}:{data.tenant}") is None or await db.select(f"{USERS}:{data.user}") is None:
+            raise ServiceError("ERRO_IDENTITY_NOT_FOUND", "Pessoa ou organização não encontrada.", 404)
+        if data.ativo and not await self._membership(data.user, staff.tenant):  # só quem é da Cogniventure vira operador
+            raise ServiceError("ERRO_IDENTITY_NOT_FOUND", "A pessoa não é da equipe da Cogniventure.", 404)
+        membership = await self._membership(data.user, data.tenant)
+        roles = list(membership["roles"]) if membership else []
+        if data.ativo and "operador" not in roles:
+            roles.append("operador")
+            if membership:
+                await db.query_shared("UPDATE $m SET roles = $roles", m=membership["id"], roles=roles)
+            else:
+                await db.query_shared("CREATE identity_memberships CONTENT { user: $u, tenant: $t, roles: $roles }",
+                                      u=RecordID(USERS, data.user), t=RecordID(TENANTS, data.tenant), roles=roles)
+            with acting_as(system(SERVICE, data.tenant)):
+                await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="joined"))
+        elif not data.ativo and "operador" in roles:
+            roles.remove("operador")
+            if roles:
+                await db.query_shared("UPDATE $m SET roles = $roles", m=membership["id"], roles=roles)
+            else:
+                await db.delete(membership["id"])
+                await db.query_shared("UPDATE identity_sessions SET revoked = true WHERE user = $u AND tenant = $t",
+                                      u=RecordID(USERS, data.user), t=RecordID(TENANTS, data.tenant))
+            with acting_as(system(SERVICE, data.tenant)):
+                await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
+                if not roles:
+                    await bus.live(ACCESS_LIVE, AccessChanged(tenant=data.tenant, change="removed"), user=data.user)
+        return OperadorResultado(user=data.user, tenant=data.tenant, roles=roles)
+
+    async def organizacoes(self, data: Empty) -> Organizacoes:
+        """rpc.identity.organizacoes (só o svc-staff): as organizações da plataforma, para montar a carteira."""
+        _from_staff()
+        rows = await db.query_shared("SELECT id, name, created_at FROM identity_tenants ORDER BY name")
+        return Organizacoes(items=[OrganizacaoResumo(id=_key(r["id"]), name=r["name"], created_at=r.get("created_at")) for r in rows])
 
     # ── Organização: nome, logo e cor da marca ──────────────────────────────
 
@@ -657,3 +704,12 @@ def _not_member() -> ServiceError:
 
 def _forbidden() -> ServiceError:
     return ServiceError("ERRO_IDENTITY_FORBIDDEN", "Só donos e administradores podem fazer isso.", 403)
+
+
+def _from_staff() -> Principal:
+    """As RPCs do staff atravessam organizações: só o svc-staff as chama (o Principal do NATS vem da plataforma), agindo
+    na organização da Cogniventure."""
+    who = current()
+    if who is None or who.sub != f"{SYSTEM_PREFIX}{STAFF_SERVICE}" or not who.tenant:
+        raise ServiceError("ERRO_IDENTITY_FORBIDDEN", "Só o serviço do staff faz isso.", 403)
+    return who

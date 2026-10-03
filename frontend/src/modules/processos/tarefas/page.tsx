@@ -94,12 +94,14 @@ function TarefaAberta({ tarefa, onDone }: { tarefa: ProcessosTarefa; onDone: () 
   const session = useSession();
   const pode = tarefa.responsavel === "cliente" ? hasAnyRole(session, "owner", "admin") : hasAnyRole(session, "operador");
   const [comentario, setComentario] = useState("");
+  const [regra, setRegra] = useState("");
   const responder = useAction(processos.responder, { onSuccess: onDone });
   const documento = useAction(integracoes.arquivo, { onSuccess: (link) => window.open(link.url, "_blank", "noopener") });
   const atrasada = tarefa.prazo ? new Date(tarefa.prazo).getTime() < Date.now() : false;
   // A resolução da exceção é a saída do passo que parou: os campos vêm do backend, com o que o agente chegou a ver.
   const resolver = {
-    run: (valores: Record<string, unknown>) => responder.run({ id: tarefa.id, dados: valores as Record<string, string | number | boolean | null>, comentario: comentario || null }),
+    run: (valores: Record<string, unknown>) =>
+      responder.run({ id: tarefa.id, dados: valores as Record<string, string | number | boolean | null>, comentario: comentario || null, regra: regra.trim() || null }),
     running: responder.running,
     error: responder.error,
   };
@@ -152,6 +154,16 @@ function TarefaAberta({ tarefa, onDone }: { tarefa: ProcessosTarefa; onDone: () 
         ) : (
           <Stack>
             <TextArea label="O que você fez (opcional)" value={comentario} onChange={setComentario} rows={2} />
+            {tarefa.aprende && (
+              <TextArea
+                label="Ensinar ao agente (opcional)"
+                value={regra}
+                onChange={setRegra}
+                rows={2}
+                placeholder="Ex.: a Leite Bom não põe vencimento no boleto: é o dia 15 do mês seguinte ao da referência."
+                hint="Vira regra do passo: o agente refaz este caso com ela e, se chegar ao que você preencheu, passa a segui-la nas próximas execuções."
+              />
+            )}
             <ActionForm
               action={resolver}
               submitLabel="Resolver e seguir o processo"

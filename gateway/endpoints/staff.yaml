@@ -1,0 +1,83 @@
+# svc-staff · rotas públicas no Gateway. Fonte da verdade: specs/staff.md §2
+service: staff
+base_path: /api/v1/staff
+
+live:
+  - topic: fila                     # chegou, mudou ou subiu (prazo) um item da fila do staff
+    model: FilaMudou
+  - topic: carteiras                # o gestor atribuiu ou tirou um cliente de uma carteira
+    model: CarteiraMudou
+
+endpoints:
+  - path: /resumo
+    method: GET
+    auth: client_jwt
+    response: Resumo
+    target_type: http
+    target_url: http://svc-staff:8000/resumo
+
+  - path: /organizacoes
+    method: GET
+    auth: client_jwt
+    response: Organizacoes
+    target_type: http
+    target_url: http://svc-staff:8000/organizacoes
+
+  - path: /carteiras
+    method: GET
+    auth: client_jwt
+    response: Carteiras
+    target_type: http
+    target_url: http://svc-staff:8000/carteiras
+
+  - path: /carteiras
+    name: atribuirCarteira
+    method: POST
+    auth: client_jwt
+    request: NovaCarteira
+    response: Carteira
+    target_type: http
+    target_url: http://svc-staff:8000/carteiras
+
+  - path: /carteiras/remover
+    name: removerCarteira
+    method: POST
+    auth: client_jwt
+    request: CarteiraRef
+    response: Carteira
+    target_type: http
+    target_url: http://svc-staff:8000/carteiras/remover
+
+  - path: /carteira
+    method: GET
+    auth: client_jwt
+    response: MinhaCarteira
+    target_type: http
+    target_url: http://svc-staff:8000/carteira
+    timeout: 30
+
+  - path: /fila
+    method: GET
+    auth: client_jwt
+    query: FilaQuery
+    response: FilaPage
+    target_type: http
+    target_url: http://svc-staff:8000/fila
+
+  - path: /fila/assumir
+    name: assumir
+    method: POST
+    auth: client_jwt
+    request: ItemRef
+    response: ItemFila
+    target_type: http
+    target_url: http://svc-staff:8000/fila/assumir
+
+  - path: /fila/atribuir
+    name: atribuir
+    method: POST
+    auth: client_jwt
+    request: Atribuicao
+    response: ItemFila
+    target_type: http
+    target_url: http://svc-staff:8000/fila/atribuir

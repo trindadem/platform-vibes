@@ -30,10 +30,19 @@ Com token:
 RPC `rpc.identity.contacts` (`ContactsRequest { users, roles }`) → `Contacts { tenant_name, items: Contact[] }`, com
 `Contact { id, name, email }`: só quem é membro da organização de quem pergunta (o `svc-notify`, README §5.15).
 
+RPCs do staff (só o `svc-staff`, agindo na organização da Cogniventure; specs/staff.md):
+- `rpc.identity.operador` (`OperadorAcesso { user, tenant, ativo }`) → `OperadorResultado { user, tenant, roles }`:
+  entrar na carteira dá o papel `operador` na organização do cliente (só a quem é membro da Cogniventure); sair tira, e
+  sem outro papel a pessoa deixa a organização e perde as sessões nela. Ao vivo `identity.membros` na organização.
+- `rpc.identity.organizacoes` (`Empty`) → `Organizacoes { items: [{ id, name, created_at }] }`.
+
 `AuthResult = { access_token, expires_in, user: User, tenant: Tenant | null, tenants: Tenant[] }`, com
 `User { id, name, email }` e `Tenant { id, name, roles }`. O token de acesso é EdDSA de 15 min: `sub` = usuário,
-`tenant` = organização ativa, `roles` = papéis nela (`owner | admin | member`). O refresh nunca vai no corpo: vai no
-cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em produção, 30 dias).
+`tenant` = organização ativa, `roles` = papéis nela (`owner | admin | member | operador`; `operador` é o staff da
+Cogniventure no cliente e vem só da carteira, nunca de convite). O refresh nunca vai no corpo: vai no
+cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em produção, 30 dias). A renovação
+devolve a sessão na última organização escolhida, se a pessoa ainda for membro (trocar numa aba vale para todas, e um
+refresh que chegou atrasado, girado antes da troca, não leva de volta para a organização anterior).
 
 ## 3. Fluxo de Execução
 1. SurrealDB, tabelas globais (`shared`): `identity_users` (email único, `password_hash` Argon2id, `failed_logins`,
@@ -58,7 +67,9 @@ cookie `cv_refresh` (HttpOnly, SameSite=Strict, Path=/api/v1/identity, Secure em
 - `ERRO_IDENTITY_SESSION_ROTATED` (401): o mesmo refresh foi trocado há menos de 30 s (corrida entre abas); o cookie
   do navegador já é o novo, então o cliente tenta de novo uma vez.
 - `ERRO_IDENTITY_NOT_MEMBER` (403) · `ERRO_IDENTITY_FORBIDDEN` (403: só owner/admin convidam e removem; admin não
-  remove owner) · `ERRO_IDENTITY_INVITE_INVALID` (404) · `ERRO_IDENTITY_MEMBER_NOT_FOUND` (404).
+  remove owner; as RPCs do staff, de quem não é o `svc-staff`) · `ERRO_IDENTITY_INVITE_INVALID` (404) ·
+  `ERRO_IDENTITY_MEMBER_NOT_FOUND` (404) · `ERRO_IDENTITY_NOT_FOUND` (404: pessoa ou organização inexistente, ou pessoa
+  que não é da Cogniventure, no `rpc.identity.operador`).
 - Limites: nome e organização 2–80 caracteres, e-mail até 254 (guardado em minúsculas), senha 8–1024.
 - Membro removido perde na hora as sessões daquela organização; o token de acesso já emitido vale até expirar (≤ 15 min).
 - `ERRO_IDENTITY_RESET_INVALID` (404): link de senha inexistente, vencido ou já usado.

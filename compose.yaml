@@ -330,3 +330,11 @@ services:
       INTEGRACOES_DOMINIO: ${INTEGRACOES_DOMINIO:-entrada.localhost}  # endereços das caixas de entrada
       # Local: o Mailpit avisa (webhook) e entrega o e-mail recebido; em produção, um provedor de entrada (spec §3).
       INTEGRACOES_MAILPIT_URL: http://mailpit:8025
+
+  svc-staff:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: staff } }
+    profiles: [modules, staff]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}  # a organização da Cogniventure: quem é dela é staff (specs/staff.md)

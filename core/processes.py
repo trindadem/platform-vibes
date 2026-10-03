@@ -131,6 +131,8 @@ class Step(BaseModel):
     chave: str | None = Field(None, pattern=r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$", description="espera: campo que identifica a execução")
     horas: float | None = Field(None, gt=0, le=24 * 365, description="espera tempo: quanto; tarefa e espera de mensagem: prazo")
     excecao: bool = Field(False, description="acao e agente: caminho de handoff para o staff")
+    leitura: bool = Field(False, description="agente: as saídas são lidas de um documento; cada uma precisa do trecho de onde "
+                                             "saiu (ou de uma regra do staff), senão o passo vai para o staff")
     resultado: str | None = Field(None, max_length=40, description="fim: como termina (ex.: pago, recusado)")
 
 
@@ -232,9 +234,10 @@ class Handoff(Exception):
     """O passo não pode seguir sozinho (documento ilegível, dado faltando, módulo fora do plano): vai para a tarefa de
     exceção do staff com o motivo. Sem caminho de exceção no passo, vira incidente no motor."""
 
-    def __init__(self, motivo: str) -> None:
+    def __init__(self, motivo: str, parcial: Mapping[str, Any] | None = None) -> None:
         super().__init__(motivo)
         self.motivo = motivo[:500]
+        self.parcial = dict(parcial or {})  # o que o passo chegou a ver: o staff começa daí, não do zero
 
 
 class StepEvent(BaseModel):

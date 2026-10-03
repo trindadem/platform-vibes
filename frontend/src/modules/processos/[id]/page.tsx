@@ -6,7 +6,7 @@ import { Badge } from "@/components/Badge";
 import { BpmnDiagram } from "@/components/BpmnDiagram";
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
-import { type ChatProgress, ChatThread } from "@/components/ChatThread";
+import { type ChatMessage, type ChatProgress, ChatThread } from "@/components/ChatThread";
 import { Columns } from "@/components/Columns";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { Page } from "@/components/Page";
@@ -15,15 +15,18 @@ import { Row } from "@/components/Row";
 import { Stack } from "@/components/Stack";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Text } from "@/components/Text";
+import { TextArea } from "@/components/TextArea";
 import { TextLink } from "@/components/TextLink";
-import { useAction, useLiveQuery, useStream } from "@/core/api";
+import { useAction, useLiveQuery, useQuery, useStream } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
-import { type ProcessosDesenho, type ProcessosPassoAgente, type ProcessosSimulacao, processos } from "@/core/contracts";
+import { identity, type ProcessosDesenho, type ProcessosPassoAgente, type ProcessosSimulacao, processos } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Desenho do processo" };
 
 const STATUS = { rascunho: "Rascunho", revisao: "Em revisão", publicada: "Publicada", arquivada: "Arquivada" };
 const TONS = { rascunho: "warning", revisao: "warning", publicada: "success", arquivada: "neutral" } as const;
+const REGRA = { avaliando: "Em avaliação", ativa: "Ativa", reprovada: "Reprovada", desativada: "Desativada" };
+const TONS_REGRA = { avaliando: "warning", ativa: "success", reprovada: "danger", desativada: "neutral" } as const;
 
 /** Passos do agente em andamento: um por ferramenta, com o status mais recente. */
 function andamento(deltas: ProcessosPassoAgente[]): ChatProgress[] {
@@ -44,26 +47,46 @@ export default function DesenhoDoProcesso() {
 
 function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; reload: () => void }) {
   const session = useSession();
-  const pode = hasAnyRole(session, "owner", "admin");
+  const empresa = hasAnyRole(session, "owner", "admin");
+  const operador = hasAnyRole(session, "operador"); // o staff da Cogniventure, na organização do cliente
+  const pode = empresa || operador;
   const id = consultado.processo.id;
+  const membros = useQuery(identity.members);
+  const regras = useLiveQuery("processos.regras", processos.regras, { processo: id });
   const resposta = useStream(processos.mensagemDesenho);
   const [pendente, setPendente] = useState<string | null>(null);
   const [simulacao, setSimulacao] = useState<ProcessosSimulacao | null>(null);
+  const [nota, setNota] = useState("");
+  const [motivo, setMotivo] = useState("");
+  const [ajuda, setAjuda] = useState("");
+  const limpar = () => { setNota(""); setMotivo(""); setAjuda(""); reload(); };
   const simular = useAction(processos.simular, { onSuccess: setSimulacao });
   const desfazer = useAction(processos.desfazer, { onSuccess: reload });
   const publicar = useAction(processos.publicar, { onSuccess: () => { setSimulacao(null); reload(); } });
   const ajustar = useAction(processos.ajustar, { onSuccess: reload });
   const descartar = useAction(processos.descartar, { onSuccess: reload });
+  const pedirRevisao = useAction(processos.pedirRevisao, { onSuccess: limpar });
+  const aprovar = useAction(processos.aprovarRevisao, { onSuccess: () => { setSimulacao(null); limpar(); } });
+  const devolver = useAction(processos.devolver, { onSuccess: limpar });
+  const pedirAjuda = useAction(processos.pedirAjuda, { onSuccess: limpar });
+  const concluirAjuda = useAction(processos.concluirAjuda, { onSuccess: reload });
+  const desativar = useAction(processos.desativarRegra, { onSuccess: regras.reload });
 
   const final = resposta.result;
   const desenho = final && final.mensagens.length > consultado.mensagens.length ? final : consultado;
   const { versao, problemas } = desenho;
   const rascunho = versao.status === "rascunho";
+  const emRevisao = versao.status === "revisao";
+  const revisar = rascunho && desenho.exige_revisao && !operador; // a empresa pede; o staff publica direto
   const erros = problemas.filter((p) => p.nivel === "erro");
   const avisos = problemas.filter((p) => p.nivel === "aviso");
   const publicada = desenho.versoes.find((v) => v.status === "publicada");
-  const falha = [simular, desfazer, publicar, ajustar, descartar].map((a) => a.error).find(Boolean);
+  const pedido = desenho.processo.ajuda;
+  const falha = [simular, desfazer, publicar, ajustar, descartar, pedirRevisao, aprovar, devolver, pedirAjuda, concluirAjuda, desativar]
+    .map((a) => a.error)
+    .find(Boolean);
 
+  const nome = (pessoa: string | null | undefined) => membros.data?.items.find((m) => m.id === pessoa)?.name;
   const enviar = async (texto: string) => {
     setPendente(texto);
     setSimulacao(null);
@@ -71,8 +94,20 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
     setPendente(null);
     reload();
   };
-  const mensagens = desenho.mensagens.map((m) => ({ id: m.id, role: m.papel === "cliente" ? ("user" as const) : ("assistant" as const), text: m.texto, steps: m.passos }));
-  if (pendente && !desenho.mensagens.some((m) => m.papel === "cliente" && m.texto === pendente)) mensagens.push({ id: "pendente", role: "user", text: pendente, steps: [] });
+  // Na conversa entram o cliente, o staff da Cogniventure (quando ajuda no setup) e o agente.
+  const mensagens: ChatMessage[] = desenho.mensagens.map((m) => ({
+    id: m.id,
+    role: m.papel === "agente" ? "assistant" : "user",
+    author:
+      m.papel === "staff"
+        ? `Staff da Cogniventure${nome(m.autor) ? ` · ${nome(m.autor)}` : ""}`
+        : m.papel === "cliente" && m.autor && m.autor !== session?.user.id
+          ? (nome(m.autor) ?? "Cliente")
+          : undefined,
+    text: m.texto,
+    steps: m.passos,
+  }));
+  if (pendente && !desenho.mensagens.some((m) => m.papel !== "agente" && m.texto === pendente)) mensagens.push({ id: "pendente", role: "user", text: pendente, steps: [] });
   if (!mensagens.length) {
     mensagens.push({
       id: "abertura",
@@ -104,10 +139,20 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
                 Descartar
               </ConfirmButton>
             )}
-            {rascunho ? (
+            {revisar ? (
+              <Button loading={pedirRevisao.running} disabled={erros.length > 0} onClick={() => void pedirRevisao.run({ processo: id, mensagem: nota.trim() || null })}>
+                Pedir revisão
+              </Button>
+            ) : rascunho ? (
               <Button loading={publicar.running} disabled={erros.length > 0} onClick={() => void publicar.run({ processo: id })}>
                 Publicar
               </Button>
+            ) : emRevisao ? (
+              operador && (
+                <Button loading={aprovar.running} onClick={() => void aprovar.run({ processo: id })}>
+                  Aprovar e publicar
+                </Button>
+              )
             ) : (
               <Button loading={ajustar.running} onClick={() => void ajustar.run({ processo: id })}>
                 Ajustar
@@ -131,12 +176,72 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
             progress={andamento(resposta.deltas)}
             error={resposta.error?.message}
             assistant="Agente de desenho"
-            placeholder={rascunho ? "Ex.: acima de 3 mil, eu aprovo antes do pagamento" : "Clique em Ajustar para mudar o fluxo"}
+            placeholder={
+              rascunho ? "Ex.: acima de 3 mil, eu aprovo antes do pagamento" : emRevisao ? "Em revisão: a conversa volta quando o staff aprovar ou devolver" : "Clique em Ajustar para mudar o fluxo"
+            }
             disabled={!pode || !rascunho}
           />
         }
       >
         <Stack>
+          {emRevisao &&
+            (operador ? (
+              <Card title="Revisão pedida" description="Confira o que muda (abaixo), as ações irreversíveis e as conexões novas no diagrama, e simule antes de aprovar.">
+                <TextArea label="Por que devolver (se for o caso)" value={motivo} onChange={setMotivo} rows={2} />
+                <Row>
+                  <Button variant="secondary" loading={devolver.running} disabled={motivo.trim().length < 3} onClick={() => void devolver.run({ processo: id, motivo: motivo.trim() })}>
+                    Devolver para ajuste
+                  </Button>
+                </Row>
+              </Card>
+            ) : (
+              <Alert title="Em revisão pelo staff da Cogniventure">
+                A versão {versao.numero} espera a revisão. Quando o staff aprovar, ela é publicada; se devolver, a conversa volta com o motivo.
+              </Alert>
+            ))}
+          {revisar && (
+            <Card title="Esta versão passa pela revisão do staff" description="Ela tem ação irreversível (como pagar) ou conexão com sistemas que a versão publicada não tinha.">
+              <TextArea label="O que o staff deve olhar (opcional)" value={nota} onChange={setNota} rows={2} />
+            </Card>
+          )}
+          {pedido ? (
+            <Alert tone="warning" title="Pedido de ajuda aberto">
+              <Stack gap="sm">
+                <Text size="sm">{pedido.texto}</Text>
+                {operador ? (
+                  <Row>
+                    <Button size="sm" variant="secondary" loading={concluirAjuda.running} onClick={() => void concluirAjuda.run({ processo: id })}>
+                      Concluir a ajuda
+                    </Button>
+                  </Row>
+                ) : (
+                  <Text size="sm" tone="muted">O staff da Cogniventure entra nesta conversa para ajustar o fluxo com você.</Text>
+                )}
+              </Stack>
+            </Alert>
+          ) : (
+            empresa &&
+            !operador &&
+            !emRevisao && (
+              <Card title="Precisa de ajuda?" description="Alguém do staff da Cogniventure entra nesta conversa e ajusta o fluxo com você.">
+                <TextArea label="O que você quer ajustar" value={ajuda} onChange={setAjuda} rows={2} />
+                <Row>
+                  <Button variant="secondary" loading={pedirAjuda.running} disabled={ajuda.trim().length < 3} onClick={() => void pedirAjuda.run({ processo: id, texto: ajuda.trim() })}>
+                    Pedir ajuda ao staff
+                  </Button>
+                </Row>
+              </Card>
+            )
+          )}
+          {(rascunho || emRevisao) && desenho.mudancas.length > 0 && (
+            <Card title={publicada ? "O que muda em relação à versão publicada" : "O que muda no fluxo de partida"}>
+              {desenho.mudancas.map((m) => (
+                <Text key={m} size="sm">
+                  {m}
+                </Text>
+              ))}
+            </Card>
+          )}
           <BpmnDiagram
             xml={desenho.bpmn}
             highlight={simulacao?.caminho ?? []}
@@ -168,9 +273,6 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
               {avisos.map((p) => p.texto).join(" ")}
             </Alert>
           )}
-          {desenho.exige_revisao && rascunho && (
-            <Alert>Esta versão tem ação irreversível ou conexão com sistemas: a revisão pelo staff da Cogniventure entra com a área do staff.</Alert>
-          )}
           <Card title="Versões">
             {desenho.versoes.map((v) => (
               <Row key={v.numero} justify="between" wrap={false}>
@@ -191,6 +293,32 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
               </Row>
             )}
           </Card>
+          {(regras.data?.itens.length ?? 0) > 0 && (
+            <Card title="O que o staff ensinou" description="Regras que nasceram de exceções resolvidas: entram no agente do passo depois de passar na avaliação.">
+              {regras.data?.itens.map((r) => (
+                <Stack key={r.id} gap="sm">
+                  <Row justify="between" wrap={false}>
+                    <Text size="sm">
+                      {r.passo_nome}: {r.texto}
+                    </Text>
+                    <Row gap="sm" wrap={false}>
+                      <StatusBadge value={r.status} labels={REGRA} tones={TONS_REGRA} />
+                      {operador && r.status === "ativa" && (
+                        <ConfirmButton size="sm" confirmLabel="Desativar a regra" loading={desativar.running} onConfirm={() => void desativar.run({ id: r.id })}>
+                          Desativar
+                        </ConfirmButton>
+                      )}
+                    </Row>
+                  </Row>
+                  {r.avaliacao && !r.avaliacao.ok && (
+                    <Text size="sm" tone="muted">
+                      {r.avaliacao.detalhes.join(" ")}
+                    </Text>
+                  )}
+                </Stack>
+              ))}
+            </Card>
+          )}
         </Stack>
       </Columns>
     </Page>

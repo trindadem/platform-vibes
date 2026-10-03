@@ -23,6 +23,9 @@ LIVE_EXECUCOES = "processos.execucoes"
 LIVE_TAREFAS = "processos.tarefas"
 CATALOG_SUBJECT = "events.processos.catalogo"  # core/processes.py: os pacotes declaram as ações no boot
 STEP_SUBJECT = "events.processos.passo"  # core/processes.py: o que o worker de um pacote fez num passo
+STAFF_SUBJECT = "events.processos.staff"  # o que espera o staff (exceção, revisão, ajuda): a fila da carteira (svc-staff)
+ACOMPANHAMENTO_SUBJECT = "rpc.processos.acompanhamento"  # svc-staff: a saúde de cada organização da carteira
+LIVE_REGRAS = "processos.regras"
 EVENT_SUBJECT = "events.integracoes.evento"  # do svc-integracoes: documento recebido, pagamento confirmado
 DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # do svc-integracoes: o texto de um documento recebido
 
@@ -32,13 +35,15 @@ MENSAGENS = "processos_mensagens"
 ACOES = "processos_acoes"  # catálogo de ações dos pacotes (o mesmo para toda organização)
 EXECUCOES = "processos_execucoes"
 TAREFAS = "processos_tarefas"
-TABLES = [PROCESSOS, VERSOES, MENSAGENS, EXECUCOES, TAREFAS]
+REGRAS = "processos_regras"
+TABLES = [PROCESSOS, VERSOES, MENSAGENS, EXECUCOES, TAREFAS, REGRAS]
 SHARED = [ACOES]
 UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"], EXECUCOES: ["instancia"], TAREFAS: ["chave"]}
 SEARCH = {PROCESSOS: ["titulo", "descricao"]}
 WRITERS = frozenset({"owner", "admin"})
 OPERADORES = frozenset({"operador"})  # o staff da Cogniventure na organização: resolve as exceções (briefing.md §8)
 STARTERS = WRITERS | OPERADORES  # quem inicia uma execução à mão
+DESIGNERS = WRITERS | OPERADORES  # quem desenha: a empresa e o staff no setup (briefing.md §8)
 UNDO = 20  # quantas alterações do rascunho dá para desfazer
 HISTORY = 20  # mensagens da conversa de desenho no contexto do agente
 
@@ -171,6 +176,7 @@ class Processo(BaseModel):
     status: Status
     prioridade: Prioridade = "media"
     publicada: int | None = Field(None, description="Número da versão publicada (a que roda)")
+    ajuda: "PedidoAjuda | None" = Field(None, description="Pedido de ajuda ao staff em aberto no desenho")
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -290,9 +296,16 @@ class Problema(BaseModel):
     texto: str
 
 
+class PedidoAjuda(BaseModel):
+    texto: str
+    por: str | None = None
+    em: datetime | None = None
+
+
 class MensagemDesenho(BaseModel):
     id: str
-    papel: Literal["cliente", "agente"]
+    papel: Literal["cliente", "agente", "staff"]
+    autor: str | None = Field(None, description="Quem escreveu (cliente ou staff)")
     texto: str
     passos: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
@@ -307,7 +320,9 @@ class Desenho(BaseModel):
     bpmn: str = Field(..., description="O BPMN da versão aberta, com o diagrama (o mesmo que vai ao motor)")
     problemas: list[Problema]
     mensagens: list[MensagemDesenho]
-    exige_revisao: bool = Field(False, description="A versão traz ação irreversível ou conexão nova")
+    exige_revisao: bool = Field(False, description="Ação irreversível ou conexão que a publicada não tinha: o staff revisa antes")
+    mudancas: list[str] = Field(default_factory=list, description="O que o rascunho muda na publicada (ou no fluxo de partida)")
+    regras: list["Regra"] = Field(default_factory=list, description="O que o staff ensinou aos passos deste processo")
 
 
 class DesenhoRef(_Input):
@@ -373,6 +388,7 @@ class AlteracaoPasso(_Input):
     chave: str | None = None
     horas: float | None = None
     excecao: bool | None = None
+    leitura: bool | None = None
     resultado: str | None = None
 
 
@@ -421,6 +437,7 @@ Condições usam a saída de um passo anterior (<passo>.<campo>) ou um parâmetr
 Como trabalhar:
 - Entenda o que o cliente quer mudar e faça as operações necessárias, poucas e certas. Valores que são regras do cliente (limites, prazos) viram parâmetros: mudar um limite que já existe é só definir_parametro.
 - Faça só o que o cliente pediu. Não acrescente passos, aprovações ou caminhos que ele não pediu; se achar que falta algo, sugira na resposta e espere ele confirmar.
+- O staff da Cogniventure também escreve na conversa quando ajuda no setup: trate o pedido dele como o do cliente.
 - Depois de mudar, confira os problemas que as ferramentas devolvem e corrija os erros antes de responder.
 - Depois de mudar uma regra de caminho, chame simular com um cenário que a teste (ex.: valores {"ler_documento.valor": 4200}) e confira que o caminho passa por onde o cliente quer; se não passar, corrija.
 - Ação irreversível (pagar, enviar, assinar) deve ter aprovação antes quando o cliente pedir controle.
@@ -480,7 +497,7 @@ FLUXOS: dict[str, Fluxo] = {
         gatilho=Trigger(tipo="evento", evento="documento.recebido", descricao="Boleto ou NF chega"),
         parametros={"limite_aprovacao": 5000},
         passos=[
-            P(id="ler_documento", tipo="agente", nome="Ler o documento", excecao=True,
+            P(id="ler_documento", tipo="agente", nome="Ler o documento", excecao=True, leitura=True,
               objetivo="Extrair do boleto ou da nota o fornecedor, o CNPJ, o valor, o vencimento e a linha digitável",
               saidas=["fornecedor", "cnpj", "valor", "vencimento", "linha_digitavel"],
               exemplo={"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 1250.0, "vencimento": "2026-10-15"}),
@@ -664,6 +681,7 @@ class Tarefa(BaseModel):
     campos: list[Campo] = Field(default_factory=list)
     documento_id: str | None = None
     prazo: datetime | None = None
+    aprende: bool = Field(False, description="Exceção de agente: ao resolver, o staff pode ensinar uma regra")
     status: Literal["aberta", "concluida"]
     resposta: dict[str, Any] = Field(default_factory=dict)
     concluida_por: str | None = None
@@ -693,6 +711,8 @@ class Resposta(_Input):
     aprovado: bool | None = Field(None, description="Aprovação: sim ou não")
     comentario: str | None = Field(None, max_length=500)
     dados: dict[str, str | float | bool | None] = Field(default_factory=dict, description="Exceção: a saída do passo")
+    regra: str | None = Field(None, min_length=10, max_length=600,
+                              description="Exceção de agente: o que o agente deve fazer da próxima vez (vira regra depois de avaliada)")
 
 
 class TarefaMudou(BaseModel):
@@ -741,5 +761,83 @@ EXECUCAO_INSTRUCOES = """Você executa um passo de um processo de BPO da Cognive
 Como trabalhar:
 - Leia o que o passo precisa (o documento do gatilho com ler_documento, o conhecimento da empresa com buscar_conhecimento quando ajudar).
 - Quando tiver certeza, chame concluir com as saídas. Valores em reais são números (1250.5), datas no formato AAAA-MM-DD.
-- Se não der para decidir com segurança (documento ilegível ou sem texto, dado que falta, valor duvidoso, pedido fora da política), não chute: chame pedir_ajuda com o motivo em uma frase. Uma pessoa do staff resolve o passo.
+- Cada saída tem de estar escrita no documento ou nos dados da execução, ou sair de uma regra que o staff ensinou para este passo. Não deduza nem estime o que não está lá: um vencimento que o boleto não traz não é o mês de referência, nem a data de emissão, nem um dia "provável".
+- Se não der para decidir com segurança (documento ilegível ou sem texto, dado que falta, valor duvidoso, pedido fora da política), não chute: chame pedir_ajuda com o motivo em uma frase (diga o que faltou). Uma pessoa do staff resolve o passo.
 - Chame concluir ou pedir_ajuda uma única vez e termine."""
+
+
+# ── Staff: revisão de versões, ajuda no setup e regras aprendidas (N5, briefing.md §5.5, §5.7 e §8) ──
+
+class ItemStaff(BaseModel):
+    """events.processos.staff: o que espera o staff nesta organização (a fila da carteira no svc-staff)."""
+
+    tipo: Literal["excecao", "revisao", "ajuda"]
+    ref: str = Field(..., description="Tarefa (exceção) ou processo (revisão, ajuda)")
+    titulo: str
+    detalhe: str | None = None
+    prazo: datetime | None = None
+    status: Literal["aberta", "concluida"]
+    link: str = Field(..., description="Onde resolver, na tela da organização")
+    em: datetime
+
+
+class RevisaoIn(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    mensagem: str | None = Field(None, max_length=1000, description="O que o staff deve olhar")
+
+
+class Devolucao(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    motivo: str = Field(..., min_length=3, max_length=1000)
+
+
+class AjudaIn(_Input):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    texto: str = Field(..., min_length=3, max_length=2000)
+
+
+class Avaliacao(BaseModel):
+    ok: bool
+    detalhes: list[str] = Field(default_factory=list)
+
+
+class Regra(BaseModel):
+    """Algo que o staff ensinou ao agente de um passo, ao resolver uma exceção. Entra no agente só depois de avaliada:
+    com ela, o agente refaz o caso que a gerou e chega no que o staff fez."""
+
+    id: str
+    processo: str
+    passo: str
+    passo_nome: str
+    texto: str
+    esperado: dict[str, Any] = Field(default_factory=dict, description="A saída que o staff preencheu no caso que a gerou")
+    status: Literal["avaliando", "ativa", "reprovada", "desativada"]
+    avaliacao: Avaliacao | None = None
+    autor: str | None = None
+    created_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
+
+
+class RegraRef(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class RegraQuery(_Input):
+    processo: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class Regras(BaseModel):
+    itens: list[Regra]
+
+
+class RegraMudou(BaseModel):
+    id: str
+    action: Literal["criada", "avaliada", "desativada"]
+
+
+Processo.model_rebuild()
+Desenho.model_rebuild()

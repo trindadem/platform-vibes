@@ -18,6 +18,9 @@ TRIGGER_SUBJECT = "events.identity.trigger"
 TENANT_CREATED_SUBJECT = "events.identity.tenant-created"
 MEMBER_JOINED_SUBJECT = "events.identity.member-joined"
 MEMBERS_LIVE = "identity.membros"  # ao vivo para a organização: alguém entrou ou saiu
+OPERADOR_SUBJECT = "rpc.identity.operador"  # svc-staff: a carteira dá ou tira o papel operador numa organização
+ORGANIZACOES_SUBJECT = "rpc.identity.organizacoes"  # svc-staff: as organizações clientes, para montar a carteira
+STAFF_SERVICE = "svc-staff"  # o único que chama as RPCs do staff (o NATS só aceita publicação da plataforma)
 ACCESS_LIVE = "identity.acesso"  # ao vivo só para a pessoa: perdeu o acesso a uma organização
 
 # Tabelas globais (README §5.9): só este serviço declara shared=[...].
@@ -96,7 +99,7 @@ class TenantInput(_Input):
 
 
 class InviteInput(_Input):
-    role: Literal["admin", "member", "operador"] = Field("member", description="Papel de quem aceitar o convite (operador: o staff da Cogniventure)")
+    role: Literal["admin", "member"] = Field("member", description="Papel de quem aceitar o convite (o operador vem só da carteira do staff)")
     email: Email | None = Field(None, description="Se informado, o convite também vai por e-mail para este endereço")
 
 
@@ -197,6 +200,30 @@ class Member(BaseModel):
     email: str
     roles: list[Role]
     joined_at: datetime
+
+
+class OperadorAcesso(BaseModel):
+    """rpc.identity.operador: a pessoa do staff entra (ativo) ou sai da carteira desta organização."""
+
+    user: Id
+    tenant: Id
+    ativo: bool
+
+
+class OperadorResultado(BaseModel):
+    user: str
+    tenant: str
+    roles: list[Role]
+
+
+class OrganizacaoResumo(BaseModel):
+    id: str
+    name: str
+    created_at: datetime | None = None
+
+
+class Organizacoes(BaseModel):
+    items: list[OrganizacaoResumo]
 
 
 class MemberList(BaseModel):

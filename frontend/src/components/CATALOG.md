@@ -115,7 +115,11 @@ Receita de conversa com um agente: mensagens em balões, passos do agente enquan
 
 ```tsx
 <ChatThread
-  messages={[{ id: "1", role: "assistant", text: "Olá! O que a sua empresa faz?" }, { id: "2", role: "user", text: "Somos uma padaria." }]}
+  messages={[
+    { id: "1", role: "assistant", text: "Olá! O que a sua empresa faz?" },
+    { id: "2", role: "user", text: "Somos uma padaria." },
+    { id: "3", role: "user", author: "Staff da Cogniventure · Otto", text: "Ajustei o limite para 3 mil." },
+  ]}
   onSend={(texto) => setNome(texto)}
   sending={false}
   progress={[{ label: "Anotando no perfil", status: "done" }]}
