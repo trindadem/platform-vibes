@@ -1,0 +1,59 @@
+# svc-atendimento · rotas públicas no Gateway. Fonte da verdade: specs/atendimento.md §2
+service: atendimento
+base_path: /api/v1/atendimento
+
+live:
+  - topic: pedidos                  # um pedido de ajuda foi aberto, respondido ou encerrado
+    model: PedidoMudou
+
+endpoints:
+  - path: /resumo
+    method: GET
+    auth: client_jwt
+    response: Resumo
+    target_type: http
+    target_url: http://svc-atendimento:8000/resumo
+
+  - path: /pedidos
+    method: GET
+    auth: client_jwt
+    query: PedidoQuery
+    response: PedidoPage
+    target_type: http
+    target_url: http://svc-atendimento:8000/pedidos
+
+  - path: /pedidos/item
+    name: pedido
+    method: GET
+    auth: client_jwt
+    query: PedidoRef
+    response: Pedido
+    target_type: http
+    target_url: http://svc-atendimento:8000/pedidos/item
+
+  - path: /pedidos
+    name: abrir
+    method: POST
+    auth: client_jwt
+    request: NovoPedido
+    response: Pedido
+    target_type: http
+    target_url: http://svc-atendimento:8000/pedidos
+
+  - path: /pedidos/mensagem
+    name: escrever
+    method: POST
+    auth: client_jwt
+    request: MensagemNova
+    response: Pedido
+    target_type: http
+    target_url: http://svc-atendimento:8000/pedidos/mensagem
+
+  - path: /pedidos/encerrar
+    name: encerrar
+    method: POST
+    auth: client_jwt
+    request: PedidoRef
+    response: Pedido
+    target_type: http
+    target_url: http://svc-atendimento:8000/pedidos/encerrar

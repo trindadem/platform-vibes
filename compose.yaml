@@ -390,3 +390,10 @@ services:
     depends_on:
       <<: *service-deps
       camunda: { condition: service_healthy }
+
+  svc-atendimento:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: atendimento } }
+    environment:  # da plataforma: sobe sempre, como o svc-notify (todo cliente fala com a Cogniventure)
+      <<: *service-env
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}  # a organização da Cogniventure não pede ajuda a si mesma

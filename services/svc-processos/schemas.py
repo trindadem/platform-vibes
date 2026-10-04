@@ -775,6 +775,8 @@ class Acompanhamento(BaseModel):
     atrasadas: int
     autonomia: float | None
     processos: list[AcompanhamentoProcesso]
+    aceitos: int = Field(0, description="Processos aceitos pela empresa (a jornada: descoberta feita)")
+    publicados: int = Field(0, description="Processos com versão publicada (a jornada: desenho feito)")
 
 
 class SaidaAgente(BaseModel):
@@ -810,6 +812,47 @@ class ItemStaff(BaseModel):
     status: Literal["aberta", "concluida"]
     link: str = Field(..., description="Onde resolver, na tela da organização")
     em: datetime
+    por: str | None = Field(None, description="Quem resolveu (concluída por uma pessoa): os números do gestor do staff")
+
+
+# A fila do staff resolve sem trocar de organização (alinhamento pós-N7, item 12): só o svc-staff chama, agindo na
+# organização do cliente, depois de conferir que a pessoa cuida dele; por = quem do staff resolveu.
+FILA_TAREFA_SUBJECT = "rpc.processos.fila_tarefa"
+FILA_RESOLVER_SUBJECT = "rpc.processos.fila_resolver"
+FILA_REVISAO_SUBJECT = "rpc.processos.fila_revisao"
+FILA_DECIDIR_SUBJECT = "rpc.processos.fila_decidir"
+STAFF_SERVICE = "svc-staff"
+
+
+class TarefaRef(BaseModel):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class ResolucaoStaff(BaseModel):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    dados: dict[str, str | float | bool | None] = Field(default_factory=dict)
+    comentario: str | None = Field(None, max_length=500)
+    regra: str | None = Field(None, min_length=10, max_length=600)
+    por: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class RevisaoRef(BaseModel):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class RevisaoResumo(BaseModel):
+    processo: str
+    titulo: str
+    numero: int
+    status: str = Field(..., description="Status da versão aberta (revisao enquanto espera o staff)")
+    mudancas: list[str] = Field(default_factory=list)
+
+
+class DecisaoStaff(BaseModel):
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    aprovar: bool
+    motivo: str | None = Field(None, min_length=3, max_length=1000)
+    por: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class RevisaoIn(_Input):

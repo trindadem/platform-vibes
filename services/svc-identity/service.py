@@ -46,6 +46,7 @@ from schemas import (
     MAX_FAILED_LOGINS,
     MAX_RESETS_PER_HOUR,
     MEMBER_JOINED_SUBJECT,
+    MEMBER_LEFT_SUBJECT,
     MEMBERS_LIVE,
     MEMBERSHIPS,
     STAFF_SERVICE,
@@ -60,10 +61,15 @@ from schemas import (
     AccessChanged,
     AuthResult,
     Cleaned,
+    ClienteCriado,
+    ClienteNovo,
     ColorInput,
     Contact,
     Contacts,
     ContactsRequest,
+    ConviteDono,
+    ConvitePendente,
+    Dono,
     Empty,
     ForgotInput,
     IdentitySettings,
@@ -78,6 +84,7 @@ from schemas import (
     Member,
     MemberJoined,
     MemberJoinedHook,
+    MemberLeft,
     MemberLeftHook,
     MemberList,
     MemberRef,
@@ -124,6 +131,11 @@ _JOIN = """{
     IF $inv = NONE { RETURN NONE; };
     CREATE identity_memberships CONTENT { user: $user, tenant: $inv.tenant, roles: [$inv.role] };
     RETURN { user: $user, tenant: $inv.tenant, role: $inv.role, inviter: $inv.created_by };
+}"""
+_CREATE_CLIENT = """{
+    LET $t = CREATE ONLY identity_tenants CONTENT { name: $name };
+    CREATE identity_invites CONTENT { code_hash: $code_hash, tenant: $t.id, role: 'owner', email: $email, expires_at: $expires_at };
+    RETURN $t.id;
 }"""
 _CREATE_TENANT = """{
     LET $t = CREATE ONLY identity_tenants CONTENT { name: $name, created_by: $user };
@@ -326,6 +338,7 @@ class IdentityService:
             "code_hash": _hash(code),
             "tenant": RecordID(TENANTS, tenant),
             "role": data.role,
+            "email": data.email,
             "expires_at": expires_at,  # quem convidou e quando: carimbos do banco (created_by, created_at)
         })
         if data.email is not None:
@@ -384,6 +397,8 @@ class IdentityService:
         )
         await bus.live(MEMBERS_LIVE, MembersChanged(user=data.user, change="removed"))
         await bus.live(ACCESS_LIVE, AccessChanged(tenant=tenant, change="removed"), user=data.user)
+        await bus.publish(MEMBER_LEFT_SUBJECT, MemberLeft(tenant=tenant, user=data.user),
+                          msg_id=f"saiu-{tenant}-{data.user}-{_key(target['id'])}")  # o svc-staff tira a carteira
         await plans.count("membros", await _member_count(tenant))
         if gone is not None:
             await webhooks.emit(
@@ -440,10 +455,66 @@ class IdentityService:
         return OperadorResultado(user=data.user, tenant=data.tenant, roles=roles)
 
     async def organizacoes(self, data: Empty) -> Organizacoes:
-        """rpc.identity.organizacoes (só o svc-staff): as organizações da plataforma, para montar a carteira."""
+        """rpc.identity.organizacoes (só o svc-staff): as organizações da plataforma, para montar a carteira e a lista
+        de clientes: o dono (ou o convite de dono pendente) e o último acesso de alguém do cliente."""
         _from_staff()
         rows = await db.query_shared("SELECT id, name, created_at FROM identity_tenants ORDER BY name")
-        return Organizacoes(items=[OrganizacaoResumo(id=_key(r["id"]), name=r["name"], created_at=r.get("created_at")) for r in rows])
+        donos = await db.query_shared("SELECT tenant, user.name AS name, user.email AS email, created_at FROM identity_memberships "
+                                      "WHERE roles CONTAINS 'owner' ORDER BY created_at")
+        convites = await db.query_shared("SELECT tenant, email, expires_at, created_at FROM identity_invites WHERE role = 'owner' "
+                                         "AND used_at = NONE AND expires_at > time::now() ORDER BY created_at")
+        acessos = await db.query_shared("SELECT tenant, roles, ultimo_acesso FROM identity_memberships WHERE ultimo_acesso != NONE")
+        dono: dict[str, Dono] = {}
+        for r in donos:
+            dono.setdefault(_key(str(r["tenant"])), Dono(name=r["name"], email=r["email"]))
+        convite = {_key(str(r["tenant"])): ConvitePendente(email=r.get("email"), expires_at=r["expires_at"]) for r in convites}
+        ultimo: dict[str, datetime] = {}
+        for r in acessos:
+            if set(r.get("roles") or []) <= {"operador"}:
+                continue  # o staff trabalhando no cliente não é o cliente usando a plataforma
+            tenant = _key(str(r["tenant"]))
+            if tenant not in ultimo or r["ultimo_acesso"] > ultimo[tenant]:
+                ultimo[tenant] = r["ultimo_acesso"]
+        return Organizacoes(items=[
+            OrganizacaoResumo(id=(t := _key(r["id"])), name=r["name"], created_at=r.get("created_at"), dono=dono.get(t),
+                              convite=None if t in dono else convite.get(t), ultimo_acesso=ultimo.get(t))
+            for r in rows
+        ])
+
+    async def cliente(self, data: ClienteNovo) -> ClienteCriado:
+        """rpc.identity.cliente (só o svc-staff): a Cogniventure abre a organização do cliente, sem ninguém dela dentro,
+        e convida o dono por e-mail. Ele entra pelo convite: cadastro novo ou, se já tem conta, entrar e aceitar."""
+        _from_staff()
+        code, expires_at = new_secret(24), _now() + timedelta(days=INVITE_DAYS)
+        tenant_id = await db.query_shared(_CREATE_CLIENT, name=data.empresa, code_hash=_hash(code), email=data.email,
+                                          expires_at=expires_at)
+        tenant = _key(str(tenant_id))
+        with acting_as(system(SERVICE, tenant)):
+            await bus.publish(TENANT_CREATED_SUBJECT, TenantCreated(tenant=tenant, name=data.empresa), msg_id=f"tenant-{tenant}")
+        await _convidar_dono(data.email, data.empresa, code)
+        return ClienteCriado(tenant=tenant, name=data.empresa, convite=ConvitePendente(email=data.email, expires_at=expires_at))
+
+    async def convite_dono(self, data: ConviteDono) -> ConvitePendente:
+        """rpc.identity.convite_dono (só o svc-staff): o convite do dono de novo, enquanto ninguém entrou como dono. O
+        convite anterior deixa de valer."""
+        _from_staff()
+        organization = await db.select(f"{TENANTS}:{data.tenant}")
+        if organization is None:
+            raise ServiceError("ERRO_IDENTITY_NOT_FOUND", "Organização não encontrada.", 404)
+        t = RecordID(TENANTS, data.tenant)
+        if await db.query_shared("SELECT VALUE id FROM identity_memberships WHERE tenant = $t AND roles CONTAINS 'owner'", t=t):
+            raise ServiceError("ERRO_IDENTITY_DONO_JA_ENTROU", "O dono já entrou nesta organização.", 409)
+        anteriores = await db.query_shared("SELECT email, created_at FROM identity_invites WHERE tenant = $t AND role = 'owner' "
+                                           "ORDER BY created_at DESC", t=t)
+        email = data.email or next((r["email"] for r in anteriores if r.get("email")), None)
+        if email is None:
+            raise ServiceError("ERRO_IDENTITY_SEM_EMAIL", "Informe o e-mail do dono.", 422)
+        await db.query_shared("UPDATE identity_invites SET expires_at = time::now() WHERE tenant = $t AND role = 'owner' "
+                              "AND used_at = NONE", t=t)
+        code, expires_at = new_secret(24), _now() + timedelta(days=INVITE_DAYS)
+        await db.create(INVITES, {"code_hash": _hash(code), "tenant": t, "role": "owner", "email": email, "expires_at": expires_at})
+        await _convidar_dono(email, organization["name"], code)
+        return ConvitePendente(email=email, expires_at=expires_at)
 
     # ── Organização: nome, logo e cor da marca ──────────────────────────────
 
@@ -519,6 +590,9 @@ class IdentityService:
         })
         if active and user.get("last_tenant") != active.id:
             await db.merge(user["id"], {"last_tenant": active.id})
+        if active:  # o último acesso de cada organização (a lista de clientes do staff)
+            await db.query_shared("UPDATE identity_memberships SET ultimo_acesso = time::now() WHERE user = $u AND tenant = $t",
+                                  u=RecordID(USERS, user_key), t=RecordID(TENANTS, active.id))
         token = issue_token(
             user_key,
             tenant=active.id if active else None,
@@ -637,6 +711,19 @@ class IdentityService:
                     action="Ver membros",
                     key=f"joined-{tenant_key}-{user_key}",
                 )
+
+
+async def _convidar_dono(email: str, empresa: str, code: str) -> None:
+    await notify.email(
+        email,
+        f"A conta de {empresa} está pronta",
+        f"A Cogniventure abriu a conta de {empresa} na plataforma e convidou você como dono.\n\n"
+        "Pelo link, crie a sua senha (ou entre, se já tiver conta) e comece pelo briefing da empresa. "
+        f"O convite vale por {INVITE_DAYS} dias.",
+        link=f"/convite?codigo={code}",
+        action="Aceitar o convite",
+        key=f"invite-{_hash(code)[:32]}",
+    )
 
 
 async def _member_count(tenant: str) -> int:

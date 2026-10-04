@@ -685,6 +685,106 @@ export const ai = {
     request<AiUsageSummary>("GET", "/api/v1/ai/usage", undefined, options),
 };
 
+export interface AtendimentoResumo {
+  /** Falso na organização da Cogniventure e para quem só é operador ali */
+  pode_pedir: boolean;
+  abertos: number;
+  respondidos: number;
+}
+
+export interface AtendimentoMensagem {
+  papel: "cliente" | "staff";
+  /** Id de quem escreveu */
+  autor: string;
+  autor_nome: string | null;
+  texto: string;
+  em: string;
+}
+
+export interface AtendimentoPedido {
+  id: string;
+  /** As primeiras palavras do pedido */
+  assunto: string;
+  status: "aberto" | "respondido" | "encerrado";
+  /** A tela de onde a pessoa pediu ajuda */
+  pagina: string | null;
+  autor: string;
+  autor_nome: string | null;
+  mensagens: AtendimentoMensagem[];
+  /** Até quando o staff responde (4 h depois da última mensagem do cliente) */
+  prazo: string | null;
+  respondido_em: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AtendimentoPedidoPage {
+  items: AtendimentoPedido[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface AtendimentoPedidoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "updated_at" | "-updated_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberto" | "respondido" | "encerrado" | null;
+  /** Só os pedidos desta pessoa (o membro vê sempre só os seus) */
+  autor?: string | null;
+}
+
+export interface AtendimentoPedidoRef {
+  id: string;
+}
+
+export interface AtendimentoNovoPedido {
+  /** O que a pessoa precisa */
+  texto: string;
+  /** A tela de onde pediu (ex.: /processos/execucoes) */
+  pagina?: string | null;
+}
+
+export interface AtendimentoMensagemNova {
+  id: string;
+  texto: string;
+}
+
+export interface AtendimentoPedidoMudou {
+  id: string;
+  action: "aberto" | "respondido" | "encerrado";
+}
+
+/** svc-atendimento · /api/v1/atendimento */
+export const atendimento = {
+  /** GET /api/v1/atendimento/resumo · http · exige token */
+  resumo: (options?: RequestOptions) =>
+    request<AtendimentoResumo>("GET", "/api/v1/atendimento/resumo", undefined, options),
+  /** GET /api/v1/atendimento/pedidos · http · exige token */
+  pedidos: (query?: AtendimentoPedidoQuery, options?: RequestOptions) =>
+    request<AtendimentoPedidoPage>("GET", withQuery("/api/v1/atendimento/pedidos", query), undefined, options),
+  /** GET /api/v1/atendimento/pedidos/item · http · exige token */
+  pedido: (query?: AtendimentoPedidoRef, options?: RequestOptions) =>
+    request<AtendimentoPedido>("GET", withQuery("/api/v1/atendimento/pedidos/item", query), undefined, options),
+  /** POST /api/v1/atendimento/pedidos · http · exige token */
+  abrir: (body: AtendimentoNovoPedido, options?: RequestOptions) =>
+    request<AtendimentoPedido>("POST", "/api/v1/atendimento/pedidos", body, options),
+  /** POST /api/v1/atendimento/pedidos/mensagem · http · exige token */
+  escrever: (body: AtendimentoMensagemNova, options?: RequestOptions) =>
+    request<AtendimentoPedido>("POST", "/api/v1/atendimento/pedidos/mensagem", body, options),
+  /** POST /api/v1/atendimento/pedidos/encerrar · http · exige token */
+  encerrar: (body: AtendimentoPedidoRef, options?: RequestOptions) =>
+    request<AtendimentoPedido>("POST", "/api/v1/atendimento/pedidos/encerrar", body, options),
+};
+
 export interface ConhecimentoMensagem {
   id: string;
   papel: "cliente" | "agente";
@@ -2728,6 +2828,10 @@ export interface ProcessosAcompanhamento {
   atrasadas: number;
   autonomia: number | null;
   processos: ProcessosAcompanhamentoProcesso[];
+  /** Processos aceitos pela empresa (a jornada: descoberta feita) */
+  aceitos: number;
+  /** Processos com versão publicada (a jornada: desenho feito) */
+  publicados: number;
 }
 
 /** A cadeia que um processo começou (ex.: proposta aceita → contrato e faturamento), acompanhada como um projeto. */
@@ -2919,13 +3023,66 @@ export interface StaffResumo {
   escaladas: number;
   revisoes: number;
   ajudas: number;
+  pedidos: number;
   organizacoes: number;
 }
 
+export interface StaffCliente {
+  organizacao: string;
+  nome: string;
+  created_at: string | null;
+  /** Nome do plano (null: sem plano atribuído) */
+  plano: string | null;
+  /** Ids das pessoas do staff com o cliente na carteira */
+  responsaveis: string[];
+  dono: StaffDono | null;
+  /** Convite de dono ainda não aceito */
+  convite: StaffConvitePendente | null;
+  /** Onde o cliente está na jornada (null: não deu para saber agora) */
+  passo: "convite" | "briefing" | "descoberta" | "desenho" | "acompanhamento" | null;
+  /** Último acesso de alguém do cliente (o staff não conta) */
+  ultimo_acesso: string | null;
+  andamento: number | null;
+  autonomia: number | null;
+}
+
+export interface StaffConvitePendente {
+  email: string | null;
+  expires_at: string;
+}
+
+export interface StaffDono {
+  name: string;
+  email: string;
+}
+
+export interface StaffClientes {
+  itens: StaffCliente[];
+}
+
+export interface StaffNovoCliente {
+  /** Nome da empresa cliente */
+  empresa: string;
+  /** E-mail do dono, que recebe o convite */
+  email: string;
+  /** Slug do plano do cliente */
+  plano: string;
+  /** Quem do staff cuida dele (entra na carteira) */
+  pessoa: string;
+}
+
+export interface StaffClienteRef {
+  organizacao: string;
+}
+
+/** rpc.identity.organizacoes (contrato do svc-identity, repetido aqui por quem consome). */
 export interface StaffOrganizacao {
   id: string;
   name: string;
   created_at: string | null;
+  dono: StaffDono | null;
+  convite: StaffConvitePendente | null;
+  ultimo_acesso: string | null;
 }
 
 export interface StaffOrganizacoes {
@@ -2965,6 +3122,8 @@ export interface StaffSaude {
   excecoes: number;
   revisoes: number;
   ajudas: number;
+  /** Pedidos de ajuda (Falar com a Cogniventure) abertos */
+  pedidos: number;
   /** Falso quando a organização não respondeu agora */
   disponivel: boolean;
 }
@@ -2978,7 +3137,7 @@ export interface StaffItemFila {
   id: string;
   organizacao: string;
   organizacao_nome: string;
-  tipo: "excecao" | "revisao" | "ajuda";
+  tipo: "excecao" | "revisao" | "ajuda" | "pedido";
   ref: string;
   titulo: string;
   detalhe: string | null;
@@ -2990,6 +3149,9 @@ export interface StaffItemFila {
   atribuida_a: string | null;
   /** Passou do prazo sem ninguém assumir: subiu para o gestor da carteira */
   escalada: boolean;
+  concluida_em: string | null;
+  /** Quem resolveu (pela fila ou na tela do cliente) */
+  resolvida_por: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -3013,7 +3175,7 @@ export interface StaffFilaQuery {
   sort?: "prazo" | "-prazo" | "created_at" | "-created_at" | null;
   /** Busca por palavras (início de palavra, sem acento) */
   q?: string | null;
-  tipo?: "excecao" | "revisao" | "ajuda" | null;
+  tipo?: "excecao" | "revisao" | "ajuda" | "pedido" | null;
   status?: "aberta" | "concluida" | null;
   escalada?: boolean | null;
   /** Gestor: a fila de todas as carteiras (não é filtro do banco) */
@@ -3028,6 +3190,108 @@ export interface StaffItemRef {
 export interface StaffAtribuicao {
   id: string;
   pessoa: string;
+}
+
+export interface StaffCampoTarefa {
+  nome: string;
+  rotulo: string;
+  tipo: string;
+  valor: unknown;
+}
+
+export interface StaffItemContexto {
+  rotulo: string;
+  valor: string;
+}
+
+export interface StaffMensagemPedido {
+  papel: "cliente" | "staff";
+  autor_nome: string | null;
+  texto: string;
+  em: string;
+}
+
+/** rpc.atendimento.pedido: o pedido de ajuda com a conversa. */
+export interface StaffPedidoFila {
+  id: string;
+  assunto: string;
+  status: string;
+  pagina: string | null;
+  mensagens: StaffMensagemPedido[];
+}
+
+/** rpc.processos.fila_revisao: a versão em revisão e o que ela muda. */
+export interface StaffRevisaoFila {
+  processo: string;
+  titulo: string;
+  numero: number;
+  status: string;
+  mudancas: string[];
+}
+
+/** rpc.processos.fila_tarefa: a exceção como o cartão da fila mostra. */
+export interface StaffTarefaFila {
+  id: string;
+  titulo: string;
+  nome: string;
+  status: string;
+  motivo: string | null;
+  campos: StaffCampoTarefa[];
+  contexto: StaffItemContexto[];
+  aprende: boolean;
+  prazo: string | null;
+}
+
+export interface StaffFilaDetalhe {
+  item: StaffItemFila;
+  tarefa: StaffTarefaFila | null;
+  revisao: StaffRevisaoFila | null;
+  pedido: StaffPedidoFila | null;
+}
+
+export interface StaffResolverExcecao {
+  id: string;
+  /** A saída do passo que parou */
+  dados?: Record<string, string | number | boolean | null>;
+  comentario?: string | null;
+  /** Exceção de agente: vira regra depois de avaliada */
+  regra?: string | null;
+}
+
+export interface StaffDecidirRevisao {
+  id: string;
+  aprovar: boolean;
+  /** Ao devolver: o que precisa mudar */
+  motivo?: string | null;
+}
+
+export interface StaffResponderPedido {
+  id: string;
+  texto: string;
+}
+
+export interface StaffNumeroLinha {
+  /** Id da pessoa ou da organização */
+  chave: string;
+  /** Nome da organização (pessoa: a tela mostra pelo id) */
+  nome: string | null;
+  resolvidos: number;
+  /** Resolvidos até o prazo (item sem prazo conta como no prazo) */
+  no_prazo: number;
+  /** Da chegada à resolução, em minutos */
+  tempo_medio_min: number | null;
+  abertos: number;
+}
+
+export interface StaffNumeros {
+  desde: string;
+  pessoas: StaffNumeroLinha[];
+  clientes: StaffNumeroLinha[];
+}
+
+export interface StaffNumerosQuery {
+  /** Os últimos N dias */
+  dias?: number;
 }
 
 export interface StaffFilaMudou {
@@ -3045,6 +3309,15 @@ export const staff = {
   /** GET /api/v1/staff/resumo · http · exige token */
   resumo: (options?: RequestOptions) =>
     request<StaffResumo>("GET", "/api/v1/staff/resumo", undefined, options),
+  /** GET /api/v1/staff/clientes · http · exige token */
+  clientes: (options?: RequestOptions) =>
+    request<StaffClientes>("GET", "/api/v1/staff/clientes", undefined, options),
+  /** POST /api/v1/staff/clientes · http · exige token */
+  novoCliente: (body: StaffNovoCliente, options?: RequestOptions) =>
+    request<StaffCliente>("POST", "/api/v1/staff/clientes", body, options),
+  /** POST /api/v1/staff/clientes/convite · http · exige token */
+  convidarDono: (body: StaffClienteRef, options?: RequestOptions) =>
+    request<StaffCliente>("POST", "/api/v1/staff/clientes/convite", body, options),
   /** GET /api/v1/staff/organizacoes · http · exige token */
   organizacoes: (options?: RequestOptions) =>
     request<StaffOrganizacoes>("GET", "/api/v1/staff/organizacoes", undefined, options),
@@ -3069,6 +3342,21 @@ export const staff = {
   /** POST /api/v1/staff/fila/atribuir · http · exige token */
   atribuir: (body: StaffAtribuicao, options?: RequestOptions) =>
     request<StaffItemFila>("POST", "/api/v1/staff/fila/atribuir", body, options),
+  /** GET /api/v1/staff/fila/detalhe · http · exige token */
+  detalhe: (query?: StaffItemRef, options?: RequestOptions) =>
+    request<StaffFilaDetalhe>("GET", withQuery("/api/v1/staff/fila/detalhe", query), undefined, options),
+  /** POST /api/v1/staff/fila/resolver · http · exige token */
+  resolver: (body: StaffResolverExcecao, options?: RequestOptions) =>
+    request<StaffItemFila>("POST", "/api/v1/staff/fila/resolver", body, options),
+  /** POST /api/v1/staff/fila/revisao · http · exige token */
+  decidir: (body: StaffDecidirRevisao, options?: RequestOptions) =>
+    request<StaffItemFila>("POST", "/api/v1/staff/fila/revisao", body, options),
+  /** POST /api/v1/staff/fila/responder · http · exige token */
+  responder: (body: StaffResponderPedido, options?: RequestOptions) =>
+    request<StaffItemFila>("POST", "/api/v1/staff/fila/responder", body, options),
+  /** GET /api/v1/staff/numeros · http · exige token */
+  numeros: (query?: StaffNumerosQuery, options?: RequestOptions) =>
+    request<StaffNumeros>("GET", withQuery("/api/v1/staff/numeros", query), undefined, options),
 };
 
 export interface VendasReceberLead {
@@ -3457,6 +3745,8 @@ export interface LiveTopics {
   "agentes.agentes": AgentesAgenteMudou;
   /** svc-ai · bus.live("ai.uso", ...) */
   "ai.uso": AiRecorded;
+  /** svc-atendimento · bus.live("atendimento.pedidos", ...) */
+  "atendimento.pedidos": AtendimentoPedidoMudou;
   /** svc-conhecimento · bus.live("conhecimento.briefing", ...) */
   "conhecimento.briefing": ConhecimentoBriefingMudou;
   /** svc-conhecimento · bus.live("conhecimento.leituras", ...) */
@@ -3522,6 +3812,7 @@ export const appModules = {
   administrativo: { title: "Administrativo", description: "Pacote de ações administrativas do BPO: admissões, compras e vencimentos da empresa", category: "Pacotes", core: false },
   agentes: { title: "Agentes", description: "Agentes da empresa: instrução, ferramentas do catálogo, política e suíte de avaliação", category: "Sua empresa", core: false },
   ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
+  atendimento: { title: "Falar com a Cogniventure", description: "Pedidos de ajuda ao staff da Cogniventure, com resposta em até 4 horas", category: "Organização", core: true },
   conhecimento: { title: "Conhecimento", description: "Briefing da empresa e a base de conhecimento que os agentes consultam", category: "Sua empresa", core: false },
   financeiro: { title: "Financeiro", description: "Pacote de ações financeiras do BPO: contas a pagar, conciliação, cobrança e fechamento", category: "Pacotes", core: false },
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },

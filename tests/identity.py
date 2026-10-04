@@ -637,3 +637,63 @@ def test_carteira_do_staff_da_e_tira_o_papel_operador_so_pelo_svc_staff(events):
     vivos = [(s, getattr(m, "change", None), w.tenant) for s, m, w in events if s.startswith("live:identity")]
     assert ("live:identity.membros", "joined", acme) in vivos and ("live:identity.membros", "removed", acme) in vivos
     assert ("live:identity.acesso:" + user, "removed", acme) in vivos  # a pessoa perde o acesso na hora
+
+
+def test_cogniventure_abre_o_cliente_convida_o_dono_e_acompanha_o_acesso(events):
+    from core.security import Principal
+
+    from schemas import MEMBER_LEFT_SUBJECT, ClienteNovo, ConviteDono
+
+    async def scenario(svc):
+        gil = await signup(svc, email="gil@cogniventure.com", organization="Cogniventure", name="Gil")
+        staff = Principal(sub="system:svc-staff", tenant=gil.auth.tenant.id, roles=frozenset({"system"}))
+        with as_user(gil):
+            with pytest.raises(ServiceError) as de_pessoa:
+                await svc.cliente(ClienteNovo(empresa="Padaria", email="ana@padaria.com"))  # só o svc-staff
+        with acting_as(staff):
+            criado = await svc.cliente(ClienteNovo(empresa="Padaria Pão Quente", email="Ana@Padaria.com"))
+            antes = {o.name: o for o in (await svc.organizacoes(Empty())).items}
+            de_novo = await svc.convite_dono(ConviteDono(tenant=criado.tenant))
+        convites = [m for s, m, _ in events if s == SEND_SUBJECT and getattr(m, "email", None) == "ana@padaria.com"]
+        codigo = convites[-1].link.split("codigo=")[1]
+        primeiro = convites[0].link.split("codigo=")[1]
+        with pytest.raises(ServiceError) as vencido:
+            await svc.invite_info(InviteCode(code=primeiro))  # o convite anterior deixou de valer
+        info = await svc.invite_info(InviteCode(code=codigo))
+        ana = await signup(svc, email="ana@padaria.com", organization=None, invite=codigo)
+        with acting_as(staff):
+            depois = {o.name: o for o in (await svc.organizacoes(Empty())).items}
+            with pytest.raises(ServiceError) as ja_entrou:
+                await svc.convite_dono(ConviteDono(tenant=criado.tenant))
+        with as_user(ana):
+            membros = await svc.list_members(Empty())
+        return de_pessoa.value, criado, antes, de_novo, vencido.value, info, ana, depois, ja_entrou.value, membros, convites
+
+    de_pessoa, criado, antes, de_novo, vencido, info, ana, depois, ja_entrou, membros, convites = run(scenario)
+    assert (de_pessoa.code, de_pessoa.status) == ("ERRO_IDENTITY_FORBIDDEN", 403)
+    padaria = antes["Padaria Pão Quente"]
+    assert padaria.dono is None and padaria.convite.email == "ana@padaria.com" and padaria.ultimo_acesso is None
+    assert de_novo.email == "ana@padaria.com" and len(convites) == 2 and "Aceitar o convite" == convites[0].action
+    assert vencido.code == "ERRO_IDENTITY_INVITE_INVALID" and info.role == "owner" and info.tenant_name == "Padaria Pão Quente"
+    assert ana.auth.tenant.id == criado.tenant and ana.auth.tenant.roles == ["owner"]
+    assert [(m.email, m.roles) for m in membros.items] == [("ana@padaria.com", ["owner"])]  # ninguém da Cogniventure dentro
+    agora = depois["Padaria Pão Quente"]
+    assert agora.dono.email == "ana@padaria.com" and agora.convite is None and agora.ultimo_acesso is not None
+    assert depois["Cogniventure"].ultimo_acesso is not None
+    assert ja_entrou.code == "ERRO_IDENTITY_DONO_JA_ENTROU"
+
+
+def test_remover_membro_avisa_a_saida_para_o_staff(events):
+    from schemas import MEMBER_LEFT_SUBJECT
+
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@acme.com", organization=None, invite=await _code(svc, ana), name="Bia")
+        events.clear()
+        with as_user(ana):
+            await svc.remove_member(MemberRef(user=bia.auth.user.id))
+        return ana, bia
+
+    ana, bia = run(scenario)
+    saidas = [(m.tenant, m.user) for s, m, _ in events if s == MEMBER_LEFT_SUBJECT]
+    assert saidas == [(ana.auth.tenant.id, bia.auth.user.id)]

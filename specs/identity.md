@@ -34,7 +34,13 @@ RPCs do staff (só o `svc-staff`, agindo na organização da Cogniventure; specs
 - `rpc.identity.operador` (`OperadorAcesso { user, tenant, ativo }`) → `OperadorResultado { user, tenant, roles }`:
   entrar na carteira dá o papel `operador` na organização do cliente (só a quem é membro da Cogniventure); sair tira, e
   sem outro papel a pessoa deixa a organização e perde as sessões nela. Ao vivo `identity.membros` na organização.
-- `rpc.identity.organizacoes` (`Empty`) → `Organizacoes { items: [{ id, name, created_at }] }`.
+- `rpc.identity.organizacoes` (`Empty`) → `Organizacoes { items: [{ id, name, created_at, dono { name, email },
+  convite { email, expires_at }, ultimo_acesso }] }`: o primeiro dono (ou o convite de dono pendente) e o último acesso
+  de alguém da organização (quem só é operador não conta).
+- `rpc.identity.cliente` (`ClienteNovo { empresa, email }`) → `ClienteCriado { tenant, name, convite }`: a Cogniventure
+  abre a organização do cliente sem ninguém dela dentro e convida o dono por e-mail (convite de papel `owner`).
+- `rpc.identity.convite_dono` (`ConviteDono { tenant, email? }`) → `ConvitePendente { email, expires_at }`: o convite
+  de dono de novo (sem `email`, o do último), enquanto ninguém entrou como dono; o anterior deixa de valer.
 
 `AuthResult = { access_token, expires_in, user: User, tenant: Tenant | null, tenants: Tenant[] }`, com
 `User { id, name, email }` e `Tenant { id, name, roles }`. O token de acesso é EdDSA de 15 min: `sub` = usuário,
@@ -52,7 +58,8 @@ refresh que chegou atrasado, girado antes da troca, não leva de volta para a or
    `revoked`), `identity_resets` (`code_hash` único, `user`, `expires_at` em 30 min, `used_at`). Cadastro, convite e
    criação de organização gravam num bloco atômico.
 2. NATS: `events.identity.tenant-created` `{ tenant, name }` e `events.identity.member-joined` `{ tenant, user, roles }`,
-   publicados em nome do novo membro. `events.identity.trigger` inicia a limpeza. Avisos pelo `core/notify.py`:
+   publicados em nome do novo membro; `events.identity.member-left` `{ tenant, user }`, em nome de quem removeu (o
+   svc-staff tira a carteira de quem sai da Cogniventure). Cada token emitido grava o último acesso no vínculo. `events.identity.trigger` inicia a limpeza. Avisos pelo `core/notify.py`:
    convite e senha por e-mail; quem convidou é avisado (tela + e-mail) quando o convidado entra.
 3. Temporal: `IdentityWorkflow` → activity `identity.cleanup` (apaga sessões, convites e links de senha vencidos),
    todo dia às 4h UTC pelo agendamento `identity-queue/limpeza` (workflows.SCHEDULES) ou pelo trigger; (timeout 5 min,
@@ -73,6 +80,8 @@ refresh que chegou atrasado, girado antes da troca, não leva de volta para a or
 - Limites: nome e organização 2–80 caracteres, e-mail até 254 (guardado em minúsculas), senha 8–1024.
 - Membro removido perde na hora as sessões daquela organização; o token de acesso já emitido vale até expirar (≤ 15 min).
 - `ERRO_IDENTITY_RESET_INVALID` (404): link de senha inexistente, vencido ou já usado.
+- `ERRO_IDENTITY_DONO_JA_ENTROU` (409): convite de dono de novo depois que o dono entrou; `ERRO_IDENTITY_SEM_EMAIL`
+  (422): convite de dono de novo sem e-mail conhecido.
 - `ERRO_PLAN_LIMIT` (402, do core): a organização já tem as pessoas que o plano permite (limite `identity.membros`;
   sem plano, sem limite, README §5.17). Conferido ao criar o convite e de novo ao aceitar (cadastro com convite ou
   `POST /join`): um convite criado antes de lotar também para. Cada entrada ou remoção informa o total ao plano.
