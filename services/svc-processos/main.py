@@ -9,6 +9,7 @@ HTTP /execucoes..., /tarefas..., /acompanhamento → execuções no motor, taref
 HTTP /desenho/revisao, /aprovar, /devolver, /ajuda... e /regras... → o staff no setup (revisão, ajuda) e o que ele ensina.
 NATS rpc.processos.acompanhamento → a saúde da organização para a carteira do staff (svc-staff).
 NATS rpc.processos.fila_*        → o staff vê e resolve exceções e revisões pela fila, sem trocar de organização.
+NATS rpc.processos.acoes         → as ações dos pacotes ligados, para um agente da empresa usar como ferramenta.
 NATS events.processos.catalogo   → os pacotes declaram as ações e os modelos (core/processes.py); o catálogo fica aqui.
 NATS events.integracoes.evento   → inicia os processos daquele gatilho e entrega mensagens às execuções que esperam.
 NATS events.processos.evento     → o mesmo, para os acontecimentos dos pacotes (vendas.pedido_proposta...).
@@ -33,6 +34,7 @@ from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    ACOES_SUBJECT,
     ACOMPANHAMENTO_SUBJECT,
     INICIAR_MODELO_SUBJECT,
     RESULTADOS_SUBJECT,
@@ -110,6 +112,7 @@ async def lifespan(app: FastAPI):
         await bus.respond(FILA_DECIDIR_SUBJECT, svc.fila_decidir, model=DecisaoStaff)
         await bus.respond(INICIAR_MODELO_SUBJECT, svc.iniciar_modelo, model=IniciarModelo)  # svc-plans: o fechamento do mês
         await bus.respond(RESULTADOS_SUBJECT, svc.resultados_staff, model=ResultadosPedido)  # svc-staff: a carteira
+        await bus.respond(ACOES_SUBJECT, svc.acoes, model=Empty)  # svc-agentes: ações dos pacotes como ferramenta
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
     await camunda.close()

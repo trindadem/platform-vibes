@@ -117,6 +117,8 @@ from schemas import (
     ProcessoLigado,
     Acompanhamento,
     AcompanhamentoProcesso,
+    AcaoPacote,
+    AcoesPacotes,
     AjudaIn,
     AlteracaoPasso,
     Autonomia,
@@ -317,6 +319,18 @@ class ProcessosService:
 
     async def catalogo(self, data: Empty) -> CatalogoAcoes:
         return CatalogoAcoes(itens=list((await _catalogo()).values()))
+
+    async def acoes(self, data: Empty) -> AcoesPacotes:
+        """rpc.processos.acoes (svc-agentes): as ações dos pacotes ligados no plano da organização, com o título do
+        pacote, para um agente da empresa usar como ferramenta (o pacote roda por rpc.<pacote>.acao). Sem resposta do
+        svc-plans, todas, com o nome do pacote no lugar do título."""
+        modulos = {m.name: m for m in (await plans.limits()).modules}
+        itens = []
+        for acao in (await _catalogo()).values():
+            modulo = modulos.get(acao.service.removeprefix("svc-"))
+            if modulo is None or modulo.enabled:
+                itens.append(AcaoPacote(**acao.model_dump(), pacote=modulo.title if modulo else acao.service.removeprefix("svc-")))
+        return AcoesPacotes(itens=itens)
 
     # ── Desenho: versões, conversa, simulação e publicação ───────────────────
 

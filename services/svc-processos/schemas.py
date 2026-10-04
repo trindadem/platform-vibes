@@ -31,6 +31,7 @@ EVENT_SUBJECT = "events.integracoes.evento"  # do svc-integracoes: documento rec
 DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # do svc-integracoes: o texto de um documento recebido
 INICIAR_MODELO_SUBJECT = "rpc.processos.iniciar_modelo"  # svc-plans: o fechamento do mês inicia o faturamento da Cogniventure
 RESULTADOS_SUBJECT = "rpc.processos.resultados"  # svc-staff: os resultados de um cliente da carteira (os mesmos da tela)
+ACOES_SUBJECT = "rpc.processos.acoes"  # svc-agentes: as ações dos pacotes ligados, para um agente usar como ferramenta
 MESES_RESULTADOS = 6  # meses no gráfico de autonomia da tela Resultados
 FUSO = "America/Sao_Paulo"  # o mês dos resultados e do resumo é o de Brasília
 PLANS_SERVICE = "svc-plans"
@@ -399,6 +400,16 @@ class Simulacao(BaseModel):
 
 class CatalogoAcoes(BaseModel):
     itens: list[CatalogAction]
+
+
+class AcaoPacote(CatalogAction):
+    pacote: str = Field(..., description="O título do módulo do pacote (ex.: Financeiro)")
+
+
+class AcoesPacotes(BaseModel):
+    """rpc.processos.acoes: as ações dos pacotes ligados no plano da organização (svc-agentes: ferramentas de agente)."""
+
+    itens: list[AcaoPacote]
 
 
 class DesenhoMudou(BaseModel):

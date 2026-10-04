@@ -1264,3 +1264,38 @@ def test_campo_de_arquivo_na_excecao_vem_do_schema_da_acao_e_leva_o_id_do_docume
         _valores_da_excecao(tarefa, Resposta(id="t1", dados={"nota_numero": "1", "nota_documento": "../../outro"}))
     assert torto.value.status == 422
     assert _valores_da_excecao(tarefa, Resposta(id="t1", dados={"nota_numero": "1"}))["nota_documento"] is None  # sem PDF: segue
+
+
+# ── O5 (fatia A): as ações dos pacotes como ferramenta de agente ─────────────
+
+from core.plans import ModuleState  # noqa: E402
+
+from schemas import ACOES_SUBJECT  # noqa: E402
+
+
+def _modulo(nome: str, titulo: str, ligado: bool) -> ModuleState:
+    return ModuleState(name=nome, service=f"svc-{nome}", title=titulo, description=f"Pacote {titulo}", category="Áreas",
+                       core=False, default=True, requires=[], enabled=ligado)
+
+
+def test_agente_da_empresa_ve_as_acoes_dos_pacotes_ligados_no_plano():
+    """rpc.processos.acoes (svc-agentes): o catálogo dos pacotes com o título de cada um; módulo desligado fica de fora."""
+    async def cenario(app):
+        for nome in ("financeiro", "juridico"):
+            await app.handlers[CATALOG_SUBJECT](_pacote(nome))
+        with acting_as(ACME):
+            sem_plano = await app.handlers[ACOES_SUBJECT](Empty())  # svc-plans fora do ar: todas, com o nome do pacote
+        app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan="essencial", plan_name="Essencial", month="2026-10", limits=[], modules=[
+            _modulo("financeiro", "Financeiro", True), _modulo("juridico", "Jurídico", False)]))
+        with acting_as(ACME):
+            com_plano = await app.handlers[ACOES_SUBJECT](Empty())
+        return sem_plano, com_plano
+
+    sem_plano, com_plano = service_app(cenario)
+    assert {a.service for a in sem_plano.itens} == {"svc-financeiro", "svc-juridico"}
+    assert {a.pacote for a in sem_plano.itens} == {"financeiro", "juridico"}
+    conferir = next(a for a in com_plano.itens if a.name == "financeiro.conferir_pedido")
+    assert {a.service for a in com_plano.itens} == {"svc-financeiro"} and conferir.pacote == "Financeiro"
+    assert conferir.risk == "leitura" and "valor" in conferir.input_schema["properties"]  # o agente vê os argumentos
+    agendar = next(a for a in com_plano.itens if a.name == "financeiro.agendar_pagamento")
+    assert agendar.risk == "irreversivel"  # vem no catálogo; o svc-agentes só deixa usar com aprovação
