@@ -9,6 +9,10 @@ live:
     model: DocumentoMudou
   - topic: pagamentos               # o banco agendou ou confirmou um pagamento
     model: PagamentoMudou
+  - topic: cobrancas                # o banco emitiu uma cobrança ou recebeu o pagamento dela
+    model: CobrancaMudou
+  - topic: enviados                 # saiu um e-mail da caixa de entrada
+    model: EnviadoMudou
   - topic: servidores               # servidor MCP conectado, atualizado, removido ou com ferramenta em quarentena
     model: ServidorMudou
 
@@ -121,3 +125,28 @@ endpoints:
     response: ServidorMcp
     target_type: http
     target_url: http://svc-integracoes:8000/servidores/remover
+
+  - path: /cobrancas
+    method: GET
+    auth: client_jwt
+    query: CobrancaQuery
+    response: CobrancaPage
+    target_type: http
+    target_url: http://svc-integracoes:8000/cobrancas
+
+  - path: /cobrancas/confirmar
+    name: confirmarCobranca
+    method: POST
+    auth: client_jwt
+    request: CobrancaRef
+    response: Cobranca
+    target_type: http
+    target_url: http://svc-integracoes:8000/cobrancas/confirmar
+
+  - path: /enviados
+    method: GET
+    auth: client_jwt
+    query: EnviadoQuery
+    response: EnviadoPage
+    target_type: http
+    target_url: http://svc-integracoes:8000/enviados

@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from "react-router";
 import { Tabs as TabsRoot, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export interface TabsProps {
-  /** Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada. */
+  /** Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada, e trocar de aba limpa os parâmetros da lista (?page=&q=...). */
   tabs: { id: string; label: string; content: ReactNode }[];
 }
 
@@ -25,7 +25,9 @@ export function Tabs({ tabs }: TabsProps) {
   const navigate = useNavigate();
   const requested = decodeURIComponent(location.hash.slice(1));
   const current = tabs.some((tab) => tab.id === requested) ? requested : tabs[0]?.id;
-  const open = (id: string) => navigate({ pathname: location.pathname, search: location.search, hash: id }, { replace: true });
+  // Página, busca e filtros da URL são da lista da aba aberta: trocar de aba começa a outra do zero (o filtro de uma
+  // lista não vale na seguinte, e o backend recusaria um valor que ela não conhece).
+  const open = (id: string) => navigate({ pathname: location.pathname, search: "", hash: id }, { replace: true });
 
   return (
     <TabsRoot value={current} onValueChange={open} className="gap-4">

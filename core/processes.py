@@ -2,7 +2,9 @@
 
     ACTIONS = [Action("conferir_pedido", "Conferir com o pedido", "Compara o documento com o pedido ou o contrato",
                       Documento, Conferencia, risk="leitura", example=Conferencia(divergente=False))]
-    await processes.declare(ACTIONS)                    # main.py, no lifespan: o catálogo vai para o svc-processos
+    MODELS = [ProcessModel("contas-a-pagar", Fluxo(...))]   # o fluxo de partida de um modelo da biblioteca (briefing §10)
+    await processes.declare(ACTIONS, MODELS)            # main.py, no lifespan: o catálogo vai para o svc-processos
+    await processes.emit("pedido_proposta", Pedido(...))  # um acontecimento do pacote inicia processos (vendas.pedido_proposta)
 
     async with processes.worker(SERVICE, ACTIONS, svc):  # main.py: cada ação roda o método de mesmo nome do service.py
         ...                                              # (conferir_pedido(self, data: Documento) -> Conferencia)
@@ -19,6 +21,14 @@ Trilhos:
   mudar um limite é uma versão nova no motor, e a execução usa os valores da versão em que começou.
 - Ação: <serviço>.<nome>, com entrada, saída, risco (leitura, escrita, externa, irreversivel), exemplo de saída (a
   simulação usa) e conexões que exige. O exemplo é conferido contra a saída na declaração.
+- Modelo: o pacote da área oferece o fluxo de partida de cada modelo da biblioteca que ele executa (o desenho de cada
+  organização começa dali). Ação do próprio pacote citada no modelo e não declarada impede o boot.
+- Paralelo: um passo paralelo com vários caminhos abre ramos que correm ao mesmo tempo; outro, com vários caminhos
+  chegando, espera todos (o BPMN é um parallelGateway nos dois casos).
+- Gatilho por outro processo: quando um processo da organização termina (com o resultado pedido), o svc-processos
+  inicia os que dependem dele, com as saídas dele no gatilho: a cadeia vira um projeto (ex.: proposta → contrato).
+- Evento de pacote: processes.emit publica <pacote>.<nome> em events.processos.evento, como a organização de quem age;
+  inicia os processos publicados com esse gatilho e, com chave, acorda a execução que espera por ele.
 - Execução: o worker de cada pacote pega os jobs <serviço>.<ação> no motor e age como a organização do processo (o id
   no motor é p_<organização>_<processo>, só o svc-processos implanta). A entrada vem dos passos anteriores pelo nome do
   campo (o mais perto antes dele; senão, do gatilho); a saída validada vai para <passo>. Ação que não pode seguir
@@ -55,13 +65,15 @@ from core.plans import plans
 from core.security import acting_as, system
 
 __all__ = [
-    "Action", "ActionCatalog", "Alternative", "CatalogAction", "Condition", "Flow", "Fluxo", "Step", "Trigger", "Deployed",
-    "Started", "Job", "Handoff", "StepEvent", "camunda", "processes", "to_bpmn", "process_id", "parse_process_id",
-    "CATALOG_SUBJECT", "STEP_SUBJECT", "START", "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END",
+    "Action", "ActionCatalog", "Alternative", "CatalogAction", "CatalogModel", "Condition", "Flow", "Fluxo", "ProcessEvent",
+    "ProcessModel", "Step", "Trigger", "Deployed", "Started", "Job", "Handoff", "StepEvent", "camunda", "processes", "to_bpmn",
+    "process_id", "parse_process_id", "build_catalog", "CATALOG_SUBJECT", "STEP_SUBJECT", "EVENT_SUBJECT", "START",
+    "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END",
 ]
 
 CATALOG_SUBJECT = "events.processos.catalogo"
 STEP_SUBJECT = "events.processos.passo"  # o que um worker fez num passo (concluiu, handoff, incidente)
+EVENT_SUBJECT = "events.processos.evento"  # um acontecimento de um pacote (vendas.pedido_proposta) para os processos
 START = "inicio"  # id reservado: o começo do fluxo (o gatilho)
 HANDOFF_ERROR = "handoff"  # código do erro BPMN que leva um passo à tarefa do staff
 HANDOFF_HOURS = 4  # prazo da tarefa de exceção do staff
@@ -118,7 +130,8 @@ class Flow(BaseModel):
 
 class Step(BaseModel):
     id: str = Field(..., pattern=_ID, description="Identificador curto em snake_case (a saída fica sob ele)")
-    tipo: Literal["acao", "agente", "tarefa", "decisao", "espera", "fim"]
+    tipo: Literal["acao", "agente", "tarefa", "decisao", "espera", "paralelo", "fim"] = Field(
+        ..., description="paralelo: com vários caminhos saindo, abre ramos ao mesmo tempo; com vários chegando, espera todos")
     nome: str = Field(..., min_length=2, max_length=80)
     acao: str | None = Field(None, description="acao: nome no catálogo (<pacote>.<ação>)")
     objetivo: str | None = Field(None, max_length=600, description="agente: o que o agente faz neste passo")
@@ -138,9 +151,12 @@ class Step(BaseModel):
 
 
 class Trigger(BaseModel):
-    tipo: Literal["evento", "agenda", "manual"] = "manual"
+    tipo: Literal["evento", "agenda", "manual", "processo"] = "manual"
     evento: str | None = Field(None, pattern=r"^[a-z][a-z0-9_.-]{1,60}$", description="evento: mensagem que inicia")
-    agenda: str | None = Field(None, max_length=60, description="agenda: cron (ex.: 0 8 * * *)")
+    agenda: str | None = Field(None, max_length=60, description="agenda: cron de 5 campos em UTC (ex.: 0 11 * * * = 8h em Brasília)")
+    processo: str | None = Field(None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$",
+                                 description="processo: o modelo da biblioteca (ou o id) do processo que, ao terminar, inicia este")
+    resultado: str | None = Field(None, max_length=40, description="processo: o fim que ele precisa alcançar (ex.: aceita); vazio, qualquer um")
     descricao: str | None = Field(None, max_length=200)
 
 
@@ -194,9 +210,63 @@ class CatalogAction(BaseModel):
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ProcessModel:
+    """O fluxo de partida de um modelo da biblioteca (briefing.md §10) que o pacote da área executa: o desenho de cada
+    organização que aceita o modelo começa daqui. id é o do modelo na biblioteca (ex.: contas-a-pagar)."""
+
+    id: str
+    fluxo: Fluxo
+
+    def __post_init__(self) -> None:
+        if not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", self.id) or len(self.id) > 60:
+            raise ValueError(f"ProcessModel: id inválido {self.id!r} (o id do modelo na biblioteca, ex.: contas-a-pagar)")
+
+
+class CatalogModel(BaseModel):
+    id: str = Field(..., description="Modelo da biblioteca")
+    service: str
+    fluxo: Fluxo
+
+
 class ActionCatalog(BaseModel):
     service: str
     actions: list[CatalogAction]
+    models: list[CatalogModel] = Field(default_factory=list, description="Fluxos de partida dos modelos que o pacote executa")
+
+
+class ProcessEvent(BaseModel):
+    """events.processos.evento: um acontecimento de um pacote (<pacote>.<nome>) para os processos da organização."""
+
+    nome: str
+    chave: str | None = None
+    dados: dict[str, Any] = Field(default_factory=dict)
+
+
+def build_catalog(service: str, actions: Sequence[Action], models: Sequence[ProcessModel] = ()) -> ActionCatalog:
+    """O catálogo que um pacote publica: as ações (<pacote>.<ação>) e os modelos. Confere o que dá para conferir no boot:
+    ação repetida, modelo repetido e ação do próprio pacote citada num modelo sem estar declarada."""
+    prefix = service.removeprefix("svc-")
+    names = [a.name for a in actions]
+    if len(names) != len(set(names)):
+        raise ValueError("processes.declare: ação repetida")
+    ids = [m.id for m in models]
+    if len(ids) != len(set(ids)):
+        raise ValueError("processes.declare: modelo repetido")
+    declared = {f"{prefix}.{name}" for name in names}
+    for model in models:
+        for step in model.fluxo.passos:
+            if step.acao and step.acao.startswith(f"{prefix}.") and step.acao not in declared:
+                raise ValueError(f"processes.declare: o modelo {model.id} usa {step.acao}, que o pacote não declara")
+            if step.tipo == "acao" and not (step.acao and _ACTION.match(step.acao)):
+                raise ValueError(f"processes.declare: o passo {step.id} do modelo {model.id} precisa da ação (<pacote>.<ação>)")
+    return ActionCatalog(service=service, actions=[
+        CatalogAction(name=f"{prefix}.{a.name}", service=service, title=a.title, description=a.description, risk=a.risk,
+                      connections=list(a.connections), output_fields=list(a.output.model_fields),
+                      example=a.example.model_dump(mode="json"), input_schema=a.input.model_json_schema(),
+                      output_schema=a.output.model_json_schema())
+        for a in actions
+    ], models=[CatalogModel(id=m.id, service=service, fluxo=m.fluxo) for m in models])
 
 
 class Job(BaseModel):
@@ -263,6 +333,7 @@ class Outcome(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
     message: str | None = None
     retries: int = 0
+    em: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Quando o handler terminou")
 
 
 JobHandler = Callable[[Job], Awaitable[dict[str, Any] | None]]
@@ -274,25 +345,31 @@ class Processes:
     def __init__(self) -> None:
         self._declared: dict[str, Action] = {}
 
-    async def declare(self, actions: Sequence[Action]) -> None:
-        """No boot: publica para o svc-processos as ações que este pacote oferece (o catálogo do desenho)."""
+    async def declare(self, actions: Sequence[Action], models: Sequence[ProcessModel] = ()) -> None:
+        """No boot: publica para o svc-processos as ações que este pacote oferece e os fluxos de partida dos modelos da
+        biblioteca que ele executa (o catálogo do desenho)."""
         service = bus.service
         if not service:
             raise RuntimeError("processes.declare: chame dentro de bus.connected(SERVICE)")
+        catalog = build_catalog(service, actions, models)
         prefix = service.removeprefix("svc-")
-        names = [a.name for a in actions]
-        if len(names) != len(set(names)):
-            raise ValueError("processes.declare: ação repetida")
         self._declared = {f"{prefix}.{a.name}": a for a in actions}
-        catalog = ActionCatalog(service=service, actions=[
-            CatalogAction(name=name, service=service, title=a.title, description=a.description, risk=a.risk,
-                          connections=list(a.connections), output_fields=list(a.output.model_fields),
-                          example=a.example.model_dump(mode="json"), input_schema=a.input.model_json_schema(),
-                          output_schema=a.output.model_json_schema())
-            for name, a in self._declared.items()
-        ])
         digest = hashlib.sha256(catalog.model_dump_json().encode()).hexdigest()[:24]
         await bus.publish(CATALOG_SUBJECT, catalog, msg_id=f"acoes-{service}-{digest}")  # réplicas: um só
+
+    async def emit(self, nome: str, dados: BaseModel | Mapping[str, Any], *, chave: str | None = None, key: str | None = None) -> None:
+        """Um acontecimento deste pacote para os processos da organização de quem age (ex.: vendas.pedido_proposta):
+        inicia os processos publicados cujo gatilho é <pacote>.<nome> e, com chave, acorda a execução que espera por ele.
+        key: a mesma intenção (o mesmo pedido) não inicia duas vezes."""
+        service = bus.service
+        if not service:
+            raise RuntimeError("processes.emit: chame dentro de bus.connected(SERVICE)")
+        if not re.match(r"^[a-z][a-z0-9_]{1,40}$", nome):
+            raise ValueError(f"processes.emit: nome inválido {nome!r} (snake_case, ex.: pedido_proposta)")
+        prefix = service.removeprefix("svc-")
+        payload = dados.model_dump(mode="json") if isinstance(dados, BaseModel) else json.loads(json.dumps(dict(dados), default=str))
+        await bus.publish(EVENT_SUBJECT, ProcessEvent(nome=f"{prefix}.{nome}", chave=chave, dados=payload),
+                          msg_id=f"evento-{prefix}-{nome}-{key}" if key else None)
 
     def declared(self) -> dict[str, Action]:
         return dict(self._declared)
@@ -372,7 +449,7 @@ class Processes:
         with acting_as(system(bus.service or "svc-processos", job.tenant)):
             await bus.publish(STEP_SUBJECT, StepEvent(
                 instancia=job.instance, processo=job.processo, motor_versao=job.version, passo=job.element, tipo=job.type,
-                status=status or "incidente", motivo=outcome.message, saida=saida or {},
+                status=status or "incidente", motivo=outcome.message, saida=saida or {}, em=outcome.em,
             ), msg_id=f"passo-{job.key}-{outcome.status}-{outcome.retries}")
 
     async def _poll(self, service: str, kind: str, handler: JobHandler, gate: asyncio.Semaphore, lock_seconds: int) -> None:
@@ -457,6 +534,14 @@ def _feel_one(alt: Alternative) -> str:
     return f"{alt.campo} {alt.operador} {_feel_value(alt.valor)}"
 
 
+def cron(agenda: str) -> str:
+    """Agenda do fluxo (cron de 5 campos, em UTC: minuto hora dia mês dia-da-semana, como os agendamentos do Temporal)
+    → a do motor (o cron do Spring que o Camunda 8 lê, com os segundos na frente). Achado do N7: com 5 campos, o motor
+    recusa o BPMN na publicação."""
+    campos = agenda.split()
+    return " ".join(["0", *campos]) if len(campos) == 5 else agenda
+
+
 def feel(condition: Condition) -> str:
     """Condição estruturada → expressão FEEL (=campo > 5000; com ou: =(a) or (b)). Valores sempre escapados."""
     partes = [_feel_one(alt) for alt in condition.alternatives()]
@@ -468,7 +553,7 @@ def _kind(step: Step | None) -> str:
         return "task"  # receiveTask: atividade, aceita o prazo na borda
     if step is None or step.tipo in ("espera", "fim"):
         return "event"
-    return "gateway" if step.tipo == "decisao" else "task"
+    return "gateway" if step.tipo in ("decisao", "paralelo") else "task"
 
 
 def _handoff_kind(step: Step) -> str | None:
@@ -515,7 +600,7 @@ def step_outputs(step: Step, actions: Mapping[str, "CatalogAction"]) -> list[str
 
 def input_sources(fluxo: Fluxo, step: Step, actions: Mapping[str, "CatalogAction"]) -> dict[str, str]:
     """De onde vem cada campo da entrada de uma ação: do passo mais perto antes dela que tem um campo com esse nome;
-    sem nenhum, do gatilho (gatilho.<campo>)."""
+    sem nenhum, do parâmetro de mesmo nome (regra do cliente, como prazo_pagamento); senão, do gatilho (gatilho.<campo>)."""
     action = actions.get(step.acao or "")
     if action is None:
         return {}
@@ -532,7 +617,10 @@ def input_sources(fluxo: Fluxo, step: Step, actions: Mapping[str, "CatalogAction
     sources: dict[str, str] = {}
     for field in action.input_schema.get("properties", {}):
         origin = next((st.id for st in ordered if field in step_outputs(st, actions)), None)
-        sources[field] = f"{origin}.{field}" if origin else f"gatilho.{field}"
+        if origin:
+            sources[field] = f"{origin}.{field}"
+        else:
+            sources[field] = f"parametros.{field}" if field in fluxo.parametros else f"gatilho.{field}"
     return sources
 
 
@@ -608,10 +696,11 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str, actions: Mapping[str, C
                 "</bpmn:extensionElements></bpmn:userTask>")
 
     trigger = fluxo.gatilho
-    # Evento e manual: o svc-processos inicia pela API (sabe quais processos da organização o evento inicia).
+    # Evento, manual e outro processo: o svc-processos inicia pela API (sabe quais processos da organização cada evento
+    # ou cada fim de processo inicia).
     definition = ""
     if trigger.tipo == "agenda" and trigger.agenda:
-        definition = f'<bpmn:timerEventDefinition><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">{escape(trigger.agenda)}</bpmn:timeCycle></bpmn:timerEventDefinition>'
+        definition = f'<bpmn:timerEventDefinition><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">{escape(cron(trigger.agenda))}</bpmn:timeCycle></bpmn:timerEventDefinition>'
     # Os parâmetros vão no BPMN (saída do início): cada versão publicada carrega os seus valores.
     params = "".join(f'<zeebe:output source="{a("=" + _feel_value(v))}" target="parametros.{k}" />' for k, v in fluxo.parametros.items())
     params = f"<bpmn:extensionElements><zeebe:ioMapping>{params}</zeebe:ioMapping></bpmn:extensionElements>" if params else ""
@@ -640,6 +729,8 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str, actions: Mapping[str, C
             default = next((f for f in fluxo.outgoing(sid) if f.condicao is None), None)
             attr = f' default="f_{sid}_{default.para}"' if default else ""
             elements.append(f'<bpmn:exclusiveGateway id="{sid}" name="{label}"{attr} />')
+        elif step.tipo == "paralelo":  # abre ramos (vários caminhos saindo) ou espera todos (vários chegando)
+            elements.append(f'<bpmn:parallelGateway id="{sid}" name="{label}" />')
         elif step.tipo == "espera" and step.espera == "mensagem" and step.mensagem:
             elements.append(f'<bpmn:receiveTask id="{sid}" name="{label}" messageRef="{message_ref(step.mensagem, step.chave)}">'
                             f'<bpmn:extensionElements><zeebe:ioMapping><zeebe:output source="=mensagem" target="{sid}" />'

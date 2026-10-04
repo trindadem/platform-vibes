@@ -1,0 +1,48 @@
+# svc-administrativo · rotas públicas no Gateway. Fonte da verdade: specs/administrativo.md §2
+service: administrativo
+base_path: /api/v1/administrativo
+
+# Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+# administrativo.<cadastro>, e vira administrativo.<cadastro> no frontend.
+resources: [colaboradores, fornecedores, vencimentos]
+
+live:
+  - topic: requisicoes              # uma requisição de compra mudou (aberta, cotando, cotação, pedido, cancelada)
+    model: RequisicaoMudou
+
+endpoints:
+  - path: /admissoes
+    name: admitir
+    method: POST
+    auth: client_jwt
+    request: NovaAdmissao
+    response: ColaboradorItem
+    target_type: http
+    target_url: http://svc-administrativo:8000/admissoes
+
+  - path: /requisicoes
+    name: requisicoes
+    method: GET
+    auth: client_jwt
+    query: RequisicaoQuery
+    response: RequisicaoPage
+    target_type: http
+    target_url: http://svc-administrativo:8000/requisicoes
+
+  - path: /requisicoes
+    name: requisitar
+    method: POST
+    auth: client_jwt
+    request: NovaRequisicao
+    response: Requisicao
+    target_type: http
+    target_url: http://svc-administrativo:8000/requisicoes
+
+  - path: /requisicoes/cotacao
+    name: registrarCotacao
+    method: POST
+    auth: client_jwt
+    request: NovaCotacao
+    response: Requisicao
+    target_type: http
+    target_url: http://svc-administrativo:8000/requisicoes/cotacao

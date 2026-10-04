@@ -16,18 +16,25 @@ DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # o texto de um documento receb
 AGENDAR_SUBJECT = "rpc.integracoes.banco_agendar"  # agenda um pagamento no banco da organização (svc-financeiro)
 FERRAMENTAS_SUBJECT = "rpc.integracoes.ferramentas"  # as ferramentas dos servidores MCP da organização (svc-agentes)
 MCP_SUBJECT = "rpc.integracoes.mcp_chamar"  # chama uma ferramenta MCP com a credencial guardada aqui (svc-agentes)
+EMAIL_SUBJECT = "rpc.integracoes.enviar_email"  # e-mail que sai da caixa de entrada da organização (pacotes)
+COBRAR_SUBJECT = "rpc.integracoes.banco_cobrar"  # emite uma cobrança (boleto) no banco da organização (svc-financeiro)
+EXTRATO_SUBJECT = "rpc.integracoes.banco_extrato"  # o extrato do banco da organização (svc-financeiro)
 LIVE_CONEXOES = "integracoes.conexoes"
 LIVE_SERVIDORES = "integracoes.servidores"
 LIVE_DOCUMENTOS = "integracoes.documentos"
 LIVE_PAGAMENTOS = "integracoes.pagamentos"
+LIVE_COBRANCAS = "integracoes.cobrancas"
+LIVE_ENVIADOS = "integracoes.enviados"
 
 CONEXOES = "integracoes_conexoes"
 DOCUMENTOS = "integracoes_documentos"
 PAGAMENTOS = "integracoes_pagamentos"
 SERVIDORES = "integracoes_servidores_mcp"
-TABLES = [CONEXOES, DOCUMENTOS, PAGAMENTOS, SERVIDORES]
-UNIQUE = {CONEXOES: ["tipo"], DOCUMENTOS: ["origem_id"], PAGAMENTOS: ["pagamento_id"], SERVIDORES: ["nome"]}
-SEARCH = {DOCUMENTOS: ["nome", "assunto", "de"]}
+COBRANCAS = "integracoes_cobrancas"
+ENVIADOS = "integracoes_enviados"
+TABLES = [CONEXOES, DOCUMENTOS, PAGAMENTOS, SERVIDORES, COBRANCAS, ENVIADOS]
+UNIQUE = {CONEXOES: ["tipo"], DOCUMENTOS: ["origem_id"], PAGAMENTOS: ["pagamento_id"], SERVIDORES: ["nome"], COBRANCAS: ["cobranca_id"]}
+SEARCH = {DOCUMENTOS: ["nome", "assunto", "de"], ENVIADOS: ["para", "assunto"]}
 WRITERS = frozenset({"owner", "admin"})
 BANK_OPERATORS = frozenset({"owner", "admin", "operador"})  # confirmam à mão um pagamento do banco simulado
 DOCUMENT_MAX_BYTES = 10_000_000
@@ -226,13 +233,128 @@ class PagamentoMudou(BaseModel):
     action: Literal["agendado", "pago"]
 
 
+# ── Banco simulado: cobranças (contas a receber) e extrato ───────────────────
+
+class CobrarNoBanco(_Input):
+    valor: float = Field(..., gt=0, le=10_000_000)
+    vencimento: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="AAAA-MM-DD")
+    pagador: str | None = Field(None, max_length=200)
+    descricao: str | None = Field(None, max_length=500)
+
+
+class CobrancaEmitida(BaseModel):
+    cobranca_id: str
+    linha_digitavel: str
+    vencimento: str
+
+
+class Cobranca(BaseModel):
+    id: str
+    cobranca_id: str
+    valor: float
+    vencimento: str
+    pagador: str | None = None
+    descricao: str | None = None
+    linha_digitavel: str
+    status: Literal["aberta", "recebida"]
+    recebido_em: datetime | None = None
+    created_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return _key(value)
+
+
+class CobrancaQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("created_at", "vencimento", "valor")
+    default_sort: ClassVar[str | None] = "-created_at"
+    status: Literal["aberta", "recebida"] | None = None
+
+
+class CobrancaPage(Page[Cobranca]):
+    pass
+
+
+class CobrancaRef(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class CobrancaSimulada(BaseModel):
+    """O banco simulado confirma o recebimento depois de alguns segundos (workflow durável)."""
+
+    id: str
+    segundos: int
+
+
+class CobrancaMudou(BaseModel):
+    id: str
+    action: Literal["emitida", "recebida"]
+
+
+class ExtratoPedido(_Input):
+    desde: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="A partir de que dia (AAAA-MM-DD)")
+
+
+class Lancamento(BaseModel):
+    tipo: Literal["pagamento", "recebimento"]
+    id: str = Field(..., description="pagamento_id (pagamento) ou cobranca_id (recebimento)")
+    valor: float = Field(..., description="Negativo no pagamento, positivo no recebimento")
+    data: str
+    descricao: str | None = None
+
+
+class Extrato(BaseModel):
+    itens: list[Lancamento]
+
+
+# ── E-mail que sai da caixa de entrada ───────────────────────────────────────
+
+class EnviarEmail(_Input):
+    para: str = Field(..., max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    assunto: str = Field(..., min_length=1, max_length=200)
+    texto: str = Field(..., min_length=1, max_length=20_000)
+
+
+class EmailEnviado(BaseModel):
+    mensagem_id: str
+    de: str = Field(..., description="O endereço da caixa de entrada da organização")
+
+
+class Enviado(BaseModel):
+    id: str
+    para: str
+    assunto: str
+    de: str
+    created_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return _key(value)
+
+
+class EnviadoQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("created_at",)
+    default_sort: ClassVar[str | None] = "-created_at"
+
+
+class EnviadoPage(Page[Enviado]):
+    pass
+
+
+class EnviadoMudou(BaseModel):
+    id: str
+    action: Literal["enviado"]
+
+
 # ── Eventos para os processos ────────────────────────────────────────────────
 
 class EventoExterno(BaseModel):
     """events.integracoes.evento: algo chegou de fora. O svc-processos inicia os processos cujo gatilho é este evento
     e, com chave, entrega a mensagem à execução que espera por ela (ex.: banco.pago com o id do pagamento)."""
 
-    nome: Literal["documento.recebido", "banco.pago"]
+    nome: Literal["documento.recebido", "banco.pago", "banco.recebido"]
     chave: str | None = None
     dados: dict[str, Any] = Field(default_factory=dict)
 
@@ -242,6 +364,7 @@ class Resumo(BaseModel):
     banco: bool = False
     documentos: int = 0
     agendados: int = 0
+    cobrancas: int = Field(0, description="Cobranças emitidas e ainda não recebidas")
 
 
 # ── Servidores MCP: ferramentas de sistemas da empresa para os agentes ───────
@@ -341,13 +464,20 @@ class Catalogo(BaseModel):
 
 CATALOGO = Catalogo(itens=[
     ItemCatalogo(tipo="caixa_entrada", nome="Caixa de entrada", disponivel=True,
-                 descricao="Um endereço de e-mail da empresa para boletos e notas: cada anexo vira documento."),
+                 descricao="Um endereço de e-mail da empresa: cada anexo que chega vira documento, e as propostas, cobranças e "
+                           "pedidos saem por ele."),
     ItemCatalogo(tipo="banco_simulado", nome="Banco (simulado)", disponivel=True,
-                 descricao="Agenda e confirma pagamentos enquanto o banco de verdade não é escolhido."),
+                 descricao="Agenda pagamentos, emite cobranças e dá o extrato enquanto o banco de verdade não é escolhido."),
     ItemCatalogo(tipo="servidor_mcp", nome="Servidor MCP", disponivel=True, varias=True,
                  descricao="Ferramentas de um sistema da empresa (ERP, CRM...) para os agentes, com a credencial guardada aqui."),
     ItemCatalogo(tipo="whatsapp", nome="WhatsApp", disponivel=False, descricao="Documentos e conversas pelo WhatsApp da empresa."),
     ItemCatalogo(tipo="banco", nome="Banco (Open Finance ou API do banco)", disponivel=False,
                  descricao="Pagamentos e extratos no banco de verdade."),
     ItemCatalogo(tipo="nfse", nome="NFS-e", disponivel=False, descricao="Emissão e consulta de notas de serviço na prefeitura."),
+    ItemCatalogo(tipo="assinatura", nome="Assinatura eletrônica", disponivel=False, descricao="Contratos assinados pelas partes, sem papel."),
+    ItemCatalogo(tipo="esocial", nome="eSocial ou folha", disponivel=False, descricao="Admissões e eventos da folha no eSocial."),
+    ItemCatalogo(tipo="tribunais", nome="Tribunais e diários oficiais", disponivel=False,
+                 descricao="Publicações e intimações da empresa pelo CNPJ."),
+    ItemCatalogo(tipo="certidoes", nome="Portais de certidões", disponivel=False,
+                 descricao="Certidões negativas da Receita/PGFN, FGTS, trabalhista, estadual e municipal."),
 ])

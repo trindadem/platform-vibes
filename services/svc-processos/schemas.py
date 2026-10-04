@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.plans import Limit, Module
-from core.processes import CatalogAction, Condition, Flow, Fluxo, Step, Trigger
+from core.processes import CatalogAction, Condition, Fluxo, Step
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -21,7 +21,8 @@ BUSCA_SUBJECT = "rpc.conhecimento.busca"  # do svc-conhecimento: busca no conhec
 LIVE_DESENHO = "processos.desenho"
 LIVE_EXECUCOES = "processos.execucoes"
 LIVE_TAREFAS = "processos.tarefas"
-CATALOG_SUBJECT = "events.processos.catalogo"  # core/processes.py: os pacotes declaram as ações no boot
+CATALOG_SUBJECT = "events.processos.catalogo"  # core/processes.py: os pacotes declaram as ações e os modelos no boot
+PACOTE_SUBJECT = "events.processos.evento"  # core/processes.py: um acontecimento de um pacote (vendas.pedido_proposta)
 STEP_SUBJECT = "events.processos.passo"  # core/processes.py: o que o worker de um pacote fez num passo
 STAFF_SUBJECT = "events.processos.staff"  # o que espera o staff (exceção, revisão, ajuda): a fila da carteira (svc-staff)
 ACOMPANHAMENTO_SUBJECT = "rpc.processos.acompanhamento"  # svc-staff: a saúde de cada organização da carteira
@@ -33,18 +34,20 @@ PROCESSOS = "processos_processos"
 VERSOES = "processos_versoes"
 MENSAGENS = "processos_mensagens"
 ACOES = "processos_acoes"  # catálogo de ações dos pacotes (o mesmo para toda organização)
+MODELOS = "processos_modelos"  # fluxos de partida dos modelos da biblioteca, declarados pelos pacotes (os mesmos para toda organização)
 EXECUCOES = "processos_execucoes"
 TAREFAS = "processos_tarefas"
 REGRAS = "processos_regras"
 TABLES = [PROCESSOS, VERSOES, MENSAGENS, EXECUCOES, TAREFAS, REGRAS]
-SHARED = [ACOES]
-UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"], EXECUCOES: ["instancia"], TAREFAS: ["chave"]}
+SHARED = [ACOES, MODELOS]
+UNIQUE = {VERSOES: ["processo", "numero"], ACOES: ["name"], MODELOS: ["modelo"], EXECUCOES: ["instancia"], TAREFAS: ["chave"]}
 SEARCH = {PROCESSOS: ["titulo", "descricao"]}
 WRITERS = frozenset({"owner", "admin"})
 OPERADORES = frozenset({"operador"})  # o staff da Cogniventure na organização: resolve as exceções (briefing.md §8)
 STARTERS = WRITERS | OPERADORES  # quem inicia uma execução à mão
 DESIGNERS = WRITERS | OPERADORES  # quem desenha: a empresa e o staff no setup (briefing.md §8)
 UNDO = 20  # quantas alterações do rascunho dá para desfazer
+CADEIA = 5  # até quantos processos, um iniciando o seguinte, uma cadeia vai (um laço entre processos para aqui)
 HISTORY = 20  # mensagens da conversa de desenho no contexto do agente
 
 MODULE = Module(
@@ -111,7 +114,7 @@ BIBLIOTECA: list[ModeloProcesso] = [
        "Todo dia", "Puxa extratos (Open Finance ou OFX), casa com os lançamentos e classifica pelas regras aprendidas",
        "Lançamento sem par acima da tolerância", ["Banco"], ["conciliar o caixa toma tempo", "muitos recebimentos por Pix e cartão"]),
     _m("faturamento-cobranca", "financeiro", "Faturamento e cobrança", "Notas emitidas, cobrança enviada e régua de lembretes.",
-       "Pedido entregue ou contrato do mês",
+       "Proposta aceita, pedido entregue ou contrato do mês",
        "Emite a NFS-e, envia boleto ou Pix e roda a régua (D-3, D+1, D+7 no WhatsApp); negocia dentro dos limites do briefing",
        "Inadimplente além de N dias ou desconto fora do limite", ["Prefeitura (NFS-e)", "Banco", "WhatsApp"],
        ["vende a prazo ou por contrato", "clientes empresas", "inadimplência"]),
@@ -120,7 +123,7 @@ BIBLIOTECA: list[ModeloProcesso] = [
        "gerencial com um resumo", "Documento que não chega ou divergência no imposto", ["E-mail do contador", "Banco"],
        ["contabilidade externa", "Simples Nacional", "quer números confiáveis"]),
     _m("gestao-contratos", "juridico", "Gestão de contratos", "Contratos lidos, comparados ao padrão e vigiados até o vencimento.",
-       "Contrato recebido", "Agente extrai partes, valores, vigência, multa, reajuste e renovação; compara com o padrão da "
+       "Proposta aceita ou contrato recebido", "Agente extrai partes, valores, vigência, multa, reajuste e renovação; compara com o padrão da "
        "empresa; arquiva e avisa 60 e 30 dias antes de vencer ou reajustar", "Cláusula de risco alto: o advogado revisa",
        ["Caixa de entrada", "Assinatura eletrônica"], ["contratos com clientes ou fornecedores", "aluguel", "serviços recorrentes"]),
     _m("publicacoes-processos", "juridico", "Publicações e processos", "Intimações encontradas, resumidas e com prazo calculado.",
@@ -172,7 +175,7 @@ class Processo(BaseModel):
     titulo: str
     descricao: str
     motivo: str | None = Field(None, description="Por que o agente sugeriu (o que no briefing indica o processo)")
-    origem: Literal["sugestao", "cliente"]
+    origem: Literal["sugestao", "cliente", "biblioteca"] = Field(..., description="biblioteca: a empresa escolheu o modelo direto da biblioteca")
     status: Status
     prioridade: Prioridade = "media"
     publicada: int | None = Field(None, description="Número da versão publicada (a que roda)")
@@ -205,6 +208,10 @@ class ProcessoRef(_Input):
 class ProcessoMudou(BaseModel):
     id: str
     action: Literal["sugerido", "aceito", "recusado", "descrito"]
+
+
+class AdicionarModelo(_Input):
+    modelo: "ModeloId" = Field(..., description="Modelo da biblioteca que a empresa quer executar")
 
 
 class Sugestao(_Input):
@@ -323,6 +330,16 @@ class Desenho(BaseModel):
     exige_revisao: bool = Field(False, description="Ação irreversível ou conexão que a publicada não tinha: o staff revisa antes")
     mudancas: list[str] = Field(default_factory=list, description="O que o rascunho muda na publicada (ou no fluxo de partida)")
     regras: list["Regra"] = Field(default_factory=list, description="O que o staff ensinou aos passos deste processo")
+    inicia: list["ProcessoLigado"] = Field(default_factory=list, description="Processos da empresa que este inicia ao terminar (a cadeia)")
+
+
+class ProcessoLigado(BaseModel):
+    """Um processo da empresa ligado a este pela cadeia: começa quando este termina (com o resultado pedido)."""
+
+    id: str
+    titulo: str
+    resultado: str | None = Field(None, description="O fim deste processo que o inicia; vazio, qualquer um")
+    publicada: int | None = None
 
 
 class DesenhoRef(_Input):
@@ -432,7 +449,9 @@ O fluxo tem um gatilho (evento, agenda ou manual) e passos ligados:
 - tarefa: uma pessoa decide (responsavel cliente ou staff, pergunta; a saída é aprovado = verdadeiro ou falso).
 - decisao: caminhos com condição (campo, operador, valor) e exatamente um caminho padrão sem condição.
 - espera: por mensagem (mensagem e chave) ou por tempo (horas).
+- paralelo: com vários caminhos saindo, abre ramos que correm ao mesmo tempo (sem condição); os ramos se juntam noutro paralelo, que espera todos e tem um caminho só depois. Nenhum ramo termina num fim antes de se juntar.
 - fim: como termina (resultado).
+O gatilho pode ser outro processo da empresa (tipo processo, com o id do modelo ou do processo e o resultado com que ele precisa terminar, ex.: proposta-comercial que termina aceita): as saídas dele chegam no gatilho deste.
 Condições usam a saída de um passo anterior (<passo>.<campo>) ou um parâmetro (parametros.<nome>), e o valor pode ser outro parâmetro (ex.: valor = parametros.limite_aprovacao). Para "isto OU aquilo" no mesmo caminho, use o campo ou da condição (lista de outras condições); nunca duas ligações entre os mesmos passos.
 
 Como trabalhar:
@@ -491,51 +510,14 @@ na biblioteca (no contexto) um modelo muito parecido, o id dele. Não invente et
 responda em uma frase o que registrou."""
 
 
-# ── Fluxos de partida (o desenho começa daqui) ───────────────────────────────
+# ── Fluxos de partida: os pacotes declaram (core/processes.py, ProcessModel) e ficam em processos_modelos ──
 
-C, F, P = Condition, Flow, Step
-FLUXOS: dict[str, Fluxo] = {
-    "contas-a-pagar": Fluxo(
-        gatilho=Trigger(tipo="evento", evento="documento.recebido", descricao="Boleto ou NF chega"),
-        parametros={"limite_aprovacao": 5000},
-        passos=[
-            P(id="ler_documento", tipo="agente", nome="Ler o documento", excecao=True, leitura=True,
-              objetivo="Extrair do boleto ou da nota o fornecedor, o CNPJ, o valor, o vencimento e a linha digitável",
-              saidas=["fornecedor", "cnpj", "valor", "vencimento", "linha_digitavel"],
-              exemplo={"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 1250.0, "vencimento": "2026-10-15"}),
-            P(id="conferir", tipo="acao", nome="Conferir com o pedido", acao="financeiro.conferir_pedido"),
-            P(id="divergente", tipo="decisao", nome="Confere com o pedido?"),
-            P(id="revisar", tipo="tarefa", nome="Resolver divergência", responsavel="staff", pergunta="Seguir com o pagamento?", horas=24),
-            P(id="revisado", tipo="decisao", nome="Seguir?"),
-            P(id="precisa_aprovacao", tipo="decisao", nome="Precisa de aprovação?"),
-            P(id="aprovar", tipo="tarefa", nome="Aprovar o pagamento", responsavel="cliente", pergunta="Aprovar o pagamento?", horas=24),
-            P(id="aprovado", tipo="decisao", nome="Aprovado?"),
-            P(id="classificar", tipo="acao", nome="Classificar no plano de contas", acao="financeiro.classificar"),
-            P(id="agendar", tipo="acao", nome="Agendar o pagamento", acao="financeiro.agendar_pagamento", excecao=True),
-            P(id="aguardar", tipo="espera", nome="Aguardar comprovante", espera="mensagem", mensagem="banco.pago",
-              chave="agendar.pagamento_id", horas=48),
-            P(id="conciliar", tipo="acao", nome="Conciliar", acao="financeiro.conciliar"),
-            P(id="pago", tipo="fim", nome="Pago", resultado="pago"),
-            P(id="recusado", tipo="fim", nome="Recusado", resultado="recusado"),
-        ],
-        ligacoes=[
-            F(de="inicio", para="ler_documento"), F(de="ler_documento", para="conferir"), F(de="conferir", para="divergente"),
-            F(de="divergente", para="revisar", condicao=C(campo="conferir.divergente", operador="verdadeiro")),
-            F(de="divergente", para="precisa_aprovacao"),
-            F(de="revisar", para="revisado"),
-            F(de="revisado", para="precisa_aprovacao", condicao=C(campo="revisar.aprovado", operador="verdadeiro")),
-            F(de="revisado", para="recusado"),
-            F(de="precisa_aprovacao", para="aprovar",
-              condicao=C(campo="ler_documento.valor", operador=">", valor="parametros.limite_aprovacao")),
-            F(de="precisa_aprovacao", para="classificar"),
-            F(de="aprovar", para="aprovado"),
-            F(de="aprovado", para="classificar", condicao=C(campo="aprovar.aprovado", operador="verdadeiro")),
-            F(de="aprovado", para="recusado"),
-            F(de="classificar", para="agendar"), F(de="agendar", para="aguardar"), F(de="aguardar", para="conciliar"),
-            F(de="conciliar", para="pago"),
-        ],
-    ),
-}
+class ModeloDeclarado(BaseModel):
+    """O fluxo de partida de um modelo da biblioteca, como o pacote da área declarou."""
+
+    modelo: str
+    service: str
+    fluxo: Fluxo
 
 
 # ── Execução: gatilhos, acompanhamento, tarefas de pessoas e autonomia ───────
@@ -596,8 +578,11 @@ class Execucao(BaseModel):
     motor_versao: int
     status: StatusExecucao
     resultado: str | None = Field(None, description="Como terminou (o fim alcançado: pago, recusado...)")
-    origem: Literal["evento", "manual", "agenda"] = "evento"
+    origem: Literal["evento", "manual", "agenda", "processo"] = "evento"
     resumo: str | None = Field(None, description="O que iniciou (ex.: o documento recebido)")
+    pai: str | None = Field(None, description="Execução do processo que iniciou esta (gatilho por outro processo)")
+    projeto: str | None = Field(None, description="A primeira execução da cadeia: as execuções de um projeto têm o mesmo")
+    nivel: int = Field(0, description="Quantos processos antes deste na cadeia")
     passo_atual: str | None = None
     passo_nome: str | None = None
     aguardando: Literal["cliente", "staff", "evento"] | None = None
@@ -625,6 +610,7 @@ class ExecucaoQuery(ListQuery):
     default_sort: ClassVar[str | None] = "-created_at"
     status: StatusExecucao | None = None
     processo: str | None = None
+    projeto: str | None = None
 
 
 class ExecucaoPage(Page[Execucao]):
@@ -640,6 +626,49 @@ class ExecucaoDetalhe(BaseModel):
     bpmn: str = Field(..., description="O BPMN da versão em que a execução roda")
     caminho: list[str] = Field(..., description="Elementos e ligações por onde passou (para pintar no diagrama)")
     atuais: list[str] = Field(..., description="Onde está agora")
+    cadeia: list["EtapaProjeto"] = Field(default_factory=list, description="O projeto de que a execução faz parte (vazio fora de uma cadeia)")
+
+
+class EtapaProjeto(BaseModel):
+    """Uma execução dentro de um projeto (a cadeia de processos que um começou)."""
+
+    id: str
+    processo: str
+    titulo: str
+    status: StatusExecucao
+    resultado: str | None = None
+    resumo: str | None = None
+    passo_nome: str | None = None
+    aguardando: Literal["cliente", "staff", "evento"] | None = None
+    handoffs: int = 0
+    pai: str | None = None
+    created_at: datetime | None = None
+    concluida_em: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return str(value).partition(":")[2].strip("⟨⟩`") if ":" in str(value) else value
+
+
+class Projeto(BaseModel):
+    """A cadeia que um processo começou (ex.: proposta aceita → contrato e faturamento), acompanhada como um projeto."""
+
+    id: str = Field(..., description="A execução que começou a cadeia")
+    titulo: str
+    resumo: str | None = None
+    status: Literal["andamento", "concluido", "atencao"] = Field(..., description="atencao: alguma execução com incidente")
+    etapas: list[EtapaProjeto]
+    created_at: datetime | None = None
+
+
+class ProjetoQuery(ListQuery):
+    sortable: ClassVar[tuple[str, ...]] = ("created_at",)
+    default_sort: ClassVar[str | None] = "-created_at"
+
+
+class ProjetoPage(Page[Projeto]):
+    pass
 
 
 class Iniciar(_Input):
@@ -843,6 +872,8 @@ class RegraMudou(BaseModel):
 
 Processo.model_rebuild()
 Desenho.model_rebuild()
+ExecucaoDetalhe.model_rebuild()
+AdicionarModelo.model_rebuild()
 
 
 # ── Agentes da empresa nos passos (svc-agentes, N6) ──────────────────────────

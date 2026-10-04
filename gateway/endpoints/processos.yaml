@@ -74,6 +74,14 @@ endpoints:
     target_type: http
     target_url: http://svc-processos:8000/processos/recusar
 
+  - path: /processos/adicionar
+    method: POST
+    auth: client_jwt
+    request: AdicionarModelo
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/processos/adicionar
+
   - path: /catalogo
     name: catalogo
     method: GET
@@ -200,6 +208,14 @@ endpoints:
     response: Acompanhamento
     target_type: http
     target_url: http://svc-processos:8000/acompanhamento
+
+  - path: /projetos
+    method: GET
+    auth: client_jwt
+    query: ProjetoQuery
+    response: ProjetoPage
+    target_type: http
+    target_url: http://svc-processos:8000/projetos
 
   - path: /desenho/revisao
     name: pedirRevisao

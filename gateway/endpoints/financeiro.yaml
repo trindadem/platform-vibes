@@ -7,8 +7,10 @@ base_path: /api/v1/financeiro
 resources: [fornecedores]
 
 live:
-  - topic: titulos                  # um título foi agendado ou pago
+  - topic: titulos                  # um título foi agendado, pago ou conciliado
     model: TituloMudou
+  - topic: faturas                  # uma fatura foi aberta, cobrada, lembrada ou paga
+    model: FaturaMudou
 
 endpoints:
   - path: /titulos
@@ -18,3 +20,11 @@ endpoints:
     response: TituloPage
     target_type: http
     target_url: http://svc-financeiro:8000/titulos
+
+  - path: /faturas
+    method: GET
+    auth: client_jwt
+    query: FaturaQuery
+    response: FaturaPage
+    target_type: http
+    target_url: http://svc-financeiro:8000/faturas

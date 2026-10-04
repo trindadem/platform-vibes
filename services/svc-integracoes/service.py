@@ -41,11 +41,15 @@ from core.temporal_runner import activities, runner
 from schemas import (
     ACCEPTED,
     BANK_OPERATORS,
+    COBRANCAS,
     CONEXOES,
     DOCUMENT_MAX_BYTES,
     DOCUMENTOS,
+    ENVIADOS,
     EVENT_SUBJECT,
+    LIVE_COBRANCAS,
     LIVE_CONEXOES,
+    LIVE_ENVIADOS,
     LIVE_DOCUMENTOS,
     LIVE_PAGAMENTOS,
     LIVE_SERVIDORES,
@@ -62,6 +66,14 @@ from schemas import (
     AvisoEmail,
     Catalogo,
     ChamadaMcp,
+    Cobranca,
+    CobrancaEmitida,
+    CobrancaMudou,
+    CobrancaPage,
+    CobrancaQuery,
+    CobrancaRef,
+    CobrancaSimulada,
+    CobrarNoBanco,
     Conexao,
     ConexaoMudou,
     ConexaoRef,
@@ -72,8 +84,17 @@ from schemas import (
     DocumentoQuery,
     DocumentoRef,
     DocumentoTexto,
+    EmailEnviado,
     Empty,
+    Enviado,
+    EnviadoMudou,
+    EnviadoPage,
+    EnviadoQuery,
+    EnviarEmail,
     EventoExterno,
+    Extrato,
+    ExtratoPedido,
+    Lancamento,
     FerramentaDisponivel,
     FerramentaMcp,
     FerramentasDisponiveis,
@@ -142,9 +163,11 @@ class IntegracoesService:
         conexoes = {c.tipo: c for c in (await self.conexoes(Empty())).itens}
         documentos = await db.query(f"SELECT count() AS n FROM {DOCUMENTOS} WHERE tenant = $tenant GROUP ALL")
         agendados = await db.query(f"SELECT count() AS n FROM {PAGAMENTOS} WHERE tenant = $tenant AND status = 'agendado' GROUP ALL")
+        cobrancas = await db.query(f"SELECT count() AS n FROM {COBRANCAS} WHERE tenant = $tenant AND status = 'aberta' GROUP ALL")
         caixa = conexoes.get("caixa_entrada")
         return Resumo(caixa_entrada=caixa.endereco if caixa else None, banco="banco_simulado" in conexoes,
-                      documentos=documentos[0]["n"] if documentos else 0, agendados=agendados[0]["n"] if agendados else 0)
+                      documentos=documentos[0]["n"] if documentos else 0, agendados=agendados[0]["n"] if agendados else 0,
+                      cobrancas=cobrancas[0]["n"] if cobrancas else 0)
 
     # ── Caixa de entrada ─────────────────────────────────────────────────────
 
@@ -193,9 +216,7 @@ class IntegracoesService:
 
     async def agendar_pagamento(self, data: AgendarPagamento) -> PagamentoAgendado:
         """rpc.integracoes.banco_agendar: agenda no banco conectado. O simulado confirma depois de confirmar_apos s."""
-        banco = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant AND tipo = 'banco_simulado' LIMIT 1")
-        if not banco:
-            raise ServiceError("ERRO_INTEGRACOES_SEM_BANCO", "Conecte o banco da empresa em Integrações para agendar pagamentos.", 409)
+        banco = [await _banco()]
         hoje = date.today().isoformat()
         data_agendada = data.vencimento if data.vencimento and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data.vencimento) and data.vencimento > hoje else hoje
         pagamento_id = "PG-" + secrets.token_hex(4).upper()
@@ -228,6 +249,83 @@ class IntegracoesService:
         ), msg_id=f"banco-pago-{current_tenant()}-{pagamento.pagamento_id}")
         await bus.live(LIVE_PAGAMENTOS, PagamentoMudou(id=pagamento.id, action="pago"))
         return pagamento
+
+    async def cobrar(self, data: CobrarNoBanco) -> CobrancaEmitida:
+        """rpc.integracoes.banco_cobrar: emite o boleto no banco conectado. O simulado confirma o recebimento depois
+        de confirmar_apos s (ou alguém confirma à mão), e a confirmação acorda a execução que espera."""
+        banco = await _banco()
+        cobranca_id = "CB-" + secrets.token_hex(4).upper()
+        row = await db.create(COBRANCAS, {"cobranca_id": cobranca_id, "valor": data.valor, "vencimento": data.vencimento,
+                                          "pagador": data.pagador, "descricao": data.descricao, "status": "aberta",
+                                          "linha_digitavel": _linha_digitavel(data.valor)})
+        cobranca = Cobranca.model_validate(row)
+        await runner.start_workflow(_workflow_cobranca(), CobrancaSimulada(id=cobranca.id, segundos=int(banco.get("confirmar_apos") or 30)),
+                                    task_queue=TASK_QUEUE, id=f"cobranca-{current_tenant()}-{cobranca.id}")
+        await bus.live(LIVE_COBRANCAS, CobrancaMudou(id=cobranca.id, action="emitida"))
+        return CobrancaEmitida(cobranca_id=cobranca_id, linha_digitavel=cobranca.linha_digitavel, vencimento=cobranca.vencimento)
+
+    async def cobrancas(self, data: CobrancaQuery) -> CobrancaPage:
+        return await db.page(COBRANCAS, data, CobrancaPage)
+
+    async def confirmar_cobranca(self, data: CobrancaRef) -> Cobranca:
+        """O banco recebeu (o simulado, sozinho, ou alguém à mão): avisa a execução que espera pelo pagamento."""
+        who = current()
+        if who is None or not (who.is_system or BANK_OPERATORS & who.roles):
+            raise ServiceError("ERRO_INTEGRACOES_FORBIDDEN", "Só donos, administradores e operadores confirmam recebimentos.", 403)
+        row = await db.select(f"{COBRANCAS}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_INTEGRACOES_NAO_ENCONTRADO", "Cobrança não encontrada.", 404)
+        if row["status"] == "recebida":
+            return Cobranca.model_validate(row)
+        cobranca = Cobranca.model_validate(await db.merge(f"{COBRANCAS}:{data.id}", {"status": "recebida", "recebido_em": datetime.now(UTC)}))
+        await bus.publish(EVENT_SUBJECT, EventoExterno(
+            nome="banco.recebido", chave=cobranca.cobranca_id,
+            dados={"cobranca_id": cobranca.cobranca_id, "valor": cobranca.valor,
+                   "recebido_em": cobranca.recebido_em.isoformat() if cobranca.recebido_em else None},
+        ), msg_id=f"banco-recebido-{current_tenant()}-{cobranca.cobranca_id}")
+        await bus.live(LIVE_COBRANCAS, CobrancaMudou(id=cobranca.id, action="recebida"))
+        return cobranca
+
+    async def extrato(self, data: ExtratoPedido) -> Extrato:
+        """rpc.integracoes.banco_extrato: o que entrou e saiu da conta desde o dia pedido (pagamentos confirmados e
+        cobranças recebidas), para a conciliação."""
+        await _banco()
+        itens: list[Lancamento] = []
+        for row in await db.query(f"SELECT * FROM {PAGAMENTOS} WHERE tenant = $tenant AND status = 'pago' ORDER BY pago_em"):
+            quando = _dia(row.get("pago_em"))
+            if quando >= data.desde:
+                itens.append(Lancamento(tipo="pagamento", id=row["pagamento_id"], valor=-float(row["valor"]), data=quando,
+                                        descricao=row.get("fornecedor")))
+        for row in await db.query(f"SELECT * FROM {COBRANCAS} WHERE tenant = $tenant AND status = 'recebida' ORDER BY recebido_em"):
+            quando = _dia(row.get("recebido_em"))
+            if quando >= data.desde:
+                itens.append(Lancamento(tipo="recebimento", id=row["cobranca_id"], valor=float(row["valor"]), data=quando,
+                                        descricao=row.get("pagador")))
+        return Extrato(itens=sorted(itens, key=lambda i: i.data))
+
+    # ── E-mail que sai da caixa de entrada ───────────────────────────────────
+
+    async def enviar_email(self, data: EnviarEmail) -> EmailEnviado:
+        """rpc.integracoes.enviar_email: sai do endereço da caixa de entrada da organização (as respostas voltam para
+        ela). No ambiente local, pelo Mailpit (nada sai para a internet); em produção, o provedor ainda não foi
+        escolhido (briefing.md §14, decisão 6): 409, e o passo vai para o staff."""
+        caixa = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant AND tipo = 'caixa_entrada' LIMIT 1")
+        if not caixa:
+            raise ServiceError("ERRO_INTEGRACOES_SEM_CAIXA", "Conecte a caixa de entrada da empresa em Integrações para enviar e-mails.", 409)
+        if not settings.mailpit_url:
+            raise ServiceError("ERRO_INTEGRACOES_SEM_PROVEDOR", "O envio de e-mail ainda não tem provedor: envie pelo e-mail da empresa.", 409)
+        de = caixa[0]["endereco"]
+        resposta = await http.post(f"{settings.mailpit_url.rstrip('/')}/api/v1/send", allow_http=True, allow_private=True, json={
+            "From": {"Email": de}, "To": [{"Email": data.para}], "Subject": data.assunto, "Text": data.texto})
+        if resposta.status_code >= 400:
+            raise ServiceError("ERRO_INTEGRACOES_EMAIL_ENVIO", "O provedor de e-mail recusou a mensagem.", 502)
+        mensagem_id = str(resposta.json().get("ID") or secrets.token_hex(8))
+        row = await db.create(ENVIADOS, {"para": data.para, "assunto": data.assunto, "de": de, "mensagem_id": mensagem_id})
+        await bus.live(LIVE_ENVIADOS, EnviadoMudou(id=Enviado.model_validate(row).id, action="enviado"))
+        return EmailEnviado(mensagem_id=mensagem_id, de=de)
+
+    async def enviados(self, data: EnviadoQuery) -> EnviadoPage:
+        return await db.page(ENVIADOS, data, EnviadoPage)
 
     # ── Servidores MCP: ferramentas dos sistemas da empresa para os agentes ──
 
@@ -319,6 +417,31 @@ def _workflow_pagamento() -> Any:
     from workflows import PagamentoSimuladoWorkflow  # o workflow importa este arquivo: a referência é resolvida na hora
 
     return PagamentoSimuladoWorkflow.run
+
+
+def _workflow_cobranca() -> Any:
+    from workflows import CobrancaSimuladaWorkflow
+
+    return CobrancaSimuladaWorkflow.run
+
+
+async def _banco() -> dict[str, Any]:
+    """A conexão do banco da organização; sem ela, 409 (no processo, o passo vai para o staff)."""
+    banco = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant AND tipo = 'banco_simulado' LIMIT 1")
+    if not banco:
+        raise ServiceError("ERRO_INTEGRACOES_SEM_BANCO", "Conecte o banco da empresa em Integrações para pagamentos, cobranças e extrato.", 409)
+    return banco[0]
+
+
+def _dia(valor: Any) -> str:
+    """Data do banco (datetime ou texto ISO) → AAAA-MM-DD."""
+    return valor.date().isoformat() if isinstance(valor, datetime) else str(valor or "")[:10]
+
+
+def _linha_digitavel(valor: float) -> str:
+    """Uma linha digitável no formato do boleto (47 dígitos), com o valor no fim: a do banco simulado."""
+    d = "".join(secrets.choice("0123456789") for _ in range(30))
+    return f"34191.{d[0:5]} {d[5:10]}.{d[10:16]} {d[16:21]}.{d[21:27]} {d[27]} {d[28:30]}00{int(round(valor * 100)):010d}"
 
 
 async def _documento(doc_id: str) -> dict[str, Any]:

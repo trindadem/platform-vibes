@@ -1,0 +1,39 @@
+# svc-vendas · rotas públicas no Gateway. Fonte da verdade: specs/vendas.md §2
+service: vendas
+base_path: /api/v1/vendas
+
+# Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
+# vendas.<cadastro>, e vira vendas.<cadastro> no frontend.
+resources: [leads, clientes]
+
+live:
+  - topic: propostas                # uma proposta mudou (pedida, montada, enviada, follow-up, aceita, recusada)
+    model: PropostaMudou
+
+endpoints:
+  - path: /leads/receber
+    name: receberLead
+    method: POST
+    auth: client_jwt
+    request: ReceberLead
+    response: LeadItem
+    target_type: http
+    target_url: http://svc-vendas:8000/leads/receber
+
+  - path: /propostas
+    name: propostas
+    method: GET
+    auth: client_jwt
+    query: PropostaQuery
+    response: PropostaPage
+    target_type: http
+    target_url: http://svc-vendas:8000/propostas
+
+  - path: /propostas
+    name: pedirProposta
+    method: POST
+    auth: client_jwt
+    request: PedidoProposta
+    response: Proposta
+    target_type: http
+    target_url: http://svc-vendas:8000/propostas

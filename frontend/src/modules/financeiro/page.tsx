@@ -8,7 +8,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { useListQuery } from "@/core/api";
 import { financeiro } from "@/core/contracts";
 
-export const meta: PageMeta = { title: "Contas a pagar", module: "financeiro" };
+export const meta: PageMeta = { title: "Financeiro", module: "financeiro" };
 
 export default function ContasAPagar() {
   const lista = useListQuery(financeiro.titulos, { live: "financeiro.titulos" });
@@ -23,10 +23,11 @@ export default function ContasAPagar() {
         columns={[
           { key: "fornecedor", header: "Fornecedor", render: (t) => t.fornecedor ?? "—" },
           { key: "valor", header: "Valor", sort: "valor", render: (t) => <Money value={t.valor} /> },
-          { key: "vencimento", header: "Vencimento", render: (t) => t.vencimento ?? "—" },
+          { key: "vencimento", header: "Vencimento", render: (t) => <DateTime value={t.vencimento} format="date" /> },
           { key: "data", header: "Agendada para", sort: "data" },
           { key: "pagamento_id", header: "Pagamento" },
-          { key: "status", header: "Status", render: (t) => <StatusBadge value={t.status} labels={{ agendado: "Agendada", pago: "Paga e conciliada" }} /> },
+          { key: "status", header: "Status", render: (t) => <StatusBadge value={t.status} labels={{ agendado: "Agendada", pago: "Paga" }} /> },
+          { key: "conciliado", header: "Extrato", render: (t) => (t.conciliado ? "Conciliada" : "—") },
           { key: "created_at", header: "Desde", sort: "created_at", render: (t) => (t.created_at ? <DateTime value={t.created_at} /> : "—") },
         ]}
       />

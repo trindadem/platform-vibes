@@ -39,6 +39,342 @@ export const gateway = {
   health: (options?: RequestOptions) => request<GatewayHealth>("GET", "/health", undefined, options),
 };
 
+export interface AdministrativoNovaAdmissao {
+  /** Quem foi contratado */
+  nome: string;
+  /** Para onde vai o pedido de documentos */
+  email: string;
+  cargo: string;
+  salario?: number | null;
+  /** Primeiro dia de trabalho */
+  inicio?: string | null;
+}
+
+/** Colaboradores: um registro. */
+export interface AdministrativoColaboradorItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  email: string | null;
+  cargo: string | null;
+  salario: number | null;
+  inicio: string | null;
+  status: "admissao" | "ativo" | "desligado";
+  exame_em: string | null;
+  acessos: string | null;
+}
+
+export interface AdministrativoCotacao {
+  fornecedor: string;
+  valor: number;
+  prazo_dias: number | null;
+}
+
+/** Uma requisição de compra: as cotações que chegaram, a escolhida e o pedido. */
+export interface AdministrativoRequisicao {
+  id: string;
+  item: string;
+  quantidade: number;
+  categoria: string | null;
+  observacao: string | null;
+  status: "aberta" | "cotando" | "pedido" | "cancelada";
+  cotacoes: AdministrativoCotacao[];
+  melhor_fornecedor: string | null;
+  melhor_valor: number | null;
+  pedido_numero: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AdministrativoRequisicaoPage {
+  items: AdministrativoRequisicao[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface AdministrativoRequisicaoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "item" | "-item" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberta" | "cotando" | "pedido" | "cancelada" | null;
+}
+
+export interface AdministrativoNovaRequisicao {
+  /** O que comprar */
+  item: string;
+  quantidade: number;
+  /** Para escolher os fornecedores que cotam */
+  categoria?: string | null;
+  observacao?: string | null;
+}
+
+export interface AdministrativoNovaCotacao {
+  requisicao: string;
+  fornecedor: string;
+  /** Valor total da cotação, em reais */
+  valor: number;
+  /** Prazo de entrega em dias */
+  prazo_dias?: number | null;
+}
+
+export interface AdministrativoRequisicaoMudou {
+  id: string;
+  action: "aberta" | "cotando" | "cotacao" | "pedido" | "cancelada";
+}
+
+export interface AdministrativoColaborador {
+  nome: string;
+  email?: string | null;
+  cargo?: string | null;
+  salario?: number | null;
+  inicio?: string | null;
+  status?: "admissao" | "ativo" | "desligado";
+  exame_em?: string | null;
+  acessos?: string | null;
+}
+
+/** Colaboradores: só os campos que mudam. */
+export interface AdministrativoColaboradorUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  email?: string | null;
+  cargo?: string | null;
+  salario?: number | null;
+  inicio?: string | null;
+  status?: "admissao" | "ativo" | "desligado" | null;
+  exame_em?: string | null;
+  acessos?: string | null;
+}
+
+/** Colaboradores: página, busca, filtros e ordem pela URL. */
+export interface AdministrativoColaboradorQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "nome" | "-nome" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "admissao" | "ativo" | "desligado" | null;
+}
+
+export interface AdministrativoColaboradorPage {
+  items: AdministrativoColaboradorItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface AdministrativoFornecedorCompra {
+  nome: string;
+  /** Para onde vão os pedidos de cotação e de compra */
+  email?: string | null;
+  /** Ex.: embalagens, limpeza, insumos */
+  categoria?: string | null;
+}
+
+/** Fornecedores de compras: só os campos que mudam. */
+export interface AdministrativoFornecedorCompraUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  /** Para onde vão os pedidos de cotação e de compra */
+  email?: string | null;
+  /** Ex.: embalagens, limpeza, insumos */
+  categoria?: string | null;
+}
+
+/** Fornecedores de compras: página, busca, filtros e ordem pela URL. */
+export interface AdministrativoFornecedorCompraQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "nome" | "-nome" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
+/** Fornecedores de compras: um registro. */
+export interface AdministrativoFornecedorCompraItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  /** Para onde vão os pedidos de cotação e de compra */
+  email: string | null;
+  /** Ex.: embalagens, limpeza, insumos */
+  categoria: string | null;
+}
+
+export interface AdministrativoFornecedorCompraPage {
+  items: AdministrativoFornecedorCompraItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface AdministrativoVencimento {
+  nome: string;
+  tipo?: "alvara" | "licenca" | "avcb" | "seguro" | "contrato_servico" | "outro";
+  vence_em: string;
+  exige_vistoria?: boolean;
+  /** Quando a empresa foi avisada da renovação */
+  avisado_em?: string | null;
+}
+
+/** Vencimentos: só os campos que mudam. */
+export interface AdministrativoVencimentoUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  tipo?: "alvara" | "licenca" | "avcb" | "seguro" | "contrato_servico" | "outro" | null;
+  vence_em?: string | null;
+  exige_vistoria?: boolean | null;
+  /** Quando a empresa foi avisada da renovação */
+  avisado_em?: string | null;
+}
+
+/** Vencimentos: página, busca, filtros e ordem pela URL. */
+export interface AdministrativoVencimentoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "vence_em" | "-vence_em" | "nome" | "-nome" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  tipo?: "alvara" | "licenca" | "avcb" | "seguro" | "contrato_servico" | "outro" | null;
+}
+
+/** Vencimentos: um registro. */
+export interface AdministrativoVencimentoItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  tipo: "alvara" | "licenca" | "avcb" | "seguro" | "contrato_servico" | "outro";
+  vence_em: string;
+  exige_vistoria: boolean;
+  /** Quando a empresa foi avisada da renovação */
+  avisado_em: string | null;
+}
+
+export interface AdministrativoVencimentoPage {
+  items: AdministrativoVencimentoItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** svc-administrativo · /api/v1/administrativo */
+export const administrativo = {
+  /** POST /api/v1/administrativo/admissoes · http · exige token */
+  admitir: (body: AdministrativoNovaAdmissao, options?: RequestOptions) =>
+    request<AdministrativoColaboradorItem>("POST", "/api/v1/administrativo/admissoes", body, options),
+  /** GET /api/v1/administrativo/requisicoes · http · exige token */
+  requisicoes: (query?: AdministrativoRequisicaoQuery, options?: RequestOptions) =>
+    request<AdministrativoRequisicaoPage>("GET", withQuery("/api/v1/administrativo/requisicoes", query), undefined, options),
+  /** POST /api/v1/administrativo/requisicoes · http · exige token */
+  requisitar: (body: AdministrativoNovaRequisicao, options?: RequestOptions) =>
+    request<AdministrativoRequisicao>("POST", "/api/v1/administrativo/requisicoes", body, options),
+  /** POST /api/v1/administrativo/requisicoes/cotacao · http · exige token */
+  registrarCotacao: (body: AdministrativoNovaCotacao, options?: RequestOptions) =>
+    request<AdministrativoRequisicao>("POST", "/api/v1/administrativo/requisicoes/cotacao", body, options),
+  /** Cadastro Colaboradores (core/resources.py) · /api/v1/administrativo/colaboradores · exige token */
+  colaboradores: {
+    /** GET /api/v1/administrativo/colaboradores · página, busca, filtros e ordem */
+    list: (query?: AdministrativoColaboradorQuery, options?: RequestOptions) =>
+      request<AdministrativoColaboradorPage>("GET", withQuery("/api/v1/administrativo/colaboradores", query), undefined, options),
+    /** GET /api/v1/administrativo/colaboradores/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<AdministrativoColaboradorItem>("GET", withQuery("/api/v1/administrativo/colaboradores/item", query), undefined, options),
+    /** POST /api/v1/administrativo/colaboradores */
+    create: (body: AdministrativoColaborador, options?: RequestOptions) =>
+      request<AdministrativoColaboradorItem>("POST", "/api/v1/administrativo/colaboradores", body, options),
+    /** POST /api/v1/administrativo/colaboradores/update · só os campos que vierem mudam */
+    update: (body: AdministrativoColaboradorUpdate, options?: RequestOptions) =>
+      request<AdministrativoColaboradorItem>("POST", "/api/v1/administrativo/colaboradores/update", body, options),
+    /** POST /api/v1/administrativo/colaboradores/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/administrativo/colaboradores/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Colaboradores", "live": "administrativo.colaboradores", "fields": [{"name": "nome", "label": "Nome", "kind": "text", "required": true}, {"name": "email", "label": "E-mail", "kind": "email", "required": false}, {"name": "cargo", "label": "Cargo", "kind": "text", "required": false}, {"name": "salario", "label": "Salário", "kind": "money", "required": false}, {"name": "inicio", "label": "Início", "kind": "date", "required": false}, {"name": "status", "label": "Situação", "kind": "select", "required": false, "options": [{"value": "admissao", "label": "Em admissão"}, {"value": "ativo", "label": "Ativo"}, {"value": "desligado", "label": "Desligado"}]}, {"name": "exame_em", "label": "Exame admissional", "kind": "datetime", "required": false}, {"name": "acessos", "label": "Acessos a criar", "kind": "textarea", "required": false}], "columns": [{"key": "nome", "header": "Nome", "kind": "text", "sort": "nome"}, {"key": "email", "header": "E-mail", "kind": "email"}, {"key": "cargo", "header": "Cargo", "kind": "text"}, {"key": "salario", "header": "Salário", "kind": "money"}, {"key": "inicio", "header": "Início", "kind": "date"}], "filters": [{"name": "status", "label": "Situação", "options": [{"value": "admissao", "label": "Em admissão"}, {"value": "ativo", "label": "Ativo"}, {"value": "desligado", "label": "Desligado"}]}], "search": "nome, cargo"} satisfies ResourceMeta,
+  },
+  /** Cadastro Fornecedores de compras (core/resources.py) · /api/v1/administrativo/fornecedores · exige token */
+  fornecedores: {
+    /** GET /api/v1/administrativo/fornecedores · página, busca, filtros e ordem */
+    list: (query?: AdministrativoFornecedorCompraQuery, options?: RequestOptions) =>
+      request<AdministrativoFornecedorCompraPage>("GET", withQuery("/api/v1/administrativo/fornecedores", query), undefined, options),
+    /** GET /api/v1/administrativo/fornecedores/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<AdministrativoFornecedorCompraItem>("GET", withQuery("/api/v1/administrativo/fornecedores/item", query), undefined, options),
+    /** POST /api/v1/administrativo/fornecedores */
+    create: (body: AdministrativoFornecedorCompra, options?: RequestOptions) =>
+      request<AdministrativoFornecedorCompraItem>("POST", "/api/v1/administrativo/fornecedores", body, options),
+    /** POST /api/v1/administrativo/fornecedores/update · só os campos que vierem mudam */
+    update: (body: AdministrativoFornecedorCompraUpdate, options?: RequestOptions) =>
+      request<AdministrativoFornecedorCompraItem>("POST", "/api/v1/administrativo/fornecedores/update", body, options),
+    /** POST /api/v1/administrativo/fornecedores/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/administrativo/fornecedores/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Fornecedores de compras", "live": "administrativo.fornecedores", "fields": [{"name": "nome", "label": "Nome", "kind": "text", "required": true}, {"name": "email", "label": "E-mail", "kind": "email", "required": false, "hint": "Para onde vão os pedidos de cotação e de compra"}, {"name": "categoria", "label": "Categoria", "kind": "text", "required": false, "hint": "Ex.: embalagens, limpeza, insumos"}], "columns": [{"key": "nome", "header": "Nome", "kind": "text", "sort": "nome"}, {"key": "email", "header": "E-mail", "kind": "email"}, {"key": "categoria", "header": "Categoria", "kind": "text"}], "filters": [], "search": "nome, categoria"} satisfies ResourceMeta,
+  },
+  /** Cadastro Vencimentos (core/resources.py) · /api/v1/administrativo/vencimentos · exige token */
+  vencimentos: {
+    /** GET /api/v1/administrativo/vencimentos · página, busca, filtros e ordem */
+    list: (query?: AdministrativoVencimentoQuery, options?: RequestOptions) =>
+      request<AdministrativoVencimentoPage>("GET", withQuery("/api/v1/administrativo/vencimentos", query), undefined, options),
+    /** GET /api/v1/administrativo/vencimentos/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<AdministrativoVencimentoItem>("GET", withQuery("/api/v1/administrativo/vencimentos/item", query), undefined, options),
+    /** POST /api/v1/administrativo/vencimentos */
+    create: (body: AdministrativoVencimento, options?: RequestOptions) =>
+      request<AdministrativoVencimentoItem>("POST", "/api/v1/administrativo/vencimentos", body, options),
+    /** POST /api/v1/administrativo/vencimentos/update · só os campos que vierem mudam */
+    update: (body: AdministrativoVencimentoUpdate, options?: RequestOptions) =>
+      request<AdministrativoVencimentoItem>("POST", "/api/v1/administrativo/vencimentos/update", body, options),
+    /** POST /api/v1/administrativo/vencimentos/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/administrativo/vencimentos/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Vencimentos", "live": "administrativo.vencimentos", "fields": [{"name": "nome", "label": "O que vence", "kind": "text", "required": true}, {"name": "tipo", "label": "Tipo", "kind": "select", "required": false, "options": [{"value": "alvara", "label": "Alvará"}, {"value": "licenca", "label": "Licença"}, {"value": "avcb", "label": "AVCB"}, {"value": "seguro", "label": "Seguro"}, {"value": "contrato_servico", "label": "Contrato de serviço"}, {"value": "outro", "label": "Outro"}]}, {"name": "vence_em", "label": "Vence em", "kind": "date", "required": true}, {"name": "exige_vistoria", "label": "Exige vistoria ou presença", "kind": "boolean", "required": false, "options": [{"value": "true", "label": "Sim"}, {"value": "false", "label": "Não"}]}, {"name": "avisado_em", "label": "Avisado em", "kind": "date", "required": false, "hint": "Quando a empresa foi avisada da renovação"}], "columns": [{"key": "nome", "header": "O que vence", "kind": "text", "sort": "nome"}, {"key": "tipo", "header": "Tipo", "kind": "select"}, {"key": "vence_em", "header": "Vence em", "kind": "date", "sort": "vence_em"}, {"key": "exige_vistoria", "header": "Exige vistoria ou presença", "kind": "boolean"}, {"key": "avisado_em", "header": "Avisado em", "kind": "date"}], "filters": [{"name": "tipo", "label": "Tipo", "options": [{"value": "alvara", "label": "Alvará"}, {"value": "licenca", "label": "Licença"}, {"value": "avcb", "label": "AVCB"}, {"value": "seguro", "label": "Seguro"}, {"value": "contrato_servico", "label": "Contrato de serviço"}, {"value": "outro", "label": "Outro"}]}], "search": "o que vence"} satisfies ResourceMeta,
+  },
+};
+
 export interface AgentesAgente {
   id: string;
   nome: string;
@@ -663,6 +999,8 @@ export interface FinanceiroTitulo {
   data: string;
   pagamento_id: string;
   status: "agendado" | "pago";
+  /** Casou com o extrato do banco */
+  conciliado: boolean;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -689,9 +1027,58 @@ export interface FinanceiroTituloQuery {
   status?: "agendado" | "pago" | null;
 }
 
+/** Uma venda faturada pelo processo: nota, cobrança no banco, régua de lembretes e recebimento. */
+export interface FinanceiroFatura {
+  id: string;
+  cliente: string;
+  cnpj: string | null;
+  email: string | null;
+  descricao: string | null;
+  valor: number;
+  vencimento: string;
+  nota_numero: string | null;
+  cobranca_id: string | null;
+  linha_digitavel: string | null;
+  status: "aberta" | "cobrada" | "paga";
+  /** Lembretes já enviados (D-3, D+1, D+7) */
+  regua: string[];
+  recebido_em: string | null;
+  conciliada: boolean;
+  proposta_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface FinanceiroFaturaPage {
+  items: FinanceiroFatura[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface FinanceiroFaturaQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "vencimento" | "-vencimento" | "valor" | "-valor" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberta" | "cobrada" | "paga" | null;
+}
+
 export interface FinanceiroTituloMudou {
   id: string;
-  action: "agendado" | "pago";
+  action: "agendado" | "pago" | "conciliado";
+}
+
+export interface FinanceiroFaturaMudou {
+  id: string;
+  action: "aberta" | "cobrada" | "paga" | "lembrete";
 }
 
 export interface FinanceiroFornecedor {
@@ -758,6 +1145,9 @@ export const financeiro = {
   /** GET /api/v1/financeiro/titulos · http · exige token */
   titulos: (query?: FinanceiroTituloQuery, options?: RequestOptions) =>
     request<FinanceiroTituloPage>("GET", withQuery("/api/v1/financeiro/titulos", query), undefined, options),
+  /** GET /api/v1/financeiro/faturas · http · exige token */
+  faturas: (query?: FinanceiroFaturaQuery, options?: RequestOptions) =>
+    request<FinanceiroFaturaPage>("GET", withQuery("/api/v1/financeiro/faturas", query), undefined, options),
   /** Cadastro Fornecedores (core/resources.py) · /api/v1/financeiro/fornecedores · exige token */
   fornecedores: {
     /** GET /api/v1/financeiro/fornecedores · página, busca, filtros e ordem */
@@ -1040,6 +1430,8 @@ export interface IntegracoesResumo {
   banco: boolean;
   documentos: number;
   agendados: number;
+  /** Cobranças emitidas e ainda não recebidas */
+  cobrancas: number;
 }
 
 export interface IntegracoesDocumento {
@@ -1183,6 +1575,74 @@ export interface IntegracoesServidorRef {
   id: string;
 }
 
+export interface IntegracoesCobranca {
+  id: string;
+  cobranca_id: string;
+  valor: number;
+  vencimento: string;
+  pagador: string | null;
+  descricao: string | null;
+  linha_digitavel: string;
+  status: "aberta" | "recebida";
+  recebido_em: string | null;
+  created_at: string | null;
+}
+
+export interface IntegracoesCobrancaPage {
+  items: IntegracoesCobranca[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface IntegracoesCobrancaQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "vencimento" | "-vencimento" | "valor" | "-valor" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberta" | "recebida" | null;
+}
+
+export interface IntegracoesCobrancaRef {
+  id: string;
+}
+
+export interface IntegracoesEnviado {
+  id: string;
+  para: string;
+  assunto: string;
+  de: string;
+  created_at: string | null;
+}
+
+export interface IntegracoesEnviadoPage {
+  items: IntegracoesEnviado[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface IntegracoesEnviadoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
 export interface IntegracoesConexaoMudou {
   id: string;
   action: "conectada" | "removida";
@@ -1196,6 +1656,16 @@ export interface IntegracoesDocumentoMudou {
 export interface IntegracoesPagamentoMudou {
   id: string;
   action: "agendado" | "pago";
+}
+
+export interface IntegracoesCobrancaMudou {
+  id: string;
+  action: "emitida" | "recebida";
+}
+
+export interface IntegracoesEnviadoMudou {
+  id: string;
+  action: "enviado";
 }
 
 export interface IntegracoesServidorMudou {
@@ -1244,6 +1714,187 @@ export const integracoes = {
   /** POST /api/v1/integracoes/servidores/remover · http · exige token */
   removerServidor: (body: IntegracoesServidorRef, options?: RequestOptions) =>
     request<IntegracoesServidorMcp>("POST", "/api/v1/integracoes/servidores/remover", body, options),
+  /** GET /api/v1/integracoes/cobrancas · http · exige token */
+  cobrancas: (query?: IntegracoesCobrancaQuery, options?: RequestOptions) =>
+    request<IntegracoesCobrancaPage>("GET", withQuery("/api/v1/integracoes/cobrancas", query), undefined, options),
+  /** POST /api/v1/integracoes/cobrancas/confirmar · http · exige token */
+  confirmarCobranca: (body: IntegracoesCobrancaRef, options?: RequestOptions) =>
+    request<IntegracoesCobranca>("POST", "/api/v1/integracoes/cobrancas/confirmar", body, options),
+  /** GET /api/v1/integracoes/enviados · http · exige token */
+  enviados: (query?: IntegracoesEnviadoQuery, options?: RequestOptions) =>
+    request<IntegracoesEnviadoPage>("GET", withQuery("/api/v1/integracoes/enviados", query), undefined, options),
+};
+
+export interface JuridicoContrato {
+  parte: string;
+  cnpj?: string | null;
+  objeto: string;
+  valor?: number | null;
+  inicio?: string | null;
+  /** A empresa é avisada 60 e 30 dias antes */
+  fim?: string | null;
+  reajuste_em?: string | null;
+  status?: "vigente" | "encerrado";
+  proposta_id?: string | null;
+}
+
+/** Contratos: só os campos que mudam. */
+export interface JuridicoContratoUpdate {
+  /** Id do registro */
+  id: string;
+  parte?: string | null;
+  cnpj?: string | null;
+  objeto?: string | null;
+  valor?: number | null;
+  inicio?: string | null;
+  /** A empresa é avisada 60 e 30 dias antes */
+  fim?: string | null;
+  reajuste_em?: string | null;
+  status?: "vigente" | "encerrado" | null;
+  proposta_id?: string | null;
+}
+
+/** Contratos: página, busca, filtros e ordem pela URL. */
+export interface JuridicoContratoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "fim" | "-fim" | "parte" | "-parte" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "vigente" | "encerrado" | null;
+}
+
+/** Contratos: um registro. */
+export interface JuridicoContratoItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  parte: string;
+  cnpj: string | null;
+  objeto: string;
+  valor: number | null;
+  inicio: string | null;
+  /** A empresa é avisada 60 e 30 dias antes */
+  fim: string | null;
+  reajuste_em: string | null;
+  status: "vigente" | "encerrado";
+  proposta_id: string | null;
+}
+
+export interface JuridicoContratoPage {
+  items: JuridicoContratoItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface JuridicoCertidao {
+  referencia: string;
+  /** Quantas vieram positivas (irregularidade) */
+  positivas?: number;
+  validade?: string | null;
+  resumo?: string | null;
+}
+
+/** Certidões: só os campos que mudam. */
+export interface JuridicoCertidaoUpdate {
+  /** Id do registro */
+  id: string;
+  referencia?: string | null;
+  /** Quantas vieram positivas (irregularidade) */
+  positivas?: number | null;
+  validade?: string | null;
+  resumo?: string | null;
+}
+
+/** Certidões: página, busca, filtros e ordem pela URL. */
+export interface JuridicoCertidaoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "referencia" | "-referencia" | "validade" | "-validade" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
+/** Certidões: um registro. */
+export interface JuridicoCertidaoItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  referencia: string;
+  /** Quantas vieram positivas (irregularidade) */
+  positivas: number;
+  validade: string | null;
+  resumo: string | null;
+}
+
+export interface JuridicoCertidaoPage {
+  items: JuridicoCertidaoItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** svc-juridico · /api/v1/juridico */
+export const juridico = {
+  /** Cadastro Contratos (core/resources.py) · /api/v1/juridico/contratos · exige token */
+  contratos: {
+    /** GET /api/v1/juridico/contratos · página, busca, filtros e ordem */
+    list: (query?: JuridicoContratoQuery, options?: RequestOptions) =>
+      request<JuridicoContratoPage>("GET", withQuery("/api/v1/juridico/contratos", query), undefined, options),
+    /** GET /api/v1/juridico/contratos/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<JuridicoContratoItem>("GET", withQuery("/api/v1/juridico/contratos/item", query), undefined, options),
+    /** POST /api/v1/juridico/contratos */
+    create: (body: JuridicoContrato, options?: RequestOptions) =>
+      request<JuridicoContratoItem>("POST", "/api/v1/juridico/contratos", body, options),
+    /** POST /api/v1/juridico/contratos/update · só os campos que vierem mudam */
+    update: (body: JuridicoContratoUpdate, options?: RequestOptions) =>
+      request<JuridicoContratoItem>("POST", "/api/v1/juridico/contratos/update", body, options),
+    /** POST /api/v1/juridico/contratos/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/juridico/contratos/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Contratos", "live": "juridico.contratos", "fields": [{"name": "parte", "label": "Outra parte", "kind": "text", "required": true}, {"name": "cnpj", "label": "CNPJ ou CPF", "kind": "text", "required": false}, {"name": "objeto", "label": "Objeto", "kind": "textarea", "required": true}, {"name": "valor", "label": "Valor", "kind": "money", "required": false}, {"name": "inicio", "label": "Início da vigência", "kind": "date", "required": false}, {"name": "fim", "label": "Fim da vigência", "kind": "date", "required": false, "hint": "A empresa é avisada 60 e 30 dias antes"}, {"name": "reajuste_em", "label": "Próximo reajuste", "kind": "date", "required": false}, {"name": "status", "label": "Situação", "kind": "select", "required": false, "options": [{"value": "vigente", "label": "Vigente"}, {"value": "encerrado", "label": "Encerrado"}]}, {"name": "proposta_id", "label": "Proposta de origem", "kind": "text", "required": false}], "columns": [{"key": "parte", "header": "Outra parte", "kind": "text", "sort": "parte"}, {"key": "valor", "header": "Valor", "kind": "money"}, {"key": "inicio", "header": "Início da vigência", "kind": "date"}, {"key": "fim", "header": "Fim da vigência", "kind": "date", "sort": "fim"}, {"key": "reajuste_em", "header": "Próximo reajuste", "kind": "date"}, {"key": "status", "header": "Situação", "kind": "select"}], "filters": [{"name": "status", "label": "Situação", "options": [{"value": "vigente", "label": "Vigente"}, {"value": "encerrado", "label": "Encerrado"}]}], "search": "outra parte, objeto"} satisfies ResourceMeta,
+  },
+  /** Cadastro Certidões (core/resources.py) · /api/v1/juridico/certidoes · exige token */
+  certidoes: {
+    /** GET /api/v1/juridico/certidoes · página, busca, filtros e ordem */
+    list: (query?: JuridicoCertidaoQuery, options?: RequestOptions) =>
+      request<JuridicoCertidaoPage>("GET", withQuery("/api/v1/juridico/certidoes", query), undefined, options),
+    /** GET /api/v1/juridico/certidoes/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<JuridicoCertidaoItem>("GET", withQuery("/api/v1/juridico/certidoes/item", query), undefined, options),
+    /** POST /api/v1/juridico/certidoes */
+    create: (body: JuridicoCertidao, options?: RequestOptions) =>
+      request<JuridicoCertidaoItem>("POST", "/api/v1/juridico/certidoes", body, options),
+    /** POST /api/v1/juridico/certidoes/update · só os campos que vierem mudam */
+    update: (body: JuridicoCertidaoUpdate, options?: RequestOptions) =>
+      request<JuridicoCertidaoItem>("POST", "/api/v1/juridico/certidoes/update", body, options),
+    /** POST /api/v1/juridico/certidoes/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/juridico/certidoes/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Certidões", "live": "juridico.certidoes", "fields": [{"name": "referencia", "label": "Mês (AAAA-MM)", "kind": "text", "required": true}, {"name": "positivas", "label": "Positivas", "kind": "number", "required": false, "hint": "Quantas vieram positivas (irregularidade)"}, {"name": "validade", "label": "Validade mais próxima", "kind": "date", "required": false}, {"name": "resumo", "label": "Resumo", "kind": "textarea", "required": false}], "columns": [{"key": "referencia", "header": "Mês (AAAA-MM)", "kind": "text", "sort": "referencia"}, {"key": "positivas", "header": "Positivas", "kind": "number"}, {"key": "validade", "header": "Validade mais próxima", "kind": "date", "sort": "validade"}], "filters": [], "search": null} satisfies ResourceMeta,
+  },
 };
 
 export interface NotifyNotification {
@@ -1559,7 +2210,8 @@ export interface ProcessosProcesso {
   descricao: string;
   /** Por que o agente sugeriu (o que no briefing indica o processo) */
   motivo: string | null;
-  origem: "sugestao" | "cliente";
+  /** biblioteca: a empresa escolheu o modelo direto da biblioteca */
+  origem: "sugestao" | "cliente" | "biblioteca";
   status: "sugerido" | "aceito" | "recusado";
   prioridade: "alta" | "media" | "baixa";
   /** Número da versão publicada (a que roda) */
@@ -1625,6 +2277,11 @@ export interface ProcessosDescricao {
 
 export interface ProcessosProcessoRef {
   id: string;
+}
+
+export interface ProcessosAdicionarModelo {
+  /** Modelo da biblioteca que a empresa quer executar */
+  modelo: "contas-a-pagar" | "conciliacao-bancaria" | "faturamento-cobranca" | "fechamento-mes" | "gestao-contratos" | "publicacoes-processos" | "certidoes-negativas" | "admissao-colaborador" | "compras-cotacao" | "vencimentos-empresa" | "qualificacao-leads" | "proposta-comercial" | "reativacao-carteira";
 }
 
 export interface ProcessosCatalogAction {
@@ -1714,6 +2371,15 @@ export interface ProcessosProblema {
   texto: string;
 }
 
+/** Um processo da empresa ligado a este pela cadeia: começa quando este termina (com o resultado pedido). */
+export interface ProcessosProcessoLigado {
+  id: string;
+  titulo: string;
+  /** O fim deste processo que o inicia; vazio, qualquer um */
+  resultado: string | null;
+  publicada: number | null;
+}
+
 /** Algo que o staff ensinou ao agente de um passo, ao resolver uma exceção. Entra no agente só depois de avaliada: com ela, o agente refaz o caso que a gerou e chega no que o staff fez. */
 export interface ProcessosRegra {
   id: string;
@@ -1732,7 +2398,8 @@ export interface ProcessosRegra {
 export interface ProcessosStep {
   /** Identificador curto em snake_case (a saída fica sob ele) */
   id: string;
-  tipo: "acao" | "agente" | "tarefa" | "decisao" | "espera" | "fim";
+  /** paralelo: com vários caminhos saindo, abre ramos ao mesmo tempo; com vários chegando, espera todos */
+  tipo: "acao" | "agente" | "tarefa" | "decisao" | "espera" | "paralelo" | "fim";
   nome: string;
   /** acao: nome no catálogo (<pacote>.<ação>) */
   acao: string | null;
@@ -1764,11 +2431,15 @@ export interface ProcessosStep {
 }
 
 export interface ProcessosTrigger {
-  tipo: "evento" | "agenda" | "manual";
+  tipo: "evento" | "agenda" | "manual" | "processo";
   /** evento: mensagem que inicia */
   evento: string | null;
-  /** agenda: cron (ex.: 0 8 * * *) */
+  /** agenda: cron de 5 campos em UTC (ex.: 0 11 * * * = 8h em Brasília) */
   agenda: string | null;
+  /** processo: o modelo da biblioteca (ou o id) do processo que, ao terminar, inicia este */
+  processo: string | null;
+  /** processo: o fim que ele precisa alcançar (ex.: aceita); vazio, qualquer um */
+  resultado: string | null;
   descricao: string | null;
 }
 
@@ -1809,6 +2480,8 @@ export interface ProcessosDesenho {
   mudancas: string[];
   /** O que o staff ensinou aos passos deste processo */
   regras: ProcessosRegra[];
+  /** Processos da empresa que este inicia ao terminar (a cadeia) */
+  inicia: ProcessosProcessoLigado[];
 }
 
 export interface ProcessosMensagemDesenhoIn {
@@ -1855,9 +2528,15 @@ export interface ProcessosExecucao {
   status: "andamento" | "concluida" | "incidente" | "cancelada";
   /** Como terminou (o fim alcançado: pago, recusado...) */
   resultado: string | null;
-  origem: "evento" | "manual" | "agenda";
+  origem: "evento" | "manual" | "agenda" | "processo";
   /** O que iniciou (ex.: o documento recebido) */
   resumo: string | null;
+  /** Execução do processo que iniciou esta (gatilho por outro processo) */
+  pai: string | null;
+  /** A primeira execução da cadeia: as execuções de um projeto têm o mesmo */
+  projeto: string | null;
+  /** Quantos processos antes deste na cadeia */
+  nivel: number;
   passo_atual: string | null;
   passo_nome: string | null;
   aguardando: "cliente" | "staff" | "evento" | null;
@@ -1903,6 +2582,23 @@ export interface ProcessosExecucaoQuery {
   q?: string | null;
   status?: "andamento" | "concluida" | "incidente" | "cancelada" | null;
   processo?: string | null;
+  projeto?: string | null;
+}
+
+/** Uma execução dentro de um projeto (a cadeia de processos que um começou). */
+export interface ProcessosEtapaProjeto {
+  id: string;
+  processo: string;
+  titulo: string;
+  status: "andamento" | "concluida" | "incidente" | "cancelada";
+  resultado: string | null;
+  resumo: string | null;
+  passo_nome: string | null;
+  aguardando: "cliente" | "staff" | "evento" | null;
+  handoffs: number;
+  pai: string | null;
+  created_at: string | null;
+  concluida_em: string | null;
 }
 
 export interface ProcessosExecucaoDetalhe {
@@ -1913,6 +2609,8 @@ export interface ProcessosExecucaoDetalhe {
   caminho: string[];
   /** Onde está agora */
   atuais: string[];
+  /** O projeto de que a execução faz parte (vazio fora de uma cadeia) */
+  cadeia: ProcessosEtapaProjeto[];
 }
 
 export interface ProcessosExecucaoRef {
@@ -2032,6 +2730,39 @@ export interface ProcessosAcompanhamento {
   processos: ProcessosAcompanhamentoProcesso[];
 }
 
+/** A cadeia que um processo começou (ex.: proposta aceita → contrato e faturamento), acompanhada como um projeto. */
+export interface ProcessosProjeto {
+  /** A execução que começou a cadeia */
+  id: string;
+  titulo: string;
+  resumo: string | null;
+  /** atencao: alguma execução com incidente */
+  status: "andamento" | "concluido" | "atencao";
+  etapas: ProcessosEtapaProjeto[];
+  created_at: string | null;
+}
+
+export interface ProcessosProjetoPage {
+  items: ProcessosProjeto[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface ProcessosProjetoQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
 export interface ProcessosRevisaoIn {
   processo: string;
   /** O que o staff deve olhar */
@@ -2108,6 +2839,9 @@ export const processos = {
   /** POST /api/v1/processos/processos/recusar · http · exige token */
   recusar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
     request<ProcessosProcesso>("POST", "/api/v1/processos/processos/recusar", body, options),
+  /** POST /api/v1/processos/processos/adicionar · http · exige token */
+  adicionar: (body: ProcessosAdicionarModelo, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/processos/adicionar", body, options),
   /** GET /api/v1/processos/catalogo · http · exige token */
   catalogo: (options?: RequestOptions) =>
     request<ProcessosCatalogoAcoes>("GET", "/api/v1/processos/catalogo", undefined, options),
@@ -2150,6 +2884,9 @@ export const processos = {
   /** GET /api/v1/processos/acompanhamento · http · exige token */
   acompanhamento: (options?: RequestOptions) =>
     request<ProcessosAcompanhamento>("GET", "/api/v1/processos/acompanhamento", undefined, options),
+  /** GET /api/v1/processos/projetos · http · exige token */
+  projetos: (query?: ProcessosProjetoQuery, options?: RequestOptions) =>
+    request<ProcessosProjetoPage>("GET", withQuery("/api/v1/processos/projetos", query), undefined, options),
   /** POST /api/v1/processos/desenho/revisao · http · exige token */
   pedirRevisao: (body: ProcessosRevisaoIn, options?: RequestOptions) =>
     request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/revisao", body, options),
@@ -2334,6 +3071,243 @@ export const staff = {
     request<StaffItemFila>("POST", "/api/v1/staff/fila/atribuir", body, options),
 };
 
+export interface VendasReceberLead {
+  nome: string;
+  email?: string | null;
+  telefone?: string | null;
+  origem?: "site" | "instagram" | "whatsapp" | "indicacao" | "outro";
+  /** O que o lead escreveu */
+  interesse?: string | null;
+}
+
+/** Leads: um registro. */
+export interface VendasLeadItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  email: string | null;
+  telefone: string | null;
+  origem: "site" | "instagram" | "whatsapp" | "indicacao" | "outro";
+  interesse: string | null;
+  status: "novo" | "qualificado" | "reuniao" | "nutricao" | "atendimento" | "cliente";
+  reuniao_em: string | null;
+}
+
+/** Uma proposta comercial: do pedido à resposta do cliente. */
+export interface VendasProposta {
+  id: string;
+  cliente: string;
+  email: string | null;
+  pedido: string;
+  descricao: string | null;
+  valor: number | null;
+  desconto: number | null;
+  validade: string | null;
+  status: "pedida" | "montada" | "enviada" | "aceita" | "recusada";
+  enviada_em: string | null;
+  /** Follow-ups enviados (D3, D7) */
+  follow_ups: string[];
+  respondida_em: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface VendasPropostaPage {
+  items: VendasProposta[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface VendasPropostaQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "created_at" | "-created_at" | "valor" | "-valor" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "pedida" | "montada" | "enviada" | "aceita" | "recusada" | null;
+}
+
+export interface VendasPedidoProposta {
+  /** Para quem é a proposta */
+  cliente: string;
+  /** Para onde a proposta vai */
+  email?: string | null;
+  /** O que o cliente pediu, nas palavras dele */
+  pedido: string;
+}
+
+export interface VendasPropostaMudou {
+  id: string;
+  action: "pedida" | "montada" | "enviada" | "follow_up" | "aceita" | "recusada";
+}
+
+export interface VendasLead {
+  nome: string;
+  email?: string | null;
+  telefone?: string | null;
+  origem?: "site" | "instagram" | "whatsapp" | "indicacao" | "outro";
+  interesse?: string | null;
+  status?: "novo" | "qualificado" | "reuniao" | "nutricao" | "atendimento" | "cliente";
+  reuniao_em?: string | null;
+}
+
+/** Leads: só os campos que mudam. */
+export interface VendasLeadUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  email?: string | null;
+  telefone?: string | null;
+  origem?: "site" | "instagram" | "whatsapp" | "indicacao" | "outro" | null;
+  interesse?: string | null;
+  status?: "novo" | "qualificado" | "reuniao" | "nutricao" | "atendimento" | "cliente" | null;
+  reuniao_em?: string | null;
+}
+
+/** Leads: página, busca, filtros e ordem pela URL. */
+export interface VendasLeadQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "nome" | "-nome" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "novo" | "qualificado" | "reuniao" | "nutricao" | "atendimento" | "cliente" | null;
+  origem?: "site" | "instagram" | "whatsapp" | "indicacao" | "outro" | null;
+}
+
+export interface VendasLeadPage {
+  items: VendasLeadItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface VendasCliente {
+  nome: string;
+  email?: string | null;
+  telefone?: string | null;
+  ultima_compra?: string | null;
+  campanha_em?: string | null;
+}
+
+/** Clientes: só os campos que mudam. */
+export interface VendasClienteUpdate {
+  /** Id do registro */
+  id: string;
+  nome?: string | null;
+  email?: string | null;
+  telefone?: string | null;
+  ultima_compra?: string | null;
+  campanha_em?: string | null;
+}
+
+/** Clientes: página, busca, filtros e ordem pela URL. */
+export interface VendasClienteQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "nome" | "-nome" | "ultima_compra" | "-ultima_compra" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+}
+
+/** Clientes: um registro. */
+export interface VendasClienteItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  nome: string;
+  email: string | null;
+  telefone: string | null;
+  ultima_compra: string | null;
+  campanha_em: string | null;
+}
+
+export interface VendasClientePage {
+  items: VendasClienteItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+/** svc-vendas · /api/v1/vendas */
+export const vendas = {
+  /** POST /api/v1/vendas/leads/receber · http · exige token */
+  receberLead: (body: VendasReceberLead, options?: RequestOptions) =>
+    request<VendasLeadItem>("POST", "/api/v1/vendas/leads/receber", body, options),
+  /** GET /api/v1/vendas/propostas · http · exige token */
+  propostas: (query?: VendasPropostaQuery, options?: RequestOptions) =>
+    request<VendasPropostaPage>("GET", withQuery("/api/v1/vendas/propostas", query), undefined, options),
+  /** POST /api/v1/vendas/propostas · http · exige token */
+  pedirProposta: (body: VendasPedidoProposta, options?: RequestOptions) =>
+    request<VendasProposta>("POST", "/api/v1/vendas/propostas", body, options),
+  /** Cadastro Leads (core/resources.py) · /api/v1/vendas/leads · exige token */
+  leads: {
+    /** GET /api/v1/vendas/leads · página, busca, filtros e ordem */
+    list: (query?: VendasLeadQuery, options?: RequestOptions) =>
+      request<VendasLeadPage>("GET", withQuery("/api/v1/vendas/leads", query), undefined, options),
+    /** GET /api/v1/vendas/leads/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<VendasLeadItem>("GET", withQuery("/api/v1/vendas/leads/item", query), undefined, options),
+    /** POST /api/v1/vendas/leads */
+    create: (body: VendasLead, options?: RequestOptions) =>
+      request<VendasLeadItem>("POST", "/api/v1/vendas/leads", body, options),
+    /** POST /api/v1/vendas/leads/update · só os campos que vierem mudam */
+    update: (body: VendasLeadUpdate, options?: RequestOptions) =>
+      request<VendasLeadItem>("POST", "/api/v1/vendas/leads/update", body, options),
+    /** POST /api/v1/vendas/leads/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/vendas/leads/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Leads", "live": "vendas.leads", "fields": [{"name": "nome", "label": "Nome", "kind": "text", "required": true}, {"name": "email", "label": "E-mail", "kind": "email", "required": false}, {"name": "telefone", "label": "Telefone", "kind": "phone", "required": false}, {"name": "origem", "label": "Origem", "kind": "select", "required": false, "options": [{"value": "site", "label": "Site"}, {"value": "instagram", "label": "Instagram"}, {"value": "whatsapp", "label": "WhatsApp"}, {"value": "indicacao", "label": "Indicação"}, {"value": "outro", "label": "Outro"}]}, {"name": "interesse", "label": "O que ele quer", "kind": "textarea", "required": false}, {"name": "status", "label": "Situação", "kind": "select", "required": false, "options": [{"value": "novo", "label": "Novo"}, {"value": "qualificado", "label": "Qualificado"}, {"value": "reuniao", "label": "Reunião marcada"}, {"value": "nutricao", "label": "Nutrição"}, {"value": "atendimento", "label": "Atendimento humano"}, {"value": "cliente", "label": "Cliente"}]}, {"name": "reuniao_em", "label": "Reunião", "kind": "datetime", "required": false}], "columns": [{"key": "nome", "header": "Nome", "kind": "text", "sort": "nome"}, {"key": "email", "header": "E-mail", "kind": "email"}, {"key": "telefone", "header": "Telefone", "kind": "phone"}, {"key": "origem", "header": "Origem", "kind": "select"}, {"key": "status", "header": "Situação", "kind": "select"}], "filters": [{"name": "status", "label": "Situação", "options": [{"value": "novo", "label": "Novo"}, {"value": "qualificado", "label": "Qualificado"}, {"value": "reuniao", "label": "Reunião marcada"}, {"value": "nutricao", "label": "Nutrição"}, {"value": "atendimento", "label": "Atendimento humano"}, {"value": "cliente", "label": "Cliente"}]}, {"name": "origem", "label": "Origem", "options": [{"value": "site", "label": "Site"}, {"value": "instagram", "label": "Instagram"}, {"value": "whatsapp", "label": "WhatsApp"}, {"value": "indicacao", "label": "Indicação"}, {"value": "outro", "label": "Outro"}]}], "search": "nome, e-mail"} satisfies ResourceMeta,
+  },
+  /** Cadastro Clientes (core/resources.py) · /api/v1/vendas/clientes · exige token */
+  clientes: {
+    /** GET /api/v1/vendas/clientes · página, busca, filtros e ordem */
+    list: (query?: VendasClienteQuery, options?: RequestOptions) =>
+      request<VendasClientePage>("GET", withQuery("/api/v1/vendas/clientes", query), undefined, options),
+    /** GET /api/v1/vendas/clientes/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<VendasClienteItem>("GET", withQuery("/api/v1/vendas/clientes/item", query), undefined, options),
+    /** POST /api/v1/vendas/clientes */
+    create: (body: VendasCliente, options?: RequestOptions) =>
+      request<VendasClienteItem>("POST", "/api/v1/vendas/clientes", body, options),
+    /** POST /api/v1/vendas/clientes/update · só os campos que vierem mudam */
+    update: (body: VendasClienteUpdate, options?: RequestOptions) =>
+      request<VendasClienteItem>("POST", "/api/v1/vendas/clientes/update", body, options),
+    /** POST /api/v1/vendas/clientes/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/vendas/clientes/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Clientes", "live": "vendas.clientes", "fields": [{"name": "nome", "label": "Nome", "kind": "text", "required": true}, {"name": "email", "label": "E-mail", "kind": "email", "required": false}, {"name": "telefone", "label": "Telefone", "kind": "phone", "required": false}, {"name": "ultima_compra", "label": "Última compra", "kind": "date", "required": false}, {"name": "campanha_em", "label": "Última campanha", "kind": "date", "required": false}], "columns": [{"key": "nome", "header": "Nome", "kind": "text", "sort": "nome"}, {"key": "email", "header": "E-mail", "kind": "email"}, {"key": "telefone", "header": "Telefone", "kind": "phone"}, {"key": "ultima_compra", "header": "Última compra", "kind": "date", "sort": "ultima_compra"}, {"key": "campanha_em", "header": "Última campanha", "kind": "date"}], "filters": [], "search": "nome, e-mail"} satisfies ResourceMeta,
+  },
+};
+
 export interface WebhooksEndpoint {
   id: string;
   url: string;
@@ -2471,6 +3445,14 @@ export const webhooks = {
 
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
 export interface LiveTopics {
+  /** svc-administrativo · bus.live("administrativo.requisicoes", ...) */
+  "administrativo.requisicoes": AdministrativoRequisicaoMudou;
+  /** svc-administrativo · cadastro colaboradores (core/resources.py) */
+  "administrativo.colaboradores": ResourceChanged;
+  /** svc-administrativo · cadastro fornecedores (core/resources.py) */
+  "administrativo.fornecedores": ResourceChanged;
+  /** svc-administrativo · cadastro vencimentos (core/resources.py) */
+  "administrativo.vencimentos": ResourceChanged;
   /** svc-agentes · bus.live("agentes.agentes", ...) */
   "agentes.agentes": AgentesAgenteMudou;
   /** svc-ai · bus.live("ai.uso", ...) */
@@ -2483,6 +3465,8 @@ export interface LiveTopics {
   "conhecimento.itens": ResourceChanged;
   /** svc-financeiro · bus.live("financeiro.titulos", ...) */
   "financeiro.titulos": FinanceiroTituloMudou;
+  /** svc-financeiro · bus.live("financeiro.faturas", ...) */
+  "financeiro.faturas": FinanceiroFaturaMudou;
   /** svc-financeiro · cadastro fornecedores (core/resources.py) */
   "financeiro.fornecedores": ResourceChanged;
   /** svc-identity · bus.live("identity.membros", ...) */
@@ -2495,8 +3479,16 @@ export interface LiveTopics {
   "integracoes.documentos": IntegracoesDocumentoMudou;
   /** svc-integracoes · bus.live("integracoes.pagamentos", ...) */
   "integracoes.pagamentos": IntegracoesPagamentoMudou;
+  /** svc-integracoes · bus.live("integracoes.cobrancas", ...) */
+  "integracoes.cobrancas": IntegracoesCobrancaMudou;
+  /** svc-integracoes · bus.live("integracoes.enviados", ...) */
+  "integracoes.enviados": IntegracoesEnviadoMudou;
   /** svc-integracoes · bus.live("integracoes.servidores", ...) */
   "integracoes.servidores": IntegracoesServidorMudou;
+  /** svc-juridico · cadastro contratos (core/resources.py) */
+  "juridico.contratos": ResourceChanged;
+  /** svc-juridico · cadastro certidoes (core/resources.py) */
+  "juridico.certidoes": ResourceChanged;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
   /** svc-plans · bus.live("plans.uso", ...) */
@@ -2515,22 +3507,31 @@ export interface LiveTopics {
   "staff.fila": StaffFilaMudou;
   /** svc-staff · bus.live("staff.carteiras", ...) */
   "staff.carteiras": StaffCarteiraMudou;
+  /** svc-vendas · bus.live("vendas.propostas", ...) */
+  "vendas.propostas": VendasPropostaMudou;
+  /** svc-vendas · cadastro leads (core/resources.py) */
+  "vendas.leads": ResourceChanged;
+  /** svc-vendas · cadastro clientes (core/resources.py) */
+  "vendas.clientes": ResourceChanged;
   /** svc-webhooks · bus.live("webhooks.entrega", ...) */
   "webhooks.entrega": WebhooksDeliveryChanged;
 }
 
 /** Módulos (o MODULE de cada services/svc-<nome>/schemas.py): o meta.module das telas e os grupos do menu. */
 export const appModules = {
+  administrativo: { title: "Administrativo", description: "Pacote de ações administrativas do BPO: admissões, compras e vencimentos da empresa", category: "Pacotes", core: false },
   agentes: { title: "Agentes", description: "Agentes da empresa: instrução, ferramentas do catálogo, política e suíte de avaliação", category: "Sua empresa", core: false },
   ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
   conhecimento: { title: "Conhecimento", description: "Briefing da empresa e a base de conhecimento que os agentes consultam", category: "Sua empresa", core: false },
   financeiro: { title: "Financeiro", description: "Pacote de ações financeiras do BPO: contas a pagar, conciliação, cobrança e fechamento", category: "Pacotes", core: false },
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
   integracoes: { title: "Integrações", description: "Conexões da empresa com o mundo de fora: caixa de entrada de documentos, banco e servidores MCP", category: "Integrações", core: false },
+  juridico: { title: "Jurídico", description: "Pacote de ações jurídicas do BPO: contratos, publicações e certidões negativas", category: "Pacotes", core: false },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
   processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados", category: "Sua empresa", core: false },
   staff: { title: "Staff", description: "Área da equipe da Cogniventure: carteira de clientes, exceções, revisões e pedidos de ajuda", category: "Cogniventure", core: false },
+  vendas: { title: "Vendas", description: "Pacote de ações de vendas do BPO: leads, propostas e reativação da carteira", category: "Pacotes", core: false },
   webhooks: { title: "Webhooks", description: "Eventos para os sistemas da organização", category: "Integrações", core: true },
 } as const;
 

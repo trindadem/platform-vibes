@@ -8,8 +8,10 @@ HTTP /desenho...                 → desenho do processo aceito: abrir, conversa
 HTTP /execucoes..., /tarefas..., /acompanhamento → execuções no motor, tarefas de pessoas e autonomia.
 HTTP /desenho/revisao, /aprovar, /devolver, /ajuda... e /regras... → o staff no setup (revisão, ajuda) e o que ele ensina.
 NATS rpc.processos.acompanhamento → a saúde da organização para a carteira do staff (svc-staff).
-NATS events.processos.catalogo   → os pacotes declaram as ações (core/processes.py); o catálogo fica aqui.
+NATS events.processos.catalogo   → os pacotes declaram as ações e os modelos (core/processes.py); o catálogo fica aqui.
 NATS events.integracoes.evento   → inicia os processos daquele gatilho e entrega mensagens às execuções que esperam.
+NATS events.processos.evento     → o mesmo, para os acontecimentos dos pacotes (vendas.pedido_proposta...).
+HTTP /projetos                   → as cadeias de processos (um termina e inicia outros), cada uma como um projeto.
 NATS events.processos.passo      → o que o worker de cada pacote fez num passo (a linha do tempo da execução).
 Motor (core/processes.py)        → os jobs dos passos de agente e os ouvintes de começo, tarefa, espera e fim.
 
@@ -33,6 +35,7 @@ from schemas import (
     ACOMPANHAMENTO_SUBJECT,
     CATALOG_SUBJECT,
     EVENT_SUBJECT,
+    PACOTE_SUBJECT,
     STEP_SUBJECT,
     MODULE,
     SEARCH,
@@ -41,6 +44,7 @@ from schemas import (
     TABLES,
     TASK_QUEUE,
     UNIQUE,
+    AdicionarModelo,
     Descoberta,
     Descricao,
     Desenho,
@@ -61,6 +65,7 @@ from schemas import (
     TarefaQuery,
     ProcessoQuery,
     ProcessoRef,
+    ProjetoQuery,
     SimulacaoIn,
 )
 from service import MIGRATIONS, ProcessosService
@@ -80,6 +85,7 @@ async def lifespan(app: FastAPI):
     ):
         await bus.subscribe(CATALOG_SUBJECT, svc.registrar_catalogo, model=ActionCatalog)
         await bus.subscribe(EVENT_SUBJECT, svc.receber_evento, model=EventoExterno)
+        await bus.subscribe(PACOTE_SUBJECT, svc.receber_evento, model=EventoExterno)  # o mesmo formato (core/processes.py)
         await bus.subscribe(STEP_SUBJECT, svc.registrar_passo, model=PassoFeito)
         await bus.respond(ACOMPANHAMENTO_SUBJECT, svc.acompanhamento, model=Empty)  # svc-staff: a saúde da carteira
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
@@ -130,6 +136,11 @@ async def aceitar(data: ProcessoRef) -> ResponseEnvelope:
 @app.post("/processos/recusar", response_model=ResponseEnvelope)
 async def recusar(data: ProcessoRef) -> ResponseEnvelope:
     return _ok(await svc.recusar(data))
+
+
+@app.post("/processos/adicionar", response_model=ResponseEnvelope)
+async def adicionar(data: AdicionarModelo) -> ResponseEnvelope:
+    return _ok(await svc.adicionar(data))
 
 
 @app.get("/catalogo", response_model=ResponseEnvelope)
@@ -200,6 +211,11 @@ async def responder(data: Resposta) -> ResponseEnvelope:
 @app.get("/acompanhamento", response_model=ResponseEnvelope)
 async def acompanhamento() -> ResponseEnvelope:
     return _ok(await svc.acompanhamento(Empty()))
+
+
+@app.get("/projetos", response_model=ResponseEnvelope)
+async def projetos(data: Annotated[ProjetoQuery, Query()]) -> ResponseEnvelope:
+    return _ok(await svc.projetos(data))
 
 
 @app.post("/desenho/revisao", response_model=ResponseEnvelope)

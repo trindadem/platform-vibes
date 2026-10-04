@@ -7,6 +7,7 @@ import { Columns } from "@/components/Columns";
 import { DateTime } from "@/components/DateTime";
 import { KeyValue } from "@/components/KeyValue";
 import { Page } from "@/components/Page";
+import { ProjectChain, type ProjectChainStep } from "@/components/ProjectChain";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
 import { Stack } from "@/components/Stack";
@@ -14,7 +15,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { Text } from "@/components/Text";
 import { TextLink } from "@/components/TextLink";
 import { useLiveQuery, useQuery } from "@/core/api";
-import { identity, type ProcessosExecucaoDetalhe, processos } from "@/core/contracts";
+import { identity, type ProcessosEtapaProjeto, type ProcessosExecucaoDetalhe, processos } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Execução" };
 
@@ -33,6 +34,20 @@ const MARCOS = {
 };
 const TONS_MARCOS = { handoff: "warning", incidente: "danger", tentando: "warning", tarefa: "accent", fim: "success" } as const;
 
+const ESPERA = { cliente: "Esperando a empresa", staff: "Com o staff", evento: "Aguardando" };
+
+/** O projeto (a cadeia de processos) de que esta execução faz parte: quem iniciou quem e onde cada uma está. */
+function etapas(itens: ProcessosEtapaProjeto[], atual: string): ProjectChainStep[] {
+  const nivel: Record<string, number> = {};
+  return itens.map((e) => {
+    nivel[e.id] = e.pai ? (nivel[e.pai] ?? 0) + 1 : 0;
+    const onde = e.aguardando ? `${ESPERA[e.aguardando]}: ${e.passo_nome ?? "próximo passo"}` : (e.passo_nome ?? "Rodando");
+    const detail = e.status === "concluida" ? `Terminou: ${e.resultado ?? "concluída"}` : e.status === "incidente" ? "Incidente" : onde;
+    return { key: e.id, title: e.id === atual ? `${e.titulo} (esta)` : e.titulo, status: e.status, detail, level: nivel[e.id],
+             to: e.id === atual ? undefined : `/processos/execucoes/${e.id}` };
+  });
+}
+
 export default function ExecucaoDoProcesso() {
   const { id = "" } = useParams();
   const detalhe = useLiveQuery("processos.execucoes", processos.execucao, { id });
@@ -44,6 +59,7 @@ function Execucao({ detalhe }: { detalhe: ProcessosExecucaoDetalhe }) {
   const membros = useQuery(identity.members); // quem resolveu: o nome, não o id (o operador do staff é membro)
   const nome = (id: string) => membros.data?.items.find((m) => m.id === id)?.name ?? "alguém da equipe";
   const saidas = Object.entries(e.saidas);
+  const primeira = detalhe.cadeia[0]; // a execução que começou o projeto
   return (
     <Page
       title={e.titulo}
@@ -53,6 +69,14 @@ function Execucao({ detalhe }: { detalhe: ProcessosExecucaoDetalhe }) {
       <Text tone="muted">
         <TextLink to="/processos/execucoes">Execuções</TextLink> · {e.status === "concluida" ? `Terminou em: ${e.resultado}` : (e.passo_nome ?? "Rodando")}
       </Text>
+      {primeira && detalhe.cadeia.length > 1 && (
+        <ProjectChain
+          title={`Projeto: ${primeira.titulo}`}
+          description={primeira.resumo ?? undefined}
+          status={detalhe.cadeia.some((x) => x.status === "incidente") ? "atencao" : detalhe.cadeia.some((x) => x.status === "andamento") ? "andamento" : "concluido"}
+          steps={etapas(detalhe.cadeia, e.id)}
+        />
+      )}
       {e.status === "incidente" && (
         <Alert tone="danger" title="Parou com incidente">
           Um passo falhou sem caminho de exceção. O staff da Cogniventure vê o incidente no motor e retoma a execução.

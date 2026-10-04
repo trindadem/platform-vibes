@@ -357,3 +357,36 @@ services:
     <<: *service
     build: { <<: *service-build, args: { SERVICE: agentes } }
     profiles: [modules, agentes]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+
+  svc-juridico:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: juridico } }
+    profiles: [modules, juridico]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      CAMUNDA_URL: http://camunda:8080  # o worker das ações juridico.* (core/processes.py)
+    depends_on:
+      <<: *service-deps
+      camunda: { condition: service_healthy }
+
+  svc-administrativo:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: administrativo } }
+    profiles: [modules, administrativo]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      CAMUNDA_URL: http://camunda:8080  # o worker das ações administrativo.* (core/processes.py)
+    depends_on:
+      <<: *service-deps
+      camunda: { condition: service_healthy }
+
+  svc-vendas:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: vendas } }
+    profiles: [modules, vendas]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)
+    environment:
+      <<: *service-env
+      CAMUNDA_URL: http://camunda:8080  # o worker das ações vendas.* (core/processes.py)
+    depends_on:
+      <<: *service-deps
+      camunda: { condition: service_healthy }

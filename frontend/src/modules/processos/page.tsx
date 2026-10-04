@@ -25,6 +25,7 @@ const AREA = { financeiro: "Financeiro", juridico: "Jurídico", administrativo: 
 const PRIORIDADE = { alta: "Prioridade alta", media: "Prioridade média", baixa: "Prioridade baixa" };
 const TOM = { alta: "warning", media: "neutral", baixa: "neutral" } as const;
 const ORDEM = { alta: 0, media: 1, baixa: 2 };
+const ORIGEM = { cliente: "descrito por você", sugestao: "sugerido pelo agente", biblioteca: "escolhido na biblioteca" };
 
 /** Prioridade alta primeiro; na mesma prioridade, na ordem em que o agente sugeriu. */
 const emOrdem = (itens: ProcessosProcesso[]) =>
@@ -74,7 +75,7 @@ export default function Processos() {
                 { id: "sugeridos", label: `Sugeridos (${por("sugerido").length})`, content: <Lista itens={por("sugerido")} pode={pode} vazio="Nenhuma sugestão pendente. Clique em Sugerir processos depois do briefing." /> },
                 { id: "aceitos", label: `Aceitos (${por("aceito").length})`, content: <Lista itens={por("aceito")} pode={pode} vazio="Nenhum processo aceito ainda." /> },
                 { id: "recusados", label: `Recusados (${por("recusado").length})`, content: <Lista itens={por("recusado")} pode={pode} vazio="Nenhum processo recusado." /> },
-                { id: "biblioteca", label: "Biblioteca", content: <BibliotecaCompleta /> },
+                { id: "biblioteca", label: "Biblioteca", content: <BibliotecaCompleta meus={pagina.items} pode={pode} onAdd={lista.reload} /> },
               ]}
             />
           );
@@ -120,7 +121,7 @@ function Lista({ itens, pode, vazio }: { itens: ProcessosProcesso[]; pode: boole
           <Card
             key={p.id}
             title={p.titulo}
-            description={`${AREA[p.area]} · ${p.origem === "cliente" ? "descrito por você" : "sugerido pelo agente"}`}
+            description={`${AREA[p.area]} · ${ORIGEM[p.origem]}`}
             footer={
               pode && (
                 <>
@@ -156,26 +157,46 @@ function Lista({ itens, pode, vazio }: { itens: ProcessosProcesso[]; pode: boole
   );
 }
 
-function BibliotecaCompleta() {
+/** Os modelos que a Cogniventure executa; a empresa escolhe direto o que quer (sem esperar a sugestão do agente). */
+function BibliotecaCompleta({ meus, pode, onAdd }: { meus: ProcessosProcesso[]; pode: boolean; onAdd: () => void }) {
   const biblioteca = useQuery(processos.biblioteca);
+  const adicionar = useAction(processos.adicionar, { onSuccess: onAdd });
   return (
     <QueryView query={biblioteca}>
       {(b) => (
-        <Grid cols={2}>
-          {b.itens.map((m) => (
-            <Card key={m.id} title={m.titulo} description={`${AREA[m.area]} · ${m.resumo}`}>
-              <KeyValue
-                stacked
-                items={[
-                  { label: "Quando começa", value: m.gatilho },
-                  { label: "O que roda sozinho", value: m.roda_sozinho },
-                  { label: "Quando uma pessoa entra", value: m.handoff },
-                  ...(m.integracoes.length ? [{ label: "Conexões", value: m.integracoes.join(", ") }] : []),
-                ]}
-              />
-            </Card>
-          ))}
-        </Grid>
+        <Stack>
+          {adicionar.error && <Alert tone="danger">{adicionar.error.message}</Alert>}
+          <Grid cols={2}>
+            {b.itens.map((m) => {
+              const meu = meus.find((p) => p.modelo === m.id);
+              const acao =
+                meu?.status === "aceito" ? (
+                  <Button size="sm" variant="secondary" to={`/processos/${meu.id}`}>
+                    {meu.publicada ? "Abrir desenho" : "Desenhar"}
+                  </Button>
+                ) : (
+                  pode && (
+                    <Button size="sm" loading={adicionar.running} onClick={() => void adicionar.run({ modelo: m.id })}>
+                      Quero este processo
+                    </Button>
+                  )
+                );
+              return (
+                <Card key={m.id} title={m.titulo} description={`${AREA[m.area]} · ${m.resumo}`} footer={acao}>
+                  <KeyValue
+                    stacked
+                    items={[
+                      { label: "Quando começa", value: m.gatilho },
+                      { label: "O que roda sozinho", value: m.roda_sozinho },
+                      { label: "Quando uma pessoa entra", value: m.handoff },
+                      ...(m.integracoes.length ? [{ label: "Conexões", value: m.integracoes.join(", ") }] : []),
+                    ]}
+                  />
+                </Card>
+              );
+            })}
+          </Grid>
+        </Stack>
       )}
     </QueryView>
   );

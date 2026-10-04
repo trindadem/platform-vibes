@@ -131,14 +131,14 @@ estruturado do que escrevendo código.
 
 | Passo do modelo | Vira no BPMN (Camunda 8) |
 |---|---|
-| Gatilho: agenda, evento, manual, outro processo | Evento de início: temporizador, mensagem, simples, ou chamado por outro processo |
+| Gatilho: agenda, evento, manual, outro processo | Evento de início: temporizador, mensagem ou simples (o `svc-processos` inicia pela API quando o outro termina) |
 | Ação | Service task com `zeebe:taskDefinition type="<pacote>.<acao>"` |
 | Agente | Service task `agentes.executar`, com o agente e o objetivo do passo |
 | Tarefa humana (cliente ou staff) | User task com grupo candidato `cliente` ou `staff` e prazo |
 | Decisão | Gateway exclusivo; condições estruturadas (campo, operador, valor) compiladas para FEEL; caminho padrão obrigatório |
 | Espera | Evento intermediário: temporizador, ou mensagem com chave de correlação |
 | Paralelo | Gateway paralelo que abre e fecha |
-| Subprocesso | Call activity para outro processo publicado da organização |
+| Subprocesso (não precisou no N7) | Call activity para outro processo publicado da organização |
 | Exceção | Evento de erro de fronteira `handoff` no passo → tarefa humana do staff |
 
 A saída de cada passo fica sob o id dele (`ler_documento.valor`). Como toda ação e todo agente declaram a saída, o
@@ -146,8 +146,13 @@ validador sabe que campos existem e recusa condição que aponta para campo inex
 
 No N3: condição com alternativas (`ou`), para "acima do limite **ou** fornecedor novo" num caminho só; regras do
 cliente (limites, prazos) são parâmetros, gravados no próprio BPMN (na saída do início), então mudar um limite é uma
-versão nova e cada execução usa o valor da versão em que começou. Paralelo e subprocesso ficam para o N7, quando um
-modelo da biblioteca pedir.
+versão nova e cada execução usa o valor da versão em que começou.
+
+No N7: **paralelo**, um passo que abre os ramos e outro que os junta (a admissão faz eSocial, contrato, exame e
+acessos ao mesmo tempo); a validação confere que cada abertura tem a junção dela e que todo ramo chega lá, e a
+simulação percorre cada ramo. **Subprocesso não precisou:** nenhum dos 13 modelos chama outro no meio; um processo que
+termina e inicia outro (seção 5.8) cobre a cadeia proposta → contrato → faturamento, com cada um tendo as próprias
+versões. Fica para quando um modelo pedir.
 
 ### 5.4 O diálogo que desenha o processo
 
@@ -236,6 +241,15 @@ modelo da biblioteca pedir.
 - **Manual:** o cliente ou o staff inicia pela tela.
 - **Outro processo:** uma proposta aceita em Vendas inicia a gestão de contratos no Jurídico e o faturamento no
   Financeiro. O workspace mostra a cadeia como um projeto.
+- **No N7:** o gatilho por processo cita o modelo (ou o processo) de origem e, se quiser, o fim que dispara
+  (`proposta-comercial`, `aceita`). Ao fim de uma execução, o `svc-processos` inicia cada processo publicado da empresa
+  que espera aquele fim, com o que a mãe juntou (as saídas dos passos) como gatilho; a filha guarda a mãe e o projeto
+  (a primeira da cadeia), e a cadeia para em 5 níveis. O desenho avisa o que não vai disparar (origem não aceita, não
+  publicada ou fim que ela não tem) e mostra quem começa depois deste. Os pacotes também publicam os próprios eventos
+  (`processes.emit`: pedido de proposta, lead, admissão, requisição) para iniciar processos.
+- **Agenda em UTC:** o cliente fala "todo dia às 8h" e o modelo guarda o cron de 5 campos em UTC (`0 11 * * *`). Achado
+  do N7: o Camunda só aceita cron de 6 campos (com segundos); o core converte na compilação, e agenda fora do formato
+  é erro do desenho.
 
 ## 6. Conhecimento
 
@@ -264,6 +278,9 @@ modelo da biblioteca pedir.
   suíte de casos rodando o agente de verdade. Um agente verificado entra num passo pela conversa de desenho
   (`usar_agente`), no lugar de uma ação (cumprindo o contrato dela) ou de outro agente, e a primeira vez passa pela
   revisão do staff. As ações dos pacotes como ferramenta de agente ficam para quando houver ações de leitura (N7).
+- **No N7** os pacotes ganharam ações de leitura (comparar cotações, pendências do mês, prazo processual, clientes
+  inativos), mas os passos de agente dos 13 modelos leem o documento e o conhecimento, que já são ferramentas da
+  plataforma. Ação de pacote como ferramenta de agente continua proposta, para quando um agente da empresa precisar.
 - **Achados do N6** com o modelo real: às vezes ele escreve a resposta ("concluir(divergente=false)", ou o JSON) em
   vez de chamar a ferramenta; o agente ganha uma segunda chance e, se a resposta for um JSON com todas as saídas, vale
   (validado como se tivesse chamado). E a suíte pegou uma regra mal aplicada (diferença de 50 dada como sem
@@ -401,6 +418,25 @@ indicadores: autonomia; tempo do recebimento ao agendamento; pagos em atraso
 É o piloto proposto porque passa por tudo: gatilho por evento, agente com exceção, regra do cliente, aprovação do
 cliente, integração irreversível, espera por mensagem e handoff do staff.
 
+### No N7: os 13 modelos nos pacotes
+
+- **Cada pacote declara os modelos dele** junto com as ações (`processes.declare(ACTIONS, MODELS)`): o fluxo de partida
+  do modelo mora no `schemas.py` do serviço que executa (financeiro, jurídico, administrativo, vendas) e chega ao
+  `svc-processos` pelo catálogo, na tabela compartilhada `processos_modelos`. Um modelo que cita ação que o pacote não
+  declarou impede o serviço de subir. A empresa pode escolher um modelo direto da biblioteca, sem passar pela
+  descoberta.
+- **Integração ainda não escolhida vira exceção do staff** (decisão 6): emitir NFS-e, coletar assinatura eletrônica,
+  enviar ao eSocial, consultar tribunais e emitir certidões são ações que, sem a conexão, dizem ao staff o que fazer e
+  pedem o resultado (o número da nota, a data da assinatura). Trocar pela integração não muda o modelo.
+- **E-mail de saída** (propostas, cobranças, pedidos de compra e de documentos) sai do endereço da caixa de entrada da
+  empresa pelo `svc-integracoes`; no ambiente local, pelo Mailpit. O banco simulado também emite cobranças e dá o
+  extrato para a conciliação.
+- **Validado na stack:** os 13 modelos adicionados da biblioteca simulam até um fim, sem erro, e publicam no Camunda.
+  A cadeia rodou de ponta a ponta no navegador: pedido de proposta → proposta montada (pelo staff, sem modelo de IA no
+  ambiente) e enviada por e-mail → a empresa aprova a resposta do cliente → fim "aceita" → gestão de contratos (termos,
+  análise, assinatura pelo staff; contrato arquivado vigente) e faturamento (nota pelo staff, boleto no banco simulado,
+  recebido e baixado). O workspace mostra a cadeia como um projeto concluído.
+
 ## 11. Console Electron (operação)
 
 Um aplicativo só do time, na pasta `console/` deste repositório (tudo num lugar só): Electron + Vite + React +
@@ -454,7 +490,7 @@ descoberto no N2 e desenhado no N3.
 | N4 Execução e acompanhamento | `core/processes.py` (workers); as ações do contas a pagar implementadas; `svc-integracoes` com as conexões que o piloto pede (caixa de entrada; banco simulado até o fornecedor ser escolhido); gatilhos; tarefas do cliente e do staff (papel `operador`); no workspace, execuções, tarefas, prazos e autonomia | Um boleto que chega na caixa de entrada percorre o processo publicado, o cliente aprova no workspace, uma exceção vira handoff resolvido por um operador, e publicar uma versão nova não muda a execução em andamento |
 | N5 Staff, carteira e setup | `svc-staff`; carteira com o papel `operador` automático; fila de handoffs da carteira com prazo e escalonamento; revisão de versões; setup com ajuda humana (o staff entra na conversa de desenho); aprender com o handoff | Um ajuste pedido no setup é feito pelo staff junto com o cliente e publicado; um handoff resolvido vira regra e a execução seguinte passa sem handoff |
 | N6 Agentes e integrações | Área de agentes (instrução, ferramentas do catálogo, MCP, política, suíte); integrações completas (catálogo, credenciais, servidores MCP) | O cliente cria um agente com uma ferramenta MCP, ele passa na suíte e é usado num passo de processo |
-| N7 Pacotes de área | Jurídico, administrativo, vendas e o resto do financeiro: ações e modelos; processos que disparam outros | Os 13 modelos simulam, e a cadeia proposta → contrato → faturamento aparece no workspace como um projeto |
+| N7 Pacotes de área | Jurídico, administrativo, vendas e o resto do financeiro: ações e modelos; processos que disparam outros | Os 13 modelos simulam, e a cadeia proposta → contrato → faturamento aparece no workspace como um projeto (feito: seção 10, "No N7") |
 | P1 Cluster | Empacotamento Kubernetes (seção 12) | A plataforma sobe no cluster com um cliente compartilhado e um dedicado; precisa estar pronto antes do primeiro cliente em produção, junto com a decisão 1 |
 | P2 Console | `console/` (seção 11), depois do P1 | Painéis do cluster e dos clientes, e um módulo criado pela IDE chega a deploy aprovado |
 
