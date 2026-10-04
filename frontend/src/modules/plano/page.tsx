@@ -6,12 +6,14 @@ import { Badge } from "@/components/Badge";
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { Code } from "@/components/Code";
+import { DateTime } from "@/components/DateTime";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { CopyField } from "@/components/CopyField";
 import { DataTable } from "@/components/DataTable";
 import { EmptyState } from "@/components/EmptyState";
 import { Grid } from "@/components/Grid";
 import { Heading } from "@/components/Heading";
+import { KeyValue } from "@/components/KeyValue";
 import { Money } from "@/components/Money";
 import { Page } from "@/components/Page";
 import { Quantity } from "@/components/Quantity";
@@ -25,7 +27,9 @@ import { Text } from "@/components/Text";
 import { TextField } from "@/components/TextField";
 import { UsageMeter } from "@/components/UsageMeter";
 import { type QueryState, refresh, useAction, useLiveQuery, useQuery } from "@/core/api";
+import { hasRoles, useSession } from "@/core/auth";
 import {
+  type PlansConta,
   type PlansAccount,
   type PlansCatalog,
   type PlansCatalogLimit,
@@ -93,6 +97,7 @@ export default function Plano() {
       <Tabs
         tabs={[
           { id: "uso", label: "Uso", content: <Uso atual={atual} /> },
+          { id: "conta", label: "Conta", content: <Conta atual={atual} /> },
           { id: "modulos", label: "Módulos", content: <Modulos atual={atual} /> },
           { id: "planos", label: "Planos", content: <Comparacao lista={lista} catalogo={catalogo} /> },
           ...(gere ? [{ id: "gerenciar", label: "Gerenciar", content: <Gerenciar lista={lista} catalogo={catalogo} /> }] : []),
@@ -132,6 +137,114 @@ function Uso({ atual }: { atual: QueryState<PlansCurrent> }) {
         </>
       )}
     </QueryView>
+  );
+}
+
+const SITUACAO = {
+  ativa: { label: "Ativa", tone: "success" },
+  suspensa: { label: "Suspensa", tone: "warning" },
+  encerrada: { label: "Encerrada", tone: "danger" },
+} as const;
+
+/** A conta: mensalidade, vencimento e situação; o dono pede o cancelamento (no fim do mês pago) e baixa os dados. */
+function Conta({ atual }: { atual: QueryState<PlansCurrent> }) {
+  const dono = hasRoles(useSession(), "owner");
+  return (
+    <QueryView query={atual}>
+      {(a) => {
+        const c = a.conta;
+        return (
+          <Stack>
+            {c.aviso && (
+              <Alert tone={c.situacao === "ativa" ? "info" : "warning"} title={c.situacao === "ativa" ? "Cancelamento pedido" : `Conta ${SITUACAO[c.situacao].label.toLowerCase()}`}>
+                {c.aviso}
+              </Alert>
+            )}
+            <Grid cols={3}>
+              <Stat label="Situação" value={<Badge tone={SITUACAO[c.situacao].tone}>{SITUACAO[c.situacao].label}</Badge>}
+                hint={c.situacao === "suspensa" && c.motivo ? c.motivo : undefined} />
+              <Stat label="Mensalidade" value={c.valor ? <Money value={c.valor} currency={c.moeda} /> : "Sem cobrança"}
+                hint={c.valor_combinado ? "Combinada com a Cogniventure" : "O preço do plano"} />
+              <Stat label="Vencimento" value={`Todo dia ${c.vencimento}`} hint="A cobrança chega por e-mail no começo do mês." />
+            </Grid>
+            {dono && !a.manages_platform && <Cancelamento conta={c} onChange={atual.reload} />}
+            {dono && !a.manages_platform && <Dados />}
+          </Stack>
+        );
+      }}
+    </QueryView>
+  );
+}
+
+function Cancelamento({ conta, onChange }: { conta: PlansConta; onChange: () => void }) {
+  const cancelar = useAction(plans.cancelar, { onSuccess: onChange });
+  const desfazer = useAction(plans.desfazerCancelamento, { onSuccess: onChange });
+  if (conta.cancelamento || conta.situacao === "encerrada") {
+    const c = conta.cancelamento;
+    return (
+      <Card title={conta.situacao === "encerrada" ? "Conta encerrada" : "Cancelamento pedido"}
+        description={conta.situacao === "encerrada"
+          ? "Nenhuma execução nova começa e as conexões foram desligadas. Baixe os dados abaixo antes da exclusão."
+          : "Até a data, tudo funciona normalmente. Depois, os dados ficam 30 dias para baixar."}>
+        <KeyValue items={[
+          ...(c ? [{ label: "Pedido por", value: c.origem === "cliente" ? "Você" : "Cogniventure" }] : []),
+          ...(c?.motivo ? [{ label: "Motivo", value: c.motivo }] : []),
+          ...(c && conta.situacao !== "encerrada" ? [{ label: "Encerra em", value: <DateTime value={c.efetivo_em} format="date" /> }] : []),
+          ...(conta.encerrada_em ? [{ label: "Encerrada em", value: <DateTime value={conta.encerrada_em} format="date" /> }] : []),
+          ...(conta.exclusao_em ? [{ label: "Os dados saem de vez em", value: <DateTime value={conta.exclusao_em} format="date" /> }] : []),
+        ]} />
+        {desfazer.error && <Alert tone="danger">{desfazer.error.message}</Alert>}
+        {conta.pode_desfazer && (
+          <Row>
+            <Button variant="secondary" loading={desfazer.running} onClick={() => desfazer.run({})}>
+              {conta.situacao === "encerrada" ? "Reativar a conta" : "Desfazer o cancelamento"}
+            </Button>
+          </Row>
+        )}
+      </Card>
+    );
+  }
+  return (
+    <Card title="Cancelar a conta" description="O cancelamento vale no fim do mês já pago: até lá, tudo funciona. Depois, os dados ficam 30 dias para baixar e você pode desfazer até a exclusão.">
+      <ActionForm
+        action={cancelar}
+        submitLabel="Pedir o cancelamento"
+        fields={[{ name: "motivo", label: "Por que está saindo? (opcional)", kind: "textarea" }]}
+      />
+    </Card>
+  );
+}
+
+/** O pacote dos dados (JSON e CSV, mais os arquivos): fica pronto em segundo plano e o dono é avisado. */
+function Dados() {
+  const atual = useQuery(plans.exportacao);
+  const pedir = useAction(plans.exportar, { onSuccess: atual.reload });
+  const baixar = useAction(plans.exportacao, { onSuccess: (r) => r.item?.url && window.open(r.item.url, "_blank", "noopener") });
+  return (
+    <Card title="Baixar os dados" description="Um pacote em formatos abertos: cada cadastro, execução (com a linha do tempo) e versão de processo em JSON e CSV, mais os arquivos recebidos.">
+      <QueryView query={atual}>
+        {({ item }) => (
+          <Stack gap="sm">
+            {item && (
+              <KeyValue items={[
+                { label: "Último pedido", value: <DateTime value={item.created_at} format="datetime" /> },
+                { label: "Situação", value: item.status === "pronta" ? "Pronto" : item.status === "preparando" ? "Preparando…" : "Falhou" },
+                ...(item.tamanho ? [{ label: "Tamanho", value: <Quantity value={Math.max(1, Math.round(item.tamanho / 1024))} unit="KB" /> }] : []),
+              ]} />
+            )}
+            {item?.aviso && <Alert tone="warning">{item.aviso}</Alert>}
+            {(pedir.error || baixar.error) && <Alert tone="danger">{(pedir.error ?? baixar.error)?.message}</Alert>}
+            <Row>
+              <Button variant="secondary" loading={pedir.running} disabled={item?.status === "preparando"} onClick={() => pedir.run({})}>
+                {item ? "Gerar de novo" : "Gerar o pacote"}
+              </Button>
+              {item?.status === "pronta" && <Button loading={baixar.running} onClick={() => baixar.run()}>Baixar</Button>}
+              {item?.status === "preparando" && <Button variant="ghost" onClick={atual.reload}>Atualizar</Button>}
+            </Row>
+          </Stack>
+        )}
+      </QueryView>
+    </Card>
   );
 }
 

@@ -26,6 +26,9 @@ Trilhos:
   segurança.
 - Cobrança fica no produto: o serviço de pagamentos confirma o pagamento e, como tarefa da plataforma
   (acting_as(system(SERVICE, org))), chama plans.assign("pro") (ou plans.assign("pro", modules={"juridico": True})).
+- Situação da conta (alinhamento pós-N7, itens 2 e 13): ativa, suspensa (atraso) ou encerrada (cancelada). Suspensa ou
+  encerrada, nada novo começa sozinho: quem inicia execuções confere antes com await plans.situacao() (sem cache: a
+  suspensão vale na hora). Fora isso, tudo funciona (a suspensão bloqueia só execuções novas).
 """
 import hashlib
 import logging
@@ -35,7 +38,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from nats.errors import NoRespondersError
 from pydantic import BaseModel, Field, StringConstraints
@@ -47,7 +50,7 @@ from core.security import Principal, add_gate, current, current_tenant
 __all__ = [
     "plans", "Plans", "Module", "Limit", "ModuleCatalog", "CatalogModule", "CatalogLimit", "ModuleState", "LimitState",
     "PlanLimits", "LimitsRequest", "UsageReport", "CountReport", "AssignRequest", "Assigned", "ModuleName", "PlanSlug",
-    "CATALOG_SUBJECT", "USAGE_SUBJECT", "COUNT_SUBJECT", "LIMITS_SUBJECT", "ASSIGN_SUBJECT",
+    "CATALOG_SUBJECT", "USAGE_SUBJECT", "COUNT_SUBJECT", "LIMITS_SUBJECT", "ASSIGN_SUBJECT", "Situacao",
 ]
 
 CATALOG_SUBJECT = "events.plans.catalog"
@@ -65,6 +68,7 @@ log = logging.getLogger("core.plans")
 
 PlanSlug = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", max_length=40)]
 ModuleName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", max_length=40)]
+Situacao = Literal["ativa", "suspensa", "encerrada"]
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,8 @@ class PlanLimits(BaseModel):
     month: str = Field(..., description="AAAA-MM, em UTC: o mês dos consumos")
     limits: list[LimitState]
     modules: list[ModuleState] = Field(default_factory=list)
+    situacao: Situacao = Field("ativa", description="Suspensa ou encerrada: nenhuma execução nova começa")
+    aviso: str | None = Field(None, description="O que a organização vê no workspace (suspensão, cancelamento pedido)")
 
     def get(self, name: str) -> LimitState | None:
         return next((state for state in self.limits if state.name == name), None)
@@ -312,10 +318,16 @@ class Plans:
         fora do ar e sem resposta guardada: nenhum limite e nenhum módulo (listas vazias)."""
         return await self._resolve() or PlanLimits(plan=None, plan_name="", month=_month(), limits=[])
 
-    async def _resolve(self) -> PlanLimits | None:
+    async def situacao(self) -> Situacao:
+        """A situação da conta da organização atual, perguntada agora (sem os 60 s guardados): quem vai iniciar uma
+        execução confere antes. Com o svc-plans fora do ar, vale a última resposta e, sem ela, ativa."""
+        resolved = await self._resolve(fresh=True)
+        return resolved.situacao if resolved is not None else "ativa"
+
+    async def _resolve(self, *, fresh: bool = False) -> PlanLimits | None:
         tenant = current_tenant()
         cached = self._cache.get(tenant)
-        if cached and cached[0] > time.monotonic():
+        if cached and cached[0] > time.monotonic() and not fresh:
             return cached[1]
         try:
             resolved = await bus.request(LIMITS_SUBJECT, LimitsRequest(), PlanLimits, timeout=2)

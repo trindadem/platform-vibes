@@ -22,11 +22,12 @@ from core.envelope import ServiceError
 from core.http_client import http, no_cookie_jar
 from core.nats_bus import bus
 from core.plans import plans
-from core.security import Principal, assert_public_url, current
+from core.security import Principal, assert_public_url, current, current_tenant
 from core.surreal import Page, db
 from core.temporal_runner import activities
 
 from schemas import (
+    ContaEncerrada,
     MANAGERS,
     MODELS,
     PLATFORM,
@@ -99,6 +100,11 @@ class AiService:
         await db.query_shared("DELETE ai_models WHERE provider = $p", p=_rid(provider["id"]))
         await db.delete(provider["id"])
         return await self.list_providers(Empty())
+
+    async def encerrada(self, data: ContaEncerrada) -> Empty:
+        """events.plans.encerrada: a conta encerrou, os provedores próprios da organização (e as chaves) são apagados."""
+        await apagar_provedores()
+        return Empty()
 
     # ── Catálogo de modelos ─────────────────────────────────────────────────
 
@@ -326,6 +332,14 @@ def _manager() -> Principal:
     if not MANAGERS & who.roles:
         raise _forbidden()
     return who
+
+
+async def apagar_provedores() -> None:
+    """Os provedores próprios da organização atual, com as chaves e os modelos (encerramento e exclusão)."""
+    org = current_tenant()
+    for provider in await db.query_shared("SELECT id FROM ai_providers WHERE owner = $org", org=org):
+        await db.query_shared("DELETE ai_models WHERE provider = $p", p=_rid(provider["id"]))
+        await db.query_shared("DELETE $p", p=_rid(provider["id"]))
 
 
 def _owners(who: Principal) -> list[str]:

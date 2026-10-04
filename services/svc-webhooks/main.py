@@ -20,6 +20,8 @@ from core.temporal_runner import runner
 from core.webhooks import webhooks
 
 from schemas import (
+    ENCERRADA_SUBJECT,
+    ContaEncerrada,
     CATALOG_SUBJECT,
     EMIT_SUBJECT,
     MODULE,
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(CATALOG_SUBJECT, on_catalog, model=Catalog)
         await bus.subscribe(EMIT_SUBJECT, on_emit, model=Emitted)
         await bus.subscribe(RETRY_SUBJECT, on_retry, model=DeliveryRef)
+        await bus.subscribe(ENCERRADA_SUBJECT, svc.encerrada, model=ContaEncerrada)  # svc-plans: a conta encerrou
         await webhooks.declare(WEBHOOKS)  # o próprio webhooks.teste entra no catálogo
         await plans.declare(MODULE)  # o módulo, com endereços por organização, no catálogo dos planos (README §5.17)
         yield

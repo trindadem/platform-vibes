@@ -123,6 +123,12 @@ class MemberRef(_Input):
     user: Id = Field(..., description="Id do usuário")
 
 
+class ExcluirConta(_Input):
+    """A pessoa apaga a própria conta (LGPD): confirma com a senha."""
+
+    password: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+
+
 class RefreshInput(_Input):
     """Interno: o main.py lê o cookie e entrega o refresh ao service (nunca vem no corpo)."""
 

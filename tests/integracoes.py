@@ -341,3 +341,21 @@ def test_cobranca_no_banco_simulado_recebe_avisa_os_processos_e_entra_no_extrato
     assert len(recebimentos) == 1 and recebimentos[0].chave == emitida.cobranca_id  # acorda a execução que espera
     assert [(i.tipo, i.id, i.valor) for i in extrato.itens] == [("pagamento", pago.pagamento_id, -1250.0), ("recebimento", emitida.cobranca_id, 4800.0)]
     assert resumo["cobrancas"] == 0 and [w[0] for w in workflows] == ["CobrancaSimuladaWorkflow.run", "PagamentoSimuladoWorkflow.run"]
+
+
+def test_conta_encerrada_revoga_as_conexoes_so_da_organizacao_que_saiu():
+    from datetime import UTC, datetime
+
+    from schemas import ENCERRADA_SUBJECT, ContaEncerrada
+
+    async def cenario(app):
+        ana, bia = app.user(*OWNER), app.user("bia", "beta", "owner")
+        await ana.post("/conexoes", json={"tipo": "caixa_entrada"})
+        await ana.post("/conexoes", json={"tipo": "banco_simulado"})
+        await bia.post("/conexoes", json={"tipo": "caixa_entrada"})
+        plans = Principal(sub="system:svc-plans", tenant="acme", roles=frozenset({"system"}))
+        await app.deliver(ENCERRADA_SUBJECT, ContaEncerrada(tenant="acme", em=datetime.now(UTC)), who=plans)
+        return (await ana.get("/conexoes")).json()["data"]["itens"], (await bia.get("/conexoes")).json()["data"]["itens"]
+
+    acme, beta = service_app(cenario)
+    assert acme == [] and [c["tipo"] for c in beta] == ["caixa_entrada"]

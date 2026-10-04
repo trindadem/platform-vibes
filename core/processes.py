@@ -862,7 +862,10 @@ class Camunda:
         return list(self._ok(response, "pegar jobs").get("jobs", []))
 
     async def complete_job(self, key: str, variables: Mapping[str, Any]) -> None:
-        self._ok(await self._call("POST", f"/v2/jobs/{key}/completion", json={"variables": dict(variables)}), "concluir o job")
+        response = await self._call("POST", f"/v2/jobs/{key}/completion", json={"variables": dict(variables)})
+        if response.status_code == 404:  # a execução foi cancelada enquanto o job rodava: nada a concluir
+            return
+        self._ok(response, "concluir o job")
 
     async def throw_error(self, key: str, code: str, message: str) -> None:
         response = await self._call("POST", f"/v2/jobs/{key}/error", json={"errorCode": code, "errorMessage": message[:500]})

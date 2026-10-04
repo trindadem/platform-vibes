@@ -73,6 +73,12 @@ export async function logout(): Promise<void> {
   }
 }
 
+/** Apaga a própria conta (LGPD), confirmando com a senha; a sessão deste navegador acaba junto. */
+export async function deleteAccount(password: string): Promise<void> {
+  await identity.excluirConta({ password });
+  clear(true);
+}
+
 export function switchTenant(tenant: string): Promise<Session> {
   return open(identity.switchTenant({ tenant }));
 }

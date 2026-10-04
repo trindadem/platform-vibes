@@ -168,11 +168,12 @@ class FinanceiroService:
     # ── Faturamento e cobrança ───────────────────────────────────────────────
 
     async def faturar(self, data: Faturamento) -> FaturaAberta:
-        """Abre a fatura da venda: quem paga, o quê, quanto e quando vence (hoje + o prazo do processo)."""
+        """Abre a fatura da venda: quem paga, o quê, quanto e quando vence (a data combinada, se veio; senão, hoje + o
+        prazo do processo)."""
         faltam = [nome for nome, valor in (("cliente", data.cliente), ("valor", data.valor)) if valor in (None, "")]
         if faltam or (data.valor or 0) <= 0:
             raise Handoff(f"Faltam dados para faturar: {', '.join(faltam) or 'valor maior que zero'}.")
-        vencimento = (date.today() + timedelta(days=data.prazo_pagamento or PRAZO_PADRAO)).isoformat()
+        vencimento = data.vencimento or (date.today() + timedelta(days=data.prazo_pagamento or PRAZO_PADRAO)).isoformat()
         row = await db.create(FATURAS, {"cliente": data.cliente, "cnpj": data.cnpj, "email": data.email, "descricao": data.descricao,
                                         "valor": round(float(data.valor), 2), "vencimento": vencimento, "status": "aberta",
                                         "regua": [], "conciliada": False, "proposta_id": data.proposta_id})
@@ -274,7 +275,8 @@ class FinanceiroService:
 
     async def regua(self, data: Empty) -> Regua:
         """Agendado (todo dia): lembra por e-mail o cliente da fatura cobrada e ainda não paga, 3 dias antes do
-        vencimento, um dia depois e uma semana depois (cada lembrete uma vez)."""
+        vencimento, um dia depois e uma semana depois (cada lembrete uma vez). Na semana de atraso, avisa também o
+        dono e o administrador da organização (alinhamento pós-N7, item 2: a vencida além do prazo chega ao gestor)."""
         enviados = 0
         hoje = date.today()
         for org in await db.tenants(FATURAS):
@@ -295,6 +297,11 @@ class FinanceiroService:
                     await db.merge(f"{FATURAS}:{fatura.id}", {"regua": [*fatura.regua, etapa]})
                     await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="lembrete"))
                     enviados += 1
+                    if etapa == "D+7":  # atraso além do prazo: chega ao gestor (na Cogniventure, ele suspende o cliente)
+                        await notify.roles("owner", "admin", title=f"Cobrança vencida há 7 dias: {fatura.cliente}"[:120],
+                                           body=f"{fatura.descricao or 'Cobrança'} de {_reais(fatura.valor)}, vencida em "
+                                                f"{_data_br(fatura.vencimento)}. O cliente já recebeu três lembretes.",
+                                           link="/financeiro/receber", action="Ver a cobrança", key=f"atraso-{fatura.id}")
         return Regua(lembretes=enviados)
 
     # ── Telas ────────────────────────────────────────────────────────────────

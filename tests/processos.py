@@ -123,7 +123,7 @@ def test_descoberta_sugere_com_motivo_e_nao_ressuscita_o_recusado(provedor):
     assert recusado.json()["data"]["status"] == "recusado" and aceito.json()["data"]["status"] == "aceito"
     assert _sse(segunda.text)[-1][1]["data"]["processos"] == []  # já decididos: nada sugerido de novo
     assert [(p["modelo"], p["status"]) for p in depois] == [("conciliacao-bancaria", "recusado"), ("contas-a-pagar", "aceito")]
-    assert resumo == {"sugeridos": 0, "aceitos": 1, "recusados": 1, "publicados": 0}
+    assert resumo == {"sugeridos": 0, "aceitos": 1, "recusados": 1, "publicados": 0, "staff": False}
     assert ("processos.processos", "sugerido") in [(t, a) for t, _, a in live]
     contexto = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
     assert "Boleto pelo Itaú" in contexto and "contas-a-pagar (financeiro)" in contexto  # perfil e biblioteca no contexto
@@ -1006,3 +1006,149 @@ def test_staff_resolve_a_excecao_pela_fila_e_o_item_fecha_com_quem_resolveu():
     assert resolvida.status == "concluida" and resolvida.concluida_por == "otto"  # quem resolveu, não o serviço
     assert revisao.status == "publicada" and revisao.numero == 1
     assert fila[-1] == ("excecao", "concluida", "otto")
+
+
+# ── Ciclo de vida (alinhamento pós-N7, itens 2 e 8): pausar, conta suspensa, voltar versão, cancelar e o fechamento ─
+
+from core.plans import LIMITS_SUBJECT, PlanLimits  # noqa: E402
+from core.security import system  # noqa: E402
+
+from schemas import INICIAR_MODELO_SUBJECT, IniciarModelo  # noqa: E402
+
+
+def test_processo_pausado_nao_inicia_e_retomado_inicia_o_proximo():
+    async def cenario(app):
+        pid = await _publicado(app)
+        ana = app.user(*OWNER)
+        membro = await app.user("mel", "acme", "member").post("/processos/pausar", json={"id": pid})
+        pausado = (await ana.post("/processos/pausar", json={"id": pid})).json()["data"]
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-1")
+        manual = await ana.post("/execucoes/iniciar", json={"processo": pid, "dados": {"documento_id": "doc2"}})
+        # A agenda do motor dispara sozinha: o ouvinte do começo cancela e registra que não iniciou.
+        await app.job(JOB_START, kind="EXECUTION_LISTENER", listener="START", processo=pid, element=f"p_acme_{pid}", instance="9500")
+        antes = list(app.motor.started)
+        retomado = (await app.user(*OPERADOR).post("/processos/retomar", json={"id": pid})).json()["data"]
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-2")
+        execucoes = (await ana.get("/execucoes", params={"sort": "created_at"})).json()["data"]["items"]
+        return membro, pausado, manual, antes, retomado, list(app.motor.started), list(app.motor.cancelled), execucoes
+
+    membro, pausado, manual, antes, retomado, depois, canceladas, execucoes = service_app(cenario)
+    assert membro.status_code == 403 and pausado["pausado"] is True and pausado["pausado_por"] == "ana"
+    assert antes == [] and manual.json()["error"]["code"] == "ERRO_PROCESSOS_PAUSADO"  # o boleto que chega não inicia
+    assert canceladas == ["9500"]
+    assert retomado["pausado"] is False and len(depois) == 1  # retomado, o próximo inicia
+    agenda = next(e for e in execucoes if e["instancia"] == "9500")
+    assert (agenda["origem"], agenda["status"], agenda["marcos"][-1]["nome"]) == ("agenda", "cancelada", "Não iniciou")
+
+
+def test_conta_suspensa_nao_inicia_execucao_nova():
+    async def cenario(app):
+        pid = await _publicado(app)
+        app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan=None, plan_name="", month="2026-10", limits=[], situacao="suspensa",
+                                                         aviso="Conta suspensa"))
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-1")
+        manual = await app.user(*OWNER).post("/execucoes/iniciar", json={"processo": pid})
+        return manual, list(app.motor.started)
+
+    manual, iniciadas = service_app(cenario)
+    assert iniciadas == [] and manual.status_code == 409
+    assert manual.json()["error"]["code"] == "ERRO_PROCESSOS_CONTA_SUSPENSA"
+
+
+def test_voltar_a_uma_versao_do_historico_publica_de_novo_como_a_proxima():
+    async def cenario(app):
+        pid = await _publicado(app)
+        ana = app.user(*OWNER)
+        await ana.post("/desenho/ajustar", json={"processo": pid})
+        with acting_as(ACME):
+            await db.query("UPDATE processos_versoes SET fluxo.parametros.limite_aprovacao = 9999 WHERE tenant = $tenant AND status = 'rascunho'")
+        await ana.post("/desenho/publicar", json={"processo": pid})
+        publicada = await ana.post("/desenho/voltar", json={"processo": pid, "numero": 2})
+        membro = await app.user("mel", "acme", "member").post("/desenho/voltar", json={"processo": pid, "numero": 1})
+        voltou = (await ana.post("/desenho/voltar", json={"processo": pid, "numero": 1})).json()["data"]
+        await ana.post("/desenho/ajustar", json={"processo": pid})
+        com_rascunho = await ana.post("/desenho/voltar", json={"processo": pid, "numero": 2})
+        return publicada, membro, voltou, com_rascunho, app.motor.deployed
+
+    publicada, membro, voltou, com_rascunho, implantadas = service_app(cenario)
+    assert publicada.json()["error"]["code"] == "ERRO_PROCESSOS_VERSAO" and membro.status_code == 403
+    assert [(v["numero"], v["status"]) for v in voltou["versoes"]] == [(1, "arquivada"), (2, "arquivada"), (3, "publicada")]
+    assert voltou["versao"]["fluxo"]["parametros"]["limite_aprovacao"] != 9999 and len(implantadas) == 3
+    assert voltou["mensagens"][-1]["texto"] == "Voltei à versão 1: ela vira a versão 3."
+    assert com_rascunho.json()["error"]["code"] == "ERRO_PROCESSOS_RASCUNHO_ABERTO"
+
+
+def test_cancelar_execucao_com_motivo_fecha_as_tarefas_e_avisa_o_que_ja_foi_feito():
+    async def cenario(app):
+        pid = await _publicado(app)
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-1")
+        instancia = str(app.motor._seq)
+        comum = {"processo": pid, "instance": instancia}
+        await app.deliver(STEP_SUBJECT, PassoFeito(instancia=instancia, processo=pid, motor_versao=1, passo="agendar",
+                                                   tipo="financeiro.agendar_pagamento", status="concluido", saida={"pagamento_id": "PG-1"}), who=SISTEMA)
+        await app.job(JOB_TASK, element="ler_documento__excecao", kind="TASK_LISTENER", listener="CREATING", variables={"gatilho": GATILHO},
+                      user_task={"userTaskKey": "81"}, **comum)
+        execucao = (await app.user(*OWNER).get("/execucoes")).json()["data"]["items"][0]
+        detalhe = (await app.user(*OWNER).get("/execucoes/item", params={"id": execucao["id"]})).json()["data"]
+        membro = await app.user("mel", "acme", "member").post("/execucoes/cancelar", json={"id": execucao["id"], "motivo": "duplicado"})
+        curto = await app.user(*OWNER).post("/execucoes/cancelar", json={"id": execucao["id"], "motivo": "x"})
+        cancelada = (await app.user(*OWNER).post("/execucoes/cancelar", json={"id": execucao["id"], "motivo": "Boleto duplicado"})).json()["data"]
+        de_novo = await app.user(*OWNER).post("/execucoes/cancelar", json={"id": execucao["id"], "motivo": "Boleto duplicado"})
+        tarefa = (await app.user(*OPERADOR).get("/tarefas", params={"responsavel": "staff"})).json()["data"]["items"][0]
+        fila = [(m.tipo, m.status) for s, m in app.published if s == STAFF_SUBJECT]
+        return instancia, detalhe, membro, curto, cancelada, de_novo, tarefa, fila, list(app.motor.cancelled)
+
+    instancia, detalhe, membro, curto, cancelada, de_novo, tarefa, fila, canceladas = service_app(cenario)
+    assert detalhe["efeitos"] == ["Agendar o pagamento"]  # a tela avisa: o pagamento agendado continua no banco
+    assert membro.status_code == 403 and curto.status_code == 422
+    assert canceladas == [instancia] and cancelada["status"] == "cancelada" and cancelada["concluida_em"]
+    assert (cancelada["marcos"][-1]["status"], cancelada["marcos"][-1]["motivo"], cancelada["marcos"][-1]["por"]) == ("cancelada", "Boleto duplicado", "ana")
+    assert de_novo.json()["error"]["code"] == "ERRO_PROCESSOS_EXECUCAO_FECHADA"
+    assert (tarefa["status"], tarefa["resposta"]) == ("concluida", {"cancelada": "Boleto duplicado"})
+    assert fila == [("excecao", "aberta"), ("excecao", "concluida")]  # o item sai da fila do staff
+
+
+def test_fechamento_do_mes_inicia_o_faturamento_publicado_so_pelo_svc_plans():
+    plataforma = system("svc-plans", "acme")
+    dados = {"cliente": "Mercado Bom", "email": "dono@mercado.com", "valor": 990.0, "descricao": "Plano Pro, outubro", "prazo_pagamento": 9}
+
+    async def cenario(app):
+        await _pacotes(app)
+        iniciar = app.handlers[INICIAR_MODELO_SUBJECT]
+        pedido = IniciarModelo(modelo="faturamento-cobranca", dados=dados, chave="plano-mb-2026-10", resumo="Mercado Bom: plano Pro")
+        with acting_as(plataforma):
+            with pytest.raises(Exception) as sem_publicar:
+                await iniciar(pedido)
+        fid = (await app.user(*OWNER).post("/processos/adicionar", json={"modelo": "faturamento-cobranca"})).json()["data"]["id"]
+        await app.user(*OWNER).post("/desenho/abrir", json={"processo": fid})
+        assert (await app.user(*OPERADOR).post("/desenho/publicar", json={"processo": fid})).status_code == 200
+        with acting_as(system("svc-staff", "acme")), pytest.raises(Exception) as outro:
+            await iniciar(pedido)
+        with acting_as(plataforma):
+            primeira = await iniciar(pedido)
+            de_novo = await iniciar(pedido)  # o mesmo mês do mesmo cliente não inicia duas vezes
+        return sem_publicar.value, outro.value, primeira, de_novo, list(app.motor.started)
+
+    sem_publicar, outro, primeira, de_novo, iniciadas = service_app(cenario)
+    assert sem_publicar.code == "ERRO_PROCESSOS_SEM_PUBLICADA" and outro.code == "ERRO_PROCESSOS_FORBIDDEN"
+    assert primeira.id == de_novo.id and (primeira.origem, primeira.resumo) == ("agenda", "Mercado Bom: plano Pro")
+    assert len(iniciadas) == 1 and iniciadas[0][1]["gatilho"]["valor"] == 990.0
+
+
+def test_na_propria_cogniventure_o_dono_e_o_admin_fazem_o_papel_do_staff(monkeypatch):
+    import service
+
+    monkeypatch.setattr(service.settings, "platform_tenant", "acme")  # a organização do teste é a da Cogniventure
+
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        pid = await _aceito(app)
+        await ana.post("/desenho/abrir", json={"processo": pid})
+        publicado = await ana.post("/desenho/publicar", json={"processo": pid})  # num cliente, só o operador publicaria
+        resumo = (await ana.get("/resumo")).json()["data"]
+        membro = (await app.user("mel", "acme", "member").get("/resumo")).json()["data"]
+        return publicado, resumo, membro
+
+    publicado, resumo, membro = service_app(cenario)
+    assert publicado.status_code == 200 and publicado.json()["data"]["versao"]["status"] == "publicada"
+    assert resumo["staff"] is True and membro["staff"] is False

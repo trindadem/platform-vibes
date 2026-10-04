@@ -28,6 +28,8 @@ from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    ENCERRADA_SUBJECT,
+    ContaEncerrada,
     AGENDAR_SUBJECT,
     COBRAR_SUBJECT,
     DOCUMENTO_SUBJECT,
@@ -76,6 +78,7 @@ async def lifespan(app: FastAPI):
     ):
         await storage.connected(SERVICE)  # os documentos recebidos (README §5.14)
         await bus.respond(DOCUMENTO_SUBJECT, svc.documento_texto, model=DocumentoRef)  # agentes dos processos
+        await bus.subscribe(ENCERRADA_SUBJECT, svc.encerrada, model=ContaEncerrada)  # svc-plans: a conta encerrou
         await bus.respond(AGENDAR_SUBJECT, svc.agendar_pagamento, model=AgendarPagamento)  # ação do svc-financeiro
         await bus.respond(FERRAMENTAS_SUBJECT, svc.ferramentas, model=Empty)  # catálogo de ferramentas dos agentes
         await bus.respond(MCP_SUBJECT, svc.chamar_mcp, model=ChamadaMcp)  # a credencial não sai deste serviço

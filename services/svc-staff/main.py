@@ -27,6 +27,7 @@ from core.temporal_runner import runner
 
 from schemas import (
     ATENDIMENTO_SUBJECT,
+    ENCERRADA_SUBJECT,
     MEMBER_LEFT_SUBJECT,
     MODULE,
     SERVICE,
@@ -37,6 +38,8 @@ from schemas import (
     Atribuicao,
     CarteiraRef,
     ClienteRef,
+    CobrancaCliente,
+    ContaEncerrada,
     DecidirRevisao,
     Empty,
     FilaQuery,
@@ -46,10 +49,11 @@ from schemas import (
     NovaCarteira,
     NovoCliente,
     NumerosQuery,
+    SituacaoCliente,
     ResolverExcecao,
     ResponderPedido,
 )
-from service import MIGRATIONS, StaffService
+from service import MIGRATIONS, StaffService, apagar_cliente
 from workflows import SCHEDULES, EscalarWorkflow
 
 svc = StaffService()
@@ -59,12 +63,13 @@ svc = StaffService()
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=TABLES, unique=UNIQUE, migrations=MIGRATIONS, service=SERVICE),
+        db.connected(tables=TABLES, unique=UNIQUE, migrations=MIGRATIONS, service=SERVICE, on_purge=apagar_cliente),
         runner.worker(TASK_QUEUE, workflows=[EscalarWorkflow], service=svc, schedules=SCHEDULES),
     ):
         await bus.subscribe(STAFF_SUBJECT, svc.receber, model=ItemStaff)
         await bus.subscribe(ATENDIMENTO_SUBJECT, svc.receber, model=ItemStaff)  # os pedidos de ajuda dos clientes
         await bus.subscribe(MEMBER_LEFT_SUBJECT, svc.saiu, model=MemberLeft)
+        await bus.subscribe(ENCERRADA_SUBJECT, svc.encerrada, model=ContaEncerrada)  # svc-plans: a conta do cliente encerrou
         await plans.declare(MODULE)
         yield
 
@@ -97,6 +102,16 @@ async def novo_cliente(data: NovoCliente) -> ResponseEnvelope:
 @app.post("/clientes/convite", response_model=ResponseEnvelope)
 async def convidar_dono(data: ClienteRef) -> ResponseEnvelope:
     return _ok(await svc.convidar_dono(data))
+
+
+@app.post("/clientes/cobranca", response_model=ResponseEnvelope)
+async def cobranca(data: CobrancaCliente) -> ResponseEnvelope:
+    return _ok(await svc.cobranca(data))
+
+
+@app.post("/clientes/situacao", response_model=ResponseEnvelope)
+async def situacao(data: SituacaoCliente) -> ResponseEnvelope:
+    return _ok(await svc.situacao(data))
 
 
 @app.get("/organizacoes", response_model=ResponseEnvelope)

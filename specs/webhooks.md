@@ -37,7 +37,8 @@ O que chega no endereço do cliente (POST, `content-type: application/json`):
    `webhook_events` (global; o catálogo, um por nome).
 2. NATS: `events.webhooks.catalog` grava o catálogo que cada serviço declara no boot (o que saiu da lista do serviço
    sai do catálogo). `events.webhooks.emit` inicia `WebhooksWorkflow` com o id da mensagem (nunca duas execuções).
-   `events.webhooks.retry` (do reenviar) inicia `RedeliverWorkflow`.
+   `events.webhooks.retry` (do reenviar) inicia `RedeliverWorkflow`. `events.plans.encerrada` (a conta da organização
+   encerrou) apaga os endereços dela: nada mais é entregue aos sistemas dela.
 3. Temporal: `WebhooksWorkflow` → `webhooks.fan_out` (uma entrega por endereço ativo inscrito no evento) → um
    `webhooks.deliver` por entrega, com até 10 tentativas (5 s, 20 s, 80 s… até 5 h entre elas, cerca de 15 h);
    esgotadas, `webhooks.give_up`. Agendamento diário apaga entregas com mais de 30 dias.

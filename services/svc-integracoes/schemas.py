@@ -481,3 +481,13 @@ CATALOGO = Catalogo(itens=[
     ItemCatalogo(tipo="certidoes", nome="Portais de certidões", disponivel=False,
                  descricao="Certidões negativas da Receita/PGFN, FGTS, trabalhista, estadual e municipal."),
 ])
+
+
+ENCERRADA_SUBJECT = "events.plans.encerrada"  # svc-plans: a conta da organização encerrou (alinhamento pós-N7, item 13)
+
+
+class ContaEncerrada(BaseModel):
+    """events.plans.encerrada (contrato do svc-plans), publicado como a organização que encerrou."""
+
+    tenant: str
+    em: datetime

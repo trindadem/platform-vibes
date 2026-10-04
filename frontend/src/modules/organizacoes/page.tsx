@@ -10,7 +10,7 @@ import { FileField } from "@/components/FileField";
 import { Page } from "@/components/Page";
 import { Picture } from "@/components/Picture";
 import { refresh, useAction, useQuery, useUpload } from "@/core/api";
-import { createTenant, switchTenant, useSession } from "@/core/auth";
+import { createTenant, deleteAccount, switchTenant, useSession } from "@/core/auth";
 import { identity } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Organizações", order: 4, module: "identity" };
@@ -27,6 +27,7 @@ export default function Organizacoes() {
   const remover = useAction(() => identity.removeLogo({}), { onSuccess: marca });
   const colorir = useAction((v: { color: string }) => identity.setColor({ color: v.color }), { onSuccess: marca });
   const descolorir = useAction(() => identity.setColor({ color: null }), { onSuccess: marca });
+  const apagar = useAction((v: { password: string }) => deleteAccount(v.password));
   const logoUrl = org.data?.logo_url;
 
   return (
@@ -81,6 +82,9 @@ export default function Organizacoes() {
           </Button>
         )}
         {descolorir.error && <Alert tone="danger">{descolorir.error.message}</Alert>}
+      </Card>
+      <Card title="Apagar a sua conta" description="Você sai de todas as organizações e o seu cadastro (nome, e-mail e senha) é apagado. O que você fez nelas fica registrado sem o seu nome. Se você é o único dono de uma organização, passe a propriedade ou peça o cancelamento antes.">
+        <ActionForm action={apagar} submitLabel="Apagar a minha conta" fields={[{ name: "password", label: "Sua senha, para confirmar", kind: "password", required: true, autoComplete: "current-password" }]} />
       </Card>
     </Page>
   );

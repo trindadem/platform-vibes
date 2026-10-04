@@ -57,7 +57,8 @@ export default function DesenhoDoProcesso() {
 function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; reload: () => void }) {
   const session = useSession();
   const empresa = hasAnyRole(session, "owner", "admin");
-  const operador = hasAnyRole(session, "operador"); // o staff da Cogniventure, na organização do cliente
+  const papel = useQuery(processos.resumo); // na própria Cogniventure, o dono e o admin fazem o papel do staff
+  const operador = hasAnyRole(session, "operador") || Boolean(papel.data?.staff); // o staff da Cogniventure, na organização do cliente
   const pode = empresa || operador;
   const id = consultado.processo.id;
   const membros = useQuery(identity.members);
@@ -80,6 +81,9 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
   const pedirAjuda = useAction(processos.pedirAjuda, { onSuccess: limpar });
   const concluirAjuda = useAction(processos.concluirAjuda, { onSuccess: reload });
   const desativar = useAction(processos.desativarRegra, { onSuccess: regras.reload });
+  const pausar = useAction(processos.pausar, { onSuccess: reload });
+  const retomar = useAction(processos.retomar, { onSuccess: reload });
+  const voltar = useAction(processos.voltar, { onSuccess: () => { setSimulacao(null); reload(); } });
 
   const final = resposta.result;
   const desenho = final && final.mensagens.length > consultado.mensagens.length ? final : consultado;
@@ -91,7 +95,7 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
   const avisos = problemas.filter((p) => p.nivel === "aviso");
   const publicada = desenho.versoes.find((v) => v.status === "publicada");
   const pedido = desenho.processo.ajuda;
-  const falha = [simular, desfazer, publicar, ajustar, descartar, pedirRevisao, aprovar, devolver, pedirAjuda, concluirAjuda, desativar]
+  const falha = [simular, desfazer, publicar, ajustar, descartar, pedirRevisao, aprovar, devolver, pedirAjuda, concluirAjuda, desativar, pausar, retomar, voltar]
     .map((a) => a.error)
     .find(Boolean);
 
@@ -167,6 +171,15 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
                 Ajustar
               </Button>
             )}
+            {publicada && (desenho.processo.pausado ? (
+              <Button variant="secondary" loading={retomar.running} onClick={() => void retomar.run({ id })}>
+                Retomar
+              </Button>
+            ) : (
+              <ConfirmButton confirmLabel="Pausar o processo" loading={pausar.running} onConfirm={() => void pausar.run({ id })}>
+                Pausar
+              </ConfirmButton>
+            ))}
           </>
         )
       }
@@ -175,6 +188,11 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
         <TextLink to="/processos">Processos</TextLink> · {desenho.processo.descricao}
       </Text>
       {falha && <Alert tone="danger">{falha.message}</Alert>}
+      {desenho.processo.pausado && (
+        <Alert tone="warning" title="Processo pausado">
+          O gatilho não inicia execuções novas; as que já estão em andamento terminam. Retome quando quiser voltar a rodar.
+        </Alert>
+      )}
       <Columns
         asideWidth="lg"
         aside={
@@ -298,14 +316,21 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
               </Stack>
             )}
           </Card>
-          <Card title="Versões">
+          <Card title="Versões" description={pode && publicada ? "Voltar a uma versão anterior a publica de novo, como a próxima versão (com a revisão do staff quando a regra pedir)." : undefined}>
             {desenho.versoes.map((v) => (
               <Row key={v.numero} justify="between" wrap={false}>
                 <Text>
                   Versão {v.numero}
                   {v.motor_versao ? ` (motor v${v.motor_versao})` : ""}
                 </Text>
-                <StatusBadge value={v.status} labels={STATUS} tones={TONS} />
+                <Row gap="sm" wrap={false}>
+                  {pode && v.status === "arquivada" && !rascunho && !emRevisao && (
+                    <ConfirmButton confirmLabel={`Voltar à versão ${v.numero}`} loading={voltar.running} onConfirm={() => void voltar.run({ processo: id, numero: v.numero })}>
+                      Voltar a esta
+                    </ConfirmButton>
+                  )}
+                  <StatusBadge value={v.status} labels={STATUS} tones={TONS} />
+                </Row>
               </Row>
             ))}
             {Object.keys(versao.fluxo.parametros).length > 0 && (

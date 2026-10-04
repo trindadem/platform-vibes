@@ -291,3 +291,66 @@ def test_fila_resolve_sem_trocar_de_organizacao_e_o_gestor_ve_os_numeros():
     assert [(p["chave"], p["resolvidos"], p["no_prazo"]) for p in numeros["pessoas"]] == [("otto", 3, 3)]
     assert [(c["chave"], c["resolvidos"], c["abertos"]) for c in numeros["clientes"]] == [("acme", 3, 0)]
     assert otto_numeros.status_code == 403  # números são do gestor
+
+
+# ── A conta do cliente (alinhamento pós-N7, itens 2 e 13) ────────────────────
+
+from core.surreal import PURGE_SUBJECT, PurgeRequest  # noqa: E402
+
+from schemas import CONTA_SUBJECT, ENCERRADA_SUBJECT, ContaEncerrada  # noqa: E402
+
+CONTA = {"situacao": "ativa", "valor": 99.0, "valor_combinado": False, "moeda": "BRL", "vencimento": 10}
+
+
+def test_gestor_combina_a_mensalidade_suspende_e_encerra_pela_aba_clientes():
+    async def cenario(app):
+        _identidade(app, [])
+        pedidos = []
+
+        estado = dict(CONTA)
+
+        def conta(pedido):  # o svc-plans guarda a conta; aqui, um dicionário
+            pedidos.append((service.current_tenant(), service.current().sub, pedido.acao, pedido.valor, pedido.vencimento, pedido.motivo, pedido.por))
+            if pedido.valor is not None:
+                estado.update(valor=pedido.valor, valor_combinado=True)
+            estado["situacao"] = {"suspender": "suspensa", "encerrar": "encerrada", "reativar": "ativa"}.get(pedido.acao, estado["situacao"])
+            return estado
+
+        app.respond(CONTA_SUBJECT, conta)
+        gina = app.user(*GESTORA)
+        cobranca = (await gina.post("/clientes/cobranca", json={"organizacao": "acme", "valor": 150, "vencimento": 15})).json()["data"]
+        suspenso = (await gina.post("/clientes/situacao", json={"organizacao": "acme", "acao": "suspender", "motivo": "Atraso"})).json()["data"]
+        staff = await app.user(*OTTO).post("/clientes/situacao", json={"organizacao": "acme", "acao": "reativar"})
+        a_propria = await gina.post("/clientes/cobranca", json={"organizacao": "cogni", "valor": 1})
+        return cobranca, suspenso, staff, a_propria, pedidos
+
+    cobranca, suspenso, staff, a_propria, pedidos = service_app(cenario)
+    assert (cobranca["conta"]["valor"], cobranca["conta"]["valor_combinado"]) == (150, True)
+    assert suspenso["conta"]["situacao"] == "suspensa"
+    assert staff.status_code == 403 and a_propria.json()["error"]["code"] == "ERRO_STAFF_ORGANIZACAO"
+    acoes = [p for p in pedidos if p[2] != "ver"]
+    assert acoes == [("acme", "system:svc-staff", "cobranca", 150, 15, None, "gina"), ("acme", "system:svc-staff", "suspender", None, None, "Atraso", "gina")]
+
+
+def test_conta_encerrada_tira_o_staff_da_carteira_e_a_exclusao_apaga_a_fila_do_cliente():
+    async def cenario(app):
+        operadores = []
+        _identidade(app, operadores)
+        gina = app.user(*GESTORA)
+        await gina.post("/carteiras", json={"pessoa": "otto", "organizacao": "acme"})
+        await gina.post("/carteiras", json={"pessoa": "zoe", "organizacao": "beta"})
+        await app.deliver(STAFF_SUBJECT, _item(ref="t1"), who=_de("acme"))
+        await app.deliver(STAFF_SUBJECT, _item(ref="t2"), who=_de("beta"))
+        plans = Principal(sub="system:svc-plans", tenant="acme", roles=frozenset({"system"}))
+        await app.deliver(ENCERRADA_SUBJECT, ContaEncerrada(tenant="acme", em=datetime.now(UTC)), who=plans)
+        carteiras = (await gina.get("/carteiras")).json()["data"]["itens"]
+        fila = (await gina.get("/fila", params={"todas": True, "status": "aberta"})).json()["data"]["items"]
+        await app.deliver(PURGE_SUBJECT, PurgeRequest(tenant="acme"), who=plans)
+        toda = (await gina.get("/fila", params={"todas": True})).json()["data"]["items"]
+        return operadores, carteiras, fila, toda
+
+    operadores, carteiras, fila, toda = service_app(cenario)
+    assert ("otto", "acme", False) in operadores  # perde o papel operador no cliente encerrado
+    assert [c["organizacao"] for c in carteiras] == ["beta"]
+    assert [i["organizacao"] for i in fila] == ["beta"]  # o que esperava no encerrado fecha
+    assert [i["organizacao"] for i in toda] == ["beta"]  # 30 dias depois, o histórico do cliente sai também

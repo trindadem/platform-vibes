@@ -83,6 +83,16 @@ endpoints:
     target_type: http
     target_url: http://svc-identity:8000/me
 
+  # A pessoa apaga a própria conta (LGPD), confirmando com a senha.
+  - path: /me/excluir
+    name: excluirConta
+    method: POST
+    auth: client_jwt
+    request: ExcluirConta
+    response: Empty
+    target_type: http
+    target_url: http://svc-identity:8000/me/excluir
+
   - path: /switch
     name: switchTenant
     method: POST

@@ -473,6 +473,13 @@ db.connected(tables=[TABLE], migrations=MIGRATIONS, service=SERVICE)   # main.py
 - O registro fica em `cv_migrations`. Uma réplica roda e as outras esperam. Se falhar, o serviço não sobe, e a próxima subida tenta de novo depois da correção. Se ficar mais de 10 min "em andamento" (a réplica caiu), outra assume.
 - Índice `unique` que mudou de campos é um índice novo, criado no boot; o antigo sai por migração (`REMOVE INDEX ...`).
 
+**A organização que sai.** O cliente que cancela baixa os dados e, 30 dias depois do encerramento, nada dele fica (alinhamento pós-N7, item 13). Sem código no serviço: com `db.connected(..., service=SERVICE)` e o bus conectado, o core atende sozinho, só para o `svc-plans`:
+
+- `rpc.<serviço>.dados` (`DataRequest { table?, start }` → `DataPage { service, tables, table, rows, next }`): as tabelas por organização do serviço e as linhas da organização de quem pede, em páginas que cabem numa mensagem do NATS. Vetores de busca ficam de fora; texto muito longo vem cortado (o arquivo original vai no pacote).
+- `events.plans.exclusao` (`PurgeRequest { tenant }`, publicado como a organização que sai): apaga as linhas dela de todas as tabelas por organização do serviço. O que mais for dela, numa tabela global ou na organização da Cogniventure, sai pelo `on_purge`: `db.connected(..., on_purge=apagar)`, uma função async sem argumentos que roda como a organização que sai (o `svc-identity` apaga vínculos, convites e a organização; o `svc-staff`, a fila e as carteiras dela).
+
+O `svc-plans` monta o pacote (JSON e CSV de cada tabela, mais os arquivos) e, na exclusão, também apaga os arquivos (`storage.purge`). O que a lei obriga a guardar (as notas que a Cogniventure emitiu ao cliente) fica na organização da Cogniventure, não na dele.
+
 ### 5.14 Arquivos (`core/storage.py`)
 
 O arquivo nunca passa pelo gateway nem pelo serviço: a tela envia direto ao armazenamento (RustFS no ambiente local; S3, R2, B2… em produção), por um link assinado que o serviço emite.
@@ -491,6 +498,7 @@ await storage.delete(arquivo.key)                                        # 5. ao
 - **Tamanho e tipo na assinatura.** O serviço diz o que aceita (`accept=` tipos ou prefixos como `"image/"`) e o máximo (`max_bytes`). Fora disso sai 422 (`ERRO_FILE_TYPE`, `ERRO_FILE_TOO_LARGE`) antes de assinar, e o armazenamento recusa outro tamanho ou tipo no envio.
 - **Envio não confirmado some sozinho em 1 dia.** Regra de ciclo de vida da área `tmp/`, aplicada no boot junto com o CORS (`STORAGE_CORS_ORIGINS`). Se a infraestrutura de produção não der essa permissão, o core avisa e segue.
 - **Download seguro.** Imagens comuns e PDF abrem na tela. O resto, inclusive SVG e HTML, que podem trazer script, sai como anexo. O nome original vai só no `Content-Disposition`, nunca na chave.
+- **A organização inteira** (seção 5.13; só tarefas da plataforma): `storage.keys()` lista as chaves dela, de todos os serviços; `storage.info(key)` dá nome, tipo e tamanho; `storage.save_file(caminho, ...)` guarda do disco, em partes e sem limite (o pacote da exportação); `storage.purge()` apaga tudo dela, guardado e temporário.
 - Variáveis: `STORAGE_URL` (interno), `STORAGE_PUBLIC_URL` (o que o navegador alcança), `STORAGE_BUCKET`, `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `STORAGE_REGION`. O `keygen` cria as credenciais locais.
 
 Exemplo pronto: o logo da organização no `svc-identity` (`/organization/logo/upload` → envio → `/organization/logo`).
@@ -577,8 +585,9 @@ await plans.enabled("crm")                          # outro módulo está ligado
 - **Resolução guardada 60 s** por processo: trocar de plano, ligar um módulo ou mudar um limite vale em até 1 min. Com o `svc-plans` fora do ar, vale a última resposta e, sem ela, nenhum limite e todo módulo ligado: plano é regra comercial, não de segurança.
 - **Planos:** quem administra a plataforma (`owner` ou `admin` da organização `PLATFORM_TENANT`) cria os planos na tela, com preço (informativo), módulos incluídos, limites e se aparecem na comparação; um deles pode ser o padrão, que vale para quem não tem plano atribuído. Plano padrão ou em uso não sai. Ligar um módulo sem os `requires` (ou desligar um requisito de um ligado) é recusado.
 - **Plano de uma organização:** pela tela (aba Gerenciar, com o código que a organização vê na aba Uso), com o plano e o ajuste de módulos só dela (um módulo a mais ou a menos que o plano), ou pelo serviço de pagamentos do produto, depois de confirmar o pagamento, como tarefa da plataforma: `with acting_as(system(SERVICE, org)): await plans.assign("pro", modules={"juridico": True})`. A cobrança fica no produto.
+- **Situação da conta:** ativa, suspensa (atraso) ou encerrada (cancelada), com o `aviso` que a organização vê no workspace; vem em `rpc.plans.limits`. Quem inicia execuções confere antes com `await plans.situacao()` (perguntada na hora, sem os 60 s): suspensa ou encerrada, nada novo começa sozinho; o resto funciona. A mensalidade, o vencimento, a suspensão e o cancelamento são do `svc-plans` (`specs/plans.md`): o gestor muda pela aba Clientes do `/staff`, e o dono cancela e baixa os dados em Plano → Conta.
 - **Limites da plataforma:** `identity.membros` (pessoas na organização), `webhooks.enderecos` (sem plano, 20), `ai.custo` (US$, a moeda dos provedores, sem conversão) e `ai.tokens`.
-- **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Módulos (por categoria, o que está no plano), Planos (comparação dos públicos e do atual, com módulos e limites) e, para quem administra a plataforma, Gerenciar (planos e o plano de cada organização).
+- **Tela `plano`:** Uso (plano, preço e uma barra por limite, ao vivo pelo aviso `plans.uso`), Conta (situação, mensalidade e vencimento; o dono pede o cancelamento, desfaz e baixa o pacote dos dados), Módulos (por categoria, o que está no plano), Planos (comparação dos públicos e do atual, com módulos e limites) e, para quem administra a plataforma, Gerenciar (planos e o plano de cada organização).
 - **No frontend:** o `MODULE` de cada serviço vira `appModules` e o tipo `ModuleName` no `contracts.ts` (manifesto sem `MODULE` não gera o contrato); a tela diz o seu em `meta.module` (seção 6).
 
 ### 5.18 Observabilidade (`core/telemetry.py`)
@@ -809,4 +818,5 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d --build
   4. Em Plano → Gerenciar: um plano não público com o módulo Staff e sem limite de pessoas, atribuído à própria Cogniventure (sem ele, fica no plano padrão, sem a área `/staff`).
   5. Em `/ia`: o provedor da plataforma `cv` com os apelidos `agente` e `desenho` (seção 5.11). Guarde a `AI_SECRETS_KEY` com o backup: sem ela, as chaves cadastradas não abrem.
   6. Em `/membros`: convidar o staff (admin = gestor das carteiras).
-  7. Em `/staff` → Clientes: abrir o primeiro cliente (organização, plano, quem cuida e o convite do dono por e-mail).
+  7. Em `/staff` → Clientes: abrir o primeiro cliente (organização, plano, quem cuida, a mensalidade e o vencimento combinados e o convite do dono por e-mail).
+  8. A cobrança dos clientes roda na própria Cogniventure: em `/integracoes`, a caixa de entrada (as cobranças saem dela) e o banco; em `/processos`, adicionar o Faturamento e cobrança da biblioteca e publicar (na Cogniventure, o dono e o admin fazem o papel do staff). No dia 1, o fechamento inicia uma execução por cliente pagante (ou na hora: `POST /api/v1/plans/fechamento`); a nota fiscal vai ao staff até a integração de NFS-e; a vencida há 7 dias chega ao gestor, que suspende o cliente na aba Clientes. Atualizou o pacote financeiro? Ajuste e publique o Faturamento de novo, para o BPMN levar as entradas novas.

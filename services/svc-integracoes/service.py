@@ -39,6 +39,7 @@ from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
 
 from schemas import (
+    ContaEncerrada,
     ACCEPTED,
     BANK_OPERATORS,
     COBRANCAS,
@@ -158,6 +159,16 @@ class IntegracoesService:
         await db.delete(f"{CONEXOES}:{data.id}")
         await bus.live(LIVE_CONEXOES, ConexaoMudou(id=data.id, action="removida"))
         return Conexao.model_validate(row)
+
+    async def encerrada(self, data: ContaEncerrada) -> Empty:
+        """events.plans.encerrada: a conta encerrou, as conexões são revogadas (banco, caixa de entrada, servidores MCP).
+        Os documentos e o histórico ficam até a exclusão, para o dono baixar."""
+        for row in await db.query(f"SELECT id FROM {CONEXOES} WHERE tenant = $tenant"):
+            await db.delete(row["id"])
+            await bus.live(LIVE_CONEXOES, ConexaoMudou(id=str(row["id"]).partition(":")[2].strip("⟨⟩`"), action="removida"))
+        for row in await db.query(f"SELECT id FROM {SERVIDORES} WHERE tenant = $tenant"):
+            await db.delete(row["id"])
+        return Empty()
 
     async def resumo(self, data: Empty) -> Resumo:
         conexoes = {c.tipo: c for c in (await self.conexoes(Empty())).itens}

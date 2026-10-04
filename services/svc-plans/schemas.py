@@ -1,5 +1,6 @@
 """svc-plans · contratos (DTOs, enums, constantes). Fonte da verdade: specs/plans.md §2"""
-from typing import Annotated, Literal
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from pydantic_settings import BaseSettings
@@ -24,8 +25,10 @@ from core.plans import (  # contrato com core/plans.py
     ModuleState,
     PlanLimits,
     PlanSlug,
+    Situacao,
     UsageReport,
 )
+from core.surreal import PURGE_SUBJECT, PurgeRequest  # a organização que sai: cada serviço apaga o que é dela
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-plans"
@@ -41,9 +44,21 @@ ACCOUNTS = "plan_accounts"
 USAGE = "plan_usage"
 USAGE_LOG = "plan_usage_log"
 COUNTS = "plan_counts"
+EXPORTS = "plan_exports"  # por organização: o pacote dos dados que o dono baixa
 SHARED_TABLES = [LIMIT_CATALOG, MODULE_CATALOG, TIERS, ACCOUNTS]
-TENANT_TABLES = [USAGE, USAGE_LOG, COUNTS]
+TENANT_TABLES = [USAGE, USAGE_LOG, COUNTS, EXPORTS]
 UNIQUE = {TIERS: ["slug"], ACCOUNTS: ["org"], USAGE: ["name", "month"], USAGE_LOG: ["message"], COUNTS: ["name"]}
+
+# Ciclo de vida da conta (alinhamento pós-N7, itens 2 e 13)
+CONTA_SUBJECT = "rpc.plans.conta"  # svc-staff, agindo no cliente: mensalidade, vencimento, suspensão e encerramento
+ENCERRADA_SUBJECT = "events.plans.encerrada"  # a conta encerrou: cada serviço desliga o que é da organização
+INICIAR_MODELO_SUBJECT = "rpc.processos.iniciar_modelo"  # o fechamento inicia o faturamento na Cogniventure
+FATURAMENTO_MODELO = "faturamento-cobranca"
+STAFF_SERVICE = "svc-staff"
+VENCIMENTO_PADRAO = 10  # dia do mês em que a mensalidade vence, se ninguém disse outro
+DIAS_ATE_EXCLUIR = 30  # depois do encerramento, os dados ficam este tempo (o dono baixa e pode reativar)
+FUSO = "America/Sao_Paulo"  # o mês pago acaba à meia-noite de Brasília
+EXPORT_FILE_BYTES = 100_000_000  # arquivo maior que isso vai listado no LEIA-ME, sem o conteúdo
 
 MANAGERS = frozenset({"owner", "admin"})
 ALERTS = (100, 80)  # patamares de aviso dos limites mensais, em % (do maior para o menor)
@@ -145,6 +160,7 @@ class Current(BaseModel):
     limits: list[LimitState]
     modules: list[ModuleState]
     manages_platform: bool
+    conta: "Conta" = Field(..., description="Mensalidade, situação e cancelamento da organização")
 
 
 class AssignInput(_Input):
@@ -178,3 +194,111 @@ class UsageChanged(BaseModel):
 class Cleaned(BaseModel):
     usage_log: int
     usage: int
+
+
+# ── Conta: mensalidade, situação e cancelamento (alinhamento pós-N7, itens 2 e 13) ──
+
+class Cancelamento(BaseModel):
+    pedido_em: datetime
+    por: str | None = Field(None, description="Id de quem pediu")
+    origem: Literal["cliente", "cogniventure"]
+    motivo: str | None = None
+    efetivo_em: datetime = Field(..., description="Quando a conta encerra: o fim do mês pago (meia-noite de Brasília)")
+
+
+class Conta(BaseModel):
+    tenant: str
+    situacao: Situacao
+    valor: float = Field(..., description="Mensalidade cobrada no fechamento: a combinada com o cliente ou o preço do plano")
+    valor_combinado: bool = Field(..., description="A Cogniventure combinou um valor só deste cliente")
+    moeda: Currency
+    vencimento: int = Field(..., description="Dia do mês em que a mensalidade vence")
+    suspensa_em: datetime | None = None
+    motivo: str | None = Field(None, description="Por que foi suspensa")
+    cancelamento: Cancelamento | None = None
+    encerrada_em: datetime | None = None
+    exclusao_em: datetime | None = Field(None, description="Quando os dados saem de vez (30 dias depois do encerramento)")
+    aviso: str | None = Field(None, description="O que a organização vê no workspace e em Plano")
+    pode_desfazer: bool = Field(False, description="O dono desfaz o cancelamento que pediu (até a exclusão)")
+
+
+class ContaAcao(BaseModel):
+    """rpc.plans.conta (só o svc-staff, agindo na organização do cliente): ver, mudar a mensalidade e o vencimento,
+    suspender, reativar, encerrar ou desfazer o encerramento."""
+
+    acao: Literal["ver", "cobranca", "suspender", "reativar", "encerrar", "desfazer"]
+    valor: float | None = Field(None, ge=0, description="cobranca: a mensalidade combinada (null: mantém)")
+    vencimento: int | None = Field(None, ge=1, le=28, description="cobranca: o dia do vencimento (null: mantém)")
+    motivo: str | None = Field(None, max_length=300)
+    por: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$", description="Quem do staff agiu")
+
+
+class CancelamentoIn(_Input):
+    motivo: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] | None = None
+
+
+class FechamentoIn(_Input):
+    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM (vazio: o mês atual)")
+
+
+class Cobrado(BaseModel):
+    tenant: str
+    nome: str
+    valor: float
+    vencimento: str = Field(..., description="AAAA-MM-DD")
+    execucao: str | None = Field(None, description="A execução do Faturamento e cobrança na Cogniventure")
+    erro: str | None = None
+
+
+class Fechamento(BaseModel):
+    mes: str
+    cobrados: list[Cobrado]
+
+
+class Encerramentos(BaseModel):
+    encerradas: int
+    excluidas: int
+
+
+class ContaEncerrada(BaseModel):
+    """events.plans.encerrada, publicado como a organização: cada serviço desliga o que é dela (carteira do staff,
+    conexões, webhooks, chaves de IA)."""
+
+    tenant: str
+    em: datetime
+
+
+class Exportacao(BaseModel):
+    id: str
+    status: Literal["preparando", "pronta", "falhou"]
+    created_at: datetime | None = None
+    pronta_em: datetime | None = None
+    tamanho: int | None = Field(None, description="Bytes do pacote")
+    url: str | None = Field(None, description="Link para baixar (10 min), quando pronta")
+    aviso: str | None = Field(None, description="O que ficou de fora (um serviço fora do ar) ou por que falhou")
+
+
+class ExportacaoAtual(BaseModel):
+    item: Exportacao | None = None
+
+
+class ExportacaoRef(BaseModel):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class IniciarModelo(BaseModel):
+    """rpc.processos.iniciar_modelo: inicia o processo publicado deste modelo na organização de quem pede."""
+
+    modelo: str
+    dados: dict[str, Any]
+    chave: str = Field(..., description="A mesma chave não inicia duas vezes")
+    resumo: str | None = None
+
+
+class ExecucaoIniciada(BaseModel):
+    id: str
+    processo: str
+    titulo: str
+
+
+Current.model_rebuild()

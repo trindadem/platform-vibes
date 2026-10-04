@@ -1710,6 +1710,28 @@ def test_arquivo_recusado_antes_de_assinar_e_chaves_forjadas(arquivos):
         UploadRequest(filename="a", content_type="não é tipo", size=1)
 
 
+def test_organizacao_que_sai_lista_guarda_do_disco_e_apaga_so_os_arquivos_dela(arquivos, tmp_path):
+    s, client = arquivos
+    pacote = tmp_path / "dados.zip"
+    pacote.write_bytes(b"PK zip")
+    with security.acting_as(ACME):
+        boleto = asyncio.run(s.save(b"%PDF", filename="boleto.pdf", content_type="application/pdf", max_bytes=100))
+        with pytest.raises(PermissionError):  # uma pessoa não lista nem apaga a organização inteira
+            asyncio.run(s.keys())
+    with security.acting_as(Principal(sub="bia", tenant="beta")):
+        asyncio.run(s.save(b"%PDF", filename="outro.pdf", content_type="application/pdf", max_bytes=100))
+    with security.acting_as(security.system("svc-plans", "acme")):
+        salvo = asyncio.run(s.save_file(str(pacote), filename="dados.zip", content_type="application/zip", folder="exportacoes"))
+        chaves = asyncio.run(s.keys())
+        info = asyncio.run(s.info(boleto.key))
+        apagados = asyncio.run(s.purge())
+        depois = asyncio.run(s.keys())
+    assert sorted(chaves) == sorted([boleto.key, salvo.key]) and salvo.size == 6  # só as da organização, de todos os serviços
+    assert (info.filename, info.content_type, info.size) == ("boleto.pdf", "application/pdf", 4)
+    assert (apagados, depois) == (2, [])
+    assert client.list_objects_v2(Bucket="cv-teste", Prefix="t/beta/").get("KeyCount") == 1  # a outra organização fica
+
+
 # ── Avisos: core/notify.py (README §5.15) ────────────────────────────────────
 
 from core import notify as notify_module  # noqa: E402
@@ -2608,6 +2630,68 @@ def test_kit_recusa_rota_do_manifesto_que_o_main_nao_tem(tmp_path):
         return {}
 
     testing_module._routes_match_manifest(app, "svc-kit", root=tmp_path)  # com a rota, passa
+
+
+_KIT_DADOS = """
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from core.envelope import install_envelope
+from core.nats_bus import bus
+from core.security import current_tenant, install_security
+from core.surreal import db
+
+APAGADAS = []
+
+async def apagar():
+    APAGADAS.append(current_tenant())
+
+@asynccontextmanager
+async def lifespan(app):
+    async with bus.connected("svc-kit"), db.connected(tables=["kit_notas", "kit_anexos"], service="svc-kit", on_purge=apagar):
+        yield
+
+app = FastAPI(lifespan=lifespan)
+install_envelope(app, service="svc-kit")
+install_security(app, service="svc-kit")
+"""
+
+
+def test_organizacao_que_sai_exporta_em_paginas_e_apaga_so_a_dela(tmp_path, monkeypatch):
+    from core.surreal import DATA_PAGE_ROWS, PURGE_SUBJECT, DataRequest, PurgeRequest
+
+    (tmp_path / "kit_dados.py").write_text(_KIT_DADOS)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in ("AUTH_ISSUER", "AUTH_AUDIENCE", "AUTH_PRIVATE_KEY", "AUTH_PUBLIC_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    plataforma = security.system("svc-plans", "acme")
+
+    async def cenario(app):
+        for org, n in (("acme", DATA_PAGE_ROWS + 5), ("beta", 2)):
+            with security.acting_as(Principal(sub="ana", tenant=org)):
+                for i in range(n):
+                    await surreal.db.create("kit_notas", {"texto": f"nota {i}", "vetor": [0.1] * 100})
+        dados = app.handlers["rpc.kit.dados"]
+        with security.acting_as(plataforma):
+            lista = await dados(DataRequest())
+            primeira = await dados(DataRequest(table="kit_notas"))
+            segunda = await dados(DataRequest(table="kit_notas", start=primeira.next))
+        erros = []
+        for quem, chamada in ((security.system("svc-outro", "acme"), dados(DataRequest())),
+                              (Principal(sub="ana", tenant="acme", roles=frozenset({"owner"})), app.handlers[PURGE_SUBJECT](PurgeRequest(tenant="acme"))),
+                              (plataforma, app.handlers[PURGE_SUBJECT](PurgeRequest(tenant="beta")))):
+            with security.acting_as(quem), pytest.raises(ServiceError) as exc:
+                await chamada
+            erros.append(exc.value.code)
+        await app.deliver(PURGE_SUBJECT, PurgeRequest(tenant="acme"), who=plataforma)
+        restam = await surreal.db._call("query", "SELECT tenant, count() AS n FROM kit_notas GROUP BY tenant", None)
+        return lista, primeira, segunda, erros, restam, list(app.main.APAGADAS)
+
+    lista, primeira, segunda, erros, restam, apagadas = service_app(cenario, main="kit_dados")
+    assert (lista.service, lista.tables, lista.rows) == ("svc-kit", ["kit_anexos", "kit_notas"], [])
+    assert (len(primeira.rows), primeira.next, len(segunda.rows), segunda.next) == (DATA_PAGE_ROWS, DATA_PAGE_ROWS, 5, None)
+    assert "vetor" not in primeira.rows[0] and primeira.rows[0]["texto"].startswith("nota")  # vetor de busca fica de fora
+    assert erros == ["ERRO_DATA_FORBIDDEN", "ERRO_DATA_FORBIDDEN", "ERRO_DATA_TENANT"]
+    assert restam == [{"tenant": "beta", "n": 2}] and apagadas == ["acme"]  # só a organização que saiu
 
 
 # ── Processos: fluxo tipado → BPMN do Camunda 8, ações declaradas e motor (core/processes.py) ─

@@ -8,11 +8,25 @@ Serviço de plataforma (README §5.17): guarda o catálogo de módulos e limites
 (geridos por quem administra a plataforma, PLATFORM_TENANT), o plano e o ajuste de módulos de cada organização e o
 consumo do mês. Quem confere é o core/plans.py, no serviço chamado (módulo) ou que vai criar ou gastar (limite); aqui
 só se resolve, soma e avisa.
+
+A conta de cada cliente (alinhamento pós-N7, itens 2 e 13): a mensalidade e o vencimento, a situação (ativa, suspensa
+por atraso ou encerrada) e o cancelamento no fim do mês pago. No fechamento do mês, cada cliente pagante inicia o
+Faturamento e cobrança na organização da Cogniventure. Encerrada, a conta fica 30 dias com os dados (o dono baixa o
+pacote e pode reativar) e depois sai de vez, de todos os serviços e dos arquivos.
 """
+import csv
 import functools
+import io
+import json
+import os
+import tempfile
 import uuid
-from datetime import UTC, datetime, timedelta
+import zipfile
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from nats.errors import NoRespondersError
 
 from surrealdb import RecordID
 
@@ -20,8 +34,9 @@ from core.envelope import ServiceError
 from core.nats_bus import bus
 from core.notify import notify
 from core.security import Principal, acting_as, current, current_tenant, system
-from core.surreal import Migration, db
-from core.temporal_runner import activities
+from core.storage import storage
+from core.surreal import DataPage, DataRequest, Migration, db
+from core.temporal_runner import activities, runner
 
 from schemas import (
     ACCOUNTS,
@@ -29,29 +44,54 @@ from schemas import (
     ALERTS,
     CONTACTS_SUBJECT,
     COUNTS,
+    DIAS_ATE_EXCLUIR,
+    ENCERRADA_SUBJECT,
+    EXPORT_FILE_BYTES,
+    EXPORTS,
+    FATURAMENTO_MODELO,
+    FUSO,
+    INICIAR_MODELO_SUBJECT,
     KEEP_LOG_DAYS,
     KEEP_MONTHS,
     MANAGERS,
     NO_PLAN,
+    PURGE_SUBJECT,
     SERVICE,
+    STAFF_SERVICE,
+    TASK_QUEUE,
     TIERS,
     USAGE,
     USAGE_LIVE,
     USAGE_LOG,
+    VENCIMENTO_PADRAO,
     Account,
     AccountRef,
     Assigned,
     AssignInput,
     AssignRequest,
+    Cancelamento,
+    CancelamentoIn,
     Catalog,
     CatalogLimit,
     CatalogModule,
     Cleaned,
+    Cobrado,
     Contacts,
     ContactsRequest,
+    Conta,
+    ContaAcao,
+    ContaEncerrada,
     CountReport,
     Current,
     Empty,
+    Encerramentos,
+    ExecucaoIniciada,
+    Exportacao,
+    ExportacaoAtual,
+    ExportacaoRef,
+    Fechamento,
+    FechamentoIn,
+    IniciarModelo,
     LimitsRequest,
     LimitState,
     ModuleCatalog,
@@ -64,6 +104,7 @@ from schemas import (
     PlanRef,
     PlansSettings,
     PlanUpdate,
+    PurgeRequest,
     UsageChanged,
     UsageReport,
 )
@@ -100,7 +141,7 @@ class PlansService:
         resolved = await self.resolve(LimitsRequest())
         return Current(
             tenant=who.tenant, plan=_plan(tier) if tier else None, month=resolved.month, limits=resolved.limits,
-            modules=resolved.modules, manages_platform=_manages_platform(who),
+            modules=resolved.modules, manages_platform=_manages_platform(who), conta=await _conta(who.tenant),
         )
 
     async def modules(self, data: Empty) -> ModuleList:
@@ -180,7 +221,7 @@ class PlansService:
         tier, account = await self._plan_of(data.tenant)
         return Account(
             tenant=data.tenant, tenant_name=name, plan=tier["slug"] if tier else None, plan_name=tier["name"] if tier else NO_PLAN,
-            assigned=account is not None, modules=_flags(account, "modules"),
+            assigned=bool(account and account.get("plan")), modules=_flags(account, "modules"),
         )
 
     async def assign_plan(self, data: AssignInput) -> Account:
@@ -224,9 +265,10 @@ class PlansService:
             )
             for limit in await _limit_catalog()
         ]
+        situacao = (account or {}).get("situacao") or "ativa"
         return PlanLimits(
             plan=tier["slug"] if tier else None, plan_name=tier["name"] if tier else NO_PLAN, month=month, limits=states,
-            modules=_module_states(await _module_catalog(), tier, account),
+            modules=_module_states(await _module_catalog(), tier, account), situacao=situacao, aviso=_aviso(account),
         )
 
     async def record_catalog(self, data: ModuleCatalog) -> Empty:
@@ -289,6 +331,223 @@ class PlansService:
         await bus.live(USAGE_LIVE, changed)
         return changed
 
+    # ── Conta: mensalidade, situação e cancelamento ────────────────────────
+
+    async def cancelar(self, data: CancelamentoIn) -> Conta:
+        """O dono pede o cancelamento: tudo funciona até o fim do mês pago; na data, a conta encerra."""
+        who = _owner()
+        row = await _account_row(who.tenant)
+        if row.get("situacao") == "encerrada" or row.get("cancelamento"):
+            raise ServiceError("ERRO_PLANS_JA_CANCELADA", "O cancelamento já foi pedido.", 409)
+        efetivo = _fim_do_mes()
+        await db.merge(row["id"], {"cancelamento": {"pedido_em": _now(), "por": who.sub, "origem": "cliente", "motivo": data.motivo,
+                                                    "efetivo_em": efetivo}})
+        nome = await _tenant_name(who.tenant)
+        with acting_as(system(SERVICE, who.tenant)):
+            await notify.user(who.sub, "Cancelamento pedido",
+                              f"A conta de {nome} funciona até {_dia(efetivo - timedelta(days=1))}, o fim do mês pago. Depois disso, "
+                              f"os dados ficam {DIAS_ATE_EXCLUIR} dias para baixar em Plano, e você pode desfazer até lá.",
+                              link="/plano", action="Ver plano", key=f"cancelamento-{who.tenant}")
+        await _avisar_gestores(f"{nome} pediu o cancelamento", f"Encerra em {_dia(efetivo)}." + (f" Motivo: {data.motivo}" if data.motivo else ""),
+                               key=f"cancelamento-{who.tenant}")
+        return await _conta(who.tenant)
+
+    async def desfazer_cancelamento(self, data: Empty) -> Conta:
+        """O dono desfaz o cancelamento que pediu: antes da data, como se não tivesse pedido; depois, reativa (até a
+        exclusão). As conexões desligadas no encerramento precisam ser refeitas."""
+        who = _owner()
+        row = await _account_row(who.tenant)
+        if not _pode_desfazer(row):
+            raise ServiceError("ERRO_PLANS_SEM_CANCELAMENTO", "Não há cancelamento seu para desfazer.", 409)
+        await _desfazer(row)
+        await _avisar_gestores(f"{await _tenant_name(who.tenant)} desfez o cancelamento", "A conta segue ativa.",
+                               key=f"desfeito-{who.tenant}-{_now():%Y%m%d%H%M}")
+        return await _conta(who.tenant)
+
+    async def conta(self, data: ContaAcao) -> Conta:
+        """rpc.plans.conta (só o svc-staff, agindo na organização do cliente; o svc-staff confere que é o gestor)."""
+        who = current()
+        if who is None or who.sub != f"system:{STAFF_SERVICE}":
+            raise ServiceError("ERRO_PLANS_FORBIDDEN", "Só o svc-staff muda a conta de um cliente.", 403)
+        org = current_tenant()
+        if org == settings().platform_tenant:
+            raise ServiceError("ERRO_PLANS_PLATAFORMA", "A conta da Cogniventure não se cobra nem se suspende.", 409)
+        if data.acao == "ver":
+            return await _conta(org)
+        await _tenant_name(org)  # organização inexistente → 404
+        row = await _account_row(org)
+        situacao = row.get("situacao") or "ativa"
+        if data.acao == "cobranca":
+            changes: dict[str, Any] = {}
+            if data.valor is not None:
+                changes["valor"] = round(data.valor, 2)
+            if data.vencimento is not None:
+                changes["vencimento"] = data.vencimento
+            if changes:
+                await db.merge(row["id"], changes)
+        elif data.acao == "suspender":
+            if situacao != "ativa":
+                raise ServiceError("ERRO_PLANS_SITUACAO", f"A conta está {situacao}: só a ativa se suspende.", 409)
+            if not data.motivo:
+                raise ServiceError("ERRO_PLANS_MOTIVO", "Diga o motivo da suspensão (o cliente vê).", 422)
+            await db.merge(row["id"], {"situacao": "suspensa", "suspensa_em": _now(), "motivo": data.motivo, "suspensa_por": data.por})
+            await _avisar_cliente(org, "Conta suspensa", f"{data.motivo}\n\nEnquanto isso, nenhuma execução nova começa: as que estão em "
+                                  "andamento terminam. Fale com a Cogniventure para regularizar.", key=f"suspensa-{org}-{_now():%Y%m%d%H%M}")
+        elif data.acao == "reativar":
+            if situacao != "suspensa":
+                raise ServiceError("ERRO_PLANS_SITUACAO", f"A conta está {situacao}: só a suspensa se reativa por aqui.", 409)
+            await db.merge(row["id"], {"situacao": "ativa", "suspensa_em": None, "motivo": None})
+            await _avisar_cliente(org, "Conta reativada", "As execuções voltam a começar normalmente.", key=f"reativada-{org}-{_now():%Y%m%d%H%M}")
+        elif data.acao == "encerrar":
+            if situacao == "encerrada" or row.get("cancelamento"):
+                raise ServiceError("ERRO_PLANS_JA_CANCELADA", "O encerramento já foi pedido.", 409)
+            agora = situacao == "suspensa"  # suspensa por atraso: o mês não foi pago, encerra na hora
+            efetivo = _now() if agora else _fim_do_mes()
+            await db.merge(row["id"], {"cancelamento": {"pedido_em": _now(), "por": data.por, "origem": "cogniventure",
+                                                        "motivo": data.motivo, "efetivo_em": efetivo}})
+            if agora:
+                await _encerrar(await _account_row(org))
+            else:
+                await _avisar_cliente(org, "A Cogniventure encerrou a conta",
+                                      f"A conta funciona até {_dia(efetivo - timedelta(days=1))}, o fim do mês pago."
+                                      + (f"\n\nMotivo: {data.motivo}" if data.motivo else ""), key=f"encerrar-{org}")
+        elif data.acao == "desfazer":
+            if not (row.get("cancelamento") or situacao == "encerrada"):
+                raise ServiceError("ERRO_PLANS_SEM_CANCELAMENTO", "Não há cancelamento para desfazer.", 409)
+            await _desfazer(row)
+        return await _conta(org)
+
+    async def fechar_mes(self, data: FechamentoIn) -> Fechamento:
+        """O fechamento do mês (agendado no dia 1, ou pelo gestor da plataforma): cada cliente pagante inicia o
+        Faturamento e cobrança publicado na organização da Cogniventure, com quem paga, o e-mail do dono, o valor e o
+        vencimento. A mesma organização no mesmo mês não inicia duas vezes."""
+        who = current()
+        if who is not None and not who.is_system:
+            _platform_manager()
+        platform = settings().platform_tenant
+        mes = data.mes or _hoje().strftime("%Y-%m")
+        if not platform:
+            return Fechamento(mes=mes, cobrados=[])
+        cobrados: list[Cobrado] = []
+        sem_processo = False
+        for row in await db.query_shared("SELECT * FROM plan_accounts WHERE org != $p ORDER BY org", p=platform):
+            if (row.get("situacao") or "ativa") == "encerrada":
+                continue
+            tier, _ = await self._plan_of(row["org"])
+            valor = _valor(row, tier)
+            if valor <= 0:
+                continue
+            ano, mes_n = (int(x) for x in mes.split("-"))
+            vence = date(ano, mes_n, int(row.get("vencimento") or VENCIMENTO_PADRAO))
+            with acting_as(system(SERVICE, row["org"])):
+                try:
+                    contatos = await bus.request(CONTACTS_SUBJECT, ContactsRequest(roles=["owner"]), Contacts, timeout=5)
+                except (TimeoutError, NoRespondersError):
+                    cobrados.append(Cobrado(tenant=row["org"], nome=row["org"], valor=valor, vencimento=vence.isoformat(),
+                                            erro="svc-identity fora do ar: tente de novo"))
+                    continue
+            nome = contatos.tenant_name or row["org"]
+            plano = f" (plano {tier['name']})" if tier else ""
+            dados = {"cliente": nome, "email": contatos.items[0].email if contatos.items else None,
+                     "descricao": f"Mensalidade da Cogniventure de {_mes_br(mes)}{plano}", "valor": valor,
+                     "vencimento": vence.isoformat(), "cliente_org": row["org"], "mes": mes}
+            item = Cobrado(tenant=row["org"], nome=nome, valor=valor, vencimento=vence.isoformat())
+            with acting_as(system(SERVICE, platform)):
+                try:
+                    iniciada = await bus.request(INICIAR_MODELO_SUBJECT, IniciarModelo(
+                        modelo=FATURAMENTO_MODELO, dados=dados, chave=f"plano-{row['org']}-{mes}", resumo=f"{nome}: mensalidade de {_mes_br(mes)}",
+                    ), ExecucaoIniciada, timeout=30)
+                    item.execucao = iniciada.id
+                except ServiceError as exc:
+                    item.erro = exc.message
+                    sem_processo = sem_processo or exc.code == "ERRO_PROCESSOS_SEM_PUBLICADA"
+                except (TimeoutError, NoRespondersError):
+                    item.erro = "svc-processos fora do ar: rode o fechamento de novo (o mesmo mês não cobra duas vezes)"
+            cobrados.append(item)
+        falhas = [c for c in cobrados if c.erro]
+        if falhas:
+            texto = ("Publique o Faturamento e cobrança na organização da Cogniventure e rode o fechamento de novo."
+                     if sem_processo else "; ".join(f"{c.nome}: {c.erro}" for c in falhas[:5]))
+            await _avisar_gestores(f"Fechamento de {_mes_br(mes)}: {len(falhas)} cliente(s) sem cobrança", texto, key=f"fechamento-{mes}-{len(falhas)}")
+        return Fechamento(mes=mes, cobrados=cobrados)
+
+    async def encerramentos(self, data: Empty) -> Encerramentos:
+        """Agendado (todo dia, logo depois da meia-noite de Brasília): encerra as contas cujo mês pago acabou e apaga de
+        vez as encerradas há 30 dias (de todos os serviços, pelo events.plans.exclusao, e dos arquivos)."""
+        encerradas = excluidas = 0
+        agora = _now()
+        for row in await db.query_shared("SELECT * FROM plan_accounts WHERE cancelamento != NONE AND situacao != 'encerrada'"):
+            if _quando(row["cancelamento"]["efetivo_em"]) <= agora:
+                await _encerrar(row)
+                encerradas += 1
+        for row in await db.query_shared("SELECT * FROM plan_accounts WHERE situacao = 'encerrada' AND exclusao_em <= $agora", agora=agora):
+            await _excluir(row)
+            excluidas += 1
+        return Encerramentos(encerradas=encerradas, excluidas=excluidas)
+
+    # ── Exportação dos dados (o dono baixa um pacote) ───────────────────────
+
+    async def pedir_exportacao(self, data: Empty) -> Exportacao:
+        """O dono pede o pacote dos dados (JSON e CSV de cada cadastro, execução e versão, mais os arquivos): fica pronto
+        em segundo plano, e ele é avisado."""
+        who = _owner()
+        rows = await db.query("SELECT * FROM plan_exports WHERE tenant = $tenant AND status = 'preparando' LIMIT 1")
+        if rows:
+            return _exportacao(rows[0])
+        row = await db.create(EXPORTS, {"status": "preparando", "pedido_por": who.sub})
+        from workflows import ExportarWorkflow  # o workflow importa este módulo
+
+        await runner.start_workflow(ExportarWorkflow.run, ExportacaoRef(id=_key(row["id"])), task_queue=TASK_QUEUE, id=f"exportar-{_key(row['id'])}")
+        return _exportacao(row)
+
+    async def exportacao(self, data: Empty) -> ExportacaoAtual:
+        """O último pacote pedido, com o link para baixar quando pronto."""
+        _owner()
+        rows = await db.query("SELECT * FROM plan_exports WHERE tenant = $tenant ORDER BY created_at DESC LIMIT 1")
+        return ExportacaoAtual(item=_exportacao(rows[0]) if rows else None)
+
+    async def exportar(self, data: ExportacaoRef) -> Exportacao:
+        """Activity: monta o zip na organização de quem pediu (cada serviço entrega as linhas dele por rpc.<serviço>.dados;
+        os arquivos vêm do armazenamento), guarda e avisa. Os pacotes anteriores saem."""
+        org = current_tenant()
+        pedido = await db.select(f"{EXPORTS}:{data.id}")
+        if pedido is None:
+            raise ServiceError("ERRO_PLANS_NOT_FOUND", "Exportação não encontrada.", 404)
+        fora: list[str] = []
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temporario:
+            caminho = temporario.name
+        try:
+            with acting_as(system(SERVICE, org)):
+                nome = await _tenant_name(org)
+                servicos = sorted({m.service for m in (await _module_catalog()).values()} | {SERVICE})
+                with zipfile.ZipFile(caminho, "w", zipfile.ZIP_DEFLATED) as pacote:
+                    tabelas = 0
+                    for servico in servicos:
+                        try:
+                            tabelas += await _exportar_servico(pacote, servico)
+                        except (TimeoutError, NoRespondersError):
+                            fora.append(servico)
+                    arquivos = await _exportar_arquivos(pacote, org)
+                    pacote.writestr("LEIA-ME.txt", _leia_me(nome, tabelas, arquivos, fora))
+                antigos = await db.query("SELECT * FROM plan_exports WHERE tenant = $tenant AND id != $id AND chave != NONE", id=_rid(pedido["id"]))
+                salvo = await storage.save_file(caminho, filename=f"dados-{_hoje():%Y-%m-%d}.zip", content_type="application/zip", folder="exportacoes")
+                for antigo in antigos:
+                    await storage.delete(antigo["chave"])
+                    await db.delete(antigo["id"])
+        except Exception:
+            await db.merge(pedido["id"], {"status": "falhou", "aviso": "Não foi possível montar o pacote: peça de novo em alguns minutos."})
+            raise
+        finally:
+            if os.path.exists(caminho):
+                os.remove(caminho)
+        aviso = f"Fora do ar no momento, ficaram de fora: {', '.join(fora)}. Peça de novo mais tarde." if fora else None
+        row = await db.merge(pedido["id"], {"status": "pronta", "pronta_em": _now(), "chave": salvo.key, "tamanho": salvo.size, "aviso": aviso})
+        with acting_as(system(SERVICE, org)):
+            await notify.user(pedido.get("pedido_por") or [], "Os dados da organização estão prontos",
+                              "O pacote (JSON e CSV, mais os arquivos) está em Plano para baixar.", link="/plano",
+                              action="Baixar", key=f"exportacao-{data.id}")
+        return _exportacao(row)
+
     # ── Manutenção (agendamento diário) ─────────────────────────────────────
 
     async def cleanup(self, data: Empty) -> Cleaned:
@@ -314,7 +573,7 @@ class PlansService:
         organização em plan_accounts (o ajuste de módulos), se houver."""
         accounts = await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org)
         account = accounts[0] if accounts else None
-        if account:
+        if account and account.get("plan"):  # a conta pode existir sem plano atribuído (cancelamento, mensalidade)
             rows = await db.query_shared("SELECT * FROM plan_tiers WHERE slug = $slug", slug=account["plan"])
             if rows:
                 return rows[0], account
@@ -372,6 +631,235 @@ class PlansService:
             action="Ver plano",
             key=f"plano-{limit.name}-{row['month']}-{reached}",
         )
+
+
+# ── Conta: helpers ──────────────────────────────────────────────────────────
+
+async def _account_row(org: str) -> dict:
+    """A linha da organização em plan_accounts; sem ela (nunca teve plano atribuído), cria uma sem plano (vale o padrão)."""
+    rows = await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org)
+    if rows:
+        return rows[0]
+    try:
+        return await db.create(ACCOUNTS, {"org": org, "plan": None, "modules": [], "assigned_by": (current() or system(SERVICE)).sub})
+    except ServiceError as exc:
+        if exc.code != "ERRO_RECORD_DUPLICATE":
+            raise
+        return (await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org))[0]
+
+
+async def _conta(org: str) -> Conta:
+    rows = await db.query_shared("SELECT * FROM plan_accounts WHERE org = $org", org=org)
+    row = rows[0] if rows else {}
+    accounts = await db.query_shared("SELECT * FROM plan_tiers WHERE slug = $slug", slug=row.get("plan") or "")
+    tier = accounts[0] if accounts else ((await db.query_shared("SELECT * FROM plan_tiers WHERE is_default = true ORDER BY slug LIMIT 1")) or [None])[0]
+    cancelamento = row.get("cancelamento")
+    return Conta(
+        tenant=org, situacao=row.get("situacao") or "ativa", valor=_valor(row, tier), valor_combinado=row.get("valor") is not None,
+        moeda=(tier or {}).get("currency") or "BRL", vencimento=int(row.get("vencimento") or VENCIMENTO_PADRAO),
+        suspensa_em=row.get("suspensa_em"), motivo=row.get("motivo"),
+        cancelamento=Cancelamento.model_validate(cancelamento) if cancelamento else None,
+        encerrada_em=row.get("encerrada_em"), exclusao_em=row.get("exclusao_em"), aviso=_aviso(row), pode_desfazer=_pode_desfazer(row),
+    )
+
+
+def _valor(row: dict | None, tier: dict | None) -> float:
+    """A mensalidade: a combinada com o cliente ou, sem ela, o preço do plano."""
+    if row and row.get("valor") is not None:
+        return float(row["valor"])
+    return float((tier or {}).get("price") or 0)
+
+
+def _aviso(row: dict | None) -> str | None:
+    """O que a organização vê no workspace e em Plano sobre a conta."""
+    if not row:
+        return None
+    situacao = row.get("situacao") or "ativa"
+    if situacao == "encerrada":
+        quando = _quando(row["exclusao_em"]) if row.get("exclusao_em") else None
+        return ("Conta encerrada: nenhuma execução nova começa. "
+                + (f"Os dados ficam disponíveis para baixar em Plano até {_dia(quando)}." if quando else ""))
+    if situacao == "suspensa":
+        return "Conta suspensa: nenhuma execução nova começa até a regularização. Fale com a Cogniventure."
+    if row.get("cancelamento"):
+        efetivo = _quando(row["cancelamento"]["efetivo_em"])
+        return f"Cancelamento pedido: a conta funciona até {_dia(efetivo - timedelta(days=1))}, o fim do mês pago."
+    return None
+
+
+def _pode_desfazer(row: dict) -> bool:
+    """O dono desfaz o que ele pediu: o cancelamento ainda não efetivo ou a conta encerrada, até a exclusão."""
+    cancelamento = row.get("cancelamento") or {}
+    return cancelamento.get("origem") == "cliente" and (row.get("situacao") != "encerrada" or bool(row.get("exclusao_em")))
+
+
+async def _desfazer(row: dict) -> None:
+    org = row["org"]
+    encerrada = row.get("situacao") == "encerrada"
+    await db.merge(row["id"], {"cancelamento": None, "situacao": "ativa" if encerrada else row.get("situacao") or "ativa",
+                               "encerrada_em": None, "exclusao_em": None})
+    texto = ("A conta voltou a funcionar. As conexões desligadas no encerramento (banco, e-mail, webhooks) precisam ser "
+             "refeitas, e a Cogniventure volta a acompanhar." if encerrada else "O cancelamento foi desfeito: a conta segue normalmente.")
+    await _avisar_cliente(org, "Conta reativada" if encerrada else "Cancelamento desfeito", texto, key=f"desfeito-{org}-{_now():%Y%m%d%H%M}")
+
+
+async def _encerrar(row: dict) -> None:
+    """O mês pago acabou (ou a Cogniventure encerrou a suspensa): nenhuma execução nova, os dados ficam 30 dias e
+    cada serviço desliga o que é da organização (events.plans.encerrada)."""
+    org, agora = row["org"], _now()
+    exclusao = agora + timedelta(days=DIAS_ATE_EXCLUIR)
+    await db.merge(row["id"], {"situacao": "encerrada", "encerrada_em": agora, "exclusao_em": exclusao})
+    with acting_as(system(SERVICE, org)):
+        await bus.publish(ENCERRADA_SUBJECT, ContaEncerrada(tenant=org, em=agora), msg_id=f"encerrada-{org}-{agora:%Y%m%d}")
+    await _avisar_cliente(org, "Conta encerrada",
+                          f"Nenhuma execução nova começa, e as conexões foram desligadas. Os dados ficam disponíveis para baixar em "
+                          f"Plano até {_dia(exclusao)}; depois disso, são apagados de vez.", key=f"encerrada-{org}-{agora:%Y%m%d}")
+    await _avisar_gestores(f"Conta encerrada: {await _tenant_name_or(org)}", f"Os dados saem de vez em {_dia(exclusao)}.",
+                           key=f"encerrada-{org}-{agora:%Y%m%d}")
+
+
+async def _excluir(row: dict) -> None:
+    """30 dias depois do encerramento: cada serviço apaga as linhas da organização (events.plans.exclusao), os arquivos
+    saem do armazenamento e a conta sai daqui."""
+    org = row["org"]
+    nome = await _tenant_name_or(org)
+    with acting_as(system(SERVICE, org)):
+        await bus.publish(PURGE_SUBJECT, PurgeRequest(tenant=org), msg_id=f"exclusao-{org}")
+        await storage.purge()
+    await db.delete(row["id"])
+    await _avisar_gestores(f"Dados apagados: {nome}", "A organização encerrada há 30 dias saiu de vez da plataforma.", key=f"excluida-{org}")
+
+
+async def _avisar_cliente(org: str, titulo: str, texto: str, *, key: str) -> None:
+    with acting_as(system(SERVICE, org)):
+        await notify.roles("owner", "admin", title=titulo, body=texto, link="/plano", action="Ver plano", key=key)
+
+
+async def _avisar_gestores(titulo: str, texto: str, *, key: str) -> None:
+    """Dono e admin da Cogniventure (os gestores do staff)."""
+    platform = settings().platform_tenant
+    if not platform:
+        return
+    with acting_as(system(SERVICE, platform)):
+        await notify.roles("owner", "admin", title=titulo[:120], body=texto, link="/staff?aba=clientes", action="Ver clientes", key=key)
+
+
+async def _tenant_name_or(org: str) -> str:
+    try:
+        return await _tenant_name(org)
+    except (ServiceError, TimeoutError, NoRespondersError):
+        return org
+
+
+async def _exportar_servico(pacote: zipfile.ZipFile, servico: str) -> int:
+    """As tabelas de um serviço, cada uma em JSON e em CSV. Devolve quantas tinham linhas."""
+    subject = f"rpc.{servico.removeprefix('svc-')}.dados"
+    lista = await bus.request(subject, DataRequest(), DataPage, timeout=10)
+    com_linhas = 0
+    for tabela in lista.tables:
+        linhas: list[dict[str, Any]] = []
+        start: int | None = 0
+        while start is not None:
+            pagina = await bus.request(subject, DataRequest(table=tabela, start=start), DataPage, timeout=30)
+            linhas += pagina.rows
+            start = pagina.next
+        if not linhas:
+            continue
+        com_linhas += 1
+        pasta = servico.removeprefix("svc-")
+        pacote.writestr(f"{pasta}/{tabela}.json", json.dumps(linhas, ensure_ascii=False, indent=1, default=str))
+        pacote.writestr(f"{pasta}/{tabela}.csv", _csv(linhas))
+    return com_linhas
+
+
+async def _exportar_arquivos(pacote: zipfile.ZipFile, org: str) -> int:
+    """Os arquivos guardados da organização (documentos recebidos, conhecimento, logo), menos os pacotes anteriores."""
+    total = 0
+    for key in await storage.keys():
+        partes = key.split("/")  # t/<org>/<serviço>/<pasta>/<id>
+        if len(partes) != 5 or partes[2] == SERVICE:
+            continue
+        info = await storage.info(key)
+        destino = f"arquivos/{partes[2].removeprefix('svc-')}/{partes[3]}/{partes[4][:8]}-{info.filename}"
+        if info.size > EXPORT_FILE_BYTES:
+            pacote.writestr(destino + ".txt", f"Arquivo de {info.size} bytes, grande demais para o pacote: peça à Cogniventure.")
+        else:
+            pacote.writestr(destino, await storage.read(key, max_bytes=EXPORT_FILE_BYTES))
+        total += 1
+    return total
+
+
+def _csv(linhas: list[dict[str, Any]]) -> str:
+    """Uma coluna por campo (o que é lista ou objeto vai como JSON), com BOM para o Excel reconhecer o UTF-8."""
+    colunas = list(dict.fromkeys(k for linha in linhas for k in linha))
+    saida = io.StringIO()
+    escritor = csv.writer(saida)
+    escritor.writerow(colunas)
+    for linha in linhas:
+        escritor.writerow([json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, dict | list) else ("" if v is None else v)
+                           for v in (linha.get(c) for c in colunas)])
+    return "\ufeff" + saida.getvalue()
+
+
+def _leia_me(nome: str, tabelas: int, arquivos: int, fora: list[str]) -> str:
+    texto = (f"Dados de {nome}, exportados em {_dia(_now())}.\n\n"
+             f"Cada pasta é um módulo da plataforma; cada tabela vem em JSON (completa) e em CSV (uma coluna por campo).\n"
+             f"Tabelas com dados: {tabelas}. Arquivos: {arquivos}, na pasta arquivos/.\n"
+             "Datas em UTC (ISO 8601). Vetores de busca ficam de fora; texto muito longo vem cortado, e o arquivo original vem junto.\n")
+    if fora:
+        texto += f"\nFora do ar no momento da exportação (ficaram de fora): {', '.join(fora)}.\n"
+    return texto
+
+
+def _exportacao(row: dict) -> Exportacao:
+    url = None
+    if row.get("status") == "pronta" and row.get("chave"):
+        url = storage.url(row["chave"], ttl=600, filename=f"dados-{_quando(row['pronta_em']):%Y-%m-%d}.zip", content_type="application/zip")
+    return Exportacao(id=_key(row["id"]), status=row["status"], created_at=row.get("created_at"), pronta_em=row.get("pronta_em"),
+                      tamanho=row.get("tamanho"), url=url, aviso=row.get("aviso"))
+
+
+def _owner() -> Principal:
+    """O dono da organização (que não seja a Cogniventure): cancela, desfaz e exporta."""
+    who = _member()
+    if "owner" not in who.roles:
+        raise ServiceError("ERRO_PLANS_FORBIDDEN", "Só o dono da organização pede o cancelamento e a exportação.", 403)
+    if who.tenant == settings().platform_tenant:
+        raise ServiceError("ERRO_PLANS_PLATAFORMA", "A organização da Cogniventure não se cancela por aqui.", 409)
+    return who
+
+
+def _fim_do_mes() -> datetime:
+    """A meia-noite (Brasília) do primeiro dia do mês seguinte: quando acaba o mês pago."""
+    hoje = _hoje()
+    seguinte = date(hoje.year + (hoje.month == 12), hoje.month % 12 + 1, 1)
+    return datetime(seguinte.year, seguinte.month, 1, tzinfo=ZoneInfo(FUSO)).astimezone(UTC)
+
+
+def _hoje() -> date:
+    return _now().astimezone(ZoneInfo(FUSO)).date()
+
+
+def _dia(quando: datetime) -> str:
+    return quando.astimezone(ZoneInfo(FUSO)).strftime("%d/%m/%Y")
+
+
+_MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+
+
+def _mes_br(mes: str) -> str:
+    ano, numero = mes.split("-")
+    return f"{_MESES[int(numero) - 1]} de {ano}"
+
+
+def _quando(valor: Any) -> datetime:
+    if isinstance(valor, datetime):
+        return valor if valor.tzinfo else valor.replace(tzinfo=UTC)
+    return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+
+
+def _key(record_id: Any) -> str:
+    return str(record_id).partition(":")[2].strip("⟨⟩`") if ":" in str(record_id) else str(record_id)
 
 
 async def _tier(slug: str) -> dict:

@@ -34,6 +34,8 @@ organização `PLATFORM_TENANT`).
    (`AI_SECRETS_KEY`, só este serviço a recebe), presa ao `owner` e ao `slug` do provedor.
 2. NATS: consome `events.ai.usage` (durável, publicado pelo `core/llm.py`) e grava tokens e custo; responde
    `rpc.ai.resolve`. `events.ai.trigger` (`ProviderRef`) dispara a busca de modelos em segundo plano.
+   `events.plans.encerrada` e a exclusão da organização (README §5.13) apagam os provedores próprios dela, com as chaves
+   e os modelos.
 3. Temporal: `AiWorkflow` → activity `ai.discover_models` (chama `GET {base_url}/models`; timeout 1 min, 3
    tentativas).
 

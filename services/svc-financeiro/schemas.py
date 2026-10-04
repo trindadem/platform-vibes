@@ -124,6 +124,8 @@ class Faturamento(BaseModel):
     descricao: str | None = Field(None, description="O que foi vendido")
     valor: float | None = Field(None, description="Valor a faturar, em reais")
     prazo_pagamento: int | None = Field(None, description="Dias até o vencimento (vazio: 15)")
+    vencimento: str | None = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$",
+                                   description="AAAA-MM-DD, quando a data já foi combinada (a mensalidade do plano); vale mais que o prazo")
     proposta_id: str | None = Field(None, description="A proposta aceita que originou a venda")
 
 

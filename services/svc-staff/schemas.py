@@ -19,6 +19,8 @@ ACOMPANHAMENTO_SUBJECT = "rpc.processos.acompanhamento"  # svc-processos: a saú
 CLIENTE_SUBJECT = "rpc.identity.cliente"  # svc-identity: abre a organização do cliente e convida o dono
 CONVITE_DONO_SUBJECT = "rpc.identity.convite_dono"  # svc-identity: o convite do dono de novo
 MEMBER_LEFT_SUBJECT = "events.identity.member-left"  # svc-identity: alguém saiu de uma organização
+CONTA_SUBJECT = "rpc.plans.conta"  # svc-plans: mensalidade, vencimento e situação do cliente (agindo nele)
+ENCERRADA_SUBJECT = "events.plans.encerrada"  # svc-plans: a conta do cliente encerrou (o staff sai da carteira)
 CONTEXTO_SUBJECT = "rpc.conhecimento.contexto"  # svc-conhecimento: o briefing da empresa (concluído ou não)
 # Resolver pela fila, sem trocar de organização: o svc-staff confere a carteira e pede ao serviço do item, agindo na
 # organização do cliente, com quem do staff resolveu (por).
@@ -141,6 +143,13 @@ class ConviteDono(BaseModel):
 
     tenant: str
     email: str | None = None
+
+
+class ContaEncerrada(BaseModel):
+    """events.plans.encerrada (contrato do svc-plans), publicado como a organização do cliente."""
+
+    tenant: str
+    em: datetime
 
 
 class MemberLeft(BaseModel):
@@ -299,6 +308,58 @@ class NovoCliente(_Input):
     email: str = Field(..., max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", description="E-mail do dono, que recebe o convite")
     plano: PlanSlug = Field(..., description="Slug do plano do cliente")
     pessoa: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$", description="Quem do staff cuida dele (entra na carteira)")
+    valor: float | None = Field(None, ge=0, description="Mensalidade combinada (vazio: o preço do plano)")
+    vencimento: int | None = Field(None, ge=1, le=28, description="Dia do vencimento (vazio: dia 10)")
+
+
+class CobrancaCliente(_Input):
+    """A mensalidade e o vencimento combinados com o cliente (o fechamento do mês cobra assim)."""
+
+    organizacao: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    valor: float | None = Field(None, ge=0, description="Mensalidade (vazio: mantém)")
+    vencimento: int | None = Field(None, ge=1, le=28, description="Dia do vencimento (vazio: mantém)")
+
+
+class SituacaoCliente(_Input):
+    """Suspender (atraso), reativar, encerrar (no fim do mês pago; na hora se suspenso) ou desfazer o encerramento."""
+
+    organizacao: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    acao: Literal["suspender", "reativar", "encerrar", "desfazer"]
+    motivo: str | None = Field(None, max_length=300, description="Suspender: o cliente vê o motivo")
+
+
+class ContaAcao(BaseModel):
+    """rpc.plans.conta (contrato do svc-plans)."""
+
+    acao: Literal["ver", "cobranca", "suspender", "reativar", "encerrar", "desfazer"]
+    valor: float | None = None
+    vencimento: int | None = None
+    motivo: str | None = None
+    por: str | None = None
+
+
+class CancelamentoConta(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    origem: Literal["cliente", "cogniventure"]
+    motivo: str | None = None
+    efetivo_em: datetime
+
+
+class ContaCliente(BaseModel):
+    """A conta do cliente no svc-plans (o que a lista mostra)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    situacao: Literal["ativa", "suspensa", "encerrada"]
+    valor: float
+    valor_combinado: bool = False
+    moeda: str = "BRL"
+    vencimento: int
+    motivo: str | None = None
+    cancelamento: CancelamentoConta | None = None
+    encerrada_em: datetime | None = None
+    exclusao_em: datetime | None = None
 
 
 class ClienteRef(_Input):
@@ -317,6 +378,7 @@ class Cliente(BaseModel):
     ultimo_acesso: datetime | None = Field(None, description="Último acesso de alguém do cliente (o staff não conta)")
     andamento: int | None = None
     autonomia: float | None = None
+    conta: ContaCliente | None = Field(None, description="Mensalidade, vencimento e situação (null: o svc-plans não respondeu)")
 
 
 class Clientes(BaseModel):

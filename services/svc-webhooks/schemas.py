@@ -156,3 +156,13 @@ class Planned(BaseModel):
 
 class Cleaned(BaseModel):
     deliveries: int
+
+
+ENCERRADA_SUBJECT = "events.plans.encerrada"  # svc-plans: a conta da organização encerrou (alinhamento pós-N7, item 13)
+
+
+class ContaEncerrada(BaseModel):
+    """events.plans.encerrada (contrato do svc-plans), publicado como a organização que encerrou."""
+
+    tenant: str
+    em: datetime

@@ -6,10 +6,14 @@ atômico que soma o consumo); o NATS vira dublê e o svc-identity responde o nom
 Rodar (da raiz): PYTHONPATH=services/svc-plans uv run python -m pytest tests/plans.py
 """
 import asyncio
+import io
+import json
+import zipfile
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from nats.errors import NoRespondersError
 from pydantic import ValidationError
 from surrealdb import AsyncSurreal
 
@@ -18,6 +22,8 @@ from core.envelope import ServiceError
 from core.notify import SEND_SUBJECT
 from core.plans import CatalogLimit, CatalogModule, CountReport, LimitsRequest, ModuleCatalog, UsageReport
 from core.security import Principal, acting_as, system
+from core.storage import StoredFile
+from core.surreal import DataPage
 
 import service
 from schemas import (
@@ -25,11 +31,19 @@ from schemas import (
     TENANT_TABLES,
     UNIQUE,
     USAGE_LIVE,
+    CONTACTS_SUBJECT,
+    ENCERRADA_SUBJECT,
+    INICIAR_MODELO_SUBJECT,
+    PURGE_SUBJECT,
     AccountRef,
     AssignInput,
     AssignRequest,
+    CancelamentoIn,
     Contacts,
+    ContaAcao,
     Empty,
+    ExportacaoRef,
+    FechamentoIn,
     PlanInput,
     PlanRef,
     PlanUpdate,
@@ -67,7 +81,7 @@ def box(monkeypatch):
     """PLATFORM_TENANT=plat, NATS em memória e o svc-identity respondendo o nome das organizações."""
     monkeypatch.setenv("PLATFORM_TENANT", "plat")
     service.settings.cache_clear()
-    state = SimpleNamespace(published=[], live=[], contacts=[])
+    state = SimpleNamespace(published=[], live=[], contacts=[], responders={}, emails={"acme": "bia@acme.com"})
 
     async def publish(subject, message, msg_id=None):
         state.published.append((subject, message, msg_id))
@@ -78,7 +92,13 @@ def box(monkeypatch):
     async def request(subject, message, response_model, timeout=5.0):
         tenant = service.current_tenant()
         state.contacts.append((subject, tenant, service.current().sub))
-        return Contacts(tenant_name=ORGS.get(tenant, ""), items=[])
+        if subject in state.responders:
+            answer = state.responders[subject](message)
+            return response_model.model_validate(answer.model_dump() if hasattr(answer, "model_dump") else answer)
+        if subject != CONTACTS_SUBJECT:
+            raise NoRespondersError
+        dono = [{"id": "dono", "name": "Dono", "email": state.emails[tenant]}] if tenant in state.emails and message.roles else []
+        return Contacts(tenant_name=ORGS.get(tenant, ""), items=dono)
 
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
@@ -408,3 +428,189 @@ def test_organizacao_e_campos_nao_vem_do_corpo():
         PlanInput.model_validate({"slug": "x", "name": "Xis", "tenant": "outra"})
     with pytest.raises(ValidationError):
         AssignInput.model_validate({"tenant": "acme", "plan": "pro", "by": "eu"})
+
+
+
+# ── Conta: mensalidade, situação, cancelamento, fechamento e exportação (alinhamento pós-N7, itens 2 e 13) ──
+
+STAFF_NO_ACME = system("svc-staff", "acme")
+
+
+def _avisos(box):
+    return [(m.title, sorted(m.roles or m.users)) for s, m, _ in box.published if s == SEND_SUBJECT]
+
+
+def test_conta_do_cliente_pelo_staff_cobranca_suspensao_e_reativacao(box):
+    async def cenario(svc):
+        await planos(svc)
+        await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro")))
+        ver = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="ver")))
+        cobranca = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="cobranca", valor=150, vencimento=15)))
+        erros = []
+        for who, acao in ((STAFF_NO_ACME, ContaAcao(acao="suspender")), (ACME, ContaAcao(acao="ver")),
+                          (system("svc-staff", "plat"), ContaAcao(acao="ver")), (STAFF_NO_ACME, ContaAcao(acao="reativar"))):
+            with pytest.raises(ServiceError) as exc:
+                await como(who, lambda: svc.conta(acao))
+            erros.append(exc.value.code)
+        suspensa = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="suspender", motivo="Mensalidade de outubro em aberto", por="gil")))
+        resolvido = await como(ACME_MEMBRO, lambda: svc.resolve(LimitsRequest()))
+        reativada = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="reativar")))
+        return ver, cobranca, erros, suspensa, resolvido, reativada
+
+    ver, cobranca, erros, suspensa, resolvido, reativada = run(cenario)
+    assert (ver.valor, ver.valor_combinado, ver.vencimento, ver.situacao) == (99, False, 10, "ativa")  # o preço do plano
+    assert (cobranca.valor, cobranca.valor_combinado, cobranca.vencimento) == (150, True, 15)
+    assert erros == ["ERRO_PLANS_MOTIVO", "ERRO_PLANS_FORBIDDEN", "ERRO_PLANS_PLATAFORMA", "ERRO_PLANS_SITUACAO"]
+    assert (suspensa.situacao, suspensa.motivo) == ("suspensa", "Mensalidade de outubro em aberto")
+    assert (resolvido.situacao, resolvido.aviso.startswith("Conta suspensa")) == ("suspensa", True)  # o core trava execuções novas
+    assert reativada.situacao == "ativa" and reativada.aviso is None
+    assert ("Conta suspensa", ["admin", "owner"]) in _avisos(box) and ("Conta reativada", ["admin", "owner"]) in _avisos(box)
+
+
+def test_cancelamento_do_dono_vale_no_fim_do_mes_encerra_e_30_dias_depois_apaga(box, monkeypatch):
+    apagados = []
+
+    async def purge():
+        apagados.append(service.current_tenant())
+        return 3
+
+    monkeypatch.setattr(service.storage, "purge", purge)
+
+    async def cenario(svc):
+        await planos(svc)
+        with pytest.raises(ServiceError) as membro:
+            await como(ACME_MEMBRO, lambda: svc.cancelar(CancelamentoIn(motivo="caro")))
+        pedido = await como(ACME, lambda: svc.cancelar(CancelamentoIn(motivo="Vamos internalizar")))
+        with pytest.raises(ServiceError) as de_novo:
+            await como(ACME, lambda: svc.cancelar(CancelamentoIn()))
+        desfeito = await como(ACME, lambda: svc.desfazer_cancelamento(Empty()))
+        await como(ACME, lambda: svc.cancelar(CancelamentoIn()))
+        efetivo = pedido.cancelamento.efetivo_em
+        antes = await como(system("svc-plans"), lambda: svc.encerramentos(Empty()))  # o mês pago ainda não acabou
+        monkeypatch.setattr(service, "_now", lambda: efetivo + timedelta(minutes=15))
+        encerrou = await como(system("svc-plans"), lambda: svc.encerramentos(Empty()))
+        encerrada = await como(ACME, lambda: svc.current(Empty()))
+        situacao = await como(ACME, lambda: svc.resolve(LimitsRequest()))
+        monkeypatch.setattr(service, "_now", lambda: efetivo + timedelta(days=30, minutes=20))
+        apagou = await como(system("svc-plans"), lambda: svc.encerramentos(Empty()))
+        sobrou = await service.db.query_shared("SELECT * FROM plan_accounts WHERE org = 'acme'")
+        return membro.value, pedido, de_novo.value, desfeito, efetivo, antes, encerrou, encerrada.conta, situacao, apagou, sobrou
+
+    membro, pedido, de_novo, desfeito, efetivo, antes, encerrou, encerrada, situacao, apagou, sobrou = run(cenario)
+    assert membro.code == "ERRO_PLANS_FORBIDDEN" and de_novo.code == "ERRO_PLANS_JA_CANCELADA"
+    hoje = datetime.now(service.ZoneInfo(service.FUSO))
+    seguinte = (hoje.replace(day=28) + timedelta(days=4)).replace(day=1)
+    assert efetivo.astimezone(service.ZoneInfo(service.FUSO)).strftime("%Y-%m-%d %H:%M") == f"{seguinte:%Y-%m-%d} 00:00"
+    assert pedido.aviso.startswith("Cancelamento pedido: a conta funciona até") and pedido.pode_desfazer
+    assert desfeito.cancelamento is None and desfeito.aviso is None
+    assert (antes.encerradas, encerrou.encerradas) == (0, 1)
+    assert (encerrada.situacao, encerrada.pode_desfazer, situacao.situacao) == ("encerrada", True, "encerrada")
+    assert encerrada.exclusao_em - encerrada.encerrada_em == timedelta(days=30)
+    eventos = [(s, getattr(m, "tenant", None), service.current_tenant) for s, m, _ in box.published if s in (ENCERRADA_SUBJECT, PURGE_SUBJECT)]
+    assert [(s, t) for s, t, _ in eventos] == [(ENCERRADA_SUBJECT, "acme"), (PURGE_SUBJECT, "acme")]
+    assert apagou.excluidas == 1 and apagados == ["acme"] and sobrou == []  # arquivos, linhas de todos e a conta
+    assert ("Acme pediu o cancelamento", ["admin", "owner"]) in _avisos(box)  # os gestores da Cogniventure sabem
+
+
+def test_cogniventure_encerra_o_suspenso_na_hora_e_o_ativo_no_fim_do_mes(box):
+    async def cenario(svc):
+        await planos(svc)
+        await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="suspender", motivo="Atraso")))
+        acme = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="encerrar", motivo="Atraso de 60 dias", por="gil")))
+        beta = await como(system("svc-staff", "beta"), lambda: svc.conta(ContaAcao(acao="encerrar")))
+        with pytest.raises(ServiceError) as dono:  # o dono não desfaz o que a Cogniventure encerrou
+            await como(ACME, lambda: svc.desfazer_cancelamento(Empty()))
+        reativada = await como(STAFF_NO_ACME, lambda: svc.conta(ContaAcao(acao="desfazer")))
+        return acme, beta, dono.value, reativada
+
+    acme, beta, dono, reativada = run(cenario)
+    assert (acme.situacao, acme.cancelamento.origem, acme.pode_desfazer) == ("encerrada", "cogniventure", False)
+    assert (beta.situacao, beta.cancelamento.origem) == ("ativa", "cogniventure")  # ativo: vale no fim do mês pago
+    assert dono.code == "ERRO_PLANS_SEM_CANCELAMENTO"
+    assert (reativada.situacao, reativada.cancelamento, reativada.exclusao_em) == ("ativa", None, None)
+
+
+def test_fechamento_inicia_o_faturamento_de_cada_cliente_pagante_na_cogniventure(box):
+    iniciados = []
+
+    def iniciar(pedido):
+        iniciados.append((service.current_tenant(), service.current().sub, pedido))
+        if pedido.dados["cliente_org"] == "beta":
+            raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", "Publique o Faturamento e cobrança para iniciar por aqui.", 409)
+        return {"id": "ex1", "processo": "fat", "titulo": "Faturamento e cobrança"}
+
+    box.responders[INICIAR_MODELO_SUBJECT] = iniciar
+
+    async def cenario(svc):
+        await planos(svc)
+        await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="acme", plan="pro")))
+        await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="beta", plan="sob-medida")))
+        await como(PLATAFORMA, lambda: svc.assign_plan(AssignInput(tenant="plat", plan="sob-medida")))  # a Cogniventure não se cobra
+        await como(system("svc-staff", "acme"), lambda: svc.conta(ContaAcao(acao="cobranca", vencimento=20)))
+        with pytest.raises(ServiceError) as cliente:
+            await como(ACME, lambda: svc.fechar_mes(FechamentoIn()))
+        return cliente.value, await como(system("svc-plans"), lambda: svc.fechar_mes(FechamentoIn(mes="2099-11")))
+
+    cliente, fechamento = run(cenario)
+    assert cliente.code == "ERRO_PLANS_FORBIDDEN"
+    assert [(c.tenant, c.valor, c.vencimento, c.execucao) for c in fechamento.cobrados] == [
+        ("acme", 99, "2099-11-20", "ex1"), ("beta", 999, "2099-11-10", None)]
+    tenant, quem, pedido = iniciados[0]
+    assert (tenant, quem, pedido.modelo, pedido.chave) == ("plat", "system:svc-plans", "faturamento-cobranca", "plano-acme-2099-11")
+    assert {k: pedido.dados[k] for k in ("cliente", "email", "valor", "descricao", "cliente_org", "vencimento")} == {
+        "cliente": "Acme", "email": "bia@acme.com", "valor": 99, "descricao": "Mensalidade da Cogniventure de novembro de 2099 (plano Pro)",
+        "cliente_org": "acme", "vencimento": "2099-11-20"}  # a fatura vence no dia combinado com o cliente
+    assert any(t.startswith("Fechamento de novembro de 2099: 1 cliente(s) sem cobrança") for t, _ in _avisos(box))
+
+
+def test_exportacao_monta_o_pacote_com_cada_servico_e_os_arquivos(box, monkeypatch):
+    guardado = {}
+
+    async def keys():
+        return ["t/acme/svc-integracoes/documentos/abcdef123456", "t/acme/svc-plans/exportacoes/antigo"]
+
+    async def info(key):
+        return StoredFile(key=key, filename="boleto.pdf", content_type="application/pdf", size=3)
+
+    async def read(key, *, max_bytes):
+        return b"PDF"
+
+    async def save_file(path, *, filename, content_type, folder="files"):
+        with open(path, "rb") as f:
+            guardado["zip"] = f.read()
+        return StoredFile(key="t/acme/svc-plans/exportacoes/novo", filename=filename, content_type=content_type, size=len(guardado["zip"]))
+
+    async def start_workflow(run, arg, *, task_queue, id=None):
+        guardado["workflow"] = (arg.id, id)
+
+    for nome, fn in (("keys", keys), ("info", info), ("read", read), ("save_file", save_file)):
+        monkeypatch.setattr(service.storage, nome, fn)
+    monkeypatch.setattr(service.storage, "url", lambda key, **kw: f"https://arquivos/{key}")
+    monkeypatch.setattr(service.runner, "start_workflow", start_workflow)
+
+    def dados(pedido):
+        assert service.current().sub == "system:svc-plans"  # só o svc-plans pede as linhas de uma organização
+        linhas = [{"id": "crm_clientes:1", "nome": "Padaria Sol", "tags": ["vip"]}] if pedido.table else []
+        return DataPage(service="svc-crm", tables=["crm_clientes"], table=pedido.table, rows=linhas, next=None)
+
+    box.responders["rpc.crm.dados"] = dados
+
+    async def cenario(svc):
+        with pytest.raises(ServiceError) as membro:
+            await como(ACME_MEMBRO, lambda: svc.pedir_exportacao(Empty()))
+        pedido = await como(ACME, lambda: svc.pedir_exportacao(Empty()))
+        de_novo = await como(ACME, lambda: svc.pedir_exportacao(Empty()))  # já preparando: o mesmo pedido
+        pronta = await como(ACME, lambda: svc.exportar(ExportacaoRef(id=pedido.id)))
+        return membro.value, pedido, de_novo, pronta, await como(ACME, lambda: svc.exportacao(Empty()))
+
+    membro, pedido, de_novo, pronta, atual = run(cenario)
+    assert membro.code == "ERRO_PLANS_FORBIDDEN"
+    assert (pedido.status, de_novo.id, guardado["workflow"]) == ("preparando", pedido.id, (pedido.id, f"exportar-{pedido.id}"))
+    assert (pronta.status, atual.item.url) == ("pronta", "https://arquivos/t/acme/svc-plans/exportacoes/novo")
+    pacote = zipfile.ZipFile(io.BytesIO(guardado["zip"]))
+    assert sorted(pacote.namelist()) == ["LEIA-ME.txt", "arquivos/integracoes/documentos/abcdef12-boleto.pdf", "crm/crm_clientes.csv",
+                                         "crm/crm_clientes.json"]
+    assert json.loads(pacote.read("crm/crm_clientes.json")) == [{"id": "crm_clientes:1", "nome": "Padaria Sol", "tags": ["vip"]}]
+    assert pacote.read("crm/crm_clientes.csv").decode("utf-8-sig").splitlines() == ["id,nome,tags", 'crm_clientes:1,Padaria Sol,"[""vip""]"']
+    assert "svc-ai" in pacote.read("LEIA-ME.txt").decode() and "svc-ai" in pronta.aviso  # quem estava fora do ar fica dito
+    assert any(t == "Os dados da organização estão prontos" for t, _ in _avisos(box))
