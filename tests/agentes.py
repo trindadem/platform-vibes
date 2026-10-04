@@ -226,3 +226,84 @@ def test_politica_perguntar_nao_executa_a_ferramenta_e_a_suite_falha(modelo):
     assert avaliado.status == "rascunho" and not avaliado.avaliacao.ok
     assert any("pediu aprovação" in d for d in avaliado.avaliacao.resultados[0].detalhes)
     assert "consultar_pedido (ERP da Acme)" in teste["aprovacao"] and teste["ajuda"]
+
+
+# ── O5 (fatia A): ação de pacote como ferramenta ─────────────────────────────
+
+from core.processes import ActionResult  # noqa: E402
+from core.security import current  # noqa: E402
+from core.surreal import db  # noqa: E402
+
+from schemas import ACOES_SUBJECT  # noqa: E402
+
+CONFERIR, AGENDAR = "acao:financeiro.conferir_pedido", "acao:financeiro.agendar_pagamento"
+ACOES = {"itens": [
+    {"name": "financeiro.conferir_pedido", "title": "Conferir com o pedido", "pacote": "Financeiro", "risk": "leitura",
+     "description": "Compara o documento com o pedido ou o contrato e diz se diverge",
+     "input_schema": {"type": "object", "properties": {"fornecedor": {"type": "string"}, "valor": {"type": "number"}}}},
+    {"name": "financeiro.agendar_pagamento", "title": "Agendar pagamento", "pacote": "Financeiro", "risk": "irreversivel",
+     "description": "Agenda o pagamento no banco", "input_schema": {"type": "object", "properties": {"valor": {"type": "number"}}}},
+]}
+
+
+def _roteiro(monkeypatch, passos: list) -> list:
+    """O modelo falso segue o roteiro: a cada volta a próxima chamada (nome, argumentos) da lista; no fim, texto."""
+    pedidos = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        pedidos.append(body)
+        feitas = sum(1 for m in body["messages"] if m["role"] == "tool")
+        if feitas < len(passos):
+            return _resposta(body["model"], _chamada(*passos[feitas]), "tool_calls")
+        return _resposta(body["model"], {"role": "assistant", "content": "Feito."}, "stop")
+
+    monkeypatch.setattr(llm, "_transport", httpx.MockTransport(responder))
+    return pedidos
+
+
+def test_acao_de_pacote_vira_ferramenta_e_roda_no_pacote_na_organizacao_do_agente(monkeypatch):
+    roteiro: list = []
+    pedidos = _roteiro(monkeypatch, roteiro)
+    chamadas = []
+
+    def pacote(chamada):
+        chamadas.append((current().sub, current().tenant, chamada.acao, chamada.entrada))
+        return ActionResult(ok=True, resultado={"divergente": True, "diferenca": 250.0, "pedido": "Contrato Moinho Sul"})
+
+    async def cenario(app):
+        _integracoes(app, [])
+        ana = app.user(*OWNER)
+        sem_processos = (await ana.get("/ferramentas")).json()["data"]
+        app.respond(ACOES_SUBJECT, lambda _: ACOES)
+        app.respond("rpc.financeiro.acao", pacote)
+        catalogo = (await ana.get("/ferramentas")).json()["data"]
+        sozinha = await ana.post("/agentes", json={**AGENTE, "nome": "Pagador", "ferramentas": [{"ref": AGENDAR}]})
+        conferente = (await ana.post("/agentes", json={**AGENTE, "nome": "Conferente", "ferramentas": [
+            {"ref": CONFERIR}, {"ref": AGENDAR, "modo": "perguntar"}]})).json()["data"]
+        roteiro[:] = [("acao_financeiro_conferir_pedido", {"fornecedor": "Moinho Sul", "valor": 1250}),
+                      ("concluir", {"divergente": True})]
+        teste = (await ana.post("/agentes/testar", json={"id": conferente["id"], "tarefa": "Confira o boleto do Moinho Sul.",
+                                                         "saidas": {"divergente": "sim_nao"}})).json()["data"]
+        ferramentas = [t["function"] for t in pedidos[-2]["tools"]]
+        with acting_as(Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))):  # gravado antes da regra: na hora vale perguntar
+            await db.merge(f"agentes_agentes:{conferente['id']}", {"ferramentas": [{"ref": AGENDAR, "modo": "permitir"}]})
+        roteiro[:] = [("acao_financeiro_agendar_pagamento", {"valor": 1250}), ("pedir_ajuda", {"motivo": "Agendar pede aprovação."})]
+        agendar = (await ana.post("/agentes/testar", json={"id": conferente["id"], "tarefa": "Agende o boleto.",
+                                                           "saidas": {"agendado": "sim_nao"}})).json()["data"]
+        return sem_processos, catalogo, sozinha, teste, ferramentas, agendar
+
+    sem_processos, catalogo, sozinha, teste, ferramentas, agendar = service_app(cenario)
+    assert sem_processos["processos"] is False and not any(i["origem"] == "pacote" for i in sem_processos["itens"])
+    assert [i["ref"] for i in catalogo["itens"]] == ["documento", "conhecimento", CONFERIR, AGENDAR, FERRAMENTA]  # plataforma, pacotes, MCP
+    acao = catalogo["itens"][2]
+    assert (acao["origem"], acao["pacote"], acao["nome"], acao["risco"]) == ("pacote", "Financeiro", "Conferir com o pedido", "leitura")
+    assert sozinha.status_code == 422 and "Agendar pagamento" in sozinha.json()["error"]["message"]  # irreversível só com perguntar
+    nomes = {f["name"]: f for f in ferramentas}
+    assert nomes["acao_financeiro_conferir_pedido"]["description"].startswith("[Financeiro] Compara o documento")
+    assert "pede aprovação" in nomes["acao_financeiro_agendar_pagamento"]["description"]
+    assert nomes["acao_financeiro_conferir_pedido"]["parameters"]["properties"]["valor"] == {"type": "number"}
+    assert chamadas == [("system:svc-agentes", "acme", "conferir_pedido", {"fornecedor": "Moinho Sul", "valor": 1250})]
+    assert teste["saidas"] == {"divergente": True} and teste["ferramentas"] == ["financeiro.conferir_pedido"]
+    assert any("Contrato Moinho Sul" in lido for lido in teste["lidos"])  # a resposta do pacote entra no que ele leu (fontes)
+    assert len(chamadas) == 1 and "Agendar pagamento (Financeiro)" in agendar["aprovacao"]  # irreversível não rodou

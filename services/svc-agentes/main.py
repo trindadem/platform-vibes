@@ -1,7 +1,7 @@
 """svc-agentes · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/agentes.md
 
 HTTP /agentes...     → os agentes da organização: lista, item, criar, editar, remover, avaliar (suíte), confiar, testar.
-HTTP /ferramentas    → o catálogo do que um agente pode usar (plataforma e servidores MCP de Integrações).
+HTTP /ferramentas    → o catálogo do que um agente pode usar (plataforma, ações dos pacotes e servidores MCP de Integrações).
 NATS rpc.agentes.lista e rpc.agentes.executar → o svc-processos oferece, confere e roda os agentes nos passos.
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-agentes main:app --port 8100 --env-file .env

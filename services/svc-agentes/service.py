@@ -7,7 +7,8 @@ Os agentes da organização (briefing.md §7.1): instrução, modelo (do svc-ai)
 plataforma e as dos servidores MCP conectados em Integrações), a política de cada ferramenta (permitir ou perguntar) e a
 suíte de avaliação. Nasce rascunho; vira verificado quando a suíte passa; confiável, só por decisão do staff. Mudar o
 que ele faz volta a rascunho. O agente roda no laço do AgentExo (llm.run_agent); ferramenta MCP é chamada pelo
-svc-integracoes, que guarda a credencial. Um passo de processo usa um agente verificado por rpc.agentes.executar.
+svc-integracoes, que guarda a credencial; ação de pacote, pelo próprio pacote (rpc.<pacote>.acao, core/processes.py).
+Ferramenta irreversível só entra pedindo aprovação. Um passo de processo usa um agente verificado por rpc.agentes.executar.
 """
 import inspect
 import json
@@ -22,11 +23,13 @@ from pydantic import BaseModel, Field, create_model
 from core.envelope import ServiceError
 from core.llm import SchemaTool, llm
 from core.nats_bus import bus
-from core.security import current
+from core.processes import ActionCall, ActionResult, action_subject
+from core.security import acting_as, current, current_tenant, system
 from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
 
 from schemas import (
+    ACOES_SUBJECT,
     AGENTES,
     BUSCA_SUBJECT,
     DOCUMENTO_SUBJECT,
@@ -34,10 +37,12 @@ from schemas import (
     INSTRUCOES_PLATAFORMA,
     LIVE_AGENTES,
     MCP_SUBJECT,
+    SERVICE,
     STAFF,
     TASK_QUEUE,
     WRITERS,
     Achados,
+    AcoesDisponiveis,
     Agente,
     AgenteMudou,
     AgenteRef,
@@ -90,14 +95,21 @@ class AgentesService:
         return Agente.model_validate(await _row(data.id))
 
     async def catalogo(self, data: Empty) -> CatalogoFerramentas:
-        """As ferramentas que um agente pode usar: as da plataforma e as dos servidores MCP da organização."""
+        """As ferramentas que um agente pode usar: as da plataforma, as ações dos pacotes ligados no plano e as dos
+        servidores MCP da organização. Quem não respondeu fica de fora, com o aviso (processos, integracoes)."""
+        try:
+            acoes = await bus.request(ACOES_SUBJECT, Empty(), AcoesDisponiveis, timeout=10)
+        except (NatsError, TimeoutError, ServiceError):
+            acoes = None
+        pacotes = [FerramentaCatalogo(ref=f"acao:{a.name}", nome=a.title, descricao=a.description, origem="pacote", pacote=a.pacote,
+                                      risco=a.risk, parametros=a.input_schema) for a in (acoes.itens if acoes else [])]
         try:
             disponiveis = await bus.request(FERRAMENTAS_SUBJECT, Empty(), FerramentasDisponiveis, timeout=10)
         except (NatsError, TimeoutError, ServiceError):
-            return CatalogoFerramentas(itens=list(PLATAFORMA), integracoes=False)
+            return CatalogoFerramentas(itens=[*PLATAFORMA, *pacotes], integracoes=False, processos=acoes is not None)
         mcp = [FerramentaCatalogo(ref=f"mcp:{f.servidor}:{f.nome}", nome=f.nome, descricao=f.descricao, origem="mcp",
                                   servidor_nome=f.servidor_nome, risco=f.risco, parametros=f.parametros) for f in disponiveis.itens]
-        return CatalogoFerramentas(itens=[*PLATAFORMA, *mcp])
+        return CatalogoFerramentas(itens=[*PLATAFORMA, *pacotes, *mcp], processos=acoes is not None)
 
     async def criar(self, data: NovoAgente) -> Agente:
         _escritor()
@@ -277,13 +289,16 @@ async def _executar(agente: Agente, tarefa: str, contexto: str, saidas: dict[str
             return texto if achados.itens else "Nada encontrado no conhecimento."
 
         ferramentas.append(buscar_conhecimento)
-    mcp = [r for r in refs if r.startswith("mcp:")]
-    if mcp:
+    externas = [r for r in refs if r.startswith(("acao:", "mcp:"))]
+    if externas:
         catalogo = {f.ref: f for f in (await AgentesService().catalogo(Empty())).itens}
         nomes: set[str] = set()
-        for ref in mcp:
-            if ref in catalogo:  # fora do catálogo (servidor removido, ferramenta em quarentena): o agente não a vê
-                ferramentas.append(_ferramenta_mcp(catalogo[ref], refs[ref], feito, nomes))
+        for ref in externas:
+            item = catalogo.get(ref)  # fora do catálogo (pacote desligado, servidor removido, quarentena): o agente não a vê
+            if item is None:
+                continue
+            modo = "perguntar" if item.risco == "irreversivel" else refs[ref]  # irreversível nunca roda sozinho
+            ferramentas.append((_ferramenta_acao if item.origem == "pacote" else _ferramenta_mcp)(item, modo, feito, nomes))
     instrucoes = f"{agente.instrucao}\n\n{INSTRUCOES_PLATAFORMA}"
     resultado = await llm.run_agent(agente.modelo, tarefa, instructions=instrucoes, tools=ferramentas, context=contexto, max_turns=8)
     textos = [resultado.text]
@@ -318,14 +333,36 @@ def _saidas_do_texto(texto: str, modelo: type[BaseModel], saidas: list[str]) -> 
     return {}
 
 
+def _ferramenta_acao(item: FerramentaCatalogo, modo: str, feito: Execucao, nomes: set[str]) -> SchemaTool:
+    """A ação do pacote como o modelo a vê; a chamada vai ao próprio pacote (rpc.<pacote>.acao), que a roda na organização
+    de quem roda o agente, com a mesma conferência de um passo do processo."""
+    pacote, acao = item.ref.removeprefix("acao:").split(".", 1)
+    nome = _nome_unico(f"acao_{pacote}_{acao}", nomes)
+
+    async def chamar(argumentos: dict[str, Any]) -> str:
+        if modo == "perguntar":  # política (ou irreversível): não executa; o passo vai para uma pessoa aprovar
+            feito.aprovacao = feito.aprovacao or f"{item.nome} ({item.pacote}) com {json.dumps(argumentos, ensure_ascii=False)[:300]}"
+            return "Esta ferramenta precisa da aprovação de uma pessoa e não foi executada. Chame pedir_ajuda dizendo o que ia fazer."
+        feito.ferramentas.append(f"{pacote}.{acao}")
+        with acting_as(system(SERVICE, current_tenant())):  # o pacote só atende o svc-agentes, na organização do agente
+            try:
+                resposta = await bus.request(action_subject(pacote), ActionCall(acao=acao, entrada=argumentos), ActionResult, timeout=60)
+            except (NatsError, TimeoutError):
+                return f"O pacote {item.pacote} não respondeu agora."
+        if not resposta.ok:
+            return f"A ação não seguiu: {resposta.motivo}"
+        texto = json.dumps(resposta.resultado, ensure_ascii=False)
+        feito.lidos.append(texto)
+        return texto
+
+    descricao = f"[{item.pacote}] {item.descricao}" + (" (pede aprovação de uma pessoa antes de rodar)" if modo == "perguntar" else "")
+    return SchemaTool(nome, descricao, item.parametros or {"type": "object", "properties": {}}, chamar)
+
+
 def _ferramenta_mcp(item: FerramentaCatalogo, modo: str, feito: Execucao, nomes: set[str]) -> SchemaTool:
     """A ferramenta MCP como o modelo a vê; a chamada vai ao svc-integracoes (a credencial não passa por aqui)."""
     servidor = item.ref.split(":")[1]
-    base = re.sub(r"[^a-z0-9_]", "_", f"mcp_{_normal_nome(item.servidor_nome or 'servidor')}_{_normal_nome(item.nome)}")[:60]
-    nome = base
-    while nome in nomes:
-        nome = f"{base[:57]}_{len(nomes)}"
-    nomes.add(nome)
+    nome = _nome_unico(f"mcp_{_normal_nome(item.servidor_nome or 'servidor')}_{_normal_nome(item.nome)}", nomes)
 
     async def chamar(argumentos: dict[str, Any]) -> str:
         if modo == "perguntar":  # política: não executa; o passo vai para uma pessoa aprovar (Ask do AgentExo)
@@ -343,6 +380,16 @@ def _ferramenta_mcp(item: FerramentaCatalogo, modo: str, feito: Execucao, nomes:
 
 # ── Ajudantes ────────────────────────────────────────────────────────────────
 
+def _nome_unico(nome: str, nomes: set[str]) -> str:
+    """O nome da ferramenta para o modelo: snake_case, até 60, sem repetir entre as do agente."""
+    base = re.sub(r"[^a-z0-9_]", "_", nome)[:60]
+    nome = base
+    while nome in nomes:
+        nome = f"{base[:57]}_{len(nomes)}"
+    nomes.add(nome)
+    return nome
+
+
 def _escritor() -> None:
     who = current()
     if who is None or not (who.is_system or WRITERS & who.roles):
@@ -357,13 +404,18 @@ async def _row(agente_id: str) -> dict[str, Any]:
 
 
 async def _conferir_ferramentas(svc: AgentesService, ferramentas: list[Any]) -> None:
-    """Só o que está no catálogo agora (servidor conectado, ferramenta fora de quarentena), sem repetir."""
+    """Só o que está no catálogo agora (pacote ligado, servidor conectado, ferramenta fora de quarentena), sem repetir;
+    irreversível só pedindo aprovação (perguntar)."""
     refs = [f.ref for f in ferramentas]
     if len(set(refs)) != len(refs):
         raise ServiceError("ERRO_AGENTES_FERRAMENTA", "Ferramenta repetida no agente.", 422)
-    disponiveis = {f.ref for f in (await svc.catalogo(Empty())).itens}
+    disponiveis = {f.ref: f for f in (await svc.catalogo(Empty())).itens}
     if fora := [r for r in refs if r not in disponiveis]:
-        raise ServiceError("ERRO_AGENTES_FERRAMENTA", f"Fora do catálogo (servidor desconectado ou em quarentena?): {', '.join(fora)}", 422)
+        raise ServiceError("ERRO_AGENTES_FERRAMENTA",
+                           f"Fora do catálogo (pacote desligado, servidor desconectado ou em quarentena?): {', '.join(fora)}", 422)
+    if sozinhas := [disponiveis[f.ref].nome for f in ferramentas if disponiveis[f.ref].risco == "irreversivel" and f.modo != "perguntar"]:
+        raise ServiceError("ERRO_AGENTES_FERRAMENTA",
+                           f"Irreversível só com a aprovação de uma pessoa (perguntar): {', '.join(sozinhas)}", 422)
 
 
 def _conferir_casos(casos: list[Caso]) -> None:

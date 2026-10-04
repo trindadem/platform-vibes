@@ -16,9 +16,12 @@ Módulo (schemas.MODULE): "Agentes", categoria Sua empresa, ligado por padrão; 
   → `Agente` (rascunho, versão 1). `POST /agentes/editar` (`EdicaoAgente {id, ...}`) → `Agente`: mudar instrução,
   modelo, ferramentas ou casos sobe a versão e volta a rascunho. `POST /agentes/remover {id}` → `Agente`. Dono, admin
   e operador (o staff ajuda no setup).
-- Ferramenta: `ref` = `documento` (ler o documento do gatilho), `conhecimento` (buscar no conhecimento da empresa) ou
-  `mcp:<servidor>:<ferramenta>`. `GET /ferramentas` → `CatalogoFerramentas {itens[{ref, nome, descricao, origem:
-  plataforma|mcp, servidor_nome, risco, parametros}], integracoes}`: só o que está no catálogo agora entra num agente.
+- Ferramenta: `ref` = `documento` (ler o documento do gatilho), `conhecimento` (buscar no conhecimento da empresa),
+  `acao:<pacote>.<ação>` (uma ação de um pacote ligado no plano) ou `mcp:<servidor>:<ferramenta>`. `GET /ferramentas` →
+  `CatalogoFerramentas {itens[{ref, nome, descricao, origem: plataforma|pacote|mcp, servidor_nome, pacote, risco,
+  parametros}], integracoes, processos}` (nessa ordem: plataforma, pacotes, MCP; `processos`/`integracoes` falsos quando
+  o svc-processos/svc-integracoes não respondeu): só o que está no catálogo agora entra num agente. Ferramenta
+  irreversível só entra com `modo: perguntar`.
 - Caso: `{id, nome, tarefa, dados{}, esperado{campo: valor}}` (até 20). `POST /agentes/avaliar {id}` → `Agente` com
   `avaliando`: a suíte roda em segundo plano. `POST /agentes/confiar {id}` (só operador, sobre um verificado) → `Agente`.
 - `POST /agentes/testar {id, tarefa, dados{}, saidas{campo: texto|numero|sim_nao}}` → `Execucao {saidas, fontes,
@@ -26,8 +29,9 @@ Módulo (schemas.MODULE): "Agentes", categoria Sua empresa, ligado por padrão; 
 - RPC `rpc.agentes.lista` (`Empty`) → `ListaAgentes {itens[{id, nome, descricao, status, ferramentas[]}]}` e RPC
   `rpc.agentes.executar` (`ExecutarAgente {agente, tarefa, contexto, saidas{campo: tipo}, leitura, regras[]}`) →
   `Execucao`: o svc-processos oferece os agentes no desenho, confere o status e roda o passo. Na organização de quem pede.
-- Consome `rpc.integracoes.ferramentas`, `rpc.integracoes.mcp_chamar`, `rpc.integracoes.documento` e
-  `rpc.conhecimento.busca`. Ao vivo: `agentes.agentes {id, action: criado|alterado|avaliando|avaliado|confiavel|removido}`.
+- Consome `rpc.processos.acoes` (as ações dos pacotes ligados, com o título do pacote), `rpc.<pacote>.acao`
+  (`ActionCall {acao, entrada}` → `ActionResult {ok, resultado, motivo}`, core/processes.py), `rpc.integracoes.ferramentas`,
+  `rpc.integracoes.mcp_chamar`, `rpc.integracoes.documento` e `rpc.conhecimento.busca`. Ao vivo: `agentes.agentes {id, action: criado|alterado|avaliando|avaliado|confiavel|removido}`.
 
 ## 3. Fluxo de Execução
 1. SurrealDB, por organização: `agentes_agentes` (nome único), com os casos e a última avaliação no registro.
@@ -35,9 +39,13 @@ Módulo (schemas.MODULE): "Agentes", categoria Sua empresa, ligado por padrão; 
    (concluir com as saídas ou pedir ajuda; não chutar), ferramentas `concluir` (as saídas pedidas e, num passo de
    leitura, `fontes`), `pedir_ajuda` e as escolhidas. Ferramenta MCP entra como `SchemaTool` (nome
    `mcp_<servidor>_<ferramenta>`, o schema do servidor) e a chamada vai ao svc-integracoes, que guarda a credencial; o
-   que ela responde entra em `lidos` (o svc-processos confere as fontes contra isso).
+   que ela responde entra em `lidos` (o svc-processos confere as fontes contra isso). Ação de pacote entra como
+   `SchemaTool` `acao_<pacote>_<ação>` (até 60 caracteres, com o `input_schema` da ação) e a chamada vai ao próprio
+   pacote (`rpc.<pacote>.acao`, 60 s) como `system:svc-agentes` na organização do agente: o pacote a roda com a mesma
+   conferência de um passo. A saída entra em `lidos`; `ok: false` volta ao modelo com o motivo.
 3. Política: ferramenta com `perguntar` não roda; o agente recebe "precisa de aprovação" e `aprovacao` registra o que
-   ele ia fazer (num processo, vira a exceção do staff; na suíte, o caso falha). Ferramenta fora do catálogo (servidor
+   ele ia fazer (num processo, vira a exceção do staff; na suíte, o caso falha). Ferramenta irreversível (de qualquer
+   origem) roda sempre como `perguntar`, mesmo gravada antes da regra; o pacote também recusa a irreversível (403). Ferramenta fora do catálogo (servidor
    removido, em quarentena) some do agente.
 4. Suíte: `AvaliarSuiteWorkflow` (Temporal) → activity `agentes.rodar_suite` (30 min, 2 tentativas): cada caso roda o
    agente de verdade e compara (número igual a um centavo; sim/não igual; texto sem acento, caixa e pontuação, igual
@@ -47,9 +55,11 @@ Módulo (schemas.MODULE): "Agentes", categoria Sua empresa, ligado por padrão; 
 
 ## 4. Casos de Borda e Erros Mapeados
 - Membro mexendo em agente → 403 `ERRO_AGENTES_FORBIDDEN`; confiar sem ser operador → 403.
-- Nome repetido → 409 `ERRO_AGENTES_NOME`. Ferramenta fora do catálogo ou repetida → 422 `ERRO_AGENTES_FERRAMENTA`;
+- Nome repetido → 409 `ERRO_AGENTES_NOME`. Ferramenta fora do catálogo, repetida ou irreversível sem `perguntar` →
+  422 `ERRO_AGENTES_FERRAMENTA`;
   dois casos com o mesmo id → 422 `ERRO_AGENTES_CASO`.
 - Avaliar sem casos → 409 `ERRO_AGENTES_SEM_CASOS`. Confiar ou executar num processo um agente em rascunho → 409
   `ERRO_AGENTES_NAO_VERIFICADO`. Agente inexistente ou de outra organização → 404 `ERRO_AGENTES_NAO_ENCONTRADO`.
-- svc-integracoes fora do ar: o catálogo traz só as da plataforma (`integracoes: false`); a ferramenta MCP falha e o
-  agente pede ajuda. Modelo recusado ou plano de IA no limite → o erro do core (README §5.11).
+- svc-integracoes fora do ar: o catálogo fica sem as MCP (`integracoes: false`); a ferramenta MCP falha e o agente
+  pede ajuda. svc-processos fora do ar: sem as ações dos pacotes (`processos: false`). Pacote desligado no plano: a ação
+  some do catálogo e do agente; pacote fora do ar: a ferramenta responde que ele não respondeu. Modelo recusado ou plano de IA no limite → o erro do core (README §5.11).

@@ -15,6 +15,7 @@ FERRAMENTAS_SUBJECT = "rpc.integracoes.ferramentas"  # svc-integracoes: as ferra
 MCP_SUBJECT = "rpc.integracoes.mcp_chamar"  # svc-integracoes: chama a ferramenta com a credencial guardada lá
 DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # svc-integracoes: o texto de um documento recebido
 BUSCA_SUBJECT = "rpc.conhecimento.busca"  # svc-conhecimento: busca no conhecimento da empresa
+ACOES_SUBJECT = "rpc.processos.acoes"  # svc-processos: as ações dos pacotes ligados no plano (rpc.<pacote>.acao roda)
 LIVE_AGENTES = "agentes.agentes"
 
 AGENTES = "agentes_agentes"
@@ -48,24 +49,26 @@ Modo = Literal["permitir", "perguntar"]
 Status = Literal["rascunho", "verificado", "confiavel"]
 Tipo = Literal["texto", "numero", "sim_nao"]
 Valor = str | float | bool
-_REF = r"^(conhecimento|documento|mcp:[A-Za-z0-9_-]{1,64}:[^\s:]{1,128})$"
+_REF = r"^(conhecimento|documento|mcp:[A-Za-z0-9_-]{1,64}:[^\s:]{1,128}|acao:[a-z][a-z0-9-]*\.[a-z][a-z0-9_]{0,39})$"
 
 
 # ── O catálogo: o que um agente pode usar ────────────────────────────────────
 
 class FerramentaCatalogo(BaseModel):
-    ref: str = Field(..., description="conhecimento, documento ou mcp:<servidor>:<ferramenta>")
+    ref: str = Field(..., description="conhecimento, documento, acao:<pacote>.<ação> ou mcp:<servidor>:<ferramenta>")
     nome: str
     descricao: str
-    origem: Literal["plataforma", "mcp"]
+    origem: Literal["plataforma", "pacote", "mcp"]
     servidor_nome: str | None = None
+    pacote: str | None = Field(None, description="origem pacote: o título do pacote (ex.: Financeiro)")
     risco: Risco
     parametros: dict[str, Any] = Field(default_factory=dict)
 
 
 class CatalogoFerramentas(BaseModel):
     itens: list[FerramentaCatalogo]
-    integracoes: bool = Field(True, description="Falso quando o svc-integracoes não respondeu (só as da plataforma)")
+    integracoes: bool = Field(True, description="Falso quando o svc-integracoes não respondeu (sem as MCP)")
+    processos: bool = Field(True, description="Falso quando o svc-processos não respondeu (sem as ações dos pacotes)")
 
 
 # ── O agente ─────────────────────────────────────────────────────────────────
@@ -221,6 +224,23 @@ class FerramentaDisponivel(BaseModel):
 
 class FerramentasDisponiveis(BaseModel):
     itens: list[FerramentaDisponivel]
+
+
+class AcaoDisponivel(BaseModel):
+    """rpc.processos.acoes (svc-processos): uma ação de um pacote ligado no plano."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(..., description="<pacote>.<ação>")
+    title: str
+    description: str
+    risk: Risco
+    pacote: str
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class AcoesDisponiveis(BaseModel):
+    itens: list[AcaoDisponivel]
 
 
 class ChamadaMcp(BaseModel):
