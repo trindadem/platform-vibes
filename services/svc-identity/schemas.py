@@ -17,9 +17,12 @@ TASK_QUEUE = "identity-queue"
 TRIGGER_SUBJECT = "events.identity.trigger"
 TENANT_CREATED_SUBJECT = "events.identity.tenant-created"
 MEMBER_JOINED_SUBJECT = "events.identity.member-joined"
+MEMBER_LEFT_SUBJECT = "events.identity.member-left"  # o svc-staff tira a carteira de quem saiu da Cogniventure
 MEMBERS_LIVE = "identity.membros"  # ao vivo para a organização: alguém entrou ou saiu
 OPERADOR_SUBJECT = "rpc.identity.operador"  # svc-staff: a carteira dá ou tira o papel operador numa organização
 ORGANIZACOES_SUBJECT = "rpc.identity.organizacoes"  # svc-staff: as organizações clientes, para montar a carteira
+CLIENTE_SUBJECT = "rpc.identity.cliente"  # svc-staff: abre a organização de um cliente e convida o dono
+CONVITE_DONO_SUBJECT = "rpc.identity.convite_dono"  # svc-staff: manda de novo o convite do dono que ainda não entrou
 STAFF_SERVICE = "svc-staff"  # o único que chama as RPCs do staff (o NATS só aceita publicação da plataforma)
 ACCESS_LIVE = "identity.acesso"  # ao vivo só para a pessoa: perdeu o acesso a uma organização
 
@@ -216,10 +219,43 @@ class OperadorResultado(BaseModel):
     roles: list[Role]
 
 
+class Dono(BaseModel):
+    name: str
+    email: str
+
+
+class ConvitePendente(BaseModel):
+    email: str | None = Field(None, description="Para quem o convite foi enviado")
+    expires_at: datetime
+
+
 class OrganizacaoResumo(BaseModel):
     id: str
     name: str
     created_at: datetime | None = None
+    dono: Dono | None = Field(None, description="O primeiro dono (null: ninguém entrou como dono ainda)")
+    convite: ConvitePendente | None = Field(None, description="Convite de dono ainda não aceito")
+    ultimo_acesso: datetime | None = Field(None, description="Último acesso de alguém do cliente (o staff operador não conta)")
+
+
+class ClienteNovo(BaseModel):
+    """rpc.identity.cliente: a Cogniventure abre a organização do cliente, sem ninguém dela dentro, e convida o dono."""
+
+    empresa: Name
+    email: Email
+
+
+class ClienteCriado(BaseModel):
+    tenant: str
+    name: str
+    convite: ConvitePendente
+
+
+class ConviteDono(BaseModel):
+    """rpc.identity.convite_dono: o convite do dono de novo (o anterior deixa de valer)."""
+
+    tenant: Id
+    email: Email | None = Field(None, description="Sem ele, o e-mail do último convite de dono")
 
 
 class Organizacoes(BaseModel):
@@ -239,6 +275,11 @@ class MemberJoined(BaseModel):
     tenant: str
     user: str
     roles: list[Role]
+
+
+class MemberLeft(BaseModel):
+    tenant: str
+    user: str
 
 
 class MembersChanged(BaseModel):

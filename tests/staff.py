@@ -70,7 +70,7 @@ def test_gestor_monta_a_carteira_e_a_pessoa_ganha_e_perde_o_papel_operador():
     assert [c["organizacao"] for c in minhas] == ["acme"] and removida["id"] == criada["id"]
     assert operadores == [("otto", "acme", True), ("otto", "acme", False)]  # entrar dá o papel; sair tira
     assert resumo_cliente == {"staff": False, "gestor": False, "excecoes": 0, "atrasadas": 0, "escaladas": 0, "revisoes": 0,
-                              "ajudas": 0, "organizacoes": 0}
+                              "ajudas": 0, "pedidos": 0, "organizacoes": 0}
 
 
 def test_fila_da_carteira_assumir_escalar_e_redistribuir():
@@ -138,3 +138,156 @@ def test_carteira_mostra_a_saude_de_cada_cliente():
     saude = carteira["itens"][0]
     assert (saude["nome"], saude["autonomia"], saude["andamento"], saude["revisoes"], saude["disponivel"]) == ("Acme", 0.75, 2, 1, True)
     assert len(perguntas) == 1
+
+
+def test_gestor_abre_o_cliente_e_acompanha_a_jornada():
+    from core.notify import CONTACTS_SUBJECT
+    from core.plans import ASSIGN_SUBJECT, LIMITS_SUBJECT
+    from core.security import current_tenant
+
+    from schemas import CLIENTE_SUBJECT, CONTEXTO_SUBJECT, CONVITE_DONO_SUBJECT
+
+    async def cenario(app):
+        operadores, planos, criados = [], {}, []
+        orgs = {"items": [{"id": "cogni", "name": "Cogniventure"},
+                          {"id": "acme", "name": "Acme", "dono": {"name": "Bia", "email": "bia@acme.com"},
+                           "ultimo_acesso": "2026-10-04T12:00:00Z"}]}
+        _identidade(app, operadores)
+        app.respond(ORGANIZACOES_SUBJECT, lambda _: orgs)
+        app.respond(CONTACTS_SUBJECT, lambda p: {"tenant_name": "Cogniventure",
+                                                  "items": [{"id": u, "name": u.title(), "email": f"{u}@cogni.com"} for u in p.users if u == "otto"]})
+
+        def cliente(pedido):
+            criados.append(pedido)
+            novo = {"id": "padaria", "name": pedido.empresa, "convite": {"email": pedido.email, "expires_at": "2026-10-11T12:00:00Z"}}
+            orgs["items"].append(novo)
+            return {"tenant": "padaria", "name": pedido.empresa, "convite": novo["convite"]}
+
+        def assign(pedido):
+            planos[current_tenant()] = pedido.plan
+            return {"tenant": current_tenant(), "plan": pedido.plan, "plan_name": pedido.plan.title()}
+
+        def limits(_):
+            plano = planos.get(current_tenant())
+            staff = {"name": "staff", "service": "svc-staff", "title": "Staff", "description": "", "category": "Cogniventure",
+                     "core": False, "default": False, "requires": [], "enabled": current_tenant() == "cogni"}
+            return {"plan": plano, "plan_name": plano.title() if plano else "", "month": "2026-10", "limits": [], "modules": [staff]}
+
+        app.respond(CLIENTE_SUBJECT, cliente)
+        app.respond(CONVITE_DONO_SUBJECT, lambda p: {"email": "dono@padaria.com", "expires_at": "2026-10-12T12:00:00Z"})
+        app.respond(ASSIGN_SUBJECT, assign)
+        app.respond(LIMITS_SUBJECT, limits)
+        app.respond(CONTEXTO_SUBJECT, lambda _: {"concluido_em": "2026-10-03T12:00:00Z", "perfil": {}, "topicos": []})
+        app.respond(ACOMPANHAMENTO_SUBJECT, lambda _: {"andamento": 1, "concluidas": 3, "incidentes": 0, "tarefas_cliente": 0,
+                                                        "tarefas_staff": 0, "atrasadas": 0, "autonomia": 1.0, "processos": [],
+                                                        "aceitos": 2, "publicados": 0})
+        gina, otto = app.user(*GESTORA), app.user(*OTTO)
+        de_fora = await gina.post("/clientes", json={"empresa": "Padaria", "email": "dono@padaria.com", "plano": "pro", "pessoa": "zed"})
+        novo = (await gina.post("/clientes", json={"empresa": "Padaria Pão Quente", "email": "dono@padaria.com", "plano": "pro",
+                                                    "pessoa": "otto"})).json()["data"]
+        lista = (await gina.get("/clientes")).json()["data"]["itens"]
+        de_novo = (await gina.post("/clientes/convite", json={"organizacao": "padaria"})).json()["data"]
+        staff_abre = await otto.post("/clientes", json={"empresa": "Xis", "email": "x@x.com", "plano": "pro", "pessoa": "otto"})
+        return de_fora, novo, lista, de_novo, staff_abre, operadores, planos, criados
+
+    de_fora, novo, lista, de_novo, staff_abre, operadores, planos, criados = service_app(cenario)
+    assert de_fora.json()["error"]["code"] == "ERRO_STAFF_PESSOA" and len(criados) == 1  # nada criado para quem não é do staff
+    assert (novo["organizacao"], novo["plano"], novo["responsaveis"], novo["passo"]) == ("padaria", "Pro", ["otto"], "convite")
+    assert novo["convite"]["email"] == "dono@padaria.com" and planos == {"padaria": "pro"}
+    assert ("otto", "padaria", True) in operadores  # a carteira deu o papel operador
+    por_org = {c["organizacao"]: c for c in lista}
+    assert set(por_org) == {"acme", "padaria"}  # a Cogniventure não é cliente
+    assert (por_org["acme"]["passo"], por_org["acme"]["dono"]["email"], por_org["acme"]["autonomia"]) == ("desenho", "bia@acme.com", 1.0)
+    assert por_org["padaria"]["passo"] == "convite" and de_novo["convite"]["email"] == "dono@padaria.com"
+    assert staff_abre.status_code == 403  # só o gestor abre cliente
+
+
+def test_quem_sai_da_cogniventure_sai_das_carteiras_e_da_fila():
+    from schemas import MEMBER_LEFT_SUBJECT, MemberLeft
+
+    async def cenario(app):
+        operadores = []
+        _identidade(app, operadores)
+        gina = app.user(*GESTORA)
+        await gina.post("/carteiras", json={"pessoa": "otto", "organizacao": "acme"})
+        await gina.post("/carteiras", json={"pessoa": "otto", "organizacao": "beta"})
+        await gina.post("/carteiras", json={"pessoa": "zoe", "organizacao": "acme"})
+        await app.deliver(STAFF_SUBJECT, _item(ref="t1"), who=_de("acme"))
+        item = (await gina.get("/fila", params={"todas": "true"})).json()["data"]["items"][0]
+        await gina.post("/fila/atribuir", json={"id": item["id"], "pessoa": "otto"})
+        await app.deliver(MEMBER_LEFT_SUBJECT, MemberLeft(tenant="acme", user="zoe"),
+                          who=Principal(sub="bia", tenant="acme", roles=frozenset({"owner"})))  # saiu de um cliente: nada muda
+        await app.deliver(MEMBER_LEFT_SUBJECT, MemberLeft(tenant="cogni", user="otto"),
+                          who=Principal(sub="gina", tenant="cogni", roles=frozenset({"admin"})))
+        carteiras = (await gina.get("/carteiras")).json()["data"]["itens"]
+        depois = (await gina.get("/fila", params={"todas": "true"})).json()["data"]["items"][0]
+        return operadores, carteiras, depois
+
+    operadores, carteiras, depois = service_app(cenario)
+    assert ("otto", "acme", False) in operadores and ("otto", "beta", False) in operadores
+    assert [(c["pessoa"], c["organizacao"]) for c in carteiras] == [("zoe", "acme")]
+    assert depois["assumida_por"] is None and depois["atribuida_a"] is None  # volta sem dono (e sobe se o prazo passar)
+
+
+def test_fila_resolve_sem_trocar_de_organizacao_e_o_gestor_ve_os_numeros():
+    from core.notify import CONTACTS_SUBJECT
+    from core.security import current, current_tenant
+
+    from schemas import (ATENDIMENTO_SUBJECT, FILA_DECIDIR_SUBJECT, FILA_RESOLVER_SUBJECT, FILA_REVISAO_SUBJECT, FILA_TAREFA_SUBJECT,
+                         PEDIDO_SUBJECT, RESPONDER_SUBJECT)
+
+    async def cenario(app):
+        _identidade(app, [])
+        chamadas = []
+
+        def registra(nome, resposta):
+            def handler(pedido):
+                chamadas.append((nome, current_tenant(), current().sub, pedido.model_dump()))
+                return resposta
+            return handler
+
+        tarefa = {"id": "t1", "titulo": "Contas a pagar", "nome": "Exceção: Ler o documento", "status": "aberta", "motivo": "Ilegível",
+                  "campos": [{"nome": "valor", "rotulo": "Valor", "tipo": "numero"}], "contexto": [{"rotulo": "Documento", "valor": "b.pdf"}]}
+        revisao = {"processo": "p9", "titulo": "Contas a pagar", "numero": 2, "status": "revisao", "mudancas": ["Limite: 5000 → 10000"]}
+        pedido = {"id": "q1", "assunto": "Boleto não entrou", "status": "aberto",
+                  "mensagens": [{"papel": "cliente", "autor_nome": "Beto", "texto": "Boleto não entrou", "em": "2026-10-04T12:00:00Z"}]}
+        app.respond(FILA_TAREFA_SUBJECT, registra("tarefa", tarefa))
+        app.respond(FILA_RESOLVER_SUBJECT, registra("resolver", {**tarefa, "status": "concluida"}))
+        app.respond(FILA_REVISAO_SUBJECT, registra("revisao", revisao))
+        app.respond(FILA_DECIDIR_SUBJECT, registra("decidir", {**revisao, "status": "publicada"}))
+        app.respond(PEDIDO_SUBJECT, registra("pedido", pedido))
+        app.respond(RESPONDER_SUBJECT, registra("responder", {**pedido, "status": "respondido"}))
+        app.respond(CONTACTS_SUBJECT, lambda p: {"tenant_name": "Cogniventure", "items": [{"id": "otto", "name": "Otto", "email": "o@c.com"}]})
+        gina, otto, zoe = app.user(*GESTORA), app.user(*OTTO), app.user(*ZOE)
+        await gina.post("/carteiras", json={"pessoa": "otto", "organizacao": "acme"})
+        await app.deliver(STAFF_SUBJECT, _item(ref="t1"), who=_de("acme"))
+        await app.deliver(STAFF_SUBJECT, _item(tipo="revisao", ref="p9", titulo="Contas a pagar: revisão da versão 2"), who=_de("acme"))
+        await app.deliver(ATENDIMENTO_SUBJECT, _item(tipo="pedido", ref="q1", titulo="Pedido de ajuda: Boleto não entrou"),
+                          who=Principal(sub="system:svc-atendimento", tenant="acme", roles=frozenset({"system"})))
+        itens = {i["tipo"]: i for i in (await otto.get("/fila")).json()["data"]["items"]}
+        detalhe = (await otto.get("/fila/detalhe", params={"id": itens["excecao"]["id"]})).json()["data"]
+        de_fora = await zoe.get("/fila/detalhe", params={"id": itens["excecao"]["id"]})
+        tipo_errado = await otto.post("/fila/resolver", json={"id": itens["revisao"]["id"], "dados": {}})
+        resolvida = (await otto.post("/fila/resolver", json={"id": itens["excecao"]["id"], "dados": {"valor": 7200}})).json()["data"]
+        de_novo = await otto.post("/fila/resolver", json={"id": itens["excecao"]["id"], "dados": {"valor": 7200}})
+        sem_motivo = await otto.post("/fila/revisao", json={"id": itens["revisao"]["id"], "aprovar": False})
+        devolvida = (await otto.post("/fila/revisao", json={"id": itens["revisao"]["id"], "aprovar": False, "motivo": "Falta o limite"})).json()["data"]
+        respondido = (await otto.post("/fila/responder", json={"id": itens["pedido"]["id"], "texto": "Entrou agora."})).json()["data"]
+        await app.deliver(STAFF_SUBJECT, _item(ref="t1", status="concluida"), who=_de("acme"))  # o aviso do processo chega depois
+        numeros = (await gina.get("/numeros", params={"dias": 7})).json()["data"]
+        otto_numeros = await otto.get("/numeros")
+        return detalhe, de_fora, tipo_errado, resolvida, de_novo, sem_motivo, devolvida, respondido, numeros, otto_numeros, chamadas
+
+    detalhe, de_fora, tipo_errado, resolvida, de_novo, sem_motivo, devolvida, respondido, numeros, otto_numeros, chamadas = service_app(cenario)
+    assert detalhe["tarefa"]["motivo"] == "Ilegível" and detalhe["tarefa"]["campos"][0]["rotulo"] == "Valor"
+    assert de_fora.status_code == 403 and tipo_errado.json()["error"]["code"] == "ERRO_STAFF_TIPO"
+    assert (resolvida["status"], resolvida["resolvida_por"]) == ("concluida", "otto") and de_novo.status_code == 409
+    assert sem_motivo.json()["error"]["code"] == "ERRO_STAFF_MOTIVO" and devolvida["status"] == "concluida"
+    assert respondido["resolvida_por"] == "otto"
+    feitas = {nome: (org, quem, corpo) for nome, org, quem, corpo in chamadas}
+    assert feitas["resolver"] == ("acme", "system:svc-staff", {"id": "t1", "dados": {"valor": 7200}, "comentario": None, "regra": None, "por": "otto"})
+    assert feitas["decidir"][2] == {"processo": "p9", "aprovar": False, "motivo": "Falta o limite", "por": "otto"}
+    assert feitas["responder"][2] == {"id": "q1", "texto": "Entrou agora.", "por": "otto", "por_nome": "Otto"}
+    assert [(p["chave"], p["resolvidos"], p["no_prazo"]) for p in numeros["pessoas"]] == [("otto", 3, 3)]
+    assert [(c["chave"], c["resolvidos"], c["abertos"]) for c in numeros["clientes"]] == [("acme", 3, 0)]
+    assert otto_numeros.status_code == 403  # números são do gestor

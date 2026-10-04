@@ -1,12 +1,15 @@
 // Área do staff da Cogniventure: só compõe o catálogo (src/components/CATALOG.md, README §6). Fonte da verdade:
-// specs/staff.md. A fila e a carteira ficam na organização da Cogniventure; para resolver, a pessoa entra na do cliente.
+// specs/staff.md. A fila e a carteira ficam na organização da Cogniventure; exceção, revisão e pedido de ajuda se
+// resolvem no próprio cartão, sem trocar de organização (a conversa de desenho abre no cliente).
 import { useState } from "react";
 import { useNavigate } from "react-router";
 import type { PageMeta } from "@/App";
+import { ActionForm } from "@/components/ActionForm";
 import { Alert } from "@/components/Alert";
 import { Badge } from "@/components/Badge";
 import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
+import { ChatThread } from "@/components/ChatThread";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { DataTable } from "@/components/DataTable";
 import { DateTime } from "@/components/DateTime";
@@ -17,20 +20,33 @@ import { Page } from "@/components/Page";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
 import { SelectField } from "@/components/SelectField";
+import { SidePanel } from "@/components/SidePanel";
 import { Stack } from "@/components/Stack";
 import { Stat } from "@/components/Stat";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
+import { TextArea } from "@/components/TextArea";
 import { Toggle } from "@/components/Toggle";
 import { useAction, useLiveQuery, useQuery } from "@/core/api";
 import { switchTenant, useSession } from "@/core/auth";
-import { identity, type StaffItemFila, type StaffResumo, staff } from "@/core/contracts";
+import { identity, plans, type StaffCliente, type StaffItemFila, type StaffResumo, staff } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Staff", module: "staff" };
 
-const TIPOS = { excecao: "Exceção", revisao: "Revisão", ajuda: "Ajuda no desenho" };
-const TONS = { excecao: "warning", revisao: "accent", ajuda: "accent" } as const;
+const TIPOS = { excecao: "Exceção", revisao: "Revisão", ajuda: "Ajuda no desenho", pedido: "Pedido de ajuda" };
+const TONS = { excecao: "warning", revisao: "accent", ajuda: "accent", pedido: "accent" } as const;
+const PERIODOS = [
+  { value: "7", label: "Últimos 7 dias" },
+  { value: "30", label: "Últimos 30 dias" },
+  { value: "90", label: "Últimos 90 dias" },
+];
+
+/** Minutos em texto curto: 45 min, 3 h 10 min. */
+const duracao = (min: number | null) =>
+  min === null ? "—" : min < 1 ? "menos de 1 min" : min < 60 ? `${Math.round(min)} min` : `${Math.floor(min / 60)} h ${Math.round(min % 60)} min`;
+const PASSOS = { convite: "Convite pendente", briefing: "Briefing", descoberta: "Descoberta", desenho: "Desenho", acompanhamento: "Acompanhamento" };
+const TONS_PASSO = { convite: "warning", briefing: "neutral", descoberta: "neutral", desenho: "accent", acompanhamento: "success" } as const;
 
 export default function Staff() {
   const resumo = useLiveQuery("staff.fila", staff.resumo);
@@ -55,14 +71,20 @@ function Area({ resumo }: { resumo: StaffResumo }) {
       <Grid cols={4}>
         <Stat label="Exceções abertas" value={resumo.excecoes} hint={`${resumo.atrasadas} atrasada${resumo.atrasadas === 1 ? "" : "s"}`} tone={resumo.atrasadas ? "danger" : "default"} />
         <Stat label="Revisões" value={resumo.revisoes} hint="versões esperando aprovação" />
-        <Stat label="Pedidos de ajuda" value={resumo.ajudas} hint="no desenho dos processos" />
+        <Stat label="Pedidos de ajuda" value={resumo.pedidos + resumo.ajudas} hint={`${resumo.ajudas} no desenho dos processos`} />
         <Stat label={resumo.gestor ? "Escaladas" : "Clientes"} value={resumo.gestor ? resumo.escaladas : resumo.organizacoes} hint={resumo.gestor ? "passaram do prazo sem dono" : "na sua carteira"} tone={resumo.gestor && resumo.escaladas ? "danger" : "default"} />
       </Grid>
       <Tabs
         tabs={[
           { id: "fila", label: "Fila", content: <Fila gestor={resumo.gestor} /> },
           { id: "carteira", label: "Carteira", content: <Carteira /> },
-          ...(resumo.gestor ? [{ id: "gestao", label: "Gestão das carteiras", content: <Gestao /> }] : []),
+          ...(resumo.gestor
+            ? [
+                { id: "clientes", label: "Clientes", content: <Clientes /> },
+                { id: "numeros", label: "Números", content: <NumerosDoStaff /> },
+                { id: "gestao", label: "Gestão das carteiras", content: <Gestao /> },
+              ]
+            : []),
         ]}
       />
     </Stack>
@@ -120,6 +142,7 @@ function ItemDaFila({ item, gestor, pessoas, nome, onDone }: {
 }) {
   const session = useSession();
   const [para, setPara] = useState("");
+  const [resolvendo, setResolvendo] = useState(false);
   const entrar = useEntrar();
   const assumir = useAction(staff.assumir, { onSuccess: onDone });
   const atribuir = useAction(staff.atribuir, { onSuccess: () => { setPara(""); onDone(); } });
@@ -149,14 +172,26 @@ function ItemDaFila({ item, gestor, pessoas, nome, onDone }: {
                 Assumir
               </Button>
             )}
-            <Button size="sm" loading={entrar.running} onClick={() => void entrar.run(item.organizacao, item.link)}>
-              Abrir no cliente
-            </Button>
+            {item.tipo === "ajuda" ? (
+              <Button size="sm" loading={entrar.running} onClick={() => void entrar.run(item.organizacao, item.link)}>
+                Abrir no cliente
+              </Button>
+            ) : (
+              <>
+                <Button size="sm" variant="secondary" loading={entrar.running} onClick={() => void entrar.run(item.organizacao, item.link)}>
+                  Abrir no cliente
+                </Button>
+                <Button size="sm" onClick={() => setResolvendo(!resolvendo)}>
+                  {resolvendo ? "Fechar" : "Resolver aqui"}
+                </Button>
+              </>
+            )}
           </Row>
         </Row>
       }
     >
       {falha && <Alert tone="danger">{falha.message}</Alert>}
+      {resolvendo && <Resolucao item={item} onDone={onDone} />}
       {gestor && (
         <Row align="end">
           <SelectField label="Passar para" value={para} onChange={setPara} options={pessoas} placeholder="Escolha alguém do staff" />
@@ -166,6 +201,143 @@ function ItemDaFila({ item, gestor, pessoas, nome, onDone }: {
         </Row>
       )}
     </Card>
+  );
+}
+
+/** Resolver no cartão: o serviço do item responde pela organização do cliente, com quem do staff resolveu. */
+function Resolucao({ item, onDone }: { item: StaffItemFila; onDone: () => void }) {
+  const detalhe = useQuery(staff.detalhe, { id: item.id });
+  const [comentario, setComentario] = useState("");
+  const [regra, setRegra] = useState("");
+  const [motivo, setMotivo] = useState("");
+  const resolver = useAction(staff.resolver, { onSuccess: onDone });
+  const decidir = useAction(staff.decidir, { onSuccess: onDone });
+  const responder = useAction(staff.responder, { onSuccess: onDone });
+  return (
+    <QueryView query={detalhe}>
+      {(d) => {
+        if (d.tarefa) {
+          const t = d.tarefa;
+          const enviar = {
+            ...resolver,
+            run: (dados: Record<string, string | number | boolean | null>) =>
+              resolver.run({ id: item.id, dados, comentario: comentario || null, regra: regra || null }),
+          };
+          return (
+            <Stack>
+              {t.motivo && <Alert tone="warning" title="Por que parou">{t.motivo}</Alert>}
+              {t.contexto.length > 0 && <KeyValue items={t.contexto.map((i) => ({ label: i.rotulo, value: i.valor }))} />}
+              <TextArea label="O que você fez (opcional)" value={comentario} onChange={setComentario} rows={2} />
+              {t.aprende && (
+                <TextArea
+                  label="Ensinar ao agente (opcional)"
+                  value={regra}
+                  onChange={setRegra}
+                  rows={2}
+                  hint="Vira regra do passo: o agente refaz este caso com ela e, se chegar ao que você preencheu, passa a segui-la."
+                />
+              )}
+              <ActionForm
+                action={enviar}
+                submitLabel="Resolver e seguir o processo"
+                initial={Object.fromEntries(t.campos.map((c) => [c.nome, c.valor === null || c.valor === undefined ? "" : String(c.valor)]))}
+                fields={t.campos.map((c) => ({ name: c.nome, label: c.rotulo, kind: c.tipo === "numero" ? "number" : c.tipo === "sim_nao" ? "boolean" : "text" }))}
+              />
+            </Stack>
+          );
+        }
+        if (d.revisao) {
+          const r = d.revisao;
+          return (
+            <Stack>
+              <Text>Versão {r.numero} de {r.titulo}. O que muda em relação à publicada:</Text>
+              {r.mudancas.length ? (
+                <KeyValue items={r.mudancas.map((m, i) => ({ label: `${i + 1}.`, value: m }))} />
+              ) : (
+                <Text size="sm" tone="muted">Nenhuma mudança listada.</Text>
+              )}
+              {decidir.error && <Alert tone="danger">{decidir.error.message}</Alert>}
+              <Row>
+                <Button loading={decidir.running} onClick={() => void decidir.run({ id: item.id, aprovar: true })}>
+                  Aprovar e publicar
+                </Button>
+              </Row>
+              <TextArea label="Para devolver: o que precisa mudar" value={motivo} onChange={setMotivo} rows={2} />
+              <Row>
+                <Button variant="secondary" disabled={motivo.trim().length < 3} loading={decidir.running} onClick={() => void decidir.run({ id: item.id, aprovar: false, motivo })}>
+                  Devolver para a empresa
+                </Button>
+              </Row>
+            </Stack>
+          );
+        }
+        if (d.pedido) {
+          return (
+            <ChatThread
+              messages={d.pedido.mensagens.map((m, i) => ({
+                id: String(i),
+                role: m.papel === "staff" ? "assistant" : "user",
+                author: m.papel === "staff" ? `Cogniventure · ${m.autor_nome ?? "staff"}` : (m.autor_nome ?? undefined),
+                text: m.texto,
+              }))}
+              onSend={(texto) => void responder.run({ id: item.id, texto })}
+              sending={responder.running}
+              error={responder.error?.message}
+              assistant="Staff da Cogniventure"
+              placeholder="Responder ao cliente"
+            />
+          );
+        }
+        return <Text tone="muted">Este item se resolve na tela do cliente.</Text>;
+      }}
+    </QueryView>
+  );
+}
+
+/** Para o gestor equilibrar as carteiras: por pessoa e por cliente, resolvidos, no prazo e tempo médio. */
+function NumerosDoStaff() {
+  const [dias, setDias] = useState("30");
+  const numeros = useLiveQuery("staff.fila", staff.numeros, { dias: Number(dias) });
+  const membros = useQuery(identity.members);
+  const nome = (id: string) => membros.data?.items.find((m) => m.id === id)?.name ?? "alguém do staff";
+  const prazo = (r: { resolvidos: number; no_prazo: number }) => (r.resolvidos ? `${Math.round((100 * r.no_prazo) / r.resolvidos)}%` : "—");
+  return (
+    <Stack>
+      <Row>
+        <SelectField label="Período" value={dias} onChange={setDias} options={PERIODOS} />
+      </Row>
+      <QueryView query={numeros}>
+        {(n) => (
+          <Stack>
+            <DataTable
+              rows={n.pessoas}
+              rowKey={(r) => r.chave}
+              caption="Por pessoa do staff"
+              empty="Ninguém resolveu nada no período."
+              columns={[
+                { key: "chave", header: "Pessoa", render: (r) => nome(r.chave) },
+                { key: "resolvidos", header: "Resolvidos" },
+                { key: "no_prazo", header: "No prazo", render: prazo },
+                { key: "tempo_medio_min", header: "Tempo médio", render: (r) => duracao(r.tempo_medio_min ?? null) },
+              ]}
+            />
+            <DataTable
+              rows={n.clientes}
+              rowKey={(r) => r.chave}
+              caption="Por cliente"
+              empty="Nenhum item no período."
+              columns={[
+                { key: "nome", header: "Cliente", render: (r) => r.nome ?? r.chave },
+                { key: "abertos", header: "Abertos agora" },
+                { key: "resolvidos", header: "Resolvidos" },
+                { key: "no_prazo", header: "No prazo", render: prazo },
+                { key: "tempo_medio_min", header: "Tempo médio", render: (r) => duracao(r.tempo_medio_min ?? null) },
+              ]}
+            />
+          </Stack>
+        )}
+      </QueryView>
+    </Stack>
   );
 }
 
@@ -189,6 +361,7 @@ function Carteira() {
                         {s.excecoes > 0 && <Badge tone="warning">{s.excecoes} exceç{s.excecoes === 1 ? "ão" : "ões"}</Badge>}
                         {s.revisoes > 0 && <Badge tone="accent">{s.revisoes} revis{s.revisoes === 1 ? "ão" : "ões"}</Badge>}
                         {s.ajudas > 0 && <Badge tone="accent">{s.ajudas} ajuda{s.ajudas === 1 ? "" : "s"}</Badge>}
+                        {s.pedidos > 0 && <Badge tone="accent">{s.pedidos} pedido{s.pedidos === 1 ? "" : "s"}</Badge>}
                       </Row>
                       <Button size="sm" variant="secondary" loading={entrar.running} onClick={() => void entrar.run(s.organizacao, "/workspace")}>
                         Entrar
@@ -216,6 +389,74 @@ function Carteira() {
           )
         }
       </QueryView>
+    </Stack>
+  );
+}
+
+/** O gestor abre clientes (organização, convite do dono, plano e carteira) e acompanha cada um pela jornada. */
+function Clientes() {
+  const clientes = useLiveQuery("staff.carteiras", staff.clientes);
+  const planos = useQuery(plans.list);
+  const membros = useQuery(identity.members);
+  const [abrindo, setAbrindo] = useState(false);
+  const novo = useAction(staff.novoCliente, { onSuccess: clientes.reload });
+  const convidar = useAction(staff.convidarDono, { onSuccess: clientes.reload });
+  const nome = (id: string) => membros.data?.items.find((m) => m.id === id)?.name ?? "alguém do staff";
+  const dono = (c: StaffCliente) =>
+    c.dono ? (
+      `${c.dono.name} (${c.dono.email})`
+    ) : c.convite ? (
+      <Row gap="sm">
+        <Text size="sm" tone="muted">Convite para {c.convite.email ?? "o dono"}, vale até <DateTime value={c.convite.expires_at} format="date" /></Text>
+        <Button size="sm" variant="secondary" loading={convidar.running} onClick={() => void convidar.run({ organizacao: c.organizacao })}>
+          Reenviar
+        </Button>
+      </Row>
+    ) : (
+      <Button size="sm" variant="secondary" loading={convidar.running} onClick={() => void convidar.run({ organizacao: c.organizacao })}>
+        Convidar de novo
+      </Button>
+    );
+  return (
+    <Stack>
+      <Row justify="between">
+        <Text tone="muted">Cada cliente nasce aqui: a organização dele, o plano, quem do staff cuida e o convite do dono por e-mail.</Text>
+        <Button onClick={() => setAbrindo(true)}>Novo cliente</Button>
+      </Row>
+      {convidar.error && <Alert tone="danger">{convidar.error.message}</Alert>}
+      <QueryView query={clientes}>
+        {(c) => (
+          <DataTable
+            rows={c.itens}
+            rowKey={(r) => r.organizacao}
+            caption="Clientes da Cogniventure"
+            empty="Nenhum cliente ainda: abra o primeiro em Novo cliente."
+            columns={[
+              { key: "nome", header: "Cliente" },
+              { key: "plano", header: "Plano", render: (r) => r.plano ?? "Sem plano" },
+              { key: "responsaveis", header: "Com quem", render: (r) => (r.responsaveis.length ? r.responsaveis.map(nome).join(", ") : "Ninguém") },
+              { key: "passo", header: "Jornada", render: (r) => (r.passo ? <StatusBadge value={r.passo} labels={PASSOS} tones={TONS_PASSO} /> : "—") },
+              { key: "ultimo_acesso", header: "Último acesso", render: (r) => (r.ultimo_acesso ? <DateTime value={r.ultimo_acesso} format="relative" /> : "Nunca") },
+              { key: "dono", header: "Dono", render: dono },
+            ]}
+          />
+        )}
+      </QueryView>
+      <SidePanel open={abrindo} onClose={() => setAbrindo(false)} title="Novo cliente" description="A organização nasce sem ninguém da Cogniventure dentro; o dono recebe o convite por e-mail e quem cuida dele ganha o papel operador.">
+        {abrindo && (
+          <ActionForm
+            action={novo}
+            submitLabel="Abrir o cliente"
+            onDone={() => setAbrindo(false)}
+            fields={[
+              { name: "empresa", label: "Empresa", required: true },
+              { name: "email", label: "E-mail do dono", kind: "email", required: true, hint: "Recebe o convite para criar a senha e começar pelo briefing." },
+              { name: "plano", label: "Plano", kind: "select", required: true, options: (planos.data?.items ?? []).map((p) => ({ value: p.slug, label: p.name })) },
+              { name: "pessoa", label: "Quem do staff cuida", kind: "select", required: true, options: (membros.data?.items ?? []).map((m) => ({ value: m.id, label: `${m.name} (${m.email})` })) },
+            ]}
+          />
+        )}
+      </SidePanel>
     </Stack>
   );
 }

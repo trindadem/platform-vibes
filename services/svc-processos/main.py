@@ -8,6 +8,7 @@ HTTP /desenho...                 → desenho do processo aceito: abrir, conversa
 HTTP /execucoes..., /tarefas..., /acompanhamento → execuções no motor, tarefas de pessoas e autonomia.
 HTTP /desenho/revisao, /aprovar, /devolver, /ajuda... e /regras... → o staff no setup (revisão, ajuda) e o que ele ensina.
 NATS rpc.processos.acompanhamento → a saúde da organização para a carteira do staff (svc-staff).
+NATS rpc.processos.fila_*        → o staff vê e resolve exceções e revisões pela fila, sem trocar de organização.
 NATS events.processos.catalogo   → os pacotes declaram as ações e os modelos (core/processes.py); o catálogo fica aqui.
 NATS events.integracoes.evento   → inicia os processos daquele gatilho e entrega mensagens às execuções que esperam.
 NATS events.processos.evento     → o mesmo, para os acontecimentos dos pacotes (vendas.pedido_proposta...).
@@ -33,6 +34,10 @@ from core.temporal_runner import runner
 
 from schemas import (
     ACOMPANHAMENTO_SUBJECT,
+    FILA_DECIDIR_SUBJECT,
+    FILA_RESOLVER_SUBJECT,
+    FILA_REVISAO_SUBJECT,
+    FILA_TAREFA_SUBJECT,
     CATALOG_SUBJECT,
     EVENT_SUBJECT,
     PACOTE_SUBJECT,
@@ -51,6 +56,7 @@ from schemas import (
     DesenhoRef,
     AjudaIn,
     Devolucao,
+    DecisaoStaff,
     Empty,
     EventoExterno,
     ExecucaoQuery,
@@ -60,9 +66,12 @@ from schemas import (
     PassoFeito,
     RegraQuery,
     RegraRef,
+    ResolucaoStaff,
     Resposta,
+    RevisaoRef,
     RevisaoIn,
     TarefaQuery,
+    TarefaRef,
     ProcessoQuery,
     ProcessoRef,
     ProjetoQuery,
@@ -88,6 +97,10 @@ async def lifespan(app: FastAPI):
         await bus.subscribe(PACOTE_SUBJECT, svc.receber_evento, model=EventoExterno)  # o mesmo formato (core/processes.py)
         await bus.subscribe(STEP_SUBJECT, svc.registrar_passo, model=PassoFeito)
         await bus.respond(ACOMPANHAMENTO_SUBJECT, svc.acompanhamento, model=Empty)  # svc-staff: a saúde da carteira
+        await bus.respond(FILA_TAREFA_SUBJECT, svc.fila_tarefa, model=TarefaRef)  # svc-staff: resolver pela fila
+        await bus.respond(FILA_RESOLVER_SUBJECT, svc.fila_resolver, model=ResolucaoStaff)
+        await bus.respond(FILA_REVISAO_SUBJECT, svc.fila_revisao, model=RevisaoRef)
+        await bus.respond(FILA_DECIDIR_SUBJECT, svc.fila_decidir, model=DecisaoStaff)
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
     await camunda.close()

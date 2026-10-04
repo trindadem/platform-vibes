@@ -16,19 +16,22 @@
  *
  * A moldura usa o nome, o logo e a cor da organização ativa (svc-identity).
  */
-import { type ComponentType, createContext, type ReactNode, useContext } from "react";
+import { type ComponentType, createContext, type ReactNode, useContext, useState } from "react";
 import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from "react-router";
+import { ActionForm } from "@/components/ActionForm";
 import { AppShell, type NavItem } from "@/components/AppShell";
 import { AuthShell } from "@/components/AuthShell";
 import { Button } from "@/components/Button";
 import { EmptyState } from "@/components/EmptyState";
 import { NotificationBell } from "@/components/NotificationBell";
+import { Row } from "@/components/Row";
 import { SessionStatus } from "@/components/SessionStatus";
+import { SidePanel } from "@/components/SidePanel";
 import { Spinner } from "@/components/Spinner";
 import { TenantSwitcher } from "@/components/TenantSwitcher";
-import { useLiveQuery, useQuery } from "@/core/api";
+import { useAction, useLiveQuery, useQuery } from "@/core/api";
 import { logout, type Session, switchTenant, useAuthState } from "@/core/auth";
-import { appModules, identity, type ModuleName, notify, plans } from "@/core/contracts";
+import { appModules, atendimento, identity, type ModuleName, notify, plans } from "@/core/contracts";
 
 const BRAND = "CV-Frame";
 const LOGIN = "/entrar";
@@ -156,7 +159,15 @@ function TenantShell({ session }: { session: Session }) {
   return (
     <ModulesContext.Provider value={included}>
       <AppShell
-        actions={tenant && <UnreadBell />}
+        actions={
+          tenant && (
+            <Row gap="sm">
+              <BackToQueue session={session} />
+              <HelpButton />
+              <UnreadBell />
+            </Row>
+          )
+        }
         brand={organization.data?.name ?? tenant?.name ?? BRAND}
         logo={organization.data?.logo_url}
         color={organization.data?.color}
@@ -210,6 +221,47 @@ function ModuleGate({ module, children }: { module?: ModuleName; children: React
 function UnreadBell() {
   const unread = useLiveQuery("notify.nova", notify.unread);
   return <NotificationBell count={unread.data?.count ?? 0} />;
+}
+
+/** O staff dentro de um cliente (só operador ali) volta à fila da Cogniventure com um clique (specs/staff.md). */
+function BackToQueue({ session }: { session: Session }) {
+  const navigate = useNavigate();
+  const roles = session.tenant?.roles ?? [];
+  const casa = session.tenants.find((t) => t.roles.some((r) => r !== "operador"));
+  if (!casa || roles.length !== 1 || roles[0] !== "operador") return null;
+  return (
+    <Button size="sm" variant="secondary" onClick={() => void switchTenant(casa.id).then(() => navigate("/staff"))}>
+      Voltar à fila do staff
+    </Button>
+  );
+}
+
+/** Falar com a Cogniventure, de qualquer tela (specs/atendimento.md): o pedido leva a tela de onde a pessoa pediu. */
+function HelpButton() {
+  const resumo = useQuery(atendimento.resumo);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [aberto, setAberto] = useState(false);
+  const abrir = useAction(atendimento.abrir, { onSuccess: (pedido) => navigate(`/atendimento?pedido=${pedido.id}`) });
+  if (!resumo.data?.pode_pedir) return null;
+  const enviar = { ...abrir, run: (body: { texto: string }) => abrir.run({ ...body, pagina: location.pathname }) };
+  return (
+    <Row gap="sm">
+      <Button size="sm" variant="secondary" onClick={() => setAberto(true)}>
+        Falar com a Cogniventure
+      </Button>
+      <SidePanel open={aberto} onClose={() => setAberto(false)} title="Falar com a Cogniventure" description="Conte o que precisa: o staff responde em até 4 horas, e a resposta chega no sino.">
+        {aberto && (
+          <ActionForm
+            action={enviar}
+            submitLabel="Enviar pedido"
+            onDone={() => setAberto(false)}
+            fields={[{ name: "texto", label: "Como podemos ajudar?", kind: "textarea", required: true, placeholder: "O boleto da Leite Bom não entrou no contas a pagar..." }]}
+          />
+        )}
+      </SidePanel>
+    </Row>
+  );
 }
 
 /** Login e cadastro só fazem sentido sem sessão: quem já entrou segue para ?next= (só rotas internas) ou o início. */

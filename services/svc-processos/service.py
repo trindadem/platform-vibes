@@ -38,11 +38,12 @@ from core.processes import (
     step_outputs,
     to_bpmn,
 )
-from core.security import acting_as, current, current_tenant, system
+from core.security import SYSTEM_PREFIX, Principal, acting_as, current, current_tenant, system
 from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
 
 from schemas import (
+    STAFF_SERVICE,
     AGENTES_EXECUTAR_SUBJECT,
     AGENTES_LISTA_SUBJECT,
     AgenteDaEmpresa,
@@ -106,6 +107,7 @@ from schemas import (
     Descricao,
     Desenho,
     DesenhoMudou,
+    DecisaoStaff,
     DesenhoRef,
     Desligamento,
     Devolucao,
@@ -147,7 +149,10 @@ from schemas import (
     RegraRef,
     Regras,
     RemocaoPasso,
+    ResolucaoStaff,
     Resposta,
+    RevisaoRef,
+    RevisaoResumo,
     Resumo,
     RevisaoIn,
     SaidaAgente,
@@ -158,6 +163,7 @@ from schemas import (
     TarefaMudou,
     TarefaPage,
     TarefaQuery,
+    TarefaRef,
     Versao,
     VersaoResumo,
 )
@@ -544,6 +550,41 @@ class ProcessosService:
             itens.append(Projeto(id=raiz.id, titulo=raiz.titulo, resumo=raiz.resumo, status=status, etapas=delas, created_at=raiz.created_at))
         return ProjetoPage(items=itens, total=raizes.total, page=raizes.page, size=raizes.size, pages=raizes.pages)
 
+    # ── A fila do staff resolve sem trocar de organização (só o svc-staff) ──
+
+    async def fila_tarefa(self, data: TarefaRef) -> Tarefa:
+        """rpc.processos.fila_tarefa: a exceção inteira (campos, contexto, motivo), para o cartão da fila."""
+        _da_fila()
+        row = await db.select(f"{TAREFAS}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Tarefa não encontrada.", 404)
+        return Tarefa.model_validate(row)
+
+    async def fila_resolver(self, data: ResolucaoStaff) -> Tarefa:
+        """rpc.processos.fila_resolver: o staff resolve a exceção pela fila, como se estivesse na tela do cliente."""
+        _da_fila()
+        with acting_as(_como_operador(data.por)):
+            return await self.responder(Resposta(id=data.id, dados=data.dados, comentario=data.comentario, regra=data.regra))
+
+    async def fila_revisao(self, data: RevisaoRef) -> RevisaoResumo:
+        """rpc.processos.fila_revisao: a versão em revisão e o que ela muda na publicada, para o cartão da fila."""
+        _da_fila()
+        desenho = await _desenho(data.processo)
+        return RevisaoResumo(processo=desenho.processo.id, titulo=desenho.processo.titulo, numero=desenho.versao.numero,
+                             status=desenho.versao.status, mudancas=desenho.mudancas)
+
+    async def fila_decidir(self, data: DecisaoStaff) -> RevisaoResumo:
+        """rpc.processos.fila_decidir: o staff aprova (publica) ou devolve a versão em revisão pela fila."""
+        _da_fila()
+        with acting_as(_como_operador(data.por)):
+            if data.aprovar:
+                await self.aprovar_revisao(DesenhoRef(processo=data.processo))
+            else:
+                if not data.motivo:
+                    raise ServiceError("ERRO_PROCESSOS_RESPOSTA", "Diga o que precisa mudar.", 422)
+                await self.devolver(Devolucao(processo=data.processo, motivo=data.motivo))
+        return await self.fila_revisao(RevisaoRef(processo=data.processo))
+
     async def tarefas(self, data: TarefaQuery) -> TarefaPage:
         return await db.page(TAREFAS, data, TarefaPage)
 
@@ -587,6 +628,7 @@ class ProcessosService:
         """O passo de acompanhamento da jornada: execuções, tarefas, atrasos e autonomia por processo e por versão."""
         execucoes = await db.query(f"SELECT processo, titulo, versao, status, handoffs FROM {EXECUCOES} WHERE tenant = $tenant")
         abertas = await db.query(f"SELECT responsavel, prazo FROM {TAREFAS} WHERE tenant = $tenant AND status = 'aberta'")
+        aceitos = await db.query(f"SELECT publicada FROM {PROCESSOS} WHERE tenant = $tenant AND status = 'aceito'")
         agora = datetime.now(UTC)
         processos: dict[str, AcompanhamentoProcesso] = {}
         for pid in dict.fromkeys(e["processo"] for e in execucoes):
@@ -602,7 +644,8 @@ class ProcessosService:
             tarefas_cliente=sum(1 for t in abertas if t["responsavel"] == "cliente"),
             tarefas_staff=sum(1 for t in abertas if t["responsavel"] == "staff"),
             atrasadas=sum(1 for t in abertas if t.get("prazo") and _quando(t["prazo"]) < agora),
-            autonomia=_autonomia(execucoes).autonomia, processos=list(processos.values()))
+            autonomia=_autonomia(execucoes).autonomia, processos=list(processos.values()),
+            aceitos=len(aceitos), publicados=sum(1 for p in aceitos if p.get("publicada")))
 
     async def registrar_passo(self, data: PassoFeito) -> Empty:
         """events.processos.passo: o worker de um pacote concluiu um passo, mandou ao staff ou abriu incidente."""
@@ -960,6 +1003,17 @@ def _desenhista() -> Any:
     return who
 
 
+def _da_fila() -> None:
+    who = current()
+    if who is None or who.sub != f"{SYSTEM_PREFIX}{STAFF_SERVICE}" or not who.tenant:
+        raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só o serviço do staff faz isso.", 403)
+
+
+def _como_operador(pessoa: str) -> Principal:
+    """A pessoa do staff na organização do cliente (o svc-staff conferiu a carteira, que dá o papel operador)."""
+    return Principal(sub=pessoa, tenant=current_tenant(), roles=frozenset({"operador"}))
+
+
 def _operador() -> Any:
     who = current()
     if who is None or not (who.is_system or OPERADORES & who.roles):
@@ -1149,7 +1203,11 @@ def _comparar(esperado: dict[str, Any], saida: dict[str, Any]) -> Avaliacao:
 
 
 async def _ao_staff(item: ItemStaff) -> None:
-    """Publica para a fila da carteira (svc-staff) como a plataforma: o módulo do staff não é da organização."""
+    """Publica para a fila da carteira (svc-staff) como a plataforma: o módulo do staff não é da organização. O item
+    concluído leva quem resolveu (os números do gestor)."""
+    who = current()
+    if item.status == "concluida" and item.por is None and who is not None and not who.is_system:
+        item = item.model_copy(update={"por": who.sub})
     with acting_as(system(SERVICE, current_tenant())):
         await bus.publish(STAFF_SUBJECT, item, msg_id=f"staff-{current_tenant()}-{item.tipo}-{item.ref}-{item.status}-{int(item.em.timestamp())}")
 

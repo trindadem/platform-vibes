@@ -24,7 +24,9 @@ from core.temporal_runner import runner
 from core.webhooks import webhooks
 
 from schemas import (
+    CLIENTE_SUBJECT,
     CONTACTS_SUBJECT,
+    CONVITE_DONO_SUBJECT,
     COOKIE_PATH,
     MODULE,
     OPERADOR_SUBJECT,
@@ -37,8 +39,10 @@ from schemas import (
     TRIGGER_SUBJECT,
     UNIQUE,
     WEBHOOKS,
+    ClienteNovo,
     ColorInput,
     ContactsRequest,
+    ConviteDono,
     Empty,
     ForgotInput,
     InviteCode,
@@ -82,6 +86,8 @@ async def lifespan(app: FastAPI):
         await bus.respond(CONTACTS_SUBJECT, svc.contacts, model=ContactsRequest)  # svc-notify: quem são as pessoas
         await bus.respond(OPERADOR_SUBJECT, svc.operador, model=OperadorAcesso)  # svc-staff: a carteira
         await bus.respond(ORGANIZACOES_SUBJECT, svc.organizacoes, model=Empty)  # svc-staff: as organizações clientes
+        await bus.respond(CLIENTE_SUBJECT, svc.cliente, model=ClienteNovo)  # svc-staff: abre o cliente e convida o dono
+        await bus.respond(CONVITE_DONO_SUBJECT, svc.convite_dono, model=ConviteDono)  # svc-staff: o convite de novo
         await webhooks.declare(WEBHOOKS)  # membro-entrou e membro-saiu no catálogo (README §5.16)
         await plans.declare(MODULE)  # o módulo, com pessoas por organização, no catálogo dos planos (README §5.17)
         yield

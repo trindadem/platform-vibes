@@ -971,3 +971,38 @@ def test_proposta_recusada_nao_inicia_nada_e_o_gatilho_por_processo_e_conferido_
     assert any("nunca termina como ganha" in p["texto"] for p in fim_errado["problemas"] if p["nivel"] == "aviso")
     assert any("ele mesmo termina" in p["texto"] for p in ele_mesmo["problemas"] if p["nivel"] == "erro")
     assert publicar.json()["error"]["code"] == "ERRO_PROCESSOS_FLUXO_INVALIDO"
+
+
+# ── A fila do staff resolve sem trocar de organização (alinhamento pós-N7, item 12) ──
+
+def test_staff_resolve_a_excecao_pela_fila_e_o_item_fecha_com_quem_resolveu():
+    from schemas import ResolucaoStaff, RevisaoRef, TarefaRef
+
+    async def cenario(app):
+        pid = await _publicado(app)
+        await app.deliver(EVENT_SUBJECT, EventoExterno(nome="documento.recebido", dados=GATILHO), who=SISTEMA, msg_id="m-9")
+        instancia = str(app.motor._seq)
+        comum = {"processo": pid, "instance": instancia}
+        await app.job(JOB_START, kind="EXECUTION_LISTENER", listener="START", element=f"p_acme_{pid}", variables={"gatilho": GATILHO}, **comum)
+        await app.deliver(STEP_SUBJECT, PassoFeito(instancia=instancia, processo=pid, motor_versao=1, passo="ler_documento",
+                                                   tipo=JOB_AGENT, status="handoff", motivo="Documento ilegível"), who=SISTEMA)
+        await app.job(JOB_TASK, element="ler_documento__excecao", kind="TASK_LISTENER", listener="CREATING", variables={"gatilho": GATILHO},
+                      user_task={"userTaskKey": "81"}, **comum)
+        tarefa_id = (await app.user("otto", "acme", "operador").get("/tarefas", params={"responsavel": "staff"})).json()["data"]["items"][0]["id"]
+        svc = __import__("service").ProcessosService()
+        with acting_as(Principal(sub="system:svc-integracoes", tenant="acme", roles=frozenset({"system"}))):
+            with pytest.raises(Exception) as outro_servico:
+                await svc.fila_tarefa(TarefaRef(id=tarefa_id))
+        with acting_as(Principal(sub="system:svc-staff", tenant="acme", roles=frozenset({"system"}))):
+            vista = await svc.fila_tarefa(TarefaRef(id=tarefa_id))
+            resolvida = await svc.fila_resolver(ResolucaoStaff(id=tarefa_id, dados=LIDO, comentario="Li pelo PDF", por="otto"))
+            revisao = await svc.fila_revisao(RevisaoRef(processo=pid))
+        fila = [(m.tipo, m.status, m.por) for s, m in app.published if s == STAFF_SUBJECT]
+        return outro_servico.value, vista, resolvida, revisao, fila
+
+    outro_servico, vista, resolvida, revisao, fila = service_app(cenario)
+    assert outro_servico.code == "ERRO_PROCESSOS_FORBIDDEN"
+    assert vista.motivo == "Documento ilegível" and [c.nome for c in vista.campos][:3] == ["fornecedor", "cnpj", "valor"]
+    assert resolvida.status == "concluida" and resolvida.concluida_por == "otto"  # quem resolveu, não o serviço
+    assert revisao.status == "publicada" and revisao.numero == 1
+    assert fila[-1] == ("excecao", "concluida", "otto")

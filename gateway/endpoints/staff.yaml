@@ -16,6 +16,34 @@ endpoints:
     target_type: http
     target_url: http://svc-staff:8000/resumo
 
+  - path: /clientes
+    method: GET
+    auth: client_jwt
+    response: Clientes
+    target_type: http
+    target_url: http://svc-staff:8000/clientes
+    timeout: 30
+
+  - path: /clientes
+    name: novoCliente
+    method: POST
+    auth: client_jwt
+    request: NovoCliente
+    response: Cliente
+    target_type: http
+    target_url: http://svc-staff:8000/clientes
+    timeout: 30
+
+  - path: /clientes/convite
+    name: convidarDono
+    method: POST
+    auth: client_jwt
+    request: ClienteRef
+    response: Cliente
+    target_type: http
+    target_url: http://svc-staff:8000/clientes/convite
+    timeout: 30
+
   - path: /organizacoes
     method: GET
     auth: client_jwt
@@ -81,3 +109,50 @@ endpoints:
     response: ItemFila
     target_type: http
     target_url: http://svc-staff:8000/fila/atribuir
+
+  - path: /fila/detalhe
+    method: GET
+    auth: client_jwt
+    query: ItemRef
+    response: FilaDetalhe
+    target_type: http
+    target_url: http://svc-staff:8000/fila/detalhe
+    timeout: 30
+
+  - path: /fila/resolver
+    name: resolver
+    method: POST
+    auth: client_jwt
+    request: ResolverExcecao
+    response: ItemFila
+    target_type: http
+    target_url: http://svc-staff:8000/fila/resolver
+    timeout: 30
+
+  - path: /fila/revisao
+    name: decidir
+    method: POST
+    auth: client_jwt
+    request: DecidirRevisao
+    response: ItemFila
+    target_type: http
+    target_url: http://svc-staff:8000/fila/revisao
+    timeout: 60
+
+  - path: /fila/responder
+    name: responder
+    method: POST
+    auth: client_jwt
+    request: ResponderPedido
+    response: ItemFila
+    target_type: http
+    target_url: http://svc-staff:8000/fila/responder
+    timeout: 30
+
+  - path: /numeros
+    method: GET
+    auth: client_jwt
+    query: NumerosQuery
+    response: Numeros
+    target_type: http
+    target_url: http://svc-staff:8000/numeros

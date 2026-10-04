@@ -491,9 +491,19 @@ descoberto no N2 e desenhado no N3.
 | N5 Staff, carteira e setup | `svc-staff`; carteira com o papel `operador` automático; fila de handoffs da carteira com prazo e escalonamento; revisão de versões; setup com ajuda humana (o staff entra na conversa de desenho); aprender com o handoff | Um ajuste pedido no setup é feito pelo staff junto com o cliente e publicado; um handoff resolvido vira regra e a execução seguinte passa sem handoff |
 | N6 Agentes e integrações | Área de agentes (instrução, ferramentas do catálogo, MCP, política, suíte); integrações completas (catálogo, credenciais, servidores MCP) | O cliente cria um agente com uma ferramenta MCP, ele passa na suíte e é usado num passo de processo |
 | N7 Pacotes de área | Jurídico, administrativo, vendas e o resto do financeiro: ações e modelos; processos que disparam outros | Os 13 modelos simulam, e a cadeia proposta → contrato → faturamento aparece no workspace como um projeto (feito: seção 10, "No N7") |
+| O1 Clientes e staff | Aba Clientes (a Cogniventure abre o cliente, dá o plano e o staff e convida o dono); saída do staff tira as carteiras; Falar com a Cogniventure (pedido de ajuda de qualquer tela, 4 h); a fila resolve exceção, revisão e pedido sem trocar de organização; números do gestor; roteiro de implantação | O gestor abre um cliente pela tela e o dono entra pelo convite; um pedido de ajuda é respondido pela fila e o cliente vê a resposta; quem sai da Cogniventure perde o acesso aos clientes |
+| O2 Ciclo de vida | Cobrança do plano pela própria plataforma, suspensão por atraso, pausar e retomar processo, voltar versão, cancelar execução, cancelamento, exportação e exclusão | No fechamento do mês cada cliente pagante gera a cobrança; suspenso, nenhuma execução nova começa; o cliente cancelado baixa os dados e 30 dias depois não sobra nada |
+| O3 Resultados | Tela Resultados (autonomia mês a mês, indicadores por modelo) e resumo mensal por e-mail | O dono vê a autonomia por processo com as versões marcadas e recebe o resumo no dia 1 |
+| O4 Documentos e e-mail | Postmark na entrada e na saída, enviar documento pela tela, leitura de foto pelo modelo, anexos | Em produção, um boleto por e-mail inicia o contas a pagar e a cobrança sai com o boleto anexado |
+| O5 Integrações | Contrato por capacidade e gateways da Cogniventure (custo por cliente), extrato via agregador, Nango, passo "chamar API", ações como ferramentas de agente | Um cliente autoriza o banco e a conciliação roda com o extrato real; um processo lê e grava num sistema do catálogo do Nango |
+| O6 WhatsApp | Ponte Baileys própria para o número da Cogniventure (documentos e aprovações), queda para o e-mail | O dono encaminha um boleto pelo WhatsApp e aprova respondendo SIM |
 | P1 Cluster | Empacotamento Kubernetes (seção 12) | A plataforma sobe no cluster com um cliente compartilhado e um dedicado; precisa estar pronto antes do primeiro cliente em produção, junto com a decisão 1 |
 | P2 Console | `console/` (seção 11), depois do P1 | Painéis do cluster e dos clientes, e um módulo criado pela IDE chega a deploy aprovado |
 
+- **Alinhamento pós-N7 (04/10/2026):** as perguntas de negócio viraram os blocos O1 a O6, um por vez, cada um validado na
+  stack e entregue num PR. Decisões que valem para todos: a Cogniventure contrata os gateways e repassa no plano; a IA
+  da plataforma é o xKiro (endpoint compatível com a OpenAI) com o Sonnet 5.5 nos apelidos `agente` e `desenho`;
+  cancelamento no fim do mês pago e exclusão 30 dias depois; segundo fator para o staff depois do piloto.
 - O antigo bloco 15 (APIs, MCP e medição) entra no N6 (MCP) e nos indicadores do N4. O bloco 14 (experiência) fica
   depois do N5, quando a jornada inteira existir.
 - O banco de provas passa a medir tarefas do negócio, a partir do N3: ações de pacote e "dada a descrição do
