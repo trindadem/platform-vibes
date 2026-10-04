@@ -11,15 +11,23 @@ Ações (`processes.declare` e `processes.worker`), cada uma o método de mesmo 
 - `juridico.coletar_assinaturas` (externa, conexão Assinatura eletrônica): `Assinatura {parte, email, objeto}` → `Assinado {assinado_em}`.
 - `juridico.arquivar_contrato` (escrita): `ContratoIn {parte, cnpj, objeto, valor, inicio, fim, reajuste_em, vigencia_meses, assinado_em, proposta_id}` → `Arquivado {contrato_id, fim, aviso_em}`.
 - `juridico.consultar_publicacoes` (externa, conexão Tribunais e diários oficiais): `Consulta {cnpj}` → `Publicacoes {novas, resumo, disponibilizada_em, dias_prazo}`.
-- `juridico.calcular_prazo` (leitura): `Prazo {disponibilizada_em, dias_prazo}` → `PrazoFinal {publicada_em, prazo_final, dias_uteis}`.
-- `juridico.emitir_certidoes` (externa, conexão Portais de certidões): `CertidoesIn {cnpj}` → `Certidoes {positivas, validade, resumo}`.
-- `juridico.registrar_certidoes` (escrita): `CertidoesEmitidas {positivas, validade, resumo}` → `RegistroCertidoes {certidao_id, aviso_em}`.
+- `juridico.calcular_prazo` (escrita): `Prazo {disponibilizada_em, dias_prazo, resumo}` → `PrazoFinal {publicada_em, prazo_final, dias_uteis}`; o prazo entra no cadastro `prazos` (o mesmo passo de novo não duplica).
+- `juridico.emitir_certidoes` (externa, conexão Portais de certidões): `CertidoesIn {cnpj}` → `Certidoes {emitidas (padrão 5), positivas, validade, resumo}`.
+- `juridico.registrar_certidoes` (escrita): `CertidoesEmitidas {emitidas, positivas, validade, resumo}` → `RegistroCertidoes {certidao_id, aviso_em}`.
 Modelos (`processes.declare`, o fluxo de partida de cada um): `gestao-contratos` (gatilho: a proposta comercial que
 termina aceita), `publicacoes-processos` (dias úteis, 7h) e `certidoes-negativas` (dia 1 de cada mês).
+Indicadores do mês (alinhamento pós-N7, item 7): gestão de contratos: contratos vigentes e vencendo ou reajustando em
+60 dias (pacote) e dias da proposta aceita ao contrato assinado; publicações: intimações recebidas (soma das novas) e
+prazos nos próximos 5 dias úteis (pacote); certidões: certidões válidas e dias até a próxima validade (pacote) e
+positivas (soma). RPC `rpc.juridico.indicadores` (`IndicatorRequest` → `IndicatorValues`), tudo no dia de corte (o
+último do mês; no corrente, hoje): vigentes = status vigente com a vigência cobrindo o dia; vencendo = destes, fim ou
+reajuste nos 60 dias seguintes; prazos = prazos processuais em aberto com o fim nos 5 dias úteis seguintes; válidas =
+emitidas − positivas da última emissão (zero se a validade mais próxima já passou).
 Rotas:
 - Cadastro declarado `contratos` (README §5.19): `Contrato {parte, cnpj, objeto, valor, inicio, fim, reajuste_em, status: vigente|encerrado, proposta_id}`.
-- Cadastro declarado `certidoes`: `Certidao {referencia, positivas, validade, resumo}`.
-- Escrevem dono, admin e operador; ao vivo `juridico.contratos` e `juridico.certidoes`.
+- Cadastro declarado `certidoes`: `Certidao {referencia, emitidas, positivas, validade, resumo}`.
+- Cadastro declarado `prazos`: `PrazoProcessual {resumo, publicada_em, prazo_final, dias_uteis, status: aberto|cumprido}` (o processo de publicações grava; o advogado marca cumprido).
+- Escrevem dono, admin e operador; ao vivo `juridico.contratos`, `juridico.certidoes` e `juridico.prazos`.
 
 ## 3. Fluxo de Execução
 1. SurrealDB, por organização: `juridico_contratos` e `juridico_certidoes` (cadastros declarados).
@@ -40,3 +48,5 @@ Rotas:
 - Prazo sem a data da disponibilização ou sem os dias → handoff.
 - Exemplo de saída que não confere com o modelo de saída, ação sem método no service.py ou modelo que cita ação não
   declarada: o serviço não sobe.
+- Indicadores: mês inválido ou que ainda não começou, ou nome que o pacote não calcula → null (sem dado no mês); a
+  tela mostra "—". Indicador "pacote" declarado sem `indicators=` no `processes.declare`: o serviço não sobe.

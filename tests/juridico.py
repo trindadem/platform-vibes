@@ -110,3 +110,55 @@ def test_certidoes_guardadas_e_avisos_antes_de_vencer(monkeypatch):
     titulos = sorted(t for _, t, _ in avisos)
     assert titulos == ["Certidões vencem em 15 dias", "Contrato com Gráfica tem reajuste em 30 dias", "Contrato com Moinho Sul vence em 60 dias"]
     assert all(papeis == ("owner", "admin") for papeis, _, _ in avisos) and len({k for _, _, k in avisos}) == 3
+
+
+def test_indicadores_do_pacote_contratos_prazos_e_certidoes():
+    """Item 7 do alinhamento pós-N7: o que as execuções não sabem o pacote calcula no corte do mês (hoje, no corrente)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import service
+    from core.processes import IndicatorRequest, indicators_subject
+
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    mes = hoje.strftime("%Y-%m")
+    em = lambda dias: (hoje + timedelta(days=dias)).isoformat()  # noqa: E731
+    segundo_util = service._proximo_util(service._proximo_util(hoje))
+
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        for parte, inicio, fim, reajuste, status in (("Moinho Sul", em(-100), em(30), None, "vigente"),   # vence em 30 dias
+                                                     ("Gráfica", em(-10), em(300), em(45), "vigente"),     # reajusta em 45
+                                                     ("Transportadora", em(-5), em(200), None, "vigente"),
+                                                     ("Antigo", em(-400), em(-35), None, "vigente"),       # já venceu
+                                                     ("Encerrado", em(-50), em(100), None, "encerrado")):
+            await ana.post("/contratos", json={"parte": parte, "objeto": "Serviço", "inicio": inicio, "fim": fim, "reajuste_em": reajuste,
+                                               "status": status})
+        await ana.post("/prazos", json={"resumo": "Contestar", "publicada_em": em(-3), "prazo_final": segundo_util.isoformat(), "dias_uteis": 5})
+        await ana.post("/prazos", json={"resumo": "Recorrer", "publicada_em": em(-3), "prazo_final": em(40), "dias_uteis": 15})
+        await ana.post("/prazos", json={"resumo": "Cumprido", "publicada_em": em(-3), "prazo_final": segundo_util.isoformat(),
+                                        "dias_uteis": 5, "status": "cumprido"})
+        for _ in range(2):  # o motor entregou o passo de novo: o prazo entra uma vez só
+            await app.job("juridico.calcular_prazo", variables={"entrada": {"disponibilizada_em": "2026-10-09", "dias_prazo": 5,
+                                                                            "resumo": "Manifestar sobre o laudo"}})
+        await app.job("juridico.registrar_certidoes", variables={"entrada": {"emitidas": 5, "positivas": 1, "validade": em(20)}})
+        responder = app.handlers[indicators_subject("svc-juridico")]
+        with acting_as(system("svc-processos", "acme")):
+            contratos = await responder(IndicatorRequest(modelo="gestao-contratos", mes=mes, nomes=["contratos_vigentes", "vencendo_60_dias"]))
+            prazos = await responder(IndicatorRequest(modelo="publicacoes-processos", mes=mes, nomes=["prazos_proximos", "intimacoes_recebidas"]))
+            certidoes = await responder(IndicatorRequest(modelo="certidoes-negativas", mes=mes, nomes=["certidoes_validas", "dias_ate_validade"]))
+            futuro = await responder(IndicatorRequest(modelo="gestao-contratos", mes="2099-01", nomes=["contratos_vigentes"]))
+        cadastro = (await ana.get("/prazos", params={"q": "laudo"})).json()["data"]["items"]
+        catalogo = next(m for s, m in app.published if s == CATALOG_SUBJECT)
+        return contratos, prazos, certidoes, futuro, cadastro, catalogo
+
+    contratos, prazos, certidoes, futuro, cadastro, catalogo = service_app(cenario)
+    assert contratos.valores == {"contratos_vigentes": 3.0, "vencendo_60_dias": 2.0}  # Moinho (fim) e Gráfica (reajuste)
+    assert prazos.valores == {"prazos_proximos": 1.0, "intimacoes_recebidas": None}  # a soma das intimações é das execuções
+    assert certidoes.valores == {"certidoes_validas": 4.0, "dias_ate_validade": 20.0}
+    assert futuro.valores == {"contratos_vigentes": None}
+    assert [(p["prazo_final"], p["status"]) for p in cadastro] == [("2026-10-20", "aberto")]
+    indicadores = {m.id: [i.nome for i in m.indicadores] for m in catalogo.models}
+    assert indicadores == {"gestao-contratos": ["contratos_vigentes", "vencendo_60_dias", "dias_ate_assinar"],
+                           "publicacoes-processos": ["intimacoes_recebidas", "prazos_proximos"],
+                           "certidoes-negativas": ["certidoes_validas", "positivas", "dias_ate_validade"]}

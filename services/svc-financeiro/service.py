@@ -316,11 +316,11 @@ class FinanceiroService:
         """Os indicadores do mês (em Brasília) que as execuções não sabem: pagos em atraso (contas a pagar) e valor em
         atraso (faturamento e cobrança). Nome desconhecido, mês inválido ou que ainda não começou: null."""
         calculos = {("contas-a-pagar", "pagos_em_atraso"): _pagos_em_atraso, ("faturamento-cobranca", "valor_em_atraso"): _valor_em_atraso}
-        limites = _limites_do_mes(data.mes)
+        janela = data.janela()
         valores: dict[str, float | None] = {}
         for nome in data.nomes:
             calculo = calculos.get((data.modelo, nome))
-            valores[nome] = await calculo(data.mes, limites[1]) if calculo and limites and limites[0] <= datetime.now(UTC) else None
+            valores[nome] = await calculo(data.mes, janela.corte) if calculo and janela else None
         return IndicatorValues(valores=valores)
 
     # ── Telas ────────────────────────────────────────────────────────────────
@@ -393,19 +393,7 @@ async def _faturas_do_mes(referencia: str) -> list[Fatura]:
     return [f for f in (Fatura.model_validate(r) for r in rows) if f.created_at and f.created_at.strftime("%Y-%m") == referencia]
 
 
-def _limites_do_mes(mes: str) -> tuple[datetime, datetime] | None:
-    """Começo e fim (exclusivo) do mês civil em Brasília, em UTC; mês inválido: None."""
-    try:
-        ano, numero = (int(x) for x in mes.split("-"))
-        fuso = ZoneInfo(FUSO)
-        inicio = datetime(ano, numero, 1, tzinfo=fuso)
-        fim = datetime(ano + (numero == 12), 1 if numero == 12 else numero + 1, 1, tzinfo=fuso)
-    except ValueError:
-        return None
-    return inicio.astimezone(UTC), fim.astimezone(UTC)
-
-
-async def _pagos_em_atraso(mes: str, fim: datetime) -> float:
+async def _pagos_em_atraso(mes: str, corte: datetime) -> float:
     """Títulos pagos (comprovante ou extrato) com a data do pagamento no mês e depois do vencimento: o banco agenda
     para hoje o boleto que chega vencido. É a situação de agora: título do mês ainda sem comprovante não entra."""
     rows = await db.query(f"SELECT * FROM {TITULOS} WHERE tenant = $tenant AND status = 'pago' AND string::starts_with(data, $mes)", mes=mes)
@@ -414,10 +402,9 @@ async def _pagos_em_atraso(mes: str, fim: datetime) -> float:
                      and r["data"] > r["vencimento"]))
 
 
-async def _valor_em_atraso(mes: str, fim: datetime) -> float:
+async def _valor_em_atraso(mes: str, corte: datetime) -> float:
     """Faturas cobradas (boleto emitido) vencidas e não recebidas no fim do mês (no mês corrente, agora): vencimento
     antes do dia de corte e sem recebimento até ele (recebido_em guarda quando a fatura foi paga)."""
-    corte = min(datetime.now(UTC), fim)
     dia = corte.astimezone(ZoneInfo(FUSO)).date().isoformat()
     rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant AND cobranca_id != NONE AND cobranca_id != NULL "
                           "AND vencimento < $dia", dia=dia)

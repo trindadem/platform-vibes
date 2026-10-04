@@ -4,6 +4,8 @@ Trilho (validado no import por @activities): todo método público é async, rec
 modelo de schemas.py. As ações do pacote (schemas.ACTIONS) são métodos de mesmo nome: o worker do motor de processos
 (core/processes.py) as chama como a organização do processo, com a entrada vinda dos passos anteriores. O que depende
 de integração ainda não escolhida vira a exceção do staff (Handoff), com o que ele deve fazer e informar.
+Os indicadores "pacote" dos modelos (schemas.MODELS) saem de indicadores (rpc.juridico.indicadores): contratos vigentes e
+vencendo, prazos processuais em aberto e a situação das certidões, com os cadastros da organização.
 """
 import re
 from datetime import date, timedelta
@@ -20,7 +22,11 @@ from schemas import (
     AVISO_CERTIDAO,
     AVISOS_CONTRATO,
     CERTIDOES,
+    CERTIDOES_PADRAO,
     CONTRATOS,
+    JANELA_CONTRATO,
+    JANELA_PRAZO,
+    PRAZOS,
     SERVICE,
     VIGENCIA_PADRAO,
     Arquivado,
@@ -35,8 +41,11 @@ from schemas import (
     Contrato,
     ContratoIn,
     Empty,
+    IndicatorRequest,
+    IndicatorValues,
     Prazo,
     PrazoFinal,
+    PrazoProcessual,
     Publicacoes,
     RegistroCertidoes,
 )
@@ -87,6 +96,12 @@ class JuridicoService:
         dia = publicada
         for _ in range(data.dias_prazo):
             dia = _proximo_util(dia)
+        resumo = (data.resumo or None) and data.resumo[:2000]
+        existe = await db.query(f"SELECT id FROM {PRAZOS.table} WHERE tenant = $tenant AND publicada_em = $p AND prazo_final = $f "
+                                "AND dias_uteis = $d AND resumo = $r LIMIT 1", p=publicada.isoformat(), f=dia.isoformat(),
+                                d=data.dias_prazo, r=resumo)
+        if not existe:  # o mesmo passo de novo (o motor tentou outra vez): o prazo já está no cadastro
+            await resources.create(PRAZOS, PrazoProcessual(resumo=resumo, publicada_em=publicada, prazo_final=dia, dias_uteis=data.dias_prazo))
         return PrazoFinal(publicada_em=publicada.isoformat(), prazo_final=dia.isoformat(), dias_uteis=data.dias_prazo)
 
     # ── Certidões negativas ──────────────────────────────────────────────────
@@ -96,16 +111,35 @@ class JuridicoService:
         e informa quantas vieram positivas e a validade mais próxima."""
         cnpj = f" do CNPJ {data.cnpj}" if data.cnpj else ""
         raise Handoff(f"A emissão de certidões ainda não tem integração: emita as certidões{cnpj} (Receita/PGFN, FGTS, trabalhista, "
-                      "estadual e municipal) e informe quantas vieram positivas e a validade mais próxima.")
+                      "estadual e municipal) e informe quantas emitiu, quantas vieram positivas e a validade mais próxima.")
 
     async def registrar_certidoes(self, data: CertidoesEmitidas) -> RegistroCertidoes:
         """As certidões do mês entram no cadastro; o agendamento diário avisa 15 dias antes da validade."""
         validade = _data(data.validade)
         if validade is None:
             raise Handoff("Falta a validade das certidões para guardar e vigiar.")
-        item = await resources.create(CERTIDOES, Certidao(referencia=date.today().strftime("%Y-%m"), positivas=max(0, data.positivas or 0),
+        emitidas = data.emitidas if data.emitidas is not None and data.emitidas >= 0 else CERTIDOES_PADRAO
+        item = await resources.create(CERTIDOES, Certidao(referencia=date.today().strftime("%Y-%m"), emitidas=emitidas,
+                                                          positivas=min(emitidas, max(0, data.positivas or 0)),
                                                           validade=validade, resumo=(data.resumo or None) and data.resumo[:2000]))
         return RegistroCertidoes(certidao_id=item.id, aviso_em=(validade - timedelta(days=AVISO_CERTIDAO)).isoformat())
+
+    # ── Indicadores "pacote" (rpc.juridico.indicadores; o svc-processos pede como system na organização) ──
+
+    async def indicadores(self, data: IndicatorRequest) -> IndicatorValues:
+        """O que as execuções não sabem, no corte do mês (o último dia; no mês corrente, hoje): contratos vigentes e os que
+        vencem ou reajustam em 60 dias, prazos em aberto nos 5 dias úteis seguintes e a situação da última emissão de
+        certidões. Nome desconhecido, mês inválido ou que ainda não começou: null."""
+        janela = data.janela()
+        calculos = {("gestao-contratos", "contratos_vigentes"): _contratos_vigentes, ("gestao-contratos", "vencendo_60_dias"): _vencendo,
+                    ("publicacoes-processos", "prazos_proximos"): _prazos_proximos,
+                    ("certidoes-negativas", "certidoes_validas"): _certidoes_validas,
+                    ("certidoes-negativas", "dias_ate_validade"): _dias_ate_validade}
+        valores: dict[str, float | None] = {}
+        for nome in data.nomes:
+            calculo = calculos.get((data.modelo, nome))
+            valores[nome] = await calculo(janela.dia, data.mes) if calculo and janela else None
+        return IndicatorValues(valores=valores)
 
     # ── Agendamento: os avisos antes de vencer ───────────────────────────────
 
@@ -137,6 +171,61 @@ class JuridicoService:
                                            key=f"certidao-{row['id']}")
                         certidoes += 1
         return Avisos(contratos=contratos, certidoes=certidoes)
+
+
+async def _vigentes(dia: date) -> list[dict]:
+    """Os contratos vigentes no dia: a vigência cobre o dia (início até ele, fim depois dele ou sem fim)."""
+    rows = await db.query(f"SELECT * FROM {CONTRATOS.table} WHERE tenant = $tenant AND status = 'vigente'")
+    out = []
+    for row in rows:
+        inicio, fim = _data(str(row.get("inicio") or "")[:10]), _data(str(row.get("fim") or "")[:10])
+        if (inicio is None or inicio <= dia) and (fim is None or fim >= dia):
+            out.append(row)
+    return out
+
+
+async def _contratos_vigentes(dia: date, mes: str) -> float:
+    return float(len(await _vigentes(dia)))
+
+
+async def _vencendo(dia: date, mes: str) -> float:
+    """Dos vigentes no dia, os que vencem ou reajustam nos JANELA_CONTRATO dias seguintes."""
+    limite = dia + timedelta(days=JANELA_CONTRATO)
+    datas = lambda row: [d for campo in ("fim", "reajuste_em") if (d := _data(str(row.get(campo) or "")[:10]))]  # noqa: E731
+    return float(sum(1 for row in await _vigentes(dia) if any(dia < d <= limite for d in datas(row))))
+
+
+async def _prazos_proximos(dia: date, mes: str) -> float:
+    """Prazos em aberto que vencem nos JANELA_PRAZO dias úteis seguintes ao dia."""
+    limite = dia
+    for _ in range(JANELA_PRAZO):
+        limite = _proximo_util(limite)
+    rows = await db.query(f"SELECT prazo_final FROM {PRAZOS.table} WHERE tenant = $tenant AND status = 'aberto'")
+    return float(sum(1 for r in rows if (final := _data(str(r.get("prazo_final") or "")[:10])) and dia < final <= limite))
+
+
+async def _ultima_emissao(mes: str) -> dict | None:
+    rows = await db.query(f"SELECT * FROM {CERTIDOES.table} WHERE tenant = $tenant AND referencia <= $mes "
+                          "ORDER BY referencia DESC, created_at DESC LIMIT 1", mes=mes)
+    return rows[0] if rows else None
+
+
+async def _certidoes_validas(dia: date, mes: str) -> float | None:
+    """As negativas da última emissão, se a validade mais próxima não passou do dia; vencida: zero (a renovação atrasou)."""
+    emissao = await _ultima_emissao(mes)
+    validade = _data(str((emissao or {}).get("validade") or "")[:10])
+    if emissao is None or validade is None:
+        return None
+    if validade < dia:
+        return 0.0
+    emitidas = int(emissao.get("emitidas") if emissao.get("emitidas") is not None else CERTIDOES_PADRAO)
+    return float(max(0, emitidas - int(emissao.get("positivas") or 0)))
+
+
+async def _dias_ate_validade(dia: date, mes: str) -> float | None:
+    emissao = await _ultima_emissao(mes)
+    validade = _data(str((emissao or {}).get("validade") or "")[:10])
+    return float((validade - dia).days) if validade else None
 
 
 def _data(valor: str | None) -> date | None:

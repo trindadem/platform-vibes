@@ -18,6 +18,12 @@ Ações (`processes.declare` e `processes.worker`), cada uma o método de mesmo 
 - `vendas.enviar_campanha` (externa, conexão Caixa de entrada): `Campanha {mensagem, dias_sem_comprar}` → `CampanhaEnviada {enviados}`.
 Modelos: `qualificacao-leads` (evento `vendas.lead`), `proposta-comercial` (evento `vendas.pedido_proposta`; termina
 `aceita`, `recusada` ou `nao_enviada`) e `reativacao-carteira` (segundas, 9h).
+Indicadores do mês (alinhamento pós-N7, item 7): leads: recebidos (iniciados no mês), qualificados (%, dos
+encaminhados) e tempo até a primeira resposta (horas, da chegada ao encaminhamento); propostas: enviadas e taxa de
+aceite (pacote) e valor aceito (soma das aceitas); reativação: clientes contatados (soma) e voltaram a comprar
+(pacote). RPC `rpc.vendas.indicadores` (`IndicatorRequest` → `IndicatorValues`): enviadas = propostas com `enviada_em`
+no mês; aceite = aceitas ÷ respondidas no mês (sem resposta: sem dado); voltaram = clientes com campanha e a última
+compra no mês, depois dela. Oportunidade no CRM ainda não existe: a compra depois da campanha é o que se mede.
 Rotas:
 - Cadastros declarados (README §5.19), escrevem dono, admin e operador: `leads` (`Lead {nome, email, telefone, origem: site|instagram|whatsapp|indicacao|outro, interesse, status: novo|qualificado|reuniao|nutricao|atendimento|cliente, reuniao_em}`) e `clientes` (`Cliente {nome, email, telefone, ultima_compra, campanha_em}`).
 - `POST /leads/receber {nome, email?, telefone?, origem, interesse}` → `LeadItem`: o lead entra (novo) e emite `vendas.lead`.
@@ -46,3 +52,5 @@ Rotas:
   se foi aceita → handoff.
 - Membro pedindo proposta ou recebendo lead → 403 `ERRO_VENDAS_FORBIDDEN`.
 - Exemplo de saída que não confere, ação sem método ou modelo com ação não declarada: o serviço não sobe.
+- Indicadores: mês inválido ou que ainda não começou, ou nome que o pacote não calcula → null (sem dado no mês); a
+  tela mostra "—". Indicador "pacote" declarado sem `indicators=` no `processes.declare`: o serviço não sobe.

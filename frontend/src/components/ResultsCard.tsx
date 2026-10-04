@@ -25,6 +25,7 @@ export interface ResultsCardProps {
 
 /**
  * Os resultados de um processo num mês: a taxa mês a mês com as marcas, os números do mês, como terminaram e os indicadores.
+ * Os números e os indicadores ficam lado a lado quando o cartão é largo (pela largura dele, não da tela: cabe num painel).
  *
  * @category Dados
  * @example
@@ -42,7 +43,7 @@ export interface ResultsCardProps {
 export function ResultsCard({ title, description, badges = [], months, monthsLabel, counts, ends, indicators }: ResultsCardProps) {
   return (
     <Card title={title} description={description}>
-      <div className="flex flex-col gap-5">
+      <div className="@container flex flex-col gap-5">
         {badges.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {badges.map((badge) => (
@@ -53,7 +54,7 @@ export function ResultsCard({ title, description, badges = [], months, monthsLab
           </div>
         )}
         <MonthlyBars label={monthsLabel} items={months} />
-        <div className="grid gap-5 md:grid-cols-2">
+        <div className="grid gap-5 @md:grid-cols-2">
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-foreground">No mês</span>
             <KeyValue items={counts} />
@@ -70,7 +71,7 @@ export function ResultsCard({ title, description, badges = [], months, monthsLab
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-foreground">Indicadores do mês</span>
             {indicators.length > 0 ? (
-              <KeyValue items={indicators} />
+              <KeyValue items={indicators} stacked />
             ) : (
               <span className="text-sm text-muted-foreground">Este processo não declara indicadores (é só da empresa).</span>
             )}

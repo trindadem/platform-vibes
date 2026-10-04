@@ -6,13 +6,14 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (52)
+## Índice (53)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
 - [ActionForm](#actionform): Receita de formulário: campos a partir de uma lista, envio pela ação, erro do servidor no campo certo. `action, fields, submitLabel?, successMessage?, initial?, onDone?`
 - [ChatThread](#chatthread): Receita de conversa com um agente: mensagens em balões, passos do agente enquanto responde, erro e campo de envio. `messages, onSend, sending?, progress?, error?, assistant?, placeholder?, disabled?`
 - [ListView](#listview): Receita de lista paginada no servidor: busca por texto, filtros, ordenação no cabeçalho, páginas e todos os estados. `list, columns, rowKey, search?, filters?, empty?, noun?, caption?, actions?`
+- [ProcessResults](#processresults): Receita de resultados de processos: um cartão por processo com a autonomia mês a mês (a versão publicada marcada no mês em que entrou), os números do mês, como as execuções terminaram e os indicadores de negócio, cada um na unidade dele (R$, %, dias, horas). `processes, empty?`
 - [QueryTable](#querytable): Receita de lista: consulta + tabela, com carregamento, erro, vazio e cartões em espaço estreito. `query, columns, rowKey, empty?, caption?`
 - [QueryView](#queryview): Receita de consulta: mostra esqueleto ao carregar, erro com "Tentar de novo", vazio ou os dados. `query, children, empty?`
 - [ResourceList](#resourcelist): Receita de cadastro inteiro: lista com busca, filtros, ordem e páginas, criação e edição em painel lateral e remoção com confirmação, tudo a partir dos campos declarados no backend (core/resources.py). `resource, columns?, rowActions?, noun?, readOnly?`
@@ -168,6 +169,28 @@ Receita de lista paginada no servidor: busca por texto, filtros, ordenação no 
 - `noun?`: `string`: Nome dos itens no plural, para o rodapé (ex.: "faturas"). Padrão: "itens".
 - `caption?`: `string`: Legenda acessível da tabela.
 - `actions?`: `ReactNode`: Ações ao lado da busca (ex.: botão de criar).
+
+---
+
+## ProcessResults
+
+Receita de resultados de processos: um cartão por processo com a autonomia mês a mês (a versão publicada marcada no mês em que entrou), os números do mês, como as execuções terminaram e os indicadores de negócio, cada um na unidade dele (R$, %, dias, horas). Dois cartões por linha quando há largura (pela largura de onde está: num painel, um). _(Receitas)_
+
+```tsx
+<ProcessResults
+  processes={[{
+    processo: "p1", titulo: "Contas a pagar", publicada: 2, pausado: false,
+    meses: [{ mes: "2026-09", concluidas: 4, autonomia: 0.5 }, { mes: "2026-10", concluidas: 10, autonomia: 0.8 }],
+    versoes: [{ numero: 2, mes: "2026-10" }],
+    iniciadas: 11, concluidas: 10, canceladas: 0, em_andamento: 1,
+    fins: [{ resultado: "pago", quantidade: 9 }, { resultado: "recusado", quantidade: 1 }],
+    indicadores: [{ titulo: "Valor pago", unidade: "moeda", valor: 42000 }, { titulo: "Pagos em atraso", unidade: "numero", valor: 1 }],
+  }]}
+/>
+```
+
+- `processes`: `ProcessResultsItem[]`: Os processos, na ordem em que aparecem.
+- `empty?`: `string`: O que mostrar sem nenhum processo publicado.
 
 ---
 
@@ -470,7 +493,7 @@ Lista de pares rótulo/valor para detalhes de um registro. _(Dados)_
 
 ## MonthlyBars
 
-Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada. _(Dados)_
+Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada. Sem largura para todos os meses (um painel lateral, o celular), rola de lado e começa no mês mais novo. _(Dados)_
 
 ```tsx
 <MonthlyBars
@@ -545,7 +568,7 @@ Projeto: a cadeia de processos que um começou (uma proposta aceita inicia o con
 
 ## ResultsCard
 
-Os resultados de um processo num mês: a taxa mês a mês com as marcas, os números do mês, como terminaram e os indicadores. _(Dados)_
+Os resultados de um processo num mês: a taxa mês a mês com as marcas, os números do mês, como terminaram e os indicadores. Os números e os indicadores ficam lado a lado quando o cartão é largo (pela largura dele, não da tela: cabe num painel). _(Dados)_
 
 ```tsx
 <ResultsCard

@@ -284,7 +284,7 @@ class Saude(BaseModel):
 
 class ResultadosQuery(_Input):
     organizacao: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
+    mes: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
 
 
 class ResultadosPedido(BaseModel):

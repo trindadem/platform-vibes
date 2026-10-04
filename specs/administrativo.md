@@ -22,10 +22,16 @@ Ações (`processes.declare` e `processes.worker`), cada uma o método de mesmo 
 - `administrativo.verificar_vencimentos` (escrita): `Antecedencia {antecedencia_dias}` → `Vencimentos {proximos, exige_presenca, resumo}`.
 Modelos: `admissao-colaborador` (evento `administrativo.admissao`; ramos em paralelo depois dos documentos),
 `compras-cotacao` (evento `administrativo.requisicao`) e `vencimentos-empresa` (todo dia, 8h).
+Indicadores do mês (alinhamento pós-N7, item 7): admissão: admissões concluídas e dias da contratação ao colaborador
+ativo; compras: pedidos emitidos e economia nas cotações (pacote) e dias da requisição ao pedido (requisições do mês);
+vencimentos: avisados com antecedência (soma) e vencidos sem renovação (pacote). RPC `rpc.administrativo.indicadores`
+(`IndicatorRequest` → `IndicatorValues`): pedidos = requisições com `pedido_em` no mês; economia = nelas, com duas ou
+mais cotações, a maior menos a escolhida; vencidos = vencimentos com a data antes do dia de corte (renovar é mudar a
+data no cadastro).
 Rotas:
 - Cadastros declarados (README §5.19), escrevem dono, admin e operador: `colaboradores` (`Colaborador {nome, email, cargo, salario, inicio, status: admissao|ativo|desligado, exame_em, acessos}`), `fornecedores` (`FornecedorCompra {nome, email, categoria}`) e `vencimentos` (`Vencimento {nome, tipo: alvara|licenca|avcb|seguro|contrato_servico|outro, vence_em, exige_vistoria, avisado_em}`).
 - `POST /admissoes {nome, email, cargo, salario?, inicio?}` → `ColaboradorItem`: entra como colaborador em admissão e emite `administrativo.admissao` (o processo começa). Dono, admin e operador.
-- `GET /requisicoes?page&size&sort&status&q` → `RequisicaoPage` de `Requisicao {id, item, quantidade, categoria, observacao, status: aberta|cotando|pedido|cancelada, cotacoes[{fornecedor, valor, prazo_dias}], melhor_fornecedor, melhor_valor, pedido_numero, created_at}`.
+- `GET /requisicoes?page&size&sort&status&q` → `RequisicaoPage` de `Requisicao {id, item, quantidade, categoria, observacao, status: aberta|cotando|pedido|cancelada, cotacoes[{fornecedor, valor, prazo_dias}], melhor_fornecedor, melhor_valor, pedido_numero, pedido_em, created_at}` (`pedido_em`: quando o pedido de compra saiu).
 - `POST /requisicoes {item, quantidade, categoria?, observacao?}` → `Requisicao` e emite `administrativo.requisicao`; `POST /requisicoes/cotacao {requisicao, fornecedor, valor, prazo_dias?}` → `Requisicao` (a cotação que chegou). Dono, admin e operador.
 - Ao vivo: `administrativo.colaboradores`, `administrativo.fornecedores`, `administrativo.vencimentos` e `administrativo.requisicoes {id, action}`.
 - Consome `rpc.integracoes.enviar_email` (contrato repetido no schemas.py); emite `events.processos.evento` por `processes.emit`.
@@ -49,3 +55,5 @@ Rotas:
   "cadastre fornecedores"; nenhuma cotação recebida → handoff "fornecedor sem resposta".
 - Membro criando admissão, requisição ou cotação → 403 `ERRO_ADMINISTRATIVO_FORBIDDEN`; requisição de outra organização → 404 `ERRO_ADMINISTRATIVO_NAO_ENCONTRADA`.
 - Exemplo de saída que não confere, ação sem método ou modelo com ação não declarada: o serviço não sobe.
+- Indicadores: mês inválido ou que ainda não começou, ou nome que o pacote não calcula → null (sem dado no mês); a
+  tela mostra "—". Indicador "pacote" declarado sem `indicators=` no `processes.declare`: o serviço não sobe.

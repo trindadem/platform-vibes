@@ -364,10 +364,10 @@ def test_consumo_soma_no_mes_uma_vez_por_mensagem_e_avisa_em_80_e_100(box):
     assert _limites(beta)["ai.custo"] == (1, pytest.approx(0.9))
     avisos = [(m.title, m.roles, m.link, msg_id, m.send_email) for subject, m, msg_id in box.published if subject == SEND_SUBJECT]
     assert avisos == [
-        ("Gasto com IA no mês: 80% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-plano-ai.custo-{MES}-80", True),
-        ("Gasto com IA no mês: 100% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-plano-ai.custo-{MES}-100", True),
-        ("Gasto com IA no mês: 80% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-plano-ai.custo-{MES}-80", True),
-    ]  # acme: 80% em m2 e 100% em m4, uma vez cada; beta: 80%
+        ("Gasto com IA no mês: 80% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-acme-plano-ai.custo-{MES}-80", True),
+        ("Gasto com IA no mês: 100% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-acme-plano-ai.custo-{MES}-100", True),
+        ("Gasto com IA no mês: 80% do limite", ["owner", "admin"], "/plano", f"notify-svc-plans-beta-plano-ai.custo-{MES}-80", True),
+    ]  # acme: 80% em m2 e 100% em m4, uma vez cada; beta: 80% (outro id: a mesma key em outra organização não é duplicata)
     assert (USAGE_LIVE, "ai.custo", 0.5) in box.live and len([e for e in box.live if e[1] == "ai.custo"]) == 7
 
 

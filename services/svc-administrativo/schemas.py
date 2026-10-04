@@ -5,7 +5,18 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.plans import Module
-from core.processes import Action, Condition, Flow, Fluxo, ProcessModel, Step, Trigger
+from core.processes import (  # IndicatorRequest e IndicatorValues: o contrato de rpc.administrativo.indicadores
+    Action,
+    Condition,
+    Flow,
+    Fluxo,
+    Indicator,
+    IndicatorRequest,
+    IndicatorValues,
+    ProcessModel,
+    Step,
+    Trigger,
+)
 from core.resources import Email, Fields, Money, Resource, Text
 from core.surreal import ListQuery, Page
 
@@ -106,6 +117,7 @@ class Requisicao(BaseModel):
     melhor_fornecedor: str | None = None
     melhor_valor: float | None = None
     pedido_numero: str | None = None
+    pedido_em: datetime | None = Field(None, description="Quando o pedido de compra saiu")
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -273,7 +285,7 @@ ACTIONS = [
            example=Vencimentos(proximos=1, exige_presenca=0, resumo="Seguro do estabelecimento vence em 25/10.")),
 ]
 
-C, F, P = Condition, Flow, Step
+C, F, I, P = Condition, Flow, Indicator, Step
 MODELS = [
     ProcessModel("admissao-colaborador", Fluxo(
         gatilho=Trigger(tipo="evento", evento="administrativo.admissao", descricao="Contratação aprovada"),
@@ -300,7 +312,12 @@ MODELS = [
             F(de="esocial", para="juntar"), F(de="contrato", para="juntar"), F(de="exame", para="juntar"), F(de="acessos", para="juntar"),
             F(de="juntar", para="concluir"), F(de="concluir", para="admitido"),
         ],
-    )),
+    ), indicadores=[
+        I("admissoes_concluidas", "Admissões concluídas", "contagem", resultado="admitido",
+          descricao="Colaboradores que ficaram ativos no mês"),
+        I("dias_ate_ativo", "Da contratação ao colaborador ativo", "tempo", unidade="dias", de="inicio", ate="concluir",
+          resultado="admitido", descricao="Média, nas admissões concluídas no mês, da contratação aprovada ao colaborador ativo"),
+    ]),
     ProcessModel("compras-cotacao", Fluxo(
         gatilho=Trigger(tipo="evento", evento="administrativo.requisicao", descricao="Requisição interna"),
         passos=[
@@ -324,7 +341,13 @@ MODELS = [
             F(de="aprovado", para="cancelar"), F(de="cancelar", para="cancelada"),
             F(de="pedido", para="entrega"), F(de="entrega", para="entregue"),
         ],
-    )),
+    ), indicadores=[
+        I("pedidos_emitidos", "Pedidos emitidos", "pacote", descricao="Pedidos de compra que saíram no mês"),
+        I("economia_cotacoes", "Economia nas cotações", "pacote", unidade="moeda",
+          descricao="Nos pedidos do mês com duas ou mais cotações, a maior cotação menos a escolhida"),
+        I("dias_ate_pedido", "Da requisição ao pedido", "tempo", unidade="dias", de="inicio", ate="pedido", base="iniciadas",
+          descricao="Média, nas requisições do mês que já viraram pedido, da requisição ao pedido emitido"),
+    ]),
     ProcessModel("vencimentos-empresa", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 11 * * *", descricao="Todo dia"),
         parametros={"antecedencia_dias": ANTECEDENCIA_PADRAO},
@@ -340,5 +363,10 @@ MODELS = [
             F(de="presenca", para="vistoria", condicao=C(campo="verificar.exige_presenca", operador=">", valor=0)),
             F(de="presenca", para="em_dia"), F(de="vistoria", para="em_dia"),
         ],
-    )),
+    ), indicadores=[
+        I("avisados", "Avisados com antecedência", "soma", campo="verificar.proximos",
+          descricao="Vencimentos avisados à empresa no mês, antes de vencer (cada um uma vez por vencimento)"),
+        I("vencidos_sem_renovacao", "Vencidos sem renovação", "pacote",
+          descricao="Itens com o vencimento antes do fim do mês (no mês corrente, de hoje) que não foram renovados"),
+    ]),
 ]

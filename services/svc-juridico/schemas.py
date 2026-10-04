@@ -5,7 +5,18 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.plans import Module
-from core.processes import Action, Condition, Flow, Fluxo, ProcessModel, Step, Trigger
+from core.processes import (  # IndicatorRequest e IndicatorValues: o contrato de rpc.juridico.indicadores
+    Action,
+    Condition,
+    Flow,
+    Fluxo,
+    Indicator,
+    IndicatorRequest,
+    IndicatorValues,
+    ProcessModel,
+    Step,
+    Trigger,
+)
 from core.resources import Fields, Money, Resource, Text
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -14,6 +25,9 @@ TASK_QUEUE = "juridico-queue"
 VIGENCIA_PADRAO = 12  # meses de um contrato, quando nem o fim nem a vigência vêm
 AVISOS_CONTRATO = (60, 30)  # dias antes do fim (e do reajuste) em que a empresa é avisada
 AVISO_CERTIDAO = 15  # dias antes da validade de uma certidão
+CERTIDOES_PADRAO = 5  # Receita/PGFN, FGTS, trabalhista, estadual e municipal
+JANELA_CONTRATO = 60  # indicador: dias à frente em que um contrato vencendo ou reajustando conta
+JANELA_PRAZO = 5  # indicador: dias úteis à frente em que um prazo processual conta
 
 MODULE = Module("Jurídico", "Pacote de ações jurídicas do BPO: contratos, publicações e certidões negativas", category="Pacotes")
 
@@ -42,16 +56,27 @@ class Contrato(Fields):
 
 class Certidao(Fields):
     referencia: str = Field(..., min_length=7, max_length=7, pattern=r"^\d{4}-\d{2}$", title="Mês (AAAA-MM)")
+    emitidas: int = Field(CERTIDOES_PADRAO, ge=0, le=20, title="Emitidas", description="Quantas certidões foram emitidas no mês")
     positivas: int = Field(0, ge=0, le=20, title="Positivas", description="Quantas vieram positivas (irregularidade)")
     validade: date | None = Field(None, title="Validade mais próxima")
     resumo: Text | None = Field(None, max_length=2000, title="Resumo")
+
+
+class PrazoProcessual(Fields):
+    resumo: Text | None = Field(None, max_length=2000, title="O que a intimação pede")
+    publicada_em: date = Field(..., title="Publicada em")
+    prazo_final: date = Field(..., title="Prazo final")
+    dias_uteis: int = Field(..., ge=1, le=365, title="Dias úteis")
+    status: Literal["aberto", "cumprido"] = Field("aberto", title="Situação")
 
 
 CONTRATOS = Resource(SERVICE, "contratos", Contrato, "Contratos", search=("parte", "objeto"), sort=("fim", "parte"),
                      filters=("status",), columns=("parte", "valor", "inicio", "fim", "reajuste_em", "status"),
                      write=("owner", "admin", "operador"))
 CERTIDOES = Resource(SERVICE, "certidoes", Certidao, "Certidões", sort=("referencia", "validade"), write=("owner", "admin", "operador"))
-RESOURCES = [CONTRATOS, CERTIDOES]
+PRAZOS = Resource(SERVICE, "prazos", PrazoProcessual, "Prazos processuais", search=("resumo",), sort=("prazo_final",),
+                  filters=("status",), write=("owner", "admin", "operador"))
+RESOURCES = [CONTRATOS, CERTIDOES, PRAZOS]
 
 
 # ── Ações: entradas e saídas ─────────────────────────────────────────────────
@@ -99,6 +124,7 @@ class Publicacoes(BaseModel):
 class Prazo(BaseModel):
     disponibilizada_em: str | None = None
     dias_prazo: int | None = None
+    resumo: str | None = Field(None, description="O que a intimação pede (vai com o prazo para o cadastro)")
 
 
 class PrazoFinal(BaseModel):
@@ -112,12 +138,14 @@ class CertidoesIn(BaseModel):
 
 
 class Certidoes(BaseModel):
+    emitidas: int = Field(CERTIDOES_PADRAO, description="Quantas certidões foram emitidas")
     positivas: int = Field(..., description="Quantas certidões vieram positivas")
     validade: str = Field(..., description="Validade mais próxima (AAAA-MM-DD)")
     resumo: str = ""
 
 
 class CertidoesEmitidas(BaseModel):
+    emitidas: int | None = None
     positivas: int | None = None
     validade: str | None = None
     resumo: str | None = None
@@ -151,13 +179,13 @@ ACTIONS = [
            example=PrazoFinal(publicada_em="2026-10-06", prazo_final="2026-10-27", dias_uteis=15)),
     Action("emitir_certidoes", "Emitir as certidões", "Emite as certidões negativas da empresa nos portais",
            CertidoesIn, Certidoes, risk="externa", connections=("Portais de certidões",),
-           example=Certidoes(positivas=0, validade="2026-12-01", resumo="Todas negativas.")),
+           example=Certidoes(emitidas=5, positivas=0, validade="2026-12-01", resumo="Todas negativas.")),
     Action("registrar_certidoes", "Guardar as certidões", "Guarda as certidões do mês e avisa 15 dias antes de vencer",
            CertidoesEmitidas, RegistroCertidoes, risk="escrita",
            example=RegistroCertidoes(certidao_id="cd1", aviso_em="2026-11-16")),
 ]
 
-C, F, P = Condition, Flow, Step
+C, F, I, P = Condition, Flow, Indicator, Step
 MODELS = [
     ProcessModel("gestao-contratos", Fluxo(
         gatilho=Trigger(tipo="processo", processo="proposta-comercial", resultado="aceita", descricao="Proposta aceita"),
@@ -188,7 +216,14 @@ MODELS = [
             F(de="liberado", para="assinar", condicao=C(campo="revisar.aprovado", operador="verdadeiro")),
             F(de="liberado", para="barrado"), F(de="assinar", para="arquivar"), F(de="arquivar", para="vigente"),
         ],
-    )),
+    ), indicadores=[
+        I("contratos_vigentes", "Contratos vigentes", "pacote",
+          descricao="Contratos com a vigência cobrindo o fim do mês (no mês corrente, hoje)"),
+        I("vencendo_60_dias", "Vencendo ou reajustando em 60 dias", "pacote",
+          descricao="Dos vigentes, os que vencem ou reajustam nos 60 dias seguintes ao fim do mês (no mês corrente, a hoje)"),
+        I("dias_ate_assinar", "Da proposta aceita ao contrato assinado", "tempo", unidade="dias", de="inicio", ate="assinar",
+          resultado="vigente", descricao="Média, nos contratos que ficaram vigentes no mês, do começo da gestão às assinaturas"),
+    ]),
     ProcessModel("publicacoes-processos", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 10 * * 1-5", descricao="Todo dia útil"),
         parametros={"cnpj": ""},
@@ -206,7 +241,12 @@ MODELS = [
             F(de="tem_intimacao", para="calcular", condicao=C(campo="consultar.novas", operador=">", valor=0)),
             F(de="tem_intimacao", para="sem_intimacoes"), F(de="calcular", para="advogado"), F(de="advogado", para="encaminhada"),
         ],
-    )),
+    ), indicadores=[
+        I("intimacoes_recebidas", "Intimações recebidas", "soma", campo="consultar.novas",
+          descricao="Intimações novas encontradas nas consultas do mês"),
+        I("prazos_proximos", "Prazos nos próximos 5 dias úteis", "pacote",
+          descricao="Prazos processuais em aberto que vencem nos 5 dias úteis seguintes ao fim do mês (no mês corrente, a hoje)"),
+    ]),
     ProcessModel("certidoes-negativas", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 11 1 * *", descricao="Todo mês"),
         parametros={"cnpj": ""},
@@ -224,5 +264,12 @@ MODELS = [
             F(de="positiva", para="regularizar", condicao=C(campo="emitir.positivas", operador=">", valor=0)),
             F(de="positiva", para="regular"), F(de="regularizar", para="irregular"),
         ],
-    )),
+    ), indicadores=[
+        I("certidoes_validas", "Certidões válidas", "pacote",
+          descricao="Negativas da última emissão, se nenhuma venceu até o fim do mês (no mês corrente, hoje); senão, zero"),
+        I("positivas", "Certidões positivas", "soma", campo="emitir.positivas",
+          descricao="Certidões que vieram positivas nas emissões do mês"),
+        I("dias_ate_validade", "Dias até a próxima validade", "pacote", unidade="dias",
+          descricao="Do fim do mês (no mês corrente, de hoje) à validade mais próxima da última emissão; negativo: já venceu"),
+    ]),
 ]

@@ -41,6 +41,7 @@ from core.processes import (
     Step,
     Trigger,
     camunda,
+    exception_merge,
     process_id,
     step_outputs,
     to_bpmn,
@@ -2046,11 +2047,14 @@ def _simular(fluxo: Fluxo, catalogo: dict[str, CatalogAction], cenario: Cenario)
                 nota = f"chegou {step.mensagem}" if step.espera == "mensagem" else f"esperou {step.horas or 0:g} h"
             elif step.tipo == "paralelo":
                 nota = "todos os ramos chegaram"
+            retoma = exception_merge(fluxo, step) if seguinte else None  # passo e exceção se juntam antes do paralelo
             if step.tipo in ("acao", "agente") and step.id in cenario.excecoes and step.excecao:
                 caminho.extend([f"{step.id}__erro", f"f_{step.id}__erro", f"{step.id}__excecao"])
                 nota = "caiu na exceção: o staff resolveu"
                 if seguinte:
                     caminho.append(f"f_{step.id}__excecao_{seguinte}")
+                    if retoma:
+                        caminho.extend([retoma, f"f_{retoma}_{seguinte}"])
                     passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=nota))
                     proximo = seguinte
                     continue
@@ -2060,6 +2064,8 @@ def _simular(fluxo: Fluxo, catalogo: dict[str, CatalogAction], cenario: Cenario)
             if not seguinte:
                 return "erro", f"{step.nome} não tem caminho depois."
             caminho.append(f"f_{step.id}_{seguinte}")
+            if retoma:
+                caminho.extend([retoma, f"f_{retoma}_{seguinte}"])
             proximo = seguinte
 
     primeiro = next((f.para for f in fluxo.outgoing(START)), None)

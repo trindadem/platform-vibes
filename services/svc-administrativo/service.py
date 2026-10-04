@@ -44,6 +44,8 @@ from schemas import (
     EnviarEmail,
     Esocial,
     Exame,
+    IndicatorRequest,
+    IndicatorValues,
     NovaAdmissao,
     NovaCotacao,
     NovaRequisicao,
@@ -210,7 +212,7 @@ class AdministrativoService:
         texto = (f"Olá!\n\nFechamos a compra de {requisicao.quantidade:g} × {requisicao.item} pelo valor total de "
                  f"{_reais(valor)}.\nPedido {numero}. Por favor, mande a nota fiscal para este e-mail.\n\nObrigado!")
         await _email(fornecedor["email"], f"Pedido de compra {numero}", texto)
-        await db.merge(f"{REQUISICOES}:{requisicao.id}", {"status": "pedido", "pedido_numero": numero})
+        await db.merge(f"{REQUISICOES}:{requisicao.id}", {"status": "pedido", "pedido_numero": numero, "pedido_em": datetime.now(UTC)})
         await bus.live(LIVE_REQUISICOES, RequisicaoMudou(id=requisicao.id, action="pedido"))
         return PedidoCompra(pedido_numero=numero)
 
@@ -247,6 +249,37 @@ class AdministrativoService:
         await notify.roles("owner", "admin", title=f"{len(proximos)} vencimento(s) da empresa chegando", body="\n".join(linhas),
                            link="/administrativo/vencimentos", key=f"vencimentos-{hoje.isoformat()}")
         return Vencimentos(proximos=len(proximos), exige_presenca=sum(1 for row, _ in proximos if row.get("exige_vistoria")), resumo=resumo[:1000])
+
+    # ── Indicadores "pacote" (rpc.administrativo.indicadores; o svc-processos pede como system na organização) ──
+
+    async def indicadores(self, data: IndicatorRequest) -> IndicatorValues:
+        """O que as execuções não sabem: pedidos de compra que saíram no mês, a economia nas cotações deles e os
+        vencimentos que passaram sem renovação até o corte (o fim do mês; no corrente, hoje). Desconhecido ou mês que
+        ainda não começou: null."""
+        janela = data.janela()
+        valores: dict[str, float | None] = {nome: None for nome in data.nomes}
+        if janela is None:
+            return IndicatorValues(valores=valores)
+        if data.modelo == "compras-cotacao" and {"pedidos_emitidos", "economia_cotacoes"} & set(data.nomes):
+            pedidos = await _pedidos_do_mes(janela.inicio, janela.fim)
+            economia = sum(max(c.valor for c in r.cotacoes) - (r.melhor_valor if r.melhor_valor is not None else min(c.valor for c in r.cotacoes))
+                           for r in pedidos if len(r.cotacoes) >= 2)
+            valores |= {k: v for k, v in (("pedidos_emitidos", float(len(pedidos))), ("economia_cotacoes", round(economia, 2))) if k in data.nomes}
+        if data.modelo == "vencimentos-empresa" and "vencidos_sem_renovacao" in data.nomes:
+            valores["vencidos_sem_renovacao"] = await _vencidos_sem_renovacao(janela.dia)
+        return IndicatorValues(valores=valores)
+
+
+async def _pedidos_do_mes(inicio: datetime, fim: datetime) -> list[Requisicao]:
+    rows = await db.query(f"SELECT * FROM {REQUISICOES} WHERE tenant = $tenant AND pedido_em != NONE AND pedido_em != NULL "
+                          "AND pedido_em >= $inicio AND pedido_em < $fim", inicio=inicio, fim=fim)
+    return [Requisicao.model_validate(r) for r in rows]
+
+
+async def _vencidos_sem_renovacao(dia: date) -> float:
+    """Renovar é mudar o vencimento no cadastro: o que ainda está com o vencimento antes do dia não foi renovado."""
+    rows = await db.query(f"SELECT vence_em FROM {VENCIMENTOS.table} WHERE tenant = $tenant")
+    return float(sum(1 for r in rows if (vence := _data(r.get("vence_em"))) and vence < dia))
 
 
 def _escritor() -> None:

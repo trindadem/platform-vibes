@@ -11,7 +11,8 @@ Trilhos:
 - link é um caminho da aplicação ("/faturas?id=1"); o svc-notify monta APP_URL + link. Endereço de fora é erro.
 - Texto puro: o svc-notify escapa tudo no HTML. Parágrafos do body separados por linha em branco.
 - Entrega durável (events.notify.send, JetStream): o svc-notify fora do ar recebe quando voltar. key= dá o mesmo id
-  à mesma intenção: repetir com a mesma key não avisa duas vezes.
+  à mesma intenção: repetir com a mesma key não avisa duas vezes. Em notify.user e notify.roles o id leva a
+  organização: a mesma key numa rotina que percorre as organizações (resumo-2026-10) avisa cada uma uma vez.
 """
 import re
 import uuid
@@ -131,7 +132,8 @@ class Notify:
     async def _send(self, request: NotifyRequest, key: str | None) -> None:
         if key is not None and not _KEY.match(key):
             raise ValueError(f"notify: key inválida {key!r} (letras, números e _ . : -, até 120)")
-        msg_id = f"notify-{request.service}-{key}" if key else f"notify-{uuid.uuid4().hex}"
+        scope = "" if request.email is not None else f"{current_tenant()}-"  # pessoas: a intenção é por organização
+        msg_id = f"notify-{request.service}-{scope}{key}" if key else f"notify-{uuid.uuid4().hex}"
         await bus.publish(SEND_SUBJECT, request, msg_id=msg_id)
 
 

@@ -882,7 +882,8 @@ def test_paralelo_mal_formado_e_erro_e_a_simulacao_percorre_os_ramos():
     textos = [p.texto for p in _problemas(torto, catalogo) if p.nivel == "erro"]
     assert any("abre e junta ramos ao mesmo tempo" in t for t in textos), textos
     simulado = _simular(admissao, catalogo, Cenario(excecoes=["esocial"]))
-    assert "esocial__excecao" in simulado.caminho and "f_esocial__excecao_juntar" in simulado.caminho and simulado.fim == "admitido"
+    assert "esocial__excecao" in simulado.caminho and "f_esocial__excecao_juntar" in simulado.caminho
+    assert "esocial__retoma" in simulado.caminho and "f_esocial__retoma_juntar" in simulado.caminho and simulado.fim == "admitido"
     recusado = _simular(admissao, catalogo, Cenario(recusas=["validar"]))
     assert recusado.fim == "pendente" and "abrir" not in recusado.caminho
 
@@ -1212,6 +1213,7 @@ def test_resultados_mostram_autonomia_por_mes_versoes_fins_e_indicadores_e_o_res
                                             "status": status, "resultado": resultado, "handoffs": handoffs, "concluida_em": quando,
                                             "origem": "evento", "marcos": marcos, "saidas": {"ler_documento": {"valor": valor}}})
         resultados = (await app.user("mel", "acme", "member").get("/resultados", params={"mes": mes, "meses": 3})).json()["data"]
+        mes_invalido = await app.user("mel", "acme", "member").get("/resultados", params={"mes": "2026-13"})
         with acting_as(Principal(sub="system:svc-staff", tenant="acme", roles=frozenset({"system"}))):
             pelo_staff = await app.handlers[RESULTADOS_SUBJECT](ResultadosPedido(mes=mes, meses=3))
         with acting_as(Principal(sub="system:svc-outro", tenant="acme", roles=frozenset({"system"}))), pytest.raises(Exception) as outro:
@@ -1219,9 +1221,10 @@ def test_resultados_mostram_autonomia_por_mes_versoes_fins_e_indicadores_e_o_res
         with acting_as(Principal(sub="system:svc-processos", roles=frozenset({"system"}))):
             resumo = await service.ProcessosService().resumo_mensal(ResumoMensalIn(mes=mes))
         avisos = [m for s, m in app.published if s == AVISO_SUBJECT and m.title.startswith("Resultados de")]
-        return pid, sozinho, resultados, pelo_staff, outro.value, resumo, avisos
+        return pid, sozinho, resultados, pelo_staff, outro.value, resumo, avisos, mes_invalido
 
-    pid, sozinho, resultados, pelo_staff, outro, resumo, avisos = service_app(cenario)
+    pid, sozinho, resultados, pelo_staff, outro, resumo, avisos, mes_invalido = service_app(cenario)
+    assert mes_invalido.status_code == 422  # mês 13 não é mês (antes de chegar ao cálculo)
     assert [p["processo"] for p in resultados["processos"]] == [pid]  # só os publicados
     p = resultados["processos"][0]
     assert resultados["meses"][-1] == mes and len(resultados["meses"]) == 3

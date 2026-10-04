@@ -86,6 +86,8 @@ export interface AdministrativoRequisicao {
   melhor_fornecedor: string | null;
   melhor_valor: number | null;
   pedido_numero: string | null;
+  /** Quando o pedido de compra saiu */
+  pedido_em: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -1907,6 +1909,8 @@ export interface JuridicoContratoPage {
 
 export interface JuridicoCertidao {
   referencia: string;
+  /** Quantas certidões foram emitidas no mês */
+  emitidas?: number;
   /** Quantas vieram positivas (irregularidade) */
   positivas?: number;
   validade?: string | null;
@@ -1918,6 +1922,8 @@ export interface JuridicoCertidaoUpdate {
   /** Id do registro */
   id: string;
   referencia?: string | null;
+  /** Quantas certidões foram emitidas no mês */
+  emitidas?: number | null;
   /** Quantas vieram positivas (irregularidade) */
   positivas?: number | null;
   validade?: string | null;
@@ -1945,6 +1951,8 @@ export interface JuridicoCertidaoItem {
   updated_at: string | null;
   updated_by: string | null;
   referencia: string;
+  /** Quantas certidões foram emitidas no mês */
+  emitidas: number;
   /** Quantas vieram positivas (irregularidade) */
   positivas: number;
   validade: string | null;
@@ -1953,6 +1961,63 @@ export interface JuridicoCertidaoItem {
 
 export interface JuridicoCertidaoPage {
   items: JuridicoCertidaoItem[];
+  /** Itens que atendem ao filtro, somando todas as páginas */
+  total: number;
+  page: number;
+  size: number;
+  /** Total de páginas (0 quando não há itens) */
+  pages: number;
+}
+
+export interface JuridicoPrazoProcessual {
+  resumo?: string | null;
+  publicada_em: string;
+  prazo_final: string;
+  dias_uteis: number;
+  status?: "aberto" | "cumprido";
+}
+
+/** Prazos processuais: só os campos que mudam. */
+export interface JuridicoPrazoProcessualUpdate {
+  /** Id do registro */
+  id: string;
+  resumo?: string | null;
+  publicada_em?: string | null;
+  prazo_final?: string | null;
+  dias_uteis?: number | null;
+  status?: "aberto" | "cumprido" | null;
+}
+
+/** Prazos processuais: página, busca, filtros e ordem pela URL. */
+export interface JuridicoPrazoProcessualQuery {
+  /** Página, a partir de 1 */
+  page?: number;
+  /** Itens por página (até 100) */
+  size?: number;
+  /** Ordem: "campo" (crescente) ou "-campo" (decrescente) */
+  sort?: "prazo_final" | "-prazo_final" | "created_at" | "-created_at" | null;
+  /** Busca por palavras (início de palavra, sem acento) */
+  q?: string | null;
+  status?: "aberto" | "cumprido" | null;
+}
+
+/** Prazos processuais: um registro. */
+export interface JuridicoPrazoProcessualItem {
+  /** Id do registro */
+  id: string;
+  created_at: string | null;
+  created_by: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+  resumo: string | null;
+  publicada_em: string;
+  prazo_final: string;
+  dias_uteis: number;
+  status: "aberto" | "cumprido";
+}
+
+export interface JuridicoPrazoProcessualPage {
+  items: JuridicoPrazoProcessualItem[];
   /** Itens que atendem ao filtro, somando todas as páginas */
   total: number;
   page: number;
@@ -2001,7 +2066,27 @@ export const juridico = {
     remove: (body: ResourceRef, options?: RequestOptions) =>
       request<ResourceRemoved>("POST", "/api/v1/juridico/certidoes/remove", body, options),
     /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
-    meta: {"title": "Certidões", "live": "juridico.certidoes", "fields": [{"name": "referencia", "label": "Mês (AAAA-MM)", "kind": "text", "required": true}, {"name": "positivas", "label": "Positivas", "kind": "number", "required": false, "hint": "Quantas vieram positivas (irregularidade)"}, {"name": "validade", "label": "Validade mais próxima", "kind": "date", "required": false}, {"name": "resumo", "label": "Resumo", "kind": "textarea", "required": false}], "columns": [{"key": "referencia", "header": "Mês (AAAA-MM)", "kind": "text", "sort": "referencia"}, {"key": "positivas", "header": "Positivas", "kind": "number"}, {"key": "validade", "header": "Validade mais próxima", "kind": "date", "sort": "validade"}], "filters": [], "search": null} satisfies ResourceMeta,
+    meta: {"title": "Certidões", "live": "juridico.certidoes", "fields": [{"name": "referencia", "label": "Mês (AAAA-MM)", "kind": "text", "required": true}, {"name": "emitidas", "label": "Emitidas", "kind": "number", "required": false, "hint": "Quantas certidões foram emitidas no mês"}, {"name": "positivas", "label": "Positivas", "kind": "number", "required": false, "hint": "Quantas vieram positivas (irregularidade)"}, {"name": "validade", "label": "Validade mais próxima", "kind": "date", "required": false}, {"name": "resumo", "label": "Resumo", "kind": "textarea", "required": false}], "columns": [{"key": "referencia", "header": "Mês (AAAA-MM)", "kind": "text", "sort": "referencia"}, {"key": "emitidas", "header": "Emitidas", "kind": "number"}, {"key": "positivas", "header": "Positivas", "kind": "number"}, {"key": "validade", "header": "Validade mais próxima", "kind": "date", "sort": "validade"}], "filters": [], "search": null} satisfies ResourceMeta,
+  },
+  /** Cadastro Prazos processuais (core/resources.py) · /api/v1/juridico/prazos · exige token */
+  prazos: {
+    /** GET /api/v1/juridico/prazos · página, busca, filtros e ordem */
+    list: (query?: JuridicoPrazoProcessualQuery, options?: RequestOptions) =>
+      request<JuridicoPrazoProcessualPage>("GET", withQuery("/api/v1/juridico/prazos", query), undefined, options),
+    /** GET /api/v1/juridico/prazos/item?id= */
+    get: (query: ResourceRef, options?: RequestOptions) =>
+      request<JuridicoPrazoProcessualItem>("GET", withQuery("/api/v1/juridico/prazos/item", query), undefined, options),
+    /** POST /api/v1/juridico/prazos */
+    create: (body: JuridicoPrazoProcessual, options?: RequestOptions) =>
+      request<JuridicoPrazoProcessualItem>("POST", "/api/v1/juridico/prazos", body, options),
+    /** POST /api/v1/juridico/prazos/update · só os campos que vierem mudam */
+    update: (body: JuridicoPrazoProcessualUpdate, options?: RequestOptions) =>
+      request<JuridicoPrazoProcessualItem>("POST", "/api/v1/juridico/prazos/update", body, options),
+    /** POST /api/v1/juridico/prazos/remove */
+    remove: (body: ResourceRef, options?: RequestOptions) =>
+      request<ResourceRemoved>("POST", "/api/v1/juridico/prazos/remove", body, options),
+    /** Campos, colunas e filtros: o que useResource e ResourceList usam para montar a tela. */
+    meta: {"title": "Prazos processuais", "live": "juridico.prazos", "fields": [{"name": "resumo", "label": "O que a intimação pede", "kind": "textarea", "required": false}, {"name": "publicada_em", "label": "Publicada em", "kind": "date", "required": true}, {"name": "prazo_final", "label": "Prazo final", "kind": "date", "required": true}, {"name": "dias_uteis", "label": "Dias úteis", "kind": "number", "required": true}, {"name": "status", "label": "Situação", "kind": "select", "required": false, "options": [{"value": "aberto", "label": "Aberto"}, {"value": "cumprido", "label": "Cumprido"}]}], "columns": [{"key": "publicada_em", "header": "Publicada em", "kind": "date"}, {"key": "prazo_final", "header": "Prazo final", "kind": "date", "sort": "prazo_final"}, {"key": "dias_uteis", "header": "Dias úteis", "kind": "number"}, {"key": "status", "header": "Situação", "kind": "select"}], "filters": [{"name": "status", "label": "Situação", "options": [{"value": "aberto", "label": "Aberto"}, {"value": "cumprido", "label": "Cumprido"}]}], "search": "o que a intimação pede"} satisfies ResourceMeta,
   },
 };
 
@@ -4100,6 +4185,8 @@ export interface LiveTopics {
   "juridico.contratos": ResourceChanged;
   /** svc-juridico · cadastro certidoes (core/resources.py) */
   "juridico.certidoes": ResourceChanged;
+  /** svc-juridico · cadastro prazos (core/resources.py) */
+  "juridico.prazos": ResourceChanged;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
   /** svc-plans · bus.live("plans.uso", ...) */

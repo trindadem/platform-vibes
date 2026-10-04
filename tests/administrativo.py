@@ -130,3 +130,48 @@ def test_vencimentos_avisam_uma_vez_por_vencimento(monkeypatch):
     assert (primeira.variables["resultado"]["proximos"], primeira.variables["resultado"]["exige_presenca"]) == (2, 1)
     assert "AVCB" in primeira.variables["resultado"]["resumo"] and "Alvará" not in primeira.variables["resultado"]["resumo"]
     assert segunda.variables["resultado"]["proximos"] == 0 and len(avisos) == 1  # o mesmo vencimento não avisa de novo
+
+
+def test_indicadores_do_pacote_pedidos_economia_e_vencidos():
+    """Item 7 do alinhamento pós-N7: pedidos que saíram no mês, a economia nas cotações e os vencidos sem renovação."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from core.processes import IndicatorRequest, indicators_subject
+    from core.security import acting_as, system
+
+    enviados = []
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    mes = hoje.strftime("%Y-%m")
+
+    async def cenario(app):
+        app.respond(EMAIL_SUBJECT, _caixa(enviados))
+        ana = app.user(*OWNER)
+        await ana.post("/fornecedores", json={"nome": "Embalagens Sul", "email": "vendas@embsul.com", "categoria": "embalagens"})
+        for item, cotacoes in (("Caixas", [("Embalagens Sul", 820), ("Caixas Já", 900), ("Papelão Bom", 1000)]),  # economia 180
+                               ("Fitas", [("Embalagens Sul", 50)])):  # uma cotação só: sem economia
+            requisicao = (await ana.post("/requisicoes", json={"item": item, "quantidade": 1, "categoria": "embalagens"})).json()["data"]
+            for fornecedor, valor in cotacoes:
+                await ana.post("/requisicoes/cotacao", json={"requisicao": requisicao["id"], "fornecedor": fornecedor, "valor": valor})
+            entrada = {"requisicao_id": requisicao["id"]}
+            comparado = await app.job("administrativo.comparar_cotacoes", variables={"entrada": entrada})
+            await app.job("administrativo.emitir_pedido", variables={"entrada": {**entrada, **comparado.variables["resultado"]}})
+        await ana.post("/requisicoes", json={"item": "Sem pedido", "quantidade": 1})  # sem pedido: não conta
+        for nome, vence in (("Alvará", (hoje - timedelta(days=3)).isoformat()), ("Seguro", (hoje + timedelta(days=20)).isoformat())):
+            await ana.post("/vencimentos", json={"nome": nome, "vence_em": vence})
+        responder = app.handlers[indicators_subject("svc-administrativo")]
+        with acting_as(system("svc-processos", "acme")):
+            compras = await responder(IndicatorRequest(modelo="compras-cotacao", mes=mes, nomes=["pedidos_emitidos", "economia_cotacoes",
+                                                                                                 "dias_ate_pedido"]))
+            vencimentos = await responder(IndicatorRequest(modelo="vencimentos-empresa", mes=mes, nomes=["vencidos_sem_renovacao"]))
+            passado = await responder(IndicatorRequest(modelo="compras-cotacao", mes="2001-01", nomes=["pedidos_emitidos"]))
+        catalogo = next(m for s, m in app.published if s == CATALOG_SUBJECT)
+        return compras, vencimentos, passado, catalogo
+
+    compras, vencimentos, passado, catalogo = service_app(cenario)
+    assert compras.valores == {"pedidos_emitidos": 2.0, "economia_cotacoes": 180.0, "dias_ate_pedido": None}
+    assert vencimentos.valores == {"vencidos_sem_renovacao": 1.0} and passado.valores == {"pedidos_emitidos": 0.0}
+    indicadores = {m.id: [i.nome for i in m.indicadores] for m in catalogo.models}
+    assert indicadores == {"admissao-colaborador": ["admissoes_concluidas", "dias_ate_ativo"],
+                           "compras-cotacao": ["pedidos_emitidos", "economia_cotacoes", "dias_ate_pedido"],
+                           "vencimentos-empresa": ["avisados", "vencidos_sem_renovacao"]}

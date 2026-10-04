@@ -5,6 +5,7 @@ reativação da carteira: o catálogo do desenho de processos) e roda o worker d
 HTTP /leads..., /clientes... → cadastros declarados (core/resources.py); POST /leads/receber inicia a qualificação.
 HTTP /propostas → as propostas; POST /propostas (o pedido) inicia o processo de proposta (events.processos.evento).
 Temporal: os follow-ups das propostas sem resposta, todo dia.
+NATS rpc.vendas.indicadores → os indicadores "pacote" dos modelos (propostas enviadas, aceite, voltaram a comprar).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-vendas main:app --port 8100 --env-file .env
 """
@@ -39,7 +40,8 @@ async def lifespan(app: FastAPI):
         processes.worker(SERVICE, ACTIONS, svc),  # os jobs vendas.<ação> do motor (core/processes.py)
     ):
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
-        await processes.declare(ACTIONS, MODELS)  # o catálogo de ações e os modelos vão para o svc-processos
+        # o catálogo de ações e os modelos (com os indicadores) vão para o svc-processos; os "pacote" saem de svc.indicadores
+        await processes.declare(ACTIONS, MODELS, indicators=svc.indicadores)
         yield
 
 
