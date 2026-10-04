@@ -32,7 +32,7 @@ export default function Agentes() {
   return (
     <Page
       title="Agentes"
-      description="Agentes da empresa: instrução, ferramentas do catálogo (inclusive as dos sistemas conectados por MCP), o que pede aprovação e a suíte que prova que ele funciona."
+      description="Agentes da empresa: instrução, ferramentas do catálogo (as ações dos pacotes do plano e as dos sistemas conectados por MCP), o que pede aprovação e a suíte que prova que ele funciona."
       actions={pode && <Button onClick={() => setNovo(true)}>Novo agente</Button>}
     >
       <QueryView query={lista}>

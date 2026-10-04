@@ -480,20 +480,24 @@ export interface AgentesExecucao {
 }
 
 export interface AgentesFerramentaCatalogo {
-  /** conhecimento, documento ou mcp:<servidor>:<ferramenta> */
+  /** conhecimento, documento, acao:<pacote>.<ação> ou mcp:<servidor>:<ferramenta> */
   ref: string;
   nome: string;
   descricao: string;
-  origem: "plataforma" | "mcp";
+  origem: "plataforma" | "pacote" | "mcp";
   servidor_nome: string | null;
+  /** origem pacote: o título do pacote (ex.: Financeiro) */
+  pacote: string | null;
   risco: "leitura" | "escrita" | "externa" | "irreversivel";
   parametros: Record<string, unknown>;
 }
 
 export interface AgentesCatalogoFerramentas {
   itens: AgentesFerramentaCatalogo[];
-  /** Falso quando o svc-integracoes não respondeu (só as da plataforma) */
+  /** Falso quando o svc-integracoes não respondeu (sem as MCP) */
   integracoes: boolean;
+  /** Falso quando o svc-processos não respondeu (sem as ações dos pacotes) */
+  processos: boolean;
 }
 
 export interface AgentesAgenteMudou {

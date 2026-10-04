@@ -100,8 +100,12 @@ function Configuracao({ agente, pode, onDone }: { agente: AgentesAgente; pode: b
   const [modelo, setModelo] = useState(agente.modelo);
   const [ferramentas, setFerramentas] = useState<AgentesFerramentaAgente[]>(agente.ferramentas);
   const salvar = useAction(agentes.editar, { onSuccess: onDone });
+  // Irreversível (agendar um pagamento, assinar) nunca roda sozinho: entra pedindo aprovação, sem escolha.
+  const irreversiveis = new Set((catalogo.data?.itens ?? []).filter((i) => i.risco === "irreversivel").map((i) => i.ref));
   const usar = (ref: string, ligado: boolean) =>
-    setFerramentas((atual) => (ligado ? [...atual, { ref, modo: "permitir" }] : atual.filter((f) => f.ref !== ref)));
+    setFerramentas((atual) =>
+      ligado ? [...atual, { ref, modo: irreversiveis.has(ref) ? "perguntar" : "permitir" }] : atual.filter((f) => f.ref !== ref),
+    );
   const modo = (ref: string, valor: string) =>
     setFerramentas((atual) => atual.map((f) => (f.ref === ref ? { ...f, modo: valor === "perguntar" ? "perguntar" : "permitir" } : f)));
   return (
@@ -112,11 +116,15 @@ function Configuracao({ agente, pode, onDone }: { agente: AgentesAgente; pode: b
         <TextArea label="Instrução" value={instrucao} onChange={setInstrucao} rows={5} hint="Como ele trabalha: o que consultar, como decidir, quando pedir ajuda." />
         <TextField label="Modelo" value={modelo} onChange={setModelo} hint="Como cadastrado em IA (provedor/modelo). Padrão: cv/agente." />
       </Card>
-      <Card title="Ferramentas" description="Do catálogo: as da plataforma e as dos servidores MCP conectados em Integrações. Pedir aprovação: ele não usa sozinho; o passo vai para uma pessoa.">
+      <Card
+        title="Ferramentas"
+        description="Do catálogo: as da plataforma, as ações dos pacotes do seu plano e as dos servidores MCP conectados em Integrações. Pedir aprovação: ele não usa sozinho; o passo vai para uma pessoa. O que é irreversível sempre pede."
+      >
         <QueryView query={catalogo}>
           {(c) => (
             <Stack>
-              {!c.integracoes && <Alert tone="warning">As integrações não responderam agora: só aparecem as ferramentas da plataforma.</Alert>}
+              {!c.processos && <Alert tone="warning">Os processos não responderam agora: as ações dos pacotes não aparecem.</Alert>}
+              {!c.integracoes && <Alert tone="warning">As integrações não responderam agora: as ferramentas dos servidores MCP não aparecem.</Alert>}
               {c.itens.map((item) => {
                 const escolhida = ferramentas.find((f) => f.ref === item.ref);
                 return (
@@ -124,6 +132,7 @@ function Configuracao({ agente, pode, onDone }: { agente: AgentesAgente; pode: b
                     <Stack gap="sm">
                       <Row gap="sm">
                         <Toggle label={item.nome} checked={Boolean(escolhida)} onChange={(ligado) => usar(item.ref, ligado)} disabled={!pode} />
+                        {item.origem === "pacote" && item.pacote && <Badge>{`Pacote ${item.pacote}`}</Badge>}
                         {item.servidor_nome && <Badge>{item.servidor_nome}</Badge>}
                         <StatusBadge value={item.risco} labels={RISCOS} tones={TONS_RISCO} />
                       </Row>
@@ -131,7 +140,12 @@ function Configuracao({ agente, pode, onDone }: { agente: AgentesAgente; pode: b
                         {item.descricao}
                       </Text>
                     </Stack>
-                    {escolhida && item.risco !== "leitura" && (
+                    {escolhida && item.risco === "irreversivel" && (
+                      <Text size="sm" tone="muted">
+                        Sempre pede aprovação
+                      </Text>
+                    )}
+                    {escolhida && item.risco !== "leitura" && item.risco !== "irreversivel" && (
                       <SelectField
                         label="Política"
                         value={escolhida.modo}
@@ -154,7 +168,16 @@ function Configuracao({ agente, pode, onDone }: { agente: AgentesAgente; pode: b
         <Row>
           <Button
             loading={salvar.running}
-            onClick={() => void salvar.run({ id: agente.id, nome, descricao, instrucao, modelo, ferramentas })}
+            onClick={() =>
+              void salvar.run({
+                id: agente.id,
+                nome,
+                descricao,
+                instrucao,
+                modelo,
+                ferramentas: ferramentas.map((f) => (irreversiveis.has(f.ref) ? { ...f, modo: "perguntar" } : f)),
+              })
+            }
           >
             Salvar
           </Button>
