@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import re
 import unicodedata
 from collections.abc import AsyncIterator, Callable
@@ -43,6 +44,11 @@ from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
 
 from schemas import (
+    BLOQUEIOS,
+    PLANS_SERVICE,
+    CancelarExecucao,
+    IniciarModelo,
+    VoltarVersao,
     STAFF_SERVICE,
     AGENTES_EXECUTAR_SUBJECT,
     AGENTES_LISTA_SUBJECT,
@@ -170,6 +176,7 @@ from schemas import (
 
 MIGRATIONS: list[Migration] = []
 settings = ProcessosSettings()
+log = logging.getLogger(SERVICE)
 _MODELOS = {m.id: m for m in BIBLIOTECA}
 # Verbos de quem diz que mudou o fluxo: sem nenhuma operação aplicada, o agente é chamado de novo (o modelo às vezes
 # responde a mudança em vez de fazê-la).
@@ -190,8 +197,9 @@ class ProcessosService:
         """O passo de descoberta da jornada, para o workspace."""
         rows = await db.query(f"SELECT status, count() AS total FROM {PROCESSOS} WHERE tenant = $tenant GROUP BY status")
         total = {r["status"]: r["total"] for r in rows}
+        who = current()
         return Resumo(sugeridos=total.get("sugerido", 0), aceitos=total.get("aceito", 0), recusados=total.get("recusado", 0),
-                      publicados=await _publicados())
+                      publicados=await _publicados(), staff=who is not None and _e_staff(who))
 
     async def descobrir(self, data: Empty) -> AsyncIterator[PassoAgente | Descoberta]:
         """O agente de descoberta lê o perfil e sugere processos da biblioteca, com o porquê; cada ferramenta é um passo."""
@@ -264,6 +272,15 @@ class ProcessosService:
         return await _mudar(data.id, "recusado")
 
     # ── Catálogo de ações dos pacotes ────────────────────────────────────────
+
+    async def pausar(self, data: ProcessoRef) -> Processo:
+        """Pausa um processo publicado: o gatilho não inicia execução nova (as em andamento terminam). Dono, admin ou
+        operador."""
+        return await _pausar(data.id, True)
+
+    async def retomar(self, data: ProcessoRef) -> Processo:
+        """Retoma o processo pausado: o próximo gatilho volta a iniciar."""
+        return await _pausar(data.id, False)
 
     async def registrar_catalogo(self, data: ActionCatalog) -> Empty:
         """events.processos.catalogo: o pacote declarou as ações e os fluxos de partida dos modelos no boot; troca os
@@ -398,7 +415,7 @@ class ProcessosService:
         who = _desenhista()
         processo = await _processo_por_id(data.processo)
         rascunho = await _rascunho(processo.id)
-        if not (who.is_system or OPERADORES & who.roles) and await _precisa_revisao(processo.id, rascunho):
+        if not _e_staff(who) and await _precisa_revisao(processo.id, rascunho):
             raise ServiceError("ERRO_PROCESSOS_REVISAO", "Esta versão traz ação irreversível ou conexão nova: peça a revisão do staff da Cogniventure.", 409)
         return await _publicar(processo, rascunho)
 
@@ -492,6 +509,33 @@ class ProcessosService:
         return await _desenho(data.processo)
 
 
+    async def voltar(self, data: VoltarVersao) -> Desenho:
+        """Voltar a uma versão do histórico: o fluxo dela vira a próxima versão e é publicado; se a regra pede a revisão
+        do staff (ação irreversível, conexão ou agente que a publicada não tem), vai para a revisão. Dono, admin ou
+        operador; com rascunho aberto, descarte antes."""
+        who = _desenhista()
+        processo = await _processo_por_id(data.processo)
+        versoes = await _versoes(processo.id)
+        if any(v["status"] in ("rascunho", "revisao") for v in versoes):
+            raise ServiceError("ERRO_PROCESSOS_RASCUNHO_ABERTO", "Há um rascunho aberto: descarte-o (ou publique) antes de voltar a uma versão.", 409)
+        alvo = next((v for v in versoes if int(v["numero"]) == data.numero), None)
+        if alvo is None or alvo["status"] != "arquivada":
+            raise ServiceError("ERRO_PROCESSOS_VERSAO", "Escolha uma versão anterior do histórico (a publicada já é a que roda).", 409)
+        numero = max(int(v["numero"]) for v in versoes) + 1
+        rascunho = await db.create(VERSOES, {"processo": processo.id, "numero": numero, "status": "rascunho", "fluxo": alvo["fluxo"],
+                                             "anteriores": [], "alteracoes": 0, "volta_de": data.numero})
+        try:
+            if not _e_staff(who) and await _precisa_revisao(processo.id, rascunho):
+                desenho = await self.pedir_revisao(RevisaoIn(processo=processo.id, mensagem=f"Voltar à versão {data.numero}"))
+            else:
+                desenho = await _publicar(processo, rascunho)
+        except ServiceError:
+            await db.delete(_ref(VERSOES, rascunho))  # não publicou nem foi à revisão: nada muda
+            raise
+        texto = f"Voltei à versão {data.numero}: ela vira a versão {numero}" + (", em revisão do staff." if desenho.versao.status == "revisao" else ".")
+        await db.create(MENSAGENS, {"processo": processo.id, "papel": _papel(who), "autor": who.sub, "texto": texto, "passos": []})
+        return await _desenho(processo.id)
+
     # ── Execução: gatilhos, acompanhamento e tarefas de pessoas ───────────────
 
     async def receber_evento(self, data: EventoExterno) -> Empty:
@@ -500,8 +544,13 @@ class ProcessosService:
         origem = bus.message_id()
         resumo = data.dados.get("resumo") or data.dados.get("nome") or data.dados.get("assunto")
         for processo, versao in await _publicados_por_evento(data.nome):
-            await _iniciar(processo, versao, origem="evento", gatilho=data.dados, resumo=str(resumo) if resumo else data.nome,
-                           chave=f"{origem}:{processo.id}" if origem else None)
+            try:
+                await _iniciar(processo, versao, origem="evento", gatilho=data.dados, resumo=str(resumo) if resumo else data.nome,
+                               chave=f"{origem}:{processo.id}" if origem else None)
+            except ServiceError as exc:
+                if exc.code not in BLOQUEIOS:
+                    raise
+                log.info("evento %s não iniciou %s: %s", data.nome, processo.id, exc.code)  # pausado ou conta suspensa
         if data.chave:
             await camunda.message(f"{current_tenant()}.{data.nome}", data.chave, {"mensagem": data.dados}, message_id=origem)
         return Empty()
@@ -516,6 +565,51 @@ class ProcessosService:
         if publicada is None:
             raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", "Publique o processo antes de iniciar uma execução.", 409)
         return await _iniciar(processo, publicada, origem="manual", gatilho={**data.dados, "origem": "manual"}, resumo="Iniciada à mão")
+
+    async def iniciar_modelo(self, data: IniciarModelo) -> Execucao:
+        """rpc.processos.iniciar_modelo (só o svc-plans): inicia o processo publicado deste modelo na organização de quem
+        pede, com os dados no gatilho (o fechamento do mês inicia o Faturamento e cobrança na Cogniventure)."""
+        who = current()
+        if who is None or who.sub != f"{SYSTEM_PREFIX}{PLANS_SERVICE}" or not who.tenant:
+            raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só o svc-plans inicia por modelo.", 403)
+        for processo in await _todos():
+            if processo.modelo != data.modelo or processo.publicada is None:
+                continue
+            publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
+            if publicada is not None:
+                return await _iniciar(processo, publicada, origem="agenda", gatilho={**data.dados, "origem": "agenda"},
+                                      resumo=data.resumo, chave=data.chave)
+        modelo = _MODELOS.get(data.modelo)
+        nome = modelo.titulo if modelo else data.modelo
+        raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", f"Publique o {nome} para iniciar por aqui.", 409)
+
+    async def cancelar_execucao(self, data: CancelarExecucao) -> Execucao:
+        """Cancela uma execução em andamento (dono, admin ou operador), com o motivo na linha do tempo. Não desfaz o que
+        já aconteceu fora da plataforma (a tela avisa antes: ExecucaoDetalhe.efeitos). As tarefas abertas dela fecham."""
+        who = current()
+        if who is None or not (who.is_system or STARTERS & who.roles):
+            raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só donos, administradores e operadores cancelam execuções.", 403)
+        row = await db.select(f"{EXECUCOES}:{data.id}")
+        if row is None:
+            raise ServiceError("ERRO_PROCESSOS_NAO_ENCONTRADO", "Execução não encontrada.", 404)
+        execucao = Execucao.model_validate(row)
+        if execucao.status not in ("andamento", "incidente"):
+            raise ServiceError("ERRO_PROCESSOS_EXECUCAO_FECHADA", "Esta execução já terminou.", 409)
+        await camunda.cancel(execucao.instancia)
+        agora = datetime.now(UTC)
+        abertas = await db.query(f"SELECT * FROM {TAREFAS} WHERE tenant = $tenant AND instancia = $i AND status = 'aberta'", i=execucao.instancia)
+        for tarefa in (Tarefa.model_validate(t) for t in abertas):
+            await db.merge(f"{TAREFAS}:{tarefa.id}", {"status": "concluida", "resposta": {"cancelada": data.motivo},
+                                                       "concluida_por": who.sub, "concluida_em": agora})
+            await bus.live(LIVE_TAREFAS, TarefaMudou(id=tarefa.id, action="concluida"))
+            if tarefa.responsavel == "staff":
+                await _ao_staff(ItemStaff(tipo="excecao", ref=tarefa.id, titulo=f"{tarefa.titulo}: {tarefa.nome}", status="concluida",
+                                          link="/processos/tarefas", em=agora))
+        await _marcar(execucao.instancia, Marco(passo=execucao.passo_atual or START, nome="Cancelada", status="cancelada", em=agora,
+                                                motivo=data.motivo, por=who.sub),
+                      aguardando=None, atual=(None, None), final={"status": "cancelada", "concluida_em": agora})
+        await bus.live(LIVE_EXECUCOES, ExecucaoMudou(id=execucao.id, action="cancelada"))
+        return Execucao.model_validate(await db.select(f"{EXECUCOES}:{execucao.id}"))
 
     async def execucoes(self, data: ExecucaoQuery) -> ExecucaoPage:
         return await db.page(EXECUCOES, data, ExecucaoPage)
@@ -536,7 +630,11 @@ class ProcessosService:
         caminho = [*dict.fromkeys(visitados), *(fid for fid, de, para in ligacoes if de in concluidos and para in visitados)]
         atuais = [e["id"] for e in elementos if e["estado"] == "ACTIVE"]
         cadeia = await _etapas(execucao.projeto) if execucao.projeto else []
-        return ExecucaoDetalhe(execucao=execucao, bpmn=bpmn, caminho=caminho, atuais=atuais, cadeia=cadeia)
+        catalogo = await _catalogo()
+        feitos = {m.passo for m in execucao.marcos if m.status == "concluido"}
+        efeitos = [s.nome for s in fluxo.passos if s.id in feitos and s.tipo == "acao" and s.acao in catalogo
+                   and catalogo[s.acao].risk in ("externa", "irreversivel")]
+        return ExecucaoDetalhe(execucao=execucao, bpmn=bpmn, caminho=caminho, atuais=atuais, cadeia=cadeia, efeitos=efeitos)
 
     async def projetos(self, data: ProjetoQuery) -> ProjetoPage:
         """As cadeias de processos (um que terminou e iniciou outros), cada uma como um projeto com as execuções dela."""
@@ -596,7 +694,7 @@ class ProcessosService:
         tarefa = Tarefa.model_validate(row)
         who = current()
         pode = WRITERS if tarefa.responsavel == "cliente" else OPERADORES
-        if who is None or not (who.is_system or pode & who.roles):
+        if who is None or not (who.is_system or pode & who.roles or (tarefa.responsavel == "staff" and _e_staff(who))):
             quem = "donos e administradores" if tarefa.responsavel == "cliente" else "operadores do staff"
             raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", f"Esta tarefa é para {quem}.", 403)
         if tarefa.status != "aberta":
@@ -702,12 +800,19 @@ class ProcessosService:
     # ── Jobs do motor para este serviço (core/processes.py: o BPMN os gera) ──
 
     async def _job_inicio(self, job: Job) -> None:
-        """A execução começou (qualquer gatilho): garante o registro dela (a de agenda só se sabe aqui)."""
+        """A execução começou (qualquer gatilho): garante o registro dela (a de agenda só se sabe aqui). A de agenda com
+        o processo pausado ou a conta suspensa é cancelada no motor na hora, e fica registrada como não iniciada."""
         if await _execucao_por_instancia(job.instance) is None:
             processo = await _processo_por_id(job.processo)
             gatilho = job.variables.get("gatilho") or {}
-            origem = gatilho.get("origem") if gatilho.get("origem") in ("manual", "processo") else ("evento" if gatilho else "agenda")
-            await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=None)
+            origem = gatilho.get("origem") if gatilho.get("origem") in ("manual", "processo", "agenda") else ("evento" if gatilho else "agenda")
+            bloqueio = await _bloqueio(processo) if origem == "agenda" and not gatilho else None
+            await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=bloqueio)
+            if bloqueio:
+                await camunda.cancel(job.instance)
+                agora = datetime.now(UTC)
+                await _marcar(job.instance, Marco(passo=START, nome="Não iniciou", status="cancelada", em=agora, motivo=bloqueio),
+                              aguardando=None, atual=(None, None), final={"status": "cancelada", "concluida_em": agora})
         return None
 
     async def _job_tarefa(self, job: Job) -> None:
@@ -1014,9 +1119,16 @@ def _como_operador(pessoa: str) -> Principal:
     return Principal(sub=pessoa, tenant=current_tenant(), roles=frozenset({"operador"}))
 
 
+def _e_staff(who: Principal) -> bool:
+    """Quem faz o papel do staff: o operador que a carteira põe no cliente; na organização da própria Cogniventure
+    (o faturamento dos clientes roda lá), o dono e o admin dela, que ninguém põe numa carteira."""
+    platform = settings.platform_tenant
+    return bool(who.is_system or OPERADORES & who.roles or (platform and who.tenant == platform and WRITERS & who.roles))
+
+
 def _operador() -> Any:
     who = current()
-    if who is None or not (who.is_system or OPERADORES & who.roles):
+    if who is None or not _e_staff(who):
         raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só o staff da Cogniventure faz isso.", 403)
     return who
 
@@ -1926,6 +2038,33 @@ async def _publicados_por_evento(evento: str) -> list[tuple[Processo, dict[str, 
     return out
 
 
+async def _pausar(processo_id: str, pausar: bool) -> Processo:
+    who = current()
+    if who is None or not (who.is_system or STARTERS & who.roles):
+        raise ServiceError("ERRO_PROCESSOS_FORBIDDEN", "Só donos, administradores e operadores pausam e retomam processos.", 403)
+    processo = await _processo_por_id(processo_id)
+    if processo.publicada is None:
+        raise ServiceError("ERRO_PROCESSOS_SEM_PUBLICADA", "Só um processo publicado se pausa.", 409)
+    mudancas = {"pausado": True, "pausado_em": datetime.now(UTC), "pausado_por": who.sub} if pausar else \
+        {"pausado": False, "pausado_em": None, "pausado_por": None}
+    processo = _processo(await db.merge(f"{PROCESSOS}:{processo.id}", mudancas))
+    await bus.live(LIVE_PROCESSOS, ProcessoMudou(id=processo.id, action="pausado" if pausar else "retomado"))
+    return processo
+
+
+async def _bloqueio(processo: Processo) -> str | None:
+    """Por que nada novo começa agora (None: pode): o processo pausado, ou a conta da organização suspensa ou encerrada
+    (o svc-plans, perguntado na hora)."""
+    if processo.pausado:
+        return "O processo está pausado: retome para iniciar execuções."
+    situacao = await plans.situacao()
+    if situacao == "suspensa":
+        return "A conta está suspensa: nenhuma execução nova começa até a regularização. Fale com a Cogniventure."
+    if situacao == "encerrada":
+        return "A conta está encerrada: nenhuma execução nova começa."
+    return None
+
+
 async def _iniciar(processo: Processo, versao: dict[str, Any], *, origem: str, gatilho: dict[str, Any], resumo: str | None,
                    chave: str | None = None, pai: Execucao | None = None) -> Execucao:
     """Inicia no motor (com o limite do plano conferido antes) e registra a execução; pai: a execução do processo que
@@ -1934,6 +2073,9 @@ async def _iniciar(processo: Processo, versao: dict[str, Any], *, origem: str, g
         existente = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND gatilho_id = $g LIMIT 1", g=chave)
         if existente:
             return Execucao.model_validate(existente[0])  # o mesmo evento entregue de novo
+    if motivo := await _bloqueio(processo):
+        situacao = "PAUSADO" if processo.pausado else ("CONTA_ENCERRADA" if "encerrada" in motivo else "CONTA_SUSPENSA")
+        raise ServiceError(f"ERRO_PROCESSOS_{situacao}", motivo, 409)
     await plans.check("execucoes")
     iniciada = await camunda.start(_motor_id(processo.id), {"gatilho": gatilho})
     execucao = await _registrar_execucao(processo, iniciada.instance, iniciada.version, origem=origem, resumo=resumo, gatilho_id=chave,

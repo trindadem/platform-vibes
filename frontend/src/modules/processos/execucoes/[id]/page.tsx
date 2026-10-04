@@ -1,7 +1,9 @@
+import { useState } from "react";
 import { useParams } from "react-router";
 import type { PageMeta } from "@/App";
 import { Alert } from "@/components/Alert";
 import { BpmnDiagram } from "@/components/BpmnDiagram";
+import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { Columns } from "@/components/Columns";
 import { DateTime } from "@/components/DateTime";
@@ -13,8 +15,10 @@ import { Row } from "@/components/Row";
 import { Stack } from "@/components/Stack";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Text } from "@/components/Text";
+import { TextArea } from "@/components/TextArea";
 import { TextLink } from "@/components/TextLink";
-import { useLiveQuery, useQuery } from "@/core/api";
+import { useAction, useLiveQuery, useQuery } from "@/core/api";
+import { hasAnyRole, useSession } from "@/core/auth";
 import { identity, type ProcessosEtapaProjeto, type ProcessosExecucaoDetalhe, processos } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Execução" };
@@ -31,8 +35,9 @@ const MARCOS = {
   resolvido: "Resolvido",
   aguardando: "Esperando",
   fim: "Terminou",
+  cancelada: "Cancelada",
 };
-const TONS_MARCOS = { handoff: "warning", incidente: "danger", tentando: "warning", tarefa: "accent", fim: "success" } as const;
+const TONS_MARCOS = { handoff: "warning", incidente: "danger", tentando: "warning", tarefa: "accent", fim: "success", cancelada: "neutral" } as const;
 
 const ESPERA = { cliente: "Esperando a empresa", staff: "Com o staff", evento: "Aguardando" };
 
@@ -51,11 +56,42 @@ function etapas(itens: ProcessosEtapaProjeto[], atual: string): ProjectChainStep
 export default function ExecucaoDoProcesso() {
   const { id = "" } = useParams();
   const detalhe = useLiveQuery("processos.execucoes", processos.execucao, { id });
-  return <QueryView query={detalhe}>{(d) => <Execucao detalhe={d} />}</QueryView>;
+  return <QueryView query={detalhe}>{(d) => <Execucao detalhe={d} reload={detalhe.reload} />}</QueryView>;
 }
 
-function Execucao({ detalhe }: { detalhe: ProcessosExecucaoDetalhe }) {
+/** Cancelar com o motivo (fica na linha do tempo), dizendo antes o que já aconteceu fora e não se desfaz. */
+function Cancelar({ detalhe, reload }: { detalhe: ProcessosExecucaoDetalhe; reload: () => void }) {
+  const [aberto, setAberto] = useState(false);
+  const [motivo, setMotivo] = useState("");
+  const cancelar = useAction(processos.cancelar, { onSuccess: () => { setAberto(false); reload(); } });
+  if (!aberto) {
+    return <Button variant="secondary" onClick={() => setAberto(true)}>Cancelar a execução</Button>;
+  }
+  return (
+    <Card title="Cancelar a execução" description="Ela para agora e não segue para os próximos passos; as tarefas abertas dela fecham.">
+      <Stack gap="sm">
+        {detalhe.efeitos.length > 0 && (
+          <Alert tone="warning" title="Cancelar não desfaz o que já aconteceu">
+            Já feito fora da plataforma: {detalhe.efeitos.join(", ")}. Se precisar desfazer (um pagamento agendado, uma cobrança enviada),
+            faça no banco ou peça ao staff.
+          </Alert>
+        )}
+        <TextArea label="Motivo (fica na linha do tempo)" value={motivo} onChange={setMotivo} placeholder="Ex.: boleto duplicado, já pago por outro caminho." />
+        {cancelar.error && <Alert tone="danger">{cancelar.error.message}</Alert>}
+        <Row>
+          <Button variant="danger" loading={cancelar.running} disabled={motivo.trim().length < 3} onClick={() => void cancelar.run({ id: detalhe.execucao.id, motivo: motivo.trim() })}>
+            Cancelar agora
+          </Button>
+          <Button variant="ghost" onClick={() => setAberto(false)}>Voltar</Button>
+        </Row>
+      </Stack>
+    </Card>
+  );
+}
+
+function Execucao({ detalhe, reload }: { detalhe: ProcessosExecucaoDetalhe; reload: () => void }) {
   const e = detalhe.execucao;
+  const podeCancelar = hasAnyRole(useSession(), "owner", "admin", "operador") && (e.status === "andamento" || e.status === "incidente");
   const membros = useQuery(identity.members); // quem resolveu: o nome, não o id (o operador do staff é membro)
   const nome = (id: string) => membros.data?.items.find((m) => m.id === id)?.name ?? "alguém da equipe";
   const saidas = Object.entries(e.saidas);
@@ -67,7 +103,8 @@ function Execucao({ detalhe }: { detalhe: ProcessosExecucaoDetalhe }) {
       actions={<StatusBadge value={e.status} labels={STATUS} tones={TONS} />}
     >
       <Text tone="muted">
-        <TextLink to="/processos/execucoes">Execuções</TextLink> · {e.status === "concluida" ? `Terminou em: ${e.resultado}` : (e.passo_nome ?? "Rodando")}
+        <TextLink to="/processos/execucoes">Execuções</TextLink> ·{" "}
+        {e.status === "concluida" ? `Terminou em: ${e.resultado}` : e.status === "cancelada" ? "Cancelada" : (e.passo_nome ?? "Rodando")}
       </Text>
       {primeira && detalhe.cadeia.length > 1 && (
         <ProjectChain
@@ -77,6 +114,12 @@ function Execucao({ detalhe }: { detalhe: ProcessosExecucaoDetalhe }) {
           steps={etapas(detalhe.cadeia, e.id)}
         />
       )}
+      {e.status === "cancelada" && (
+        <Alert tone="info" title="Cancelada">
+          {e.marcos.findLast((m) => m.status === "cancelada")?.motivo ?? "A execução foi cancelada."}
+        </Alert>
+      )}
+      {podeCancelar && <Cancelar detalhe={detalhe} reload={reload} />}
       {e.status === "incidente" && (
         <Alert tone="danger" title="Parou com incidente">
           Um passo falhou sem caminho de exceção. O staff da Cogniventure vê o incidente no motor e retoma a execução.

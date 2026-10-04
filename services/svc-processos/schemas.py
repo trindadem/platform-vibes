@@ -29,6 +29,10 @@ ACOMPANHAMENTO_SUBJECT = "rpc.processos.acompanhamento"  # svc-staff: a saúde d
 LIVE_REGRAS = "processos.regras"
 EVENT_SUBJECT = "events.integracoes.evento"  # do svc-integracoes: documento recebido, pagamento confirmado
 DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # do svc-integracoes: o texto de um documento recebido
+INICIAR_MODELO_SUBJECT = "rpc.processos.iniciar_modelo"  # svc-plans: o fechamento do mês inicia o faturamento da Cogniventure
+PLANS_SERVICE = "svc-plans"
+# Nada novo começa: o processo pausado, a conta suspensa (atraso) ou encerrada (alinhamento pós-N7, itens 2, 8 e 13).
+BLOQUEIOS = frozenset({"ERRO_PROCESSOS_PAUSADO", "ERRO_PROCESSOS_CONTA_SUSPENSA", "ERRO_PROCESSOS_CONTA_ENCERRADA"})
 
 PROCESSOS = "processos_processos"
 VERSOES = "processos_versoes"
@@ -64,6 +68,8 @@ class ProcessosSettings(BaseSettings):
 
     model: str = Field("cv/agente", description="Modelo dos agentes de descoberta e descrição, como cadastrado no svc-ai")
     desenho_model: str = Field("cv/desenho", description="Modelo do agente de desenho (edita o fluxo); sem ele no svc-ai, vale o model")
+    platform_tenant: str | None = Field(None, validation_alias="PLATFORM_TENANT",
+                                        description="A organização da Cogniventure: nos processos dela, o dono e o admin são o staff")
 
 
 class _Input(BaseModel):
@@ -180,6 +186,9 @@ class Processo(BaseModel):
     prioridade: Prioridade = "media"
     publicada: int | None = Field(None, description="Número da versão publicada (a que roda)")
     ajuda: "PedidoAjuda | None" = Field(None, description="Pedido de ajuda ao staff em aberto no desenho")
+    pausado: bool = Field(False, description="Pausado: o gatilho não inicia execução nova (as em andamento terminam)")
+    pausado_em: datetime | None = None
+    pausado_por: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -207,7 +216,7 @@ class ProcessoRef(_Input):
 
 class ProcessoMudou(BaseModel):
     id: str
-    action: Literal["sugerido", "aceito", "recusado", "descrito"]
+    action: Literal["sugerido", "aceito", "recusado", "descrito", "pausado", "retomado"]
 
 
 class AdicionarModelo(_Input):
@@ -255,6 +264,7 @@ class Resumo(BaseModel):
     aceitos: int
     recusados: int
     publicados: int = Field(0, description="Aceitos com versão publicada (rodando no motor)")
+    staff: bool = Field(False, description="Quem pede faz o papel do staff aqui: revisa, publica e resolve as exceções")
 
 
 # ── Desenho: versões, operações do agente, simulação e publicação ──────────
@@ -344,6 +354,13 @@ class ProcessoLigado(BaseModel):
 
 class DesenhoRef(_Input):
     processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class VoltarVersao(_Input):
+    """Voltar a uma versão do histórico: ela é publicada de novo como a próxima versão."""
+
+    processo: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    numero: int = Field(..., ge=1, description="A versão (arquivada) a que se volta")
 
 
 class MensagemDesenhoIn(_Input):
@@ -563,7 +580,7 @@ class Marco(BaseModel):
 
     passo: str
     nome: str
-    status: Literal["iniciada", "concluido", "handoff", "incidente", "tentando", "tarefa", "resolvido", "aguardando", "fim"]
+    status: Literal["iniciada", "concluido", "handoff", "incidente", "tentando", "tarefa", "resolvido", "aguardando", "fim", "cancelada"]
     em: datetime
     motivo: str | None = None
     por: str | None = Field(None, description="Quem resolveu (tarefa de pessoa)")
@@ -627,6 +644,7 @@ class ExecucaoDetalhe(BaseModel):
     caminho: list[str] = Field(..., description="Elementos e ligações por onde passou (para pintar no diagrama)")
     atuais: list[str] = Field(..., description="Onde está agora")
     cadeia: list["EtapaProjeto"] = Field(default_factory=list, description="O projeto de que a execução faz parte (vazio fora de uma cadeia)")
+    efeitos: list[str] = Field(default_factory=list, description="Passos já feitos fora da plataforma, que cancelar não desfaz (ex.: o pagamento agendado)")
 
 
 class EtapaProjeto(BaseModel):
@@ -676,9 +694,24 @@ class Iniciar(_Input):
     dados: dict[str, str | float | bool] = Field(default_factory=dict, description="O que o gatilho traria (ex.: documento_id)")
 
 
+class CancelarExecucao(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    motivo: str = Field(..., min_length=3, max_length=500, description="Fica na linha do tempo")
+
+
+class IniciarModelo(BaseModel):
+    """rpc.processos.iniciar_modelo (só o svc-plans): inicia o processo publicado deste modelo na organização de quem
+    pede; a mesma chave não inicia duas vezes."""
+
+    modelo: str = Field(..., pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    dados: dict[str, Any] = Field(default_factory=dict)
+    chave: str = Field(..., pattern=r"^[A-Za-z0-9_.:-]{1,120}$")
+    resumo: str | None = Field(None, max_length=300)
+
+
 class ExecucaoMudou(BaseModel):
     id: str
-    action: Literal["iniciada", "mudou", "concluida"]
+    action: Literal["iniciada", "mudou", "concluida", "cancelada"]
 
 
 class Campo(BaseModel):

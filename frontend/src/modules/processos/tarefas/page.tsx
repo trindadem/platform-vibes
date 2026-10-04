@@ -26,7 +26,8 @@ const TIPOS = { aprovacao: "Aprovação", excecao: "Exceção" };
 
 export default function Tarefas() {
   const session = useSession();
-  const operador = hasAnyRole(session, "operador");
+  const resumo = useQuery(processos.resumo); // na própria Cogniventure, o dono e o admin fazem o papel do staff
+  const operador = hasAnyRole(session, "operador") || Boolean(resumo.data?.staff);
   const cliente = <Fila responsavel="cliente" vazio="Nada esperando por você agora." />;
   const staff = <Fila responsavel="staff" vazio="Nenhuma exceção aberta para o staff." />;
   return (
@@ -92,7 +93,8 @@ function Fila({ responsavel, vazio }: { responsavel: "cliente" | "staff"; vazio:
 
 function TarefaAberta({ tarefa, onDone }: { tarefa: ProcessosTarefa; onDone: () => void }) {
   const session = useSession();
-  const pode = tarefa.responsavel === "cliente" ? hasAnyRole(session, "owner", "admin") : hasAnyRole(session, "operador");
+  const resumo = useQuery(processos.resumo);
+  const pode = tarefa.responsavel === "cliente" ? hasAnyRole(session, "owner", "admin") : hasAnyRole(session, "operador") || Boolean(resumo.data?.staff);
   const [comentario, setComentario] = useState("");
   const [regra, setRegra] = useState("");
   const responder = useAction(processos.responder, { onSuccess: onDone });

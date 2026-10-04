@@ -1346,6 +1346,11 @@ export interface IdentityMe {
   tenants: IdentityTenant[];
 }
 
+/** A pessoa apaga a própria conta (LGPD): confirma com a senha. */
+export interface IdentityExcluirConta {
+  password: string;
+}
+
 export interface IdentitySwitchInput {
   /** Organização que passa a ser a ativa */
   tenant: string;
@@ -1463,6 +1468,9 @@ export const identity = {
   /** GET /api/v1/identity/me · http · exige token */
   me: (options?: RequestOptions) =>
     request<IdentityMe>("GET", "/api/v1/identity/me", undefined, options),
+  /** POST /api/v1/identity/me/excluir · http · exige token */
+  excluirConta: (body: IdentityExcluirConta, options?: RequestOptions) =>
+    request<IdentityEmpty>("POST", "/api/v1/identity/me/excluir", body, options),
   /** POST /api/v1/identity/switch · http · exige token · sessão em cookie */
   switchTenant: (body: IdentitySwitchInput, options?: RequestOptions) =>
     request<IdentityAuthResult>("POST", "/api/v1/identity/switch", body, options),
@@ -2067,6 +2075,39 @@ export const notify = {
     request<NotifyPreferences>("POST", "/api/v1/notify/preferences", body, options),
 };
 
+export interface PlansCancelamento {
+  pedido_em: string;
+  /** Id de quem pediu */
+  por: string | null;
+  origem: "cliente" | "cogniventure";
+  motivo: string | null;
+  /** Quando a conta encerra: o fim do mês pago (meia-noite de Brasília) */
+  efetivo_em: string;
+}
+
+export interface PlansConta {
+  tenant: string;
+  situacao: "ativa" | "suspensa" | "encerrada";
+  /** Mensalidade cobrada no fechamento: a combinada com o cliente ou o preço do plano */
+  valor: number;
+  /** A Cogniventure combinou um valor só deste cliente */
+  valor_combinado: boolean;
+  moeda: "BRL" | "USD" | "EUR";
+  /** Dia do mês em que a mensalidade vence */
+  vencimento: number;
+  suspensa_em: string | null;
+  /** Por que foi suspensa */
+  motivo: string | null;
+  cancelamento: PlansCancelamento | null;
+  encerrada_em: string | null;
+  /** Quando os dados saem de vez (30 dias depois do encerramento) */
+  exclusao_em: string | null;
+  /** O que a organização vê no workspace e em Plano */
+  aviso: string | null;
+  /** O dono desfaz o cancelamento que pediu (até a exclusão) */
+  pode_desfazer: boolean;
+}
+
 export interface PlansLimitState {
   /** Nome completo: <serviço>.<limite> */
   name: string;
@@ -2130,6 +2171,8 @@ export interface PlansCurrent {
   limits: PlansLimitState[];
   modules: PlansModuleState[];
   manages_platform: boolean;
+  /** Mensalidade, situação e cancelamento da organização */
+  conta: PlansConta;
 }
 
 export interface PlansPlanList {
@@ -2238,6 +2281,51 @@ export interface PlansAssignInput {
   modules?: Record<string, boolean> | null;
 }
 
+export interface PlansCancelamentoIn {
+  motivo?: string | null;
+}
+
+export interface PlansEmpty {
+}
+
+export interface PlansExportacao {
+  id: string;
+  status: "preparando" | "pronta" | "falhou";
+  created_at: string | null;
+  pronta_em: string | null;
+  /** Bytes do pacote */
+  tamanho: number | null;
+  /** Link para baixar (10 min), quando pronta */
+  url: string | null;
+  /** O que ficou de fora (um serviço fora do ar) ou por que falhou */
+  aviso: string | null;
+}
+
+export interface PlansExportacaoAtual {
+  item: PlansExportacao | null;
+}
+
+export interface PlansFechamentoIn {
+  /** AAAA-MM (vazio: o mês atual) */
+  mes?: string | null;
+}
+
+export interface PlansCobrado {
+  tenant: string;
+  nome: string;
+  valor: number;
+  /** AAAA-MM-DD */
+  vencimento: string;
+  /** A execução do Faturamento e cobrança na Cogniventure */
+  execucao: string | null;
+  erro: string | null;
+}
+
+export interface PlansFechamento {
+  mes: string;
+  cobrados: PlansCobrado[];
+}
+
 /** Consumo ou total que mudou (também vai ao vivo para a tela da organização). */
 export interface PlansUsageChanged {
   name: string;
@@ -2273,6 +2361,21 @@ export const plans = {
   /** POST /api/v1/plans/assign · http · exige token */
   assign: (body: PlansAssignInput, options?: RequestOptions) =>
     request<PlansAccount>("POST", "/api/v1/plans/assign", body, options),
+  /** POST /api/v1/plans/cancelamento · http · exige token */
+  cancelar: (body: PlansCancelamentoIn, options?: RequestOptions) =>
+    request<PlansConta>("POST", "/api/v1/plans/cancelamento", body, options),
+  /** POST /api/v1/plans/cancelamento/desfazer · http · exige token */
+  desfazerCancelamento: (body: PlansEmpty, options?: RequestOptions) =>
+    request<PlansConta>("POST", "/api/v1/plans/cancelamento/desfazer", body, options),
+  /** GET /api/v1/plans/exportacao · http · exige token */
+  exportacao: (options?: RequestOptions) =>
+    request<PlansExportacaoAtual>("GET", "/api/v1/plans/exportacao", undefined, options),
+  /** POST /api/v1/plans/exportacao · http · exige token */
+  exportar: (body: PlansEmpty, options?: RequestOptions) =>
+    request<PlansExportacao>("POST", "/api/v1/plans/exportacao", body, options),
+  /** POST /api/v1/plans/fechamento · http · exige token */
+  fecharMes: (body: PlansFechamentoIn, options?: RequestOptions) =>
+    request<PlansFechamento>("POST", "/api/v1/plans/fechamento", body, options),
 };
 
 export interface ProcessosModeloProcesso {
@@ -2318,6 +2421,10 @@ export interface ProcessosProcesso {
   publicada: number | null;
   /** Pedido de ajuda ao staff em aberto no desenho */
   ajuda: ProcessosPedidoAjuda | null;
+  /** Pausado: o gatilho não inicia execução nova (as em andamento terminam) */
+  pausado: boolean;
+  pausado_em: string | null;
+  pausado_por: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -2351,6 +2458,8 @@ export interface ProcessosResumo {
   recusados: number;
   /** Aceitos com versão publicada (rodando no motor) */
   publicados: number;
+  /** Quem pede faz o papel do staff aqui: revisa, publica e resolve as exceções */
+  staff: boolean;
 }
 
 export interface ProcessosEmpty {
@@ -2616,6 +2725,13 @@ export interface ProcessosSimulacao {
   problemas: string[];
 }
 
+/** Voltar a uma versão do histórico: ela é publicada de novo como a próxima versão. */
+export interface ProcessosVoltarVersao {
+  processo: string;
+  /** A versão (arquivada) a que se volta */
+  numero: number;
+}
+
 export interface ProcessosExecucao {
   id: string;
   /** Execução no motor */
@@ -2654,7 +2770,7 @@ export interface ProcessosExecucao {
 export interface ProcessosMarco {
   passo: string;
   nome: string;
-  status: "iniciada" | "concluido" | "handoff" | "incidente" | "tentando" | "tarefa" | "resolvido" | "aguardando" | "fim";
+  status: "iniciada" | "concluido" | "handoff" | "incidente" | "tentando" | "tarefa" | "resolvido" | "aguardando" | "fim" | "cancelada";
   em: string;
   motivo: string | null;
   /** Quem resolveu (tarefa de pessoa) */
@@ -2711,6 +2827,8 @@ export interface ProcessosExecucaoDetalhe {
   atuais: string[];
   /** O projeto de que a execução faz parte (vazio fora de uma cadeia) */
   cadeia: ProcessosEtapaProjeto[];
+  /** Passos já feitos fora da plataforma, que cancelar não desfaz (ex.: o pagamento agendado) */
+  efeitos: string[];
 }
 
 export interface ProcessosExecucaoRef {
@@ -2721,6 +2839,12 @@ export interface ProcessosIniciar {
   processo: string;
   /** O que o gatilho traria (ex.: documento_id) */
   dados?: Record<string, string | number | boolean>;
+}
+
+export interface ProcessosCancelarExecucao {
+  id: string;
+  /** Fica na linha do tempo */
+  motivo: string;
 }
 
 /** Um campo que a pessoa preenche ao resolver uma exceção (a saída do passo que parou). */
@@ -2897,7 +3021,7 @@ export interface ProcessosRegraRef {
 
 export interface ProcessosProcessoMudou {
   id: string;
-  action: "sugerido" | "aceito" | "recusado" | "descrito";
+  action: "sugerido" | "aceito" | "recusado" | "descrito" | "pausado" | "retomado";
 }
 
 export interface ProcessosDesenhoMudou {
@@ -2907,7 +3031,7 @@ export interface ProcessosDesenhoMudou {
 
 export interface ProcessosExecucaoMudou {
   id: string;
-  action: "iniciada" | "mudou" | "concluida";
+  action: "iniciada" | "mudou" | "concluida" | "cancelada";
 }
 
 export interface ProcessosTarefaMudou {
@@ -2943,6 +3067,12 @@ export const processos = {
   /** POST /api/v1/processos/processos/recusar · http · exige token */
   recusar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
     request<ProcessosProcesso>("POST", "/api/v1/processos/processos/recusar", body, options),
+  /** POST /api/v1/processos/processos/pausar · http · exige token */
+  pausar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/processos/pausar", body, options),
+  /** POST /api/v1/processos/processos/retomar · http · exige token */
+  retomar: (body: ProcessosProcessoRef, options?: RequestOptions) =>
+    request<ProcessosProcesso>("POST", "/api/v1/processos/processos/retomar", body, options),
   /** POST /api/v1/processos/processos/adicionar · http · exige token */
   adicionar: (body: ProcessosAdicionarModelo, options?: RequestOptions) =>
     request<ProcessosProcesso>("POST", "/api/v1/processos/processos/adicionar", body, options),
@@ -2970,6 +3100,9 @@ export const processos = {
   /** POST /api/v1/processos/desenho/descartar · http · exige token */
   descartar: (body: ProcessosDesenhoRef, options?: RequestOptions) =>
     request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/descartar", body, options),
+  /** POST /api/v1/processos/desenho/voltar · http · exige token */
+  voltar: (body: ProcessosVoltarVersao, options?: RequestOptions) =>
+    request<ProcessosDesenho>("POST", "/api/v1/processos/desenho/voltar", body, options),
   /** GET /api/v1/processos/execucoes · http · exige token */
   execucoes: (query?: ProcessosExecucaoQuery, options?: RequestOptions) =>
     request<ProcessosExecucaoPage>("GET", withQuery("/api/v1/processos/execucoes", query), undefined, options),
@@ -2979,6 +3112,9 @@ export const processos = {
   /** POST /api/v1/processos/execucoes/iniciar · http · exige token */
   iniciar: (body: ProcessosIniciar, options?: RequestOptions) =>
     request<ProcessosExecucao>("POST", "/api/v1/processos/execucoes/iniciar", body, options),
+  /** POST /api/v1/processos/execucoes/cancelar · http · exige token */
+  cancelar: (body: ProcessosCancelarExecucao, options?: RequestOptions) =>
+    request<ProcessosExecucao>("POST", "/api/v1/processos/execucoes/cancelar", body, options),
   /** GET /api/v1/processos/tarefas · http · exige token */
   tarefas: (query?: ProcessosTarefaQuery, options?: RequestOptions) =>
     request<ProcessosTarefaPage>("GET", withQuery("/api/v1/processos/tarefas", query), undefined, options),
@@ -3027,6 +3163,12 @@ export interface StaffResumo {
   organizacoes: number;
 }
 
+export interface StaffCancelamentoConta {
+  origem: "cliente" | "cogniventure";
+  motivo: string | null;
+  efetivo_em: string;
+}
+
 export interface StaffCliente {
   organizacao: string;
   nome: string;
@@ -3044,6 +3186,21 @@ export interface StaffCliente {
   ultimo_acesso: string | null;
   andamento: number | null;
   autonomia: number | null;
+  /** Mensalidade, vencimento e situação (null: o svc-plans não respondeu) */
+  conta: StaffContaCliente | null;
+}
+
+/** A conta do cliente no svc-plans (o que a lista mostra). */
+export interface StaffContaCliente {
+  situacao: "ativa" | "suspensa" | "encerrada";
+  valor: number;
+  valor_combinado: boolean;
+  moeda: string;
+  vencimento: number;
+  motivo: string | null;
+  cancelamento: StaffCancelamentoConta | null;
+  encerrada_em: string | null;
+  exclusao_em: string | null;
 }
 
 export interface StaffConvitePendente {
@@ -3069,10 +3226,31 @@ export interface StaffNovoCliente {
   plano: string;
   /** Quem do staff cuida dele (entra na carteira) */
   pessoa: string;
+  /** Mensalidade combinada (vazio: o preço do plano) */
+  valor?: number | null;
+  /** Dia do vencimento (vazio: dia 10) */
+  vencimento?: number | null;
 }
 
 export interface StaffClienteRef {
   organizacao: string;
+}
+
+/** A mensalidade e o vencimento combinados com o cliente (o fechamento do mês cobra assim). */
+export interface StaffCobrancaCliente {
+  organizacao: string;
+  /** Mensalidade (vazio: mantém) */
+  valor?: number | null;
+  /** Dia do vencimento (vazio: mantém) */
+  vencimento?: number | null;
+}
+
+/** Suspender (atraso), reativar, encerrar (no fim do mês pago; na hora se suspenso) ou desfazer o encerramento. */
+export interface StaffSituacaoCliente {
+  organizacao: string;
+  acao: "suspender" | "reativar" | "encerrar" | "desfazer";
+  /** Suspender: o cliente vê o motivo */
+  motivo?: string | null;
 }
 
 /** rpc.identity.organizacoes (contrato do svc-identity, repetido aqui por quem consome). */
@@ -3318,6 +3496,12 @@ export const staff = {
   /** POST /api/v1/staff/clientes/convite · http · exige token */
   convidarDono: (body: StaffClienteRef, options?: RequestOptions) =>
     request<StaffCliente>("POST", "/api/v1/staff/clientes/convite", body, options),
+  /** POST /api/v1/staff/clientes/cobranca · http · exige token */
+  cobranca: (body: StaffCobrancaCliente, options?: RequestOptions) =>
+    request<StaffCliente>("POST", "/api/v1/staff/clientes/cobranca", body, options),
+  /** POST /api/v1/staff/clientes/situacao · http · exige token */
+  situacaoCliente: (body: StaffSituacaoCliente, options?: RequestOptions) =>
+    request<StaffCliente>("POST", "/api/v1/staff/clientes/situacao", body, options),
   /** GET /api/v1/staff/organizacoes · http · exige token */
   organizacoes: (options?: RequestOptions) =>
     request<StaffOrganizacoes>("GET", "/api/v1/staff/organizacoes", undefined, options),

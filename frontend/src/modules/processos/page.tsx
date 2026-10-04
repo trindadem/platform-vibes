@@ -141,6 +141,7 @@ function Lista({ itens, pode, vazio }: { itens: ProcessosProcesso[]; pode: boole
                     </Button>
                   )}
                   {p.publicada && <Badge tone="success">Publicado · versão {p.publicada}</Badge>}
+                  {p.pausado && <Badge tone="warning">Pausado</Badge>}
                 </>
               )
             }

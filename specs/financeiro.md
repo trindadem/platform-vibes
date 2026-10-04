@@ -37,9 +37,9 @@ Rotas:
 4. Classificar: a conta e o centro de custo do fornecedor; fornecedor novo entra no cadastro com a conta padrão (a nota seguinte dele já não é nova).
 5. Agendar: pede ao banco conectado e grava o título agendado. Conciliar: o título com aquele pagamento fica pago.
 6. Conciliar o extrato: pede o extrato desde ontem (ou `dias`); cada pagamento casa com um título (pago e conciliado) e cada recebimento com uma fatura (conciliada) pelo id; o resto é sem par, somado.
-7. Faturar: a fatura nasce aberta com vencimento hoje + `prazo_pagamento` (padrão 15). Emitir nota: sem integração de NFS-e, o staff emite e informa o número (handoff). Cobrar: emite o boleto no banco e o envia por e-mail ao cliente (sem e-mail ou sem caixa de entrada, `enviada` falso). Baixar: confere no extrato se a cobrança foi recebida e marca a fatura paga.
+7. Faturar: a fatura nasce aberta com o `vencimento` que veio (a data combinada, como a mensalidade do plano que o fechamento da Cogniventure fatura) ou, sem ele, hoje + `prazo_pagamento` (padrão 15). Emitir nota: sem integração de NFS-e, o staff emite e informa o número (handoff). Cobrar: emite o boleto no banco e o envia por e-mail ao cliente (sem e-mail ou sem caixa de entrada, `enviada` falso). Baixar: confere no extrato se a cobrança foi recebida e marca a fatura paga.
 8. Fechamento: pendências do mês (títulos sem comprovante, faturas sem nota); o resumo e os lançamentos por e-mail ao contador; DAS = receita do mês (faturas) × alíquota (padrão 6%), vencendo no dia 20 do mês seguinte; a DRE gerencial (receitas − despesas) vai como aviso a dono e administrador.
-9. Agendamento diário (`ReguaWorkflow`, 9h em Brasília): fatura cobrada e não paga recebe por e-mail o lembrete D-3 (até 3 dias antes), D+1 e D+7, cada um uma vez (`regua`).
+9. Agendamento diário (`ReguaWorkflow`, 9h em Brasília): fatura cobrada e não paga recebe por e-mail o lembrete D-3 (até 3 dias antes), D+1 e D+7, cada um uma vez (`regua`). No D+7, dono e admin da organização também são avisados (tela + e-mail): a vencida além do prazo chega ao gestor (na Cogniventure, ele suspende o cliente pela aba Clientes).
 
 ## 4. Casos de Borda e Erros Mapeados
 - Entrada que falta campo obrigatório (ex.: sem vencimento) → handoff "Faltam dados para ..." (core/processes.py); faturar sem cliente ou valor → handoff.

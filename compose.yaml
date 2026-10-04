@@ -318,6 +318,7 @@ services:
       PROCESSOS_MODEL: ${PROCESSOS_MODEL:-cv/agente}
       PROCESSOS_DESENHO_MODEL: ${PROCESSOS_DESENHO_MODEL:-cv/desenho}  # edita o fluxo: pede um modelo mais forte
       CAMUNDA_URL: http://camunda:8080  # implanta e inicia; os workers dos pacotes também falam com o motor
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}  # nos processos da própria Cogniventure, o dono e o admin são o staff
     depends_on:
       <<: *service-deps
       camunda: { condition: service_healthy }

@@ -44,6 +44,25 @@ endpoints:
     target_url: http://svc-staff:8000/clientes/convite
     timeout: 30
 
+  # A conta do cliente (alinhamento pós-N7, itens 2 e 13): mensalidade, vencimento, suspensão e encerramento.
+  - path: /clientes/cobranca
+    name: cobranca
+    method: POST
+    auth: client_jwt
+    request: CobrancaCliente
+    response: Cliente
+    target_type: http
+    target_url: http://svc-staff:8000/clientes/cobranca
+
+  - path: /clientes/situacao
+    name: situacaoCliente
+    method: POST
+    auth: client_jwt
+    request: SituacaoCliente
+    response: Cliente
+    target_type: http
+    target_url: http://svc-staff:8000/clientes/situacao
+
   - path: /organizacoes
     method: GET
     auth: client_jwt

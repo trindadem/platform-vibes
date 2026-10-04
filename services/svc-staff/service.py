@@ -7,7 +7,8 @@ O staff é a equipe da Cogniventure: quem é membro da organização da platafor
 são gestores da carteira. Tudo deste serviço fica nessa organização: a carteira (quem cuida de qual cliente) e a fila
 (o que espera o staff em cada cliente, espelhado dos eventos do svc-processos). Entrar na carteira dá o papel operador
 na organização do cliente (svc-identity); sair tira. Para resolver, a pessoa entra na organização do cliente.
-O gestor também abre os clientes (organização, convite do dono, plano e carteira) e os acompanha pela jornada.
+O gestor também abre os clientes (organização, convite do dono, plano e carteira) e os acompanha pela jornada; combina
+a mensalidade e o vencimento, suspende o cliente em atraso, reativa e encerra (a conta é do svc-plans).
 """
 import asyncio
 from datetime import UTC, datetime, timedelta
@@ -27,6 +28,7 @@ from schemas import (
     ACOMPANHAMENTO_SUBJECT,
     CARTEIRAS,
     CLIENTE_SUBJECT,
+    CONTA_SUBJECT,
     CONTEXTO_SUBJECT,
     CONVITE_DONO_SUBJECT,
     FILA_DECIDIR_SUBJECT,
@@ -50,6 +52,10 @@ from schemas import (
     Carteiras,
     Cliente,
     ClienteCriado,
+    CobrancaCliente,
+    ContaAcao,
+    ContaCliente,
+    ContaEncerrada,
     ClienteNovo,
     ClienteRef,
     Clientes,
@@ -88,6 +94,7 @@ from schemas import (
     Resumo,
     RevisaoFila,
     Saude,
+    SituacaoCliente,
     StaffSettings,
     TarefaFila,
 )
@@ -206,6 +213,8 @@ class StaffService:
         criado = await _identidade(CLIENTE_SUBJECT, ClienteNovo(empresa=data.empresa, email=data.email), ClienteCriado)
         with acting_as(system(SERVICE, criado.tenant)):
             await plans.assign(data.plano)
+        if data.valor is not None or data.vencimento is not None:
+            await _conta(criado.tenant, ContaAcao(acao="cobranca", valor=data.valor, vencimento=data.vencimento, por=current().sub))
         await self.atribuir_carteira(NovaCarteira(pessoa=data.pessoa, organizacao=criado.tenant))
         return await _cliente(Organizacao(id=criado.tenant, name=criado.name, convite=criado.convite), [data.pessoa])
 
@@ -218,6 +227,39 @@ class StaffService:
             raise ServiceError("ERRO_STAFF_ORGANIZACAO", "Organização cliente não encontrada.", 404)
         rows = await db.query(f"SELECT VALUE pessoa FROM {CARTEIRAS} WHERE tenant = $tenant AND organizacao = $o", o=data.organizacao)
         return await _cliente(organizacao, list(rows))
+
+    async def cobranca(self, data: CobrancaCliente) -> Cliente:
+        """A mensalidade e o vencimento combinados com o cliente: o fechamento do mês cobra assim."""
+        who = _gestor()
+        await _conta(data.organizacao, ContaAcao(acao="cobranca", valor=data.valor, vencimento=data.vencimento, por=who.sub))
+        return await _um_cliente(data.organizacao)
+
+    async def situacao(self, data: SituacaoCliente) -> Cliente:
+        """Suspender o cliente em atraso (nenhuma execução nova começa), reativar quando o pagamento entra, encerrar (no
+        fim do mês pago; na hora, se suspenso) ou desfazer o encerramento."""
+        who = _gestor()
+        await _conta(data.organizacao, ContaAcao(acao=data.acao, motivo=data.motivo, por=who.sub))
+        return await _um_cliente(data.organizacao)
+
+    async def encerrada(self, data: ContaEncerrada) -> Empty:
+        """events.plans.encerrada (como a organização do cliente): o staff sai da carteira dele (perde o papel operador)
+        e o que esperava na fila fecha."""
+        if not settings.platform_tenant:
+            return Empty()
+        organizacao = current_tenant()
+        with acting_as(system(SERVICE, settings.platform_tenant)):
+            for row in await db.query(f"SELECT * FROM {CARTEIRAS} WHERE tenant = $tenant AND organizacao = $o", o=organizacao):
+                carteira = Carteira.model_validate(row)
+                try:
+                    await _operador(carteira.pessoa, carteira.organizacao, ativo=False)
+                except ServiceError as exc:
+                    if exc.status != 404:
+                        raise
+                await db.delete(f"{CARTEIRAS}:{carteira.id}")
+                await bus.live(LIVE_CARTEIRAS, CarteiraMudou(id=carteira.id, action="removida"))
+            await db.query(f"UPDATE {FILA} SET status = 'concluida', concluida_em = time::now() WHERE tenant = $tenant "
+                           "AND organizacao = $o AND status = 'aberta'", o=organizacao)
+        return Empty()
 
     # ── Fila ─────────────────────────────────────────────────────────────────
 
@@ -458,13 +500,47 @@ async def _do_staff(pessoa: str) -> None:
         raise ServiceError("ERRO_STAFF_PESSOA", "A pessoa não é da equipe da Cogniventure.", 404)
 
 
+async def apagar_cliente() -> None:
+    """A organização do cliente saiu de vez (db.connected(on_purge=...), como ela): a fila e as carteiras dela, que
+    ficam na organização da Cogniventure, saem também."""
+    organizacao = current_tenant()
+    if not settings.platform_tenant or organizacao == settings.platform_tenant:
+        return
+    with acting_as(system(SERVICE, settings.platform_tenant)):
+        await db.query(f"DELETE {FILA} WHERE tenant = $tenant AND organizacao = $o", o=organizacao)
+        await db.query(f"DELETE {CARTEIRAS} WHERE tenant = $tenant AND organizacao = $o", o=organizacao)
+
+
+async def _conta(organizacao: str, acao: ContaAcao) -> ContaCliente:
+    """A conta do cliente no svc-plans, agindo nele (só o svc-staff pode)."""
+    if organizacao == settings.platform_tenant or not any(o.id == organizacao for o in await _organizacoes()):
+        raise ServiceError("ERRO_STAFF_ORGANIZACAO", "Organização cliente não encontrada.", 404)
+    try:
+        with acting_as(system(SERVICE, organizacao)):
+            return await bus.request(CONTA_SUBJECT, acao, ContaCliente, timeout=10)
+    except (NatsError, TimeoutError):
+        raise ServiceError("ERRO_STAFF_PLANOS", "O serviço de planos não respondeu. Tente de novo em instantes.", 503) from None
+
+
+async def _um_cliente(organizacao_id: str) -> Cliente:
+    organizacao = next((o for o in await _organizacoes() if o.id == organizacao_id), None)
+    if organizacao is None:
+        raise ServiceError("ERRO_STAFF_ORGANIZACAO", "Organização cliente não encontrada.", 404)
+    rows = await db.query(f"SELECT VALUE pessoa FROM {CARTEIRAS} WHERE tenant = $tenant AND organizacao = $o", o=organizacao_id)
+    return await _cliente(organizacao, list(rows))
+
+
 async def _cliente(organizacao: Organizacao, responsaveis: list[str]) -> Cliente:
-    """Um cliente na lista: o que a identidade sabe, mais o plano e o passo da jornada, perguntados como ele."""
+    """Um cliente na lista: o que a identidade sabe, mais o plano, a conta e o passo da jornada, perguntados como ele."""
     cliente = Cliente(organizacao=organizacao.id, nome=organizacao.name, created_at=organizacao.created_at, responsaveis=responsaveis,
                       dono=organizacao.dono, convite=organizacao.convite, ultimo_acesso=organizacao.ultimo_acesso)
     with acting_as(system(SERVICE, organizacao.id)):
         limites = await plans.limits()
         cliente.plano = limites.plan_name if limites.plan else None
+        try:
+            cliente.conta = await bus.request(CONTA_SUBJECT, ContaAcao(acao="ver"), ContaCliente, timeout=5)
+        except (NatsError, TimeoutError, ServiceError):
+            cliente.conta = None
         if organizacao.dono is None:
             cliente.passo = "convite"
             return cliente

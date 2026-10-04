@@ -24,6 +24,10 @@ Trilhos:
   palavras, sempre na organização atual. A query é um ListQuery (page, size, sort, q) cuja subclasse declara os
   filtros como campos: x → igualdade, x_from/x_to → intervalo, list[...] → um dos valores. Só ordena pelos campos
   de `sortable`; só busca nos campos declarados em db.connected(search={"tabela": ["campo"]}).
+- Organização que sai (README §5.13): com service=SERVICE e o bus conectado, db.connected atende sozinho, para o svc-plans,
+  rpc.<serviço>.dados (as linhas de cada tabela por organização, em páginas, para a exportação) e
+  events.plans.exclusao (apaga as linhas da organização de todas as tabelas por organização; on_purge= apaga o
+  resto que é dela, ex.: o que fica numa tabela global). Ninguém mais pede: o serviço não escreve nada.
 
 Variáveis: SURREAL_URL (padrão ws://localhost:8000) e, obrigatórias e sem padrão,
 SURREAL_NAMESPACE, SURREAL_DATABASE, SURREAL_USER, SURREAL_PASSWORD.
@@ -46,6 +50,7 @@ from surrealdb import AsyncSurreal, ConnectionUnavailableError, RecordID, Server
 from surrealdb.errors import parse_query_error
 
 from core.envelope import ServiceError
+from core.nats_bus import bus
 from core.security import acting_as, current, current_tenant, system
 
 TENANT = "tenant"
@@ -77,6 +82,35 @@ _duration = metrics.get_meter("core.surreal").create_histogram(
     "db.client.operation.duration", unit="s", description="Tempo de cada consulta ao SurrealDB"
 )
 _OPERATION = re.compile(r"^\s*\{?\s*(?:LET\s+\$\w+\s*=\s*\(?\s*)?([A-Za-z]+)")
+
+# A organização que sai (README §5.13): o svc-plans exporta os dados dela e, 30 dias depois do encerramento, apaga.
+PURGE_SUBJECT = "events.plans.exclusao"
+DATA_SERVICE = "svc-plans"  # o único que pede as linhas de outra organização e a exclusão
+DATA_PAGE_BYTES = 400_000  # cada página cabe numa mensagem do NATS (1 MB), com folga
+DATA_PAGE_ROWS = 100
+_VECTOR = 64  # lista de números maior que isso é vetor de busca (embedding): não serve a quem exporta
+_LONG_TEXT = 100_000
+
+
+class PurgeRequest(BaseModel):
+    """events.plans.exclusao: a organização do cabeçalho sai de vez (encerrada há 30 dias)."""
+
+    tenant: str
+
+
+class DataRequest(BaseModel):
+    """rpc.<serviço>.dados: uma página das linhas da organização do cabeçalho numa tabela (sem tabela: só a lista)."""
+
+    table: str | None = None
+    start: int = Field(0, ge=0)
+
+
+class DataPage(BaseModel):
+    service: str
+    tables: list[str] = Field(..., description="As tabelas por organização do serviço")
+    table: str | None = None
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    next: int | None = Field(None, description="Onde começa a próxima página; null: acabou")
 
 
 class ListQuery(BaseModel):
@@ -184,6 +218,7 @@ class Database:
         self._tenant_tables: frozenset[str] = frozenset()
         self._shared_tables: frozenset[str] = frozenset()
         self._search: dict[str, tuple[str, ...]] = {}
+        self._on_purge: Callable[[], Awaitable[None]] | None = None
 
     @asynccontextmanager
     async def connected(
@@ -196,6 +231,7 @@ class Database:
         migrations: Sequence[Migration] = (),
         service: str | None = None,
         resources: Iterable[Any] = (),
+        on_purge: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator["Database"]:
         """Conecta no boot (falha cedo se faltar credencial) e garante tabelas, campo tenant e índices.
 
@@ -206,6 +242,7 @@ class Database:
         em ordem. resources (core/resources.py) acrescenta a tabela por organização, a busca e o índice único de cada
         cadastro declarado. Idempotente. O SurrealDB 3 recusa SELECT em
         tabela que nunca recebeu registro; declarar no boot faz a primeira listagem devolver [] em vez de erro.
+        on_purge: o que mais apagar quando a organização sai (roda como ela, depois das tabelas por organização).
         """
         resources = list(resources)
         tables = [*tables, *(r.table for r in resources)]
@@ -252,11 +289,16 @@ class Database:
             await self._call("query", statement, None)
         self._tenant_tables, self._shared_tables = frozenset(per_tenant), frozenset(globals_)
         self._search = searches
+        self._on_purge = on_purge
         if migrations:
             await self._migrate(service or "", migrations)
+        if service and bus.service == service:  # a organização que sai: exportação e exclusão sem código no serviço
+            await bus.respond(f"rpc.{bus.service.removeprefix('svc-')}.dados", self._data_page, model=DataRequest)
+            await bus.subscribe(PURGE_SUBJECT, self._purge, model=PurgeRequest)
         try:
             yield self
         finally:
+            self._on_purge = None
             await self.close()
 
     async def close(self) -> None:
@@ -402,6 +444,42 @@ class Database:
         else:
             await self._call("query", "DELETE $rid WHERE tenant = $tenant", {"rid": rid, TENANT: tenant})
 
+    async def _data_page(self, data: DataRequest) -> DataPage:
+        """rpc.<serviço>.dados (só o svc-plans): as tabelas por organização e uma página de uma delas, na organização
+        do cabeçalho. Vetores de busca ficam de fora; texto muito longo vai cortado (o arquivo original vai junto)."""
+        _from_data_service()
+        tables = sorted(self._tenant_tables)
+        if data.table is None:
+            return DataPage(service=bus.service or "", tables=tables)
+        if data.table not in self._tenant_tables:
+            raise ServiceError("ERRO_DATA_TABLE", "Tabela fora deste serviço.", status=404)
+        rows = await self._call(
+            "query", f"SELECT * FROM {data.table} WHERE {TENANT} = $tenant ORDER BY id LIMIT {DATA_PAGE_ROWS} START $start",
+            {TENANT: current_tenant(), "start": data.start},
+        )
+        out, size = [], 0
+        for row in rows or []:
+            clean = _exportable(row)
+            weight = len(str(clean))
+            if out and size + weight > DATA_PAGE_BYTES:
+                break
+            out.append(clean)
+            size += weight
+        done = len(out) == len(rows or []) and len(rows or []) < DATA_PAGE_ROWS
+        return DataPage(service=bus.service or "", tables=tables, table=data.table, rows=out, next=None if done else data.start + len(out))
+
+    async def _purge(self, data: PurgeRequest) -> None:
+        """events.plans.exclusao (só o svc-plans, como a organização que sai): apaga as linhas dela em todas as tabelas
+        por organização deste serviço e roda o on_purge. Repetir não faz mal: o que já saiu não está mais lá."""
+        _from_data_service()
+        if current_tenant() != data.tenant:
+            raise ServiceError("ERRO_DATA_TENANT", "A exclusão vale só para a organização de quem pede.", status=403)
+        for table in sorted(self._tenant_tables):
+            await self._call("query", f"DELETE {table} WHERE {TENANT} = $tenant", {TENANT: data.tenant})
+        if self._on_purge is not None:
+            await self._on_purge()
+        log.info("organização %s apagada deste serviço", data.tenant)
+
     async def _migrate(self, service: str, migrations: Sequence[Migration]) -> None:
         """Roda as migrações pendentes em ordem. Uma réplica por vez: quem cria o registro primeiro roda; as outras
         esperam. Falhou: o boot para (o registro fica failed e a próxima subida tenta de novo)."""
@@ -526,6 +604,27 @@ class Database:
                     await asyncio.sleep(random.uniform(0.01, 0.05) * conflicts)
                     continue
                 raise
+
+
+def _from_data_service() -> None:
+    who = current()
+    if who is None or not who.is_system or who.sub != f"system:{DATA_SERVICE}":
+        raise ServiceError("ERRO_DATA_FORBIDDEN", "Só o svc-plans exporta ou apaga os dados de uma organização.", status=403)
+
+
+def _exportable(value: Any) -> Any:
+    """Para a exportação: sem vetores de busca (listas longas de números) e com texto muito longo cortado."""
+    if isinstance(value, dict):
+        return {k: _exportable(v) for k, v in value.items() if not _is_vector(v)}
+    if isinstance(value, list):
+        return [_exportable(v) for v in value]
+    if isinstance(value, str) and len(value) > _LONG_TEXT:
+        return value[:_LONG_TEXT] + " [cortado: o restante está no arquivo original]"
+    return value
+
+
+def _is_vector(value: Any) -> bool:
+    return isinstance(value, list) and len(value) > _VECTOR and all(isinstance(v, int | float) for v in value)
 
 
 def _ident(name: str) -> str:

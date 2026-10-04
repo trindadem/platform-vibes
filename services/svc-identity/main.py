@@ -50,6 +50,7 @@ from schemas import (
     JoinRequest,
     KeepRequest,
     LoginInput,
+    ExcluirConta,
     MemberRef,
     OperadorAcesso,
     RefreshInput,
@@ -62,7 +63,7 @@ from schemas import (
     TenantRequest,
     UploadRequest,
 )
-from service import IdentityService, settings
+from service import IdentityService, apagar_organizacao, settings
 from workflows import SCHEDULES, IdentityWorkflow
 
 svc = IdentityService()
@@ -78,7 +79,7 @@ async def on_trigger(data: Empty) -> None:
 async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
-        db.connected(shared=SHARED_TABLES, unique=UNIQUE),
+        db.connected(shared=SHARED_TABLES, unique=UNIQUE, service=SERVICE, on_purge=apagar_organizacao),
         runner.worker(TASK_QUEUE, workflows=[IdentityWorkflow], service=svc, schedules=SCHEDULES),
     ):
         await storage.connected(SERVICE)  # logo da organização (README §5.14)
@@ -169,6 +170,13 @@ async def reset_password(data: ResetInput) -> ResponseEnvelope:
 @app.get("/me", response_model=ResponseEnvelope)
 async def me() -> ResponseEnvelope:
     return _ok(await svc.me(Empty()))
+
+
+@app.post("/me/excluir", response_model=ResponseEnvelope)
+async def excluir_conta(data: ExcluirConta, response: Response) -> ResponseEnvelope:
+    result = await svc.excluir_conta(data)
+    response.delete_cookie(REFRESH_COOKIE, path=COOKIE_PATH)  # a conta não existe mais: a sessão deste navegador também não
+    return _ok(result)
 
 
 @app.post("/switch", response_model=ResponseEnvelope)

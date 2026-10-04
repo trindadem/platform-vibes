@@ -47,6 +47,7 @@ from schemas import (
 
 PASSWORD = "senha-forte-1"
 PLANO = {"membros": None, "contagens": []}  # limite de pessoas do plano (None: sem limite) e totais informados
+SITUACAO: dict[str, str] = {}  # situação da conta de cada organização no svc-plans (sem nada: ativa)
 
 
 @pytest.fixture
@@ -73,7 +74,8 @@ def events(monkeypatch):
         assert subject == LIMITS_SUBJECT, subject
         state = LimitState(name="identity.membros", service="svc-identity", description="Pessoas na organização",
                            default=None, monthly=False, unit="pessoas", limit=PLANO["membros"], used=0)
-        return PlanLimits(plan="teste", plan_name="Teste", month="2026-10", limits=[state])
+        return PlanLimits(plan="teste", plan_name="Teste", month="2026-10", limits=[state],
+                          situacao=SITUACAO.get(security.current_tenant(), "ativa"))
 
     monkeypatch.setattr(service.bus, "publish", publish)
     monkeypatch.setattr(service.bus, "live", live)
@@ -82,6 +84,7 @@ def events(monkeypatch):
     service.plans.clear()
     monkeypatch.setattr(service.plans, "_declared", {})
     PLANO.update(membros=None, contagens=[])
+    SITUACAO.clear()
     asyncio.run(service.webhooks.declare(WEBHOOKS))  # como o boot: eventos no catálogo
     asyncio.run(service.plans.declare(MODULE))
     published.clear()
@@ -697,3 +700,56 @@ def test_remover_membro_avisa_a_saida_para_o_staff(events):
     ana, bia = run(scenario)
     saidas = [(m.tenant, m.user) for s, m, _ in events if s == MEMBER_LEFT_SUBJECT]
     assert saidas == [(ana.auth.tenant.id, bia.auth.user.id)]
+
+
+def test_pessoa_apaga_a_propria_conta_e_o_unico_dono_de_organizacao_ativa_espera(events):
+    from schemas import MEMBER_LEFT_SUBJECT, ExcluirConta
+
+    async def scenario(svc):
+        ana = await signup(svc)
+        bia = await signup(svc, email="bia@acme.com", organization=None, invite=await _code(svc, ana), name="Bia")
+        with as_user(bia):
+            beta = await svc.create_tenant(TenantRequest(name="Beta"))  # a Bia é a única dona da Beta
+        erros = []
+        for senha in ("errada-123", PASSWORD):
+            with as_user(beta), pytest.raises(ServiceError) as exc:
+                await svc.excluir_conta(ExcluirConta(password=senha))
+            erros.append(exc.value.code)
+        SITUACAO[beta.auth.tenant.id] = "encerrada"  # pediu o cancelamento e a conta encerrou: pode sair
+        events.clear()
+        with as_user(beta):
+            await svc.excluir_conta(ExcluirConta(password=PASSWORD))
+        restam = await service.db.query_shared("SELECT VALUE email FROM identity_users ORDER BY email")
+        vinculos = await service.db.query_shared("SELECT VALUE tenant FROM identity_memberships")
+        with pytest.raises(ServiceError) as login:
+            await svc.login(LoginInput(email="bia@acme.com", password=PASSWORD))
+        with as_user(ana), pytest.raises(ServiceError) as dona:  # a Ana é a única dona da Acme, que está ativa
+            await svc.excluir_conta(ExcluirConta(password=PASSWORD))
+        return ana, beta, erros, restam, vinculos, login.value, dona.value
+
+    ana, beta, erros, restam, vinculos, login, dona = run(scenario)
+    assert erros == ["ERRO_IDENTITY_INVALID_CREDENTIALS", "ERRO_IDENTITY_LAST_OWNER"]
+    assert restam == ["ana@acme.com"] and len(vinculos) == 1  # só o vínculo da Ana sobra
+    saidas = sorted(m.tenant for s, m, _ in events if s == MEMBER_LEFT_SUBJECT)
+    assert saidas == sorted([ana.auth.tenant.id, beta.auth.tenant.id])  # o svc-staff fica sabendo de cada saída
+    assert any(s == SEND_SUBJECT and m.title == "Sua conta foi apagada" for s, m, _ in events)
+    assert login.code == "ERRO_IDENTITY_INVALID_CREDENTIALS" and dona.code == "ERRO_IDENTITY_LAST_OWNER"
+
+
+def test_organizacao_que_sai_apaga_vinculos_convites_e_a_propria_organizacao(events):
+    async def scenario(svc):
+        ana = await signup(svc)
+        await _code(svc, ana)
+        acme = ana.auth.tenant.id
+        with as_user(ana):
+            outra = await svc.create_tenant(TenantRequest(name="Outra"))
+        with acting_as(security.system("svc-plans", acme)):
+            await service.apagar_organizacao()
+        organizacoes = await service.db.query_shared("SELECT VALUE name FROM identity_tenants")
+        convites = await service.db.query_shared("SELECT VALUE id FROM identity_invites")
+        login = await svc.login(LoginInput(email="ana@acme.com", password=PASSWORD))
+        return outra, organizacoes, convites, login
+
+    outra, organizacoes, convites, login = run(scenario)
+    assert organizacoes == ["Outra"] and convites == []
+    assert [t.name for t in login.auth.tenants] == ["Outra"]  # a pessoa continua, com as outras organizações

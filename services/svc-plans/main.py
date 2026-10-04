@@ -3,7 +3,8 @@
 HTTP: plano, módulos e consumo da organização ativa, comparação de planos e, para quem administra a plataforma, os
 planos e o plano de cada organização (todas exigem token).
 NATS: CATALOG_SUBJECT grava os módulos e limites declarados; USAGE_SUBJECT soma consumo; COUNT_SUBJECT guarda totais;
-rpc.plans.limits responde ao core/plans.py; rpc.plans.assign troca o plano (tarefa da plataforma).
+rpc.plans.limits responde ao core/plans.py; rpc.plans.assign troca o plano (tarefa da plataforma); rpc.plans.conta
+muda a conta de um cliente (svc-staff). A conta: cancelamento e exportação (o dono), fechamento do mês e encerramentos.
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-plans main:app --port 8100 --env-file .env
 """
@@ -16,6 +17,7 @@ from core.envelope import ResponseEnvelope, install_envelope
 from core.nats_bus import bus
 from core.plans import plans
 from core.security import install_security
+from core.storage import storage
 from core.surreal import db
 from core.telemetry import install_telemetry
 from core.temporal_runner import runner
@@ -23,6 +25,7 @@ from core.temporal_runner import runner
 from schemas import (
     ASSIGN_SUBJECT,
     CATALOG_SUBJECT,
+    CONTA_SUBJECT,
     COUNT_SUBJECT,
     LIMITS_SUBJECT,
     MODULE,
@@ -35,8 +38,11 @@ from schemas import (
     AccountRef,
     AssignInput,
     AssignRequest,
+    CancelamentoIn,
+    ContaAcao,
     CountReport,
     Empty,
+    FechamentoIn,
     LimitsRequest,
     ModuleCatalog,
     PlanInput,
@@ -45,7 +51,7 @@ from schemas import (
     UsageReport,
 )
 from service import MIGRATIONS, PlansService, settings
-from workflows import SCHEDULES, PlansCleanupWorkflow
+from workflows import SCHEDULES, WORKFLOWS
 
 svc = PlansService()
 
@@ -68,13 +74,15 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE, migrations=MIGRATIONS, service=SERVICE),
-        runner.worker(TASK_QUEUE, workflows=[PlansCleanupWorkflow], service=svc, schedules=SCHEDULES),
+        runner.worker(TASK_QUEUE, workflows=WORKFLOWS, service=svc, schedules=SCHEDULES),
     ):
+        await storage.connected(SERVICE)  # o pacote da exportação; a exclusão apaga os arquivos da organização
         await bus.subscribe(CATALOG_SUBJECT, on_catalog, model=ModuleCatalog)
         await bus.subscribe(USAGE_SUBJECT, on_usage, model=UsageReport)
         await bus.subscribe(COUNT_SUBJECT, on_count, model=CountReport)
         await bus.respond(LIMITS_SUBJECT, svc.resolve, model=LimitsRequest)
         await bus.respond(ASSIGN_SUBJECT, svc.assign, model=AssignRequest)
+        await bus.respond(CONTA_SUBJECT, svc.conta, model=ContaAcao)  # svc-staff: a conta de um cliente
         await plans.declare(MODULE)  # o próprio módulo, da plataforma, no catálogo (README §5.17)
         yield
 
@@ -132,3 +140,28 @@ async def account(data: Annotated[AccountRef, Query()]) -> ResponseEnvelope:
 @app.post("/assign", response_model=ResponseEnvelope)
 async def assign(data: AssignInput) -> ResponseEnvelope:
     return _ok(await svc.assign_plan(data))
+
+
+@app.post("/cancelamento", response_model=ResponseEnvelope)
+async def cancelar(data: CancelamentoIn) -> ResponseEnvelope:
+    return _ok(await svc.cancelar(data))
+
+
+@app.post("/cancelamento/desfazer", response_model=ResponseEnvelope)
+async def desfazer_cancelamento(data: Empty) -> ResponseEnvelope:
+    return _ok(await svc.desfazer_cancelamento(data))
+
+
+@app.get("/exportacao", response_model=ResponseEnvelope)
+async def exportacao() -> ResponseEnvelope:
+    return _ok(await svc.exportacao(Empty()))
+
+
+@app.post("/exportacao", response_model=ResponseEnvelope)
+async def pedir_exportacao(data: Empty) -> ResponseEnvelope:
+    return _ok(await svc.pedir_exportacao(data))
+
+
+@app.post("/fechamento", response_model=ResponseEnvelope)
+async def fechar_mes(data: FechamentoIn) -> ResponseEnvelope:
+    return _ok(await svc.fechar_mes(data))

@@ -74,6 +74,25 @@ endpoints:
     target_type: http
     target_url: http://svc-processos:8000/processos/recusar
 
+  # Pausado, o gatilho não inicia execução nova (alinhamento pós-N7, item 8).
+  - path: /processos/pausar
+    name: pausar
+    method: POST
+    auth: client_jwt
+    request: ProcessoRef
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/processos/pausar
+
+  - path: /processos/retomar
+    name: retomar
+    method: POST
+    auth: client_jwt
+    request: ProcessoRef
+    response: Processo
+    target_type: http
+    target_url: http://svc-processos:8000/processos/retomar
+
   - path: /processos/adicionar
     method: POST
     auth: client_jwt
@@ -157,6 +176,16 @@ endpoints:
     target_type: http
     target_url: http://svc-processos:8000/desenho/descartar
 
+  - path: /desenho/voltar
+    name: voltar
+    method: POST
+    auth: client_jwt
+    request: VoltarVersao
+    response: Desenho
+    target_type: http
+    target_url: http://svc-processos:8000/desenho/voltar
+    timeout: 30
+
   - path: /execucoes
     method: GET
     auth: client_jwt
@@ -183,6 +212,15 @@ endpoints:
     target_type: http
     target_url: http://svc-processos:8000/execucoes/iniciar
     timeout: 30
+
+  - path: /execucoes/cancelar
+    name: cancelar
+    method: POST
+    auth: client_jwt
+    request: CancelarExecucao
+    response: Execucao
+    target_type: http
+    target_url: http://svc-processos:8000/execucoes/cancelar
 
   - path: /tarefas
     method: GET

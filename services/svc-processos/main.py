@@ -34,6 +34,7 @@ from core.temporal_runner import runner
 
 from schemas import (
     ACOMPANHAMENTO_SUBJECT,
+    INICIAR_MODELO_SUBJECT,
     FILA_DECIDIR_SUBJECT,
     FILA_RESOLVER_SUBJECT,
     FILA_REVISAO_SUBJECT,
@@ -55,6 +56,7 @@ from schemas import (
     Desenho,
     DesenhoRef,
     AjudaIn,
+    CancelarExecucao,
     Devolucao,
     DecisaoStaff,
     Empty,
@@ -62,6 +64,7 @@ from schemas import (
     ExecucaoQuery,
     ExecucaoRef,
     Iniciar,
+    IniciarModelo,
     MensagemDesenhoIn,
     PassoFeito,
     RegraQuery,
@@ -76,6 +79,7 @@ from schemas import (
     ProcessoRef,
     ProjetoQuery,
     SimulacaoIn,
+    VoltarVersao,
 )
 from service import MIGRATIONS, ProcessosService
 from workflows import SCHEDULES, AvaliarRegraWorkflow
@@ -101,6 +105,7 @@ async def lifespan(app: FastAPI):
         await bus.respond(FILA_RESOLVER_SUBJECT, svc.fila_resolver, model=ResolucaoStaff)
         await bus.respond(FILA_REVISAO_SUBJECT, svc.fila_revisao, model=RevisaoRef)
         await bus.respond(FILA_DECIDIR_SUBJECT, svc.fila_decidir, model=DecisaoStaff)
+        await bus.respond(INICIAR_MODELO_SUBJECT, svc.iniciar_modelo, model=IniciarModelo)  # svc-plans: o fechamento do mês
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
     await camunda.close()
@@ -151,6 +156,16 @@ async def recusar(data: ProcessoRef) -> ResponseEnvelope:
     return _ok(await svc.recusar(data))
 
 
+@app.post("/processos/pausar", response_model=ResponseEnvelope)
+async def pausar(data: ProcessoRef) -> ResponseEnvelope:
+    return _ok(await svc.pausar(data))
+
+
+@app.post("/processos/retomar", response_model=ResponseEnvelope)
+async def retomar(data: ProcessoRef) -> ResponseEnvelope:
+    return _ok(await svc.retomar(data))
+
+
 @app.post("/processos/adicionar", response_model=ResponseEnvelope)
 async def adicionar(data: AdicionarModelo) -> ResponseEnvelope:
     return _ok(await svc.adicionar(data))
@@ -196,6 +211,11 @@ async def descartar(data: DesenhoRef) -> ResponseEnvelope:
     return _ok(await svc.descartar(data))
 
 
+@app.post("/desenho/voltar", response_model=ResponseEnvelope)
+async def voltar(data: VoltarVersao) -> ResponseEnvelope:
+    return _ok(await svc.voltar(data))
+
+
 @app.get("/execucoes", response_model=ResponseEnvelope)
 async def execucoes(data: Annotated[ExecucaoQuery, Query()]) -> ResponseEnvelope:
     return _ok(await svc.execucoes(data))
@@ -209,6 +229,11 @@ async def execucao(data: Annotated[ExecucaoRef, Query()]) -> ResponseEnvelope:
 @app.post("/execucoes/iniciar", response_model=ResponseEnvelope)
 async def iniciar(data: Iniciar) -> ResponseEnvelope:
     return _ok(await svc.iniciar(data))
+
+
+@app.post("/execucoes/cancelar", response_model=ResponseEnvelope)
+async def cancelar_execucao(data: CancelarExecucao) -> ResponseEnvelope:
+    return _ok(await svc.cancelar_execucao(data))
 
 
 @app.get("/tarefas", response_model=ResponseEnvelope)

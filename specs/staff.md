@@ -23,6 +23,13 @@ disso, toda rota responde 403 (menos `/resumo`, que responde `staff: false`).
   - `POST /clientes {empresa, email, plano, pessoa}` → `Cliente`: abre a organização sem ninguém da Cogniventure dentro,
     com o convite de dono por e-mail; atribui o plano; põe na carteira da pessoa (que vira operador).
   - `POST /clientes/convite {organizacao}` → `Cliente`: o convite do dono de novo (o anterior deixa de valer).
+  - A conta (alinhamento pós-N7, itens 2 e 13): `Cliente.conta {situacao: ativa|suspensa|encerrada, valor,
+    valor_combinado, moeda, vencimento, motivo, cancelamento {origem, motivo, efetivo_em}, encerrada_em, exclusao_em}`
+    (do svc-plans). `POST /clientes/cobranca {organizacao, valor?, vencimento?}` → `Cliente`: a mensalidade e o dia do
+    vencimento que o fechamento do mês cobra. `POST /clientes/situacao {organizacao, acao: suspender|reativar|encerrar|
+    desfazer, motivo?}` → `Cliente`: suspender o cliente em atraso (motivo obrigatório; nenhuma execução nova começa),
+    reativar quando o pagamento entra, encerrar (na hora se suspenso; senão, no fim do mês pago) e desfazer.
+    `POST /clientes` aceita também `valor` e `vencimento`.
 - Carteira:
   - `GET /organizacoes` → `Organizacoes {items[{id, name, created_at}]}`: as organizações clientes (sem a da
     Cogniventure). Só gestor.
@@ -51,13 +58,16 @@ disso, toda rota responde 403 (menos `/resumo`, que responde `staff: false`).
     `POST /fila/responder {id, texto}` (pedido de ajuda) → `ItemFila` concluído, com `resolvida_por`.
 - `GET /numeros?dias=30` → `Numeros {desde, pessoas[NumeroLinha], clientes[NumeroLinha]}` com `NumeroLinha {chave,
   nome, resolvidos, no_prazo, tempo_medio_min, abertos}`: por pessoa e por cliente no período. Só gestor.
-- Entra: eventos `events.processos.staff` (svc-processos) e `events.atendimento.staff` (svc-atendimento), ambos
+- Entra: `events.plans.encerrada {tenant, em}` (a conta do cliente encerrou: o staff sai da carteira dele e perde o
+  papel operador; o que esperava na fila fecha); a exclusão (README §5.13) apaga a fila e as carteiras do cliente, que
+  ficam na organização da Cogniventure. Eventos `events.processos.staff` (svc-processos) e `events.atendimento.staff` (svc-atendimento), ambos
   `ItemStaff {tipo: excecao|revisao|ajuda|pedido, ref, titulo, detalhe, prazo, status, link, em, por}`, publicados
   como a organização do cliente (`por`: quem resolveu); `events.identity.member-left {tenant, user}`.
 - Chama, agindo na organização da Cogniventure: `rpc.identity.organizacoes`, `rpc.identity.operador {user, tenant,
   ativo}`, `rpc.identity.cliente {empresa, email}`, `rpc.identity.convite_dono {tenant}` e `rpc.identity.contacts`.
   Agindo na organização do cliente: `rpc.processos.acompanhamento`, `rpc.conhecimento.contexto`, `rpc.plans.assign`
-  e `rpc.plans.limits` (core), `rpc.processos.fila_tarefa|fila_resolver|fila_revisao|fila_decidir` e
+  e `rpc.plans.limits` (core), `rpc.plans.conta` (a conta do cliente, com `por` = o gestor),
+  `rpc.processos.fila_tarefa|fila_resolver|fila_revisao|fila_decidir` e
   `rpc.atendimento.pedido|responder` (com `por` = quem do staff resolve).
 - Ao vivo: `staff.carteiras {id, action: atribuida|removida}` e `staff.fila {id, action: chegou|mudou|escalada}`.
 
@@ -92,6 +102,7 @@ disso, toda rota responde 403 (menos `/resumo`, que responde `staff: false`).
   negócio do serviço do item volta como veio (ex.: 422 `ERRO_PROCESSOS_RESPOSTA`).
 - Novo cliente com responsável que não é do staff → 404 `ERRO_STAFF_PESSOA`, sem criar nada; plano inexistente → 404
   `ERRO_PLANS_NOT_FOUND` (a organização fica criada, sem plano: ele é atribuído em Plano).
+- svc-plans fora do ar ao mudar a conta → 503 `ERRO_STAFF_PLANOS`; na lista, a conta daquele cliente vem `null`.
 - svc-identity fora do ar → 503 `ERRO_STAFF_IDENTIDADE`; svc-processos fora do ar → a saúde daquele cliente vem com
   `disponivel: false` (o resto da carteira aparece).
 - Sem `PLATFORM_TENANT` configurado: ninguém é staff, os eventos são ignorados e o escalonamento não faz nada.

@@ -20,6 +20,8 @@ from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
 from schemas import (
+    ENCERRADA_SUBJECT,
+    ContaEncerrada,
     RESOLVE_SUBJECT,
     SERVICE,
     SHARED_TABLES,
@@ -39,7 +41,7 @@ from schemas import (
     ResolveRequest,
     UsageEvent,
 )
-from service import AiService, settings
+from service import AiService, apagar_provedores, settings
 from workflows import AiWorkflow
 
 svc = AiService()
@@ -59,11 +61,12 @@ async def lifespan(app: FastAPI):
     settings()  # sem AI_SECRETS_KEY válida o serviço não sobe
     async with (
         bus.connected(SERVICE),
-        db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE, search=SEARCH),
+        db.connected(tables=TENANT_TABLES, shared=SHARED_TABLES, unique=UNIQUE, search=SEARCH, service=SERVICE, on_purge=apagar_provedores),
         runner.worker(TASK_QUEUE, workflows=[AiWorkflow], service=svc),
     ):
         await bus.subscribe(TRIGGER_SUBJECT, on_trigger, model=ProviderRef)
         await bus.subscribe(USAGE_SUBJECT, on_usage, model=UsageEvent)
+        await bus.subscribe(ENCERRADA_SUBJECT, svc.encerrada, model=ContaEncerrada)  # svc-plans: a conta encerrou
         await bus.respond(RESOLVE_SUBJECT, svc.resolve, model=ResolveRequest)
         await plans.declare(MODULE)  # o módulo, com custo e tokens do mês, no catálogo dos planos (README §5.17)
         yield

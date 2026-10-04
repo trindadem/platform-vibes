@@ -10,7 +10,8 @@ import { Spinner } from "@/components/Spinner";
 import { Stack } from "@/components/Stack";
 import { Stat } from "@/components/Stat";
 import { Text } from "@/components/Text";
-import { useLive, useLiveQuery } from "@/core/api";
+import { TextLink } from "@/components/TextLink";
+import { useLive, useLiveQuery, useQuery } from "@/core/api";
 import { useSession } from "@/core/auth";
 import {
   type ConhecimentoResumo,
@@ -18,6 +19,7 @@ import {
   type ProcessosAcompanhamento,
   type ProcessosEtapaProjeto,
   type ProcessosResumo,
+  plans,
   processos,
 } from "@/core/contracts";
 
@@ -110,11 +112,17 @@ export default function Workspace() {
   const acompanhamento = useLiveQuery("processos.execucoes", processos.acompanhamento);
   const projetos = useLiveQuery("processos.execucoes", processos.projetos, { size: 3 });
   useLive("processos.tarefas", () => acompanhamento.reload());
+  const conta = useQuery(plans.current); // suspensa, cancelamento pedido ou encerrada: o aviso vem primeiro
   const r = resumo.data;
   const a = acompanhamento.data;
   const publicados = (descoberta.data?.publicados ?? 0) > 0;
   return (
     <Page title="Workspace" description={`A jornada da ${session?.tenant?.name ?? "sua empresa"} na Cogniventure, passo a passo.`}>
+      {conta.data?.conta.aviso && (
+        <Alert tone={conta.data.conta.situacao === "ativa" ? "info" : "warning"} title="Conta">
+          {conta.data.conta.aviso} <TextLink to="/plano">Ver em Plano</TextLink>
+        </Alert>
+      )}
       {resumo.error && <Alert tone="warning">Não foi possível carregar o andamento: {resumo.error.message}</Alert>}
       {publicados && a ? (
         <Grid cols={4}>

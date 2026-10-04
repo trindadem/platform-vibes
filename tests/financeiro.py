@@ -125,11 +125,13 @@ def test_faturar_emitir_nota_com_o_staff_cobrar_e_baixar_pelo_extrato():
         extrato["itens"] = [{"tipo": "recebimento", "id": "CB-1A2B3C4D", "valor": 4800.0, "data": "2026-10-05"}]
         depois = await app.job("financeiro.baixar", variables={"entrada": {"cobranca_id": "CB-1A2B3C4D"}})
         faturas = (await app.user(*OWNER).get("/faturas")).json()["data"]["items"]
-        return faturado, sem_valor, nota, cobrado, antes, depois, faturas
+        combinada = await app.job("financeiro.faturar", variables={"entrada": {**venda, "vencimento": "2026-10-15"}})  # a mensalidade do plano
+        return faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada
 
-    faturado, sem_valor, nota, cobrado, antes, depois, faturas = service_app(cenario)
+    faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada = service_app(cenario)
     vencimento = (date.today() + timedelta(days=10)).isoformat()
     assert faturado.variables["resultado"]["vencimento"] == vencimento and sem_valor.status == "handoff"
+    assert combinada.variables["resultado"]["vencimento"] == "2026-10-15"  # a data combinada vale mais que o prazo
     assert nota.status == "handoff" and "R$ 4.800,00" in nota.message and "prefeitura" in nota.message  # NFS-e: o staff emite
     assert cobrado.variables["resultado"]["enviada"] is True and enviados[0].para == "compras@paoquente.com.br"
     assert "2026/000123" in enviados[0].texto and "34191.79001" in enviados[0].texto

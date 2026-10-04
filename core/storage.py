@@ -12,6 +12,11 @@ O arquivo nunca passa pelos serviços nem pelo gateway: o navegador envia direto
                                                                               #    o serviço guarda o que recebeu
     await storage.delete(arquivo.key)                                         # 5. ao apagar o registro
 
+    A organização que sai (README §5.13; só tarefas da plataforma, o svc-plans):
+    for key in await storage.keys(): info = await storage.info(key)           # todos os arquivos dela (exportação)
+    pacote = await storage.save_file(caminho, filename="dados.zip", ...)      # arquivo grande, do disco
+    await storage.purge()                                                     # apaga tudo dela, de todos os serviços
+
 Trilhos:
 - Toda chave começa pela organização de quem age: tmp/<org>/... no envio, t/<org>/<serviço>/... depois de guardada.
   Chave de outra organização é, para quem pede, inexistente (404 ERRO_FILE_NOT_FOUND). Ninguém escolhe a chave.
@@ -44,7 +49,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints,
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from core.envelope import ServiceError
-from core.security import current_tenant
+from core.security import current, current_tenant
 
 UPLOAD_SECONDS = 600  # validade do link de envio
 DOWNLOAD_SECONDS = 300  # validade padrão do link de download
@@ -243,6 +248,61 @@ class Storage:
         self._own(key)
         await asyncio.to_thread(self._client.delete_object, Bucket=s.bucket, Key=key)
 
+    async def save_file(self, path: str, *, filename: str, content_type: str, folder: str = "files") -> StoredFile:
+        """Como save, mas do disco e sem limite de tamanho (o envio vai em partes): para o que a própria plataforma gera,
+        como o pacote da exportação. Só tarefas da plataforma."""
+        s = self._ready()
+        _platform_task()
+        if not re.fullmatch(r"[a-z0-9-]{1,40}", folder):
+            raise ValueError(f"folder inválido: {folder!r} (a-z, 0-9 e hífen)")
+        name = _clean_name(filename) or "arquivo"
+        key = f"t/{_tenant_segment()}/{self._service}/{folder}/{uuid.uuid4().hex}"
+        await asyncio.to_thread(self._client.upload_file, path, s.bucket, key,
+                                ExtraArgs={"ContentType": content_type, "Metadata": {_FILENAME_META: quote(name)}})
+        head = await asyncio.to_thread(self._client.head_object, Bucket=s.bucket, Key=key)
+        return StoredFile(key=key, filename=name, content_type=content_type, size=head["ContentLength"])
+
+    async def keys(self) -> list[str]:
+        """As chaves de todos os arquivos guardados da organização atual, de todos os serviços. Só tarefas da plataforma."""
+        _platform_task()
+        return await self._list(f"t/{_tenant_segment()}/")
+
+    async def info(self, key: str) -> StoredFile:
+        """Nome, tipo e tamanho de um arquivo guardado da organização atual."""
+        s = self._ready()
+        self._own(key)
+        try:
+            head = await asyncio.to_thread(self._client.head_object, Bucket=s.bucket, Key=key)
+        except ClientError as exc:
+            if _missing(exc):
+                raise _not_found() from None
+            raise
+        return StoredFile(key=key, filename=unquote(head.get("Metadata", {}).get(_FILENAME_META, "")) or key.rsplit("/", 1)[-1],
+                          content_type=head.get("ContentType", "application/octet-stream"), size=head["ContentLength"])
+
+    async def purge(self) -> int:
+        """Apaga todos os arquivos da organização atual, guardados e temporários, de todos os serviços (a organização
+        encerrada há 30 dias). Devolve quantos saíram. Só tarefas da plataforma."""
+        s = self._ready()
+        _platform_task()
+        tenant = _tenant_segment()
+        keys = [*await self._list(f"t/{tenant}/"), *await self._list(f"tmp/{tenant}/")]
+        for start in range(0, len(keys), 1000):
+            batch = [{"Key": key} for key in keys[start:start + 1000]]
+            await asyncio.to_thread(self._client.delete_objects, Bucket=s.bucket, Delete={"Objects": batch, "Quiet": True})
+        return len(keys)
+
+    async def _list(self, prefix: str) -> list[str]:
+        s = self._ready()
+
+        def run() -> list[str]:
+            found: list[str] = []
+            for page in self._client.get_paginator("list_objects_v2").paginate(Bucket=s.bucket, Prefix=prefix):
+                found += [item["Key"] for item in page.get("Contents", [])]
+            return found
+
+        return await asyncio.to_thread(run)
+
     def _own(self, key: str) -> None:
         parts = key.split("/")
         if len(parts) != 5 or parts[:2] != ["t", _tenant_segment()] or not _KEY_ID.match(parts[4]) or ".." in key:
@@ -287,6 +347,12 @@ def _client(s: StorageSettings, endpoint: str) -> Any:
         region_name=s.region,
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}, retries={"max_attempts": 3}),
     )
+
+
+def _platform_task() -> None:
+    who = current()
+    if who is None or not who.is_system:
+        raise PermissionError("storage: listar, apagar tudo e guardar do disco são para tarefas da plataforma (acting_as(system(...)))")
 
 
 def _tenant_segment() -> str:

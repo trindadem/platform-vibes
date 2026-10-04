@@ -71,6 +71,7 @@ from schemas import (
     ConvitePendente,
     Dono,
     Empty,
+    ExcluirConta,
     ForgotInput,
     IdentitySettings,
     Invite,
@@ -294,6 +295,49 @@ class IdentityService:
         if user is None:
             raise _invalid_session()
         return Me(user=_user_view(user), tenant=who.tenant, tenants=await self._tenants(who.sub))
+
+    async def excluir_conta(self, data: ExcluirConta) -> Empty:
+        """A pessoa apaga a própria conta (LGPD): sai de todas as organizações, perde as sessões e o cadastro some. Quem
+        é o único dono de uma organização ativa passa a propriedade ou pede o cancelamento antes. O que ela fez nos
+        registros fica pelo id, sem nome nem e-mail."""
+        who = _who()
+        user = await db.select(f"{USERS}:{who.sub}")
+        if user is None:
+            raise _invalid_session()
+        if not await verify_password(user["password_hash"], data.password):
+            raise _bad_credentials()
+        user_rid = RecordID(USERS, who.sub)
+        vinculos = await db.query_shared("SELECT * FROM identity_memberships WHERE user = $u", u=user_rid)
+        for vinculo in vinculos:
+            tenant = _key(vinculo["tenant"])
+            if "owner" not in vinculo["roles"]:
+                continue
+            donos = await db.query_shared("SELECT VALUE id FROM identity_memberships WHERE tenant = $t AND roles CONTAINS 'owner'",
+                                          t=RecordID(TENANTS, tenant))
+            if len(donos) > 1:
+                continue
+            with acting_as(system(SERVICE, tenant)):
+                encerrada = await plans.situacao() == "encerrada"
+            if not encerrada:
+                nome = (await db.select(f"{TENANTS}:{tenant}") or {}).get("name", tenant)
+                raise ServiceError("ERRO_IDENTITY_LAST_OWNER", f"Você é o único dono de {nome}: passe a propriedade a outra pessoa "
+                                   "ou peça o cancelamento em Plano antes de apagar a sua conta.", 409)
+        for vinculo in vinculos:
+            tenant = _key(vinculo["tenant"])
+            await db.delete(vinculo["id"])
+            with acting_as(system(SERVICE, tenant)):
+                await bus.publish(MEMBER_LEFT_SUBJECT, MemberLeft(tenant=tenant, user=who.sub),
+                                  msg_id=f"saiu-{tenant}-{who.sub}-{_key(vinculo['id'])}")  # o svc-staff tira a carteira
+                await plans.count("membros", await _member_count(tenant))
+                await bus.live(MEMBERS_LIVE, MembersChanged(user=who.sub, change="removed"))
+        await db.query_shared("DELETE identity_sessions WHERE user = $u", u=user_rid)
+        await db.query_shared("DELETE identity_resets WHERE user = $u", u=user_rid)
+        await db.query_shared("DELETE identity_invites WHERE email = $e AND used_by = NONE", e=user["email"])
+        await db.delete(user["id"])
+        await notify.email(user["email"], "Sua conta foi apagada",
+                           "A sua conta na plataforma foi apagada a seu pedido, com o nome, o e-mail e a senha. "
+                           "Se não foi você, fale com a Cogniventure.", key=f"conta-apagada-{who.sub}")
+        return Empty()
 
     async def switch_tenant(self, data: SwitchRequest) -> Session:
         who = _who()
@@ -732,6 +776,18 @@ async def _member_count(tenant: str) -> int:
         t=RecordID(TENANTS, tenant),
     )
     return rows[0]["total"] if rows else 0
+
+
+async def apagar_organizacao() -> None:
+    """A organização saiu de vez (db.connected(on_purge=...), como ela, 30 dias depois do encerramento): vínculos,
+    convites, sessões, o logo e a própria organização. As pessoas continuam com as contas delas."""
+    tenant = current_tenant()
+    t = RecordID(TENANTS, tenant)
+    await db.query_shared("DELETE identity_memberships WHERE tenant = $t", t=t)
+    await db.query_shared("DELETE identity_invites WHERE tenant = $t", t=t)
+    await db.query_shared("DELETE identity_sessions WHERE tenant = $t", t=t)
+    await db.query_shared("UPDATE identity_users SET last_tenant = NONE WHERE last_tenant = $k", k=tenant)
+    await db.query_shared("DELETE $t", t=t)
 
 
 def _who() -> Principal:

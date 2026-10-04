@@ -32,6 +32,7 @@ from core.temporal_runner import activities
 from core.webhooks import new_secret, sign
 
 from schemas import (
+    ContaEncerrada,
     ALL_EVENTS,
     DELIVERIES,
     DELIVERY_LIVE,
@@ -124,6 +125,13 @@ class WebhooksService:
         await db.delete(row["id"])  # entregas pendentes viram skipped na próxima tentativa
         await plans.count("enderecos", await _endpoint_count())
         return await self.list_endpoints(Empty())
+
+    async def encerrada(self, data: ContaEncerrada) -> Empty:
+        """events.plans.encerrada: a conta encerrou, os endereços saem (nada mais é entregue aos sistemas dela)."""
+        for row in await db.query("SELECT id FROM webhook_endpoints WHERE tenant = $tenant"):
+            await db.delete(row["id"])
+        await plans.count("enderecos", 0)
+        return Empty()
 
     async def rotate_secret(self, data: EndpointRef) -> EndpointSecret:
         _manager()

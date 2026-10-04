@@ -79,3 +79,48 @@ endpoints:
     response: Account
     target_type: http
     target_url: http://svc-plans:8000/assign
+
+  # Conta: o dono cancela (no fim do mês pago), desfaz e baixa os dados; o gestor da plataforma roda o fechamento.
+  - path: /cancelamento
+    name: cancelar
+    method: POST
+    auth: client_jwt
+    request: CancelamentoIn
+    response: Conta
+    target_type: http
+    target_url: http://svc-plans:8000/cancelamento
+
+  - path: /cancelamento/desfazer
+    name: desfazerCancelamento
+    method: POST
+    auth: client_jwt
+    request: Empty
+    response: Conta
+    target_type: http
+    target_url: http://svc-plans:8000/cancelamento/desfazer
+
+  - path: /exportacao
+    name: exportacao
+    method: GET
+    auth: client_jwt
+    response: ExportacaoAtual
+    target_type: http
+    target_url: http://svc-plans:8000/exportacao
+
+  - path: /exportacao
+    name: exportar
+    method: POST
+    auth: client_jwt
+    request: Empty
+    response: Exportacao
+    target_type: http
+    target_url: http://svc-plans:8000/exportacao
+
+  - path: /fechamento
+    name: fecharMes
+    method: POST
+    auth: client_jwt
+    request: FechamentoIn
+    response: Fechamento
+    target_type: http
+    target_url: http://svc-plans:8000/fechamento

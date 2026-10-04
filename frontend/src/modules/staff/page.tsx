@@ -16,6 +16,7 @@ import { DateTime } from "@/components/DateTime";
 import { EmptyState } from "@/components/EmptyState";
 import { Grid } from "@/components/Grid";
 import { KeyValue } from "@/components/KeyValue";
+import { Money } from "@/components/Money";
 import { Page } from "@/components/Page";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
@@ -47,6 +48,21 @@ const duracao = (min: number | null) =>
   min === null ? "—" : min < 1 ? "menos de 1 min" : min < 60 ? `${Math.round(min)} min` : `${Math.floor(min / 60)} h ${Math.round(min % 60)} min`;
 const PASSOS = { convite: "Convite pendente", briefing: "Briefing", descoberta: "Descoberta", desenho: "Desenho", acompanhamento: "Acompanhamento" };
 const TONS_PASSO = { convite: "warning", briefing: "neutral", descoberta: "neutral", desenho: "accent", acompanhamento: "success" } as const;
+const SITUACAO = { ativa: "Ativa", suspensa: "Suspensa", encerrada: "Encerrada" };
+const TONS_SITUACAO = { ativa: "success", suspensa: "warning", encerrada: "danger" } as const;
+
+/** A situação da conta numa palavra, com o encerramento marcado (no fim do mês pago). */
+function situacao(c: StaffCliente) {
+  if (!c.conta) return "—";
+  return (
+    <Stack gap="sm">
+      <StatusBadge value={c.conta.situacao} labels={SITUACAO} tones={TONS_SITUACAO} />
+      {c.conta.cancelamento && c.conta.situacao !== "encerrada" && (
+        <Text size="sm" tone="muted">Encerra em <DateTime value={c.conta.cancelamento.efetivo_em} format="date" /></Text>
+      )}
+    </Stack>
+  );
+}
 
 export default function Staff() {
   const resumo = useLiveQuery("staff.fila", staff.resumo);
@@ -399,6 +415,7 @@ function Clientes() {
   const planos = useQuery(plans.list);
   const membros = useQuery(identity.members);
   const [abrindo, setAbrindo] = useState(false);
+  const [conta, setConta] = useState<string | null>(null);
   const novo = useAction(staff.novoCliente, { onSuccess: clientes.reload });
   const convidar = useAction(staff.convidarDono, { onSuccess: clientes.reload });
   const nome = (id: string) => membros.data?.items.find((m) => m.id === id)?.name ?? "alguém do staff";
@@ -438,10 +455,17 @@ function Clientes() {
               { key: "passo", header: "Jornada", render: (r) => (r.passo ? <StatusBadge value={r.passo} labels={PASSOS} tones={TONS_PASSO} /> : "—") },
               { key: "ultimo_acesso", header: "Último acesso", render: (r) => (r.ultimo_acesso ? <DateTime value={r.ultimo_acesso} format="relative" /> : "Nunca") },
               { key: "dono", header: "Dono", render: dono },
+              { key: "conta", header: "Mensalidade", render: (r) => (r.conta ? <Text size="sm">{r.conta.valor ? <Money value={r.conta.valor} currency="BRL" /> : "Sem cobrança"} · dia {r.conta.vencimento}</Text> : "—") },
+              { key: "situacao", header: "Conta", render: situacao },
+              { key: "acoes", header: "", render: (r) => <Button size="sm" variant="ghost" onClick={() => setConta(r.organizacao)}>Conta</Button> },
             ]}
           />
         )}
       </QueryView>
+      <SidePanel open={conta !== null} onClose={() => setConta(null)} title="Conta do cliente"
+        description="A mensalidade e o vencimento que o fechamento do mês cobra; suspender o cliente em atraso; encerrar a conta.">
+        {conta && clientes.data && <ContaDoCliente cliente={clientes.data.itens.find((c) => c.organizacao === conta)} onChange={clientes.reload} />}
+      </SidePanel>
       <SidePanel open={abrindo} onClose={() => setAbrindo(false)} title="Novo cliente" description="A organização nasce sem ninguém da Cogniventure dentro; o dono recebe o convite por e-mail e quem cuida dele ganha o papel operador.">
         {abrindo && (
           <ActionForm
@@ -453,10 +477,70 @@ function Clientes() {
               { name: "email", label: "E-mail do dono", kind: "email", required: true, hint: "Recebe o convite para criar a senha e começar pelo briefing." },
               { name: "plano", label: "Plano", kind: "select", required: true, options: (planos.data?.items ?? []).map((p) => ({ value: p.slug, label: p.name })) },
               { name: "pessoa", label: "Quem do staff cuida", kind: "select", required: true, options: (membros.data?.items ?? []).map((m) => ({ value: m.id, label: `${m.name} (${m.email})` })) },
+              { name: "valor", label: "Mensalidade combinada (R$)", kind: "number", hint: "Vazio: o preço do plano." },
+              { name: "vencimento", label: "Dia do vencimento", kind: "number", hint: "De 1 a 28 (vazio: dia 10)." },
             ]}
           />
         )}
       </SidePanel>
+    </Stack>
+  );
+}
+
+/** A conta de um cliente: o que o fechamento cobra, suspender e reativar, encerrar e desfazer. */
+function ContaDoCliente({ cliente, onChange }: { cliente: StaffCliente | undefined; onChange: () => void }) {
+  const organizacao = cliente?.organizacao ?? "";
+  const cobranca = useAction((v: { valor?: number | null; vencimento?: number | null }) => staff.cobranca({ organizacao, ...v }), { onSuccess: onChange });
+  const suspender = useAction((v: { motivo: string }) => staff.situacaoCliente({ organizacao, acao: "suspender", motivo: v.motivo }), { onSuccess: onChange });
+  const encerrar = useAction((v: { motivo?: string | null }) => staff.situacaoCliente({ organizacao, acao: "encerrar", motivo: v.motivo ?? null }), { onSuccess: onChange });
+  const mudar = useAction((acao: "reativar" | "desfazer") => staff.situacaoCliente({ organizacao, acao }), { onSuccess: onChange });
+  const c = cliente?.conta;
+  if (!cliente || !c) return <Alert tone="warning">A conta deste cliente não respondeu agora. Tente de novo em instantes.</Alert>;
+  return (
+    <Stack>
+      <KeyValue items={[
+        { label: "Cliente", value: cliente.nome },
+        { label: "Situação", value: situacao(cliente) },
+        ...(c.motivo ? [{ label: "Motivo da suspensão", value: c.motivo }] : []),
+        ...(c.cancelamento ? [{ label: "Encerramento", value: `${c.cancelamento.origem === "cliente" ? "Pedido pelo cliente" : "Pela Cogniventure"}${c.cancelamento.motivo ? `: ${c.cancelamento.motivo}` : ""}` }] : []),
+        ...(c.exclusao_em ? [{ label: "Os dados saem de vez em", value: <DateTime value={c.exclusao_em} format="date" /> }] : []),
+      ]} />
+      {mudar.error && <Alert tone="danger">{mudar.error.message}</Alert>}
+      <Card title="Cobrança" description="O fechamento do dia 1 inicia o Faturamento e cobrança na organização da Cogniventure com este valor e este vencimento.">
+        <ActionForm
+          action={cobranca}
+          submitLabel="Salvar"
+          successMessage="Cobrança atualizada."
+          initial={{ valor: String(c.valor), vencimento: String(c.vencimento) }}
+          fields={[
+            { name: "valor", label: "Mensalidade (R$)", kind: "number", required: true },
+            { name: "vencimento", label: "Dia do vencimento", kind: "number", required: true, hint: "De 1 a 28." },
+          ]}
+        />
+      </Card>
+      {c.situacao === "ativa" && (
+        <Card title="Suspender" description="Para o cliente em atraso: nenhuma execução nova começa (as em andamento terminam) e ele vê o aviso no workspace.">
+          <ActionForm action={suspender} submitLabel="Suspender" fields={[{ name: "motivo", label: "Motivo (o cliente vê)", kind: "textarea", required: true }]} />
+        </Card>
+      )}
+      {c.situacao === "suspensa" && (
+        <Row>
+          <Button loading={mudar.running} onClick={() => void mudar.run("reativar")}>Reativar (o pagamento entrou)</Button>
+        </Row>
+      )}
+      {(c.cancelamento || c.situacao === "encerrada") ? (
+        <Row>
+          <Button variant="secondary" loading={mudar.running} onClick={() => void mudar.run("desfazer")}>
+            {c.situacao === "encerrada" ? "Reativar a conta encerrada" : "Desfazer o encerramento"}
+          </Button>
+        </Row>
+      ) : (
+        <Card title="Encerrar a conta" description={c.situacao === "suspensa"
+          ? "Suspenso por atraso: encerra na hora. Os dados ficam 30 dias para o cliente baixar e depois saem de vez."
+          : "Encerra no fim do mês pago. Depois, os dados ficam 30 dias para o cliente baixar e saem de vez."}>
+          <ActionForm action={encerrar} submitLabel="Encerrar a conta" fields={[{ name: "motivo", label: "Motivo", kind: "textarea" }]} />
+        </Card>
+      )}
     </Stack>
   );
 }

@@ -26,6 +26,9 @@ Com token:
 - `POST /organization/logo/upload` (`UploadRequest`) → `Upload`; `POST /organization/logo` (`KeepRequest`) e
   `POST /organization/logo/remove` → `Organization` · só owner/admin (README §5.14)
 - `POST /organization/color` (`ColorInput { color: "#rrggbb" | null }`) → `Organization` · só owner/admin
+- `POST /me/excluir` (`ExcluirConta { password }`) → `Empty`: a pessoa apaga a própria conta (LGPD), confirmando com a
+  senha: sai de todas as organizações (cada saída publica `member-left`), perde as sessões e o cadastro some (o que fez
+  nos registros fica pelo id, sem nome nem e-mail); recebe a confirmação por e-mail e o cookie de sessão é apagado.
 
 RPC `rpc.identity.contacts` (`ContactsRequest { users, roles }`) → `Contacts { tenant_name, items: Contact[] }`, com
 `Contact { id, name, email }`: só quem é membro da organização de quem pergunta (o `svc-notify`, README §5.15).
@@ -59,7 +62,9 @@ refresh que chegou atrasado, girado antes da troca, não leva de volta para a or
    criação de organização gravam num bloco atômico.
 2. NATS: `events.identity.tenant-created` `{ tenant, name }` e `events.identity.member-joined` `{ tenant, user, roles }`,
    publicados em nome do novo membro; `events.identity.member-left` `{ tenant, user }`, em nome de quem removeu (o
-   svc-staff tira a carteira de quem sai da Cogniventure). Cada token emitido grava o último acesso no vínculo. `events.identity.trigger` inicia a limpeza. Avisos pelo `core/notify.py`:
+   svc-staff tira a carteira de quem sai da Cogniventure). Cada token emitido grava o último acesso no vínculo.
+   A organização que sai de vez (`events.plans.exclusao`, README §5.13): os vínculos, os convites, as sessões nela e a
+   própria organização são apagados; as pessoas continuam com as contas e as outras organizações. `events.identity.trigger` inicia a limpeza. Avisos pelo `core/notify.py`:
    convite e senha por e-mail; quem convidou é avisado (tela + e-mail) quando o convidado entra.
 3. Temporal: `IdentityWorkflow` → activity `identity.cleanup` (apaga sessões, convites e links de senha vencidos),
    todo dia às 4h UTC pelo agendamento `identity-queue/limpeza` (workflows.SCHEDULES) ou pelo trigger; (timeout 5 min,
@@ -89,3 +94,5 @@ refresh que chegou atrasado, girado antes da troca, não leva de volta para a or
   de ninguém); o link vale 30 min e uma vez. Trocar a senha encerra todas as sessões, invalida os outros links e
   avisa a pessoa por e-mail.
 - Sem verificação de e-mail no cadastro (decisão da v1).
+- Apagar a própria conta: senha errada → 401 `ERRO_IDENTITY_INVALID_CREDENTIALS`; único dono de uma organização que
+  não está encerrada (no svc-plans) → 409 `ERRO_IDENTITY_LAST_OWNER` (passe a propriedade ou peça o cancelamento antes).
