@@ -2934,6 +2934,91 @@ def test_job_do_motor_roda_a_acao_como_a_organizacao_do_processo(monkeypatch):
         procs._action_handler("financeiro", _AGENDAR, _Errado())  # retorno fora da saída declarada: não sobe
 
 
+class _Consulta(BaseModel):
+    pagamento_id: str
+
+
+class _Situacao(BaseModel):
+    pago: bool
+    valor: float
+
+
+_CONSULTAR = Action("consultar_pagamento", "Consultar pagamento", "Diz se um pagamento agendado já saiu do banco", _Consulta,
+                    _Situacao, risk="leitura", example=_Situacao(pago=True, valor=10))
+
+
+class _PacoteComConsulta(_Pacote):
+    def __init__(self):
+        super().__init__()
+        self.quem = []
+
+    async def consultar_pagamento(self, data: _Consulta) -> _Situacao:
+        self.quem.append((security.current().sub, security.current().tenant))
+        if data.pagamento_id == "PG-0":
+            raise processes_module.Handoff("Pagamento não encontrado no banco.")
+        if data.pagamento_id == "PG-409":
+            raise ServiceError("ERRO_FINANCEIRO_SEM_BANCO", "A organização não conectou um banco.", 409)
+        if data.pagamento_id == "PG-503":
+            raise ServiceError("ERRO_INTEGRACOES_FORA", "Banco fora do ar.", 503)
+        return _Situacao(pago=True, valor=1250)
+
+
+def test_acao_do_pacote_como_ferramenta_do_agente(monkeypatch):
+    """O alinhamento pós-N7 (item 6): um agente da empresa usa a ação de um pacote como ferramenta, por rpc.<pacote>.acao."""
+    from core.processes import ActionCall, processes as procs
+
+    ligado = {"financeiro": True}
+
+    async def no_plano(nome):
+        return ligado[nome]
+
+    monkeypatch.setattr(processes_module.plans, "enabled", no_plano)
+    pacote = _PacoteComConsulta()
+    responder = procs._action_responder("svc-financeiro", [_AGENDAR, _CONSULTAR], pacote)
+    agente = security.system("svc-agentes", "acme")
+
+    async def chamar(quem, acao, entrada=None):
+        with security.acting_as(quem):
+            try:
+                return await responder(ActionCall(acao=acao, entrada=entrada or {}))
+            except ServiceError as exc:
+                return exc.code, exc.status
+
+    async def cenario():
+        ok = await chamar(agente, "consultar_pagamento", {"pagamento_id": "PG-1"})
+        handoff = await chamar(agente, "consultar_pagamento", {"pagamento_id": "PG-0"})
+        negocio = await chamar(agente, "consultar_pagamento", {"pagamento_id": "PG-409"})
+        faltando = await chamar(agente, "consultar_pagamento")
+        fora = await chamar(agente, "consultar_pagamento", {"pagamento_id": "PG-503"})
+        irreversivel = await chamar(agente, "agendar", {"valor": 10, "vencimento": "2026-10-15"})
+        inexistente = await chamar(agente, "pagar_tudo")
+        recusados = [await chamar(quem, "consultar_pagamento", {"pagamento_id": "PG-1"}) for quem in (
+            security.system("svc-vendas", "acme"),  # outro serviço
+            Principal(sub="ana", tenant="acme", roles=frozenset({"owner"})),  # uma pessoa
+            security.system("svc-agentes"),  # sem organização
+            None,
+        )]
+        ligado["financeiro"] = False
+        desligado = await chamar(agente, "consultar_pagamento", {"pagamento_id": "PG-1"})
+        return ok, handoff, negocio, faltando, fora, irreversivel, inexistente, recusados, desligado
+
+    ok, handoff, negocio, faltando, fora, irreversivel, inexistente, recusados, desligado = asyncio.run(cenario())
+    assert (ok.ok, ok.resultado, ok.motivo) == (True, {"pago": True, "valor": 1250.0}, None)
+    assert pacote.quem[0] == ("system:svc-financeiro", "acme")  # roda como o pacote, na organização do agente
+    assert (handoff.ok, handoff.motivo) == (False, "Pagamento não encontrado no banco.")
+    assert (negocio.ok, negocio.motivo) == (False, "A organização não conectou um banco.")
+    assert faltando.ok is False and "pagamento_id" in faltando.motivo  # a mesma conferência de entrada do job
+    assert fora == ("ERRO_INTEGRACOES_FORA", 503)  # infraestrutura: erro do RPC, não um motivo de negócio
+    assert irreversivel == ("ERRO_PROCESSOS_ACAO_IRREVERSIVEL", 403) and pacote.recebidos == []  # nem chegou ao método
+    assert inexistente == ("ERRO_PROCESSOS_ACAO_NAO_ENCONTRADA", 404)
+    assert recusados == [("ERRO_PROCESSOS_ACAO_FORBIDDEN", 403)] * 4
+    assert desligado.ok is False and "plano" in desligado.motivo
+    assert len(pacote.quem) == 4  # PG-1, PG-0, PG-409 e PG-503; os recusados e o módulo desligado não rodaram
+    assert processes_module.action_subject("svc-financeiro") == "rpc.financeiro.acao"
+    with pytest.raises(ValidationError):
+        ActionCall(acao="financeiro.consultar_pagamento")  # o nome curto: o pacote vem do subject
+
+
 def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
     from core.processes import Handoff, processes as procs
 
@@ -2957,8 +3042,14 @@ def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
     async def ligado(nome):
         return nome == "financeiro"
 
+    atendidos = []
+
+    async def respond(subject, handler, model):
+        atendidos.append((subject, model))
+
     monkeypatch.setattr(processes_module.plans, "enabled", ligado)
     monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "respond", respond)
     monkeypatch.setattr(nats_bus.bus, "_service", "svc-financeiro")
     monkeypatch.setattr(processes_module.camunda, "_client",
                         httpx.AsyncClient(base_url="http://camunda:8080", transport=httpx.MockTransport(motor)))
@@ -2969,8 +3060,11 @@ def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
                 if sum(1 for path, _ in chamadas if path != "/v2/jobs/activation") >= 3:
                     break
                 await asyncio.sleep(0.01)
+        async with procs.worker("svc-processos", jobs={"processos.inicio": lambda job: None}):
+            pass  # sem ações: nenhum rpc.<serviço>.acao
 
     asyncio.run(cenario())
+    assert atendidos == [("rpc.financeiro.acao", processes_module.ActionCall)]  # a ação também como ferramenta de agente
     respostas = {path: corpo for path, corpo in chamadas if path != "/v2/jobs/activation"}
     assert respostas["/v2/jobs/77/completion"] == {"variables": {"resultado": {"pagamento_id": "PG-1250"}}}
     assert respostas["/v2/jobs/78/error"]["errorCode"] == "handoff"  # com caminho de exceção: tarefa do staff

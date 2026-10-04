@@ -8,10 +8,11 @@ Rodar (da raiz): PYTHONPATH=services/svc-financeiro uv run python -m pytest test
 from datetime import date, timedelta
 
 from core.envelope import ServiceError
-from core.processes import CATALOG_SUBJECT, STEP_SUBJECT
+from core.processes import CATALOG_SUBJECT, STEP_SUBJECT, ActionCall, action_subject
+from core.security import acting_as, system
 from core.testing import service_app
 
-from schemas import ACTIONS, AGENDAR_SUBJECT, COBRAR_SUBJECT, EMAIL_SUBJECT, EXTRATO_SUBJECT
+from schemas import ACTIONS, AGENDAR_SUBJECT, COBRAR_SUBJECT, EMAIL_SUBJECT, EXTRATO_SUBJECT, SERVICE
 
 OWNER = ("ana", "acme", "owner")
 DOC = {"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 1250.0, "vencimento": "2026-10-15"}
@@ -61,6 +62,32 @@ def test_conferir_e_classificar_pelo_cadastro_de_fornecedores():
     passos = [m for s, m in publicados if s == STEP_SUBJECT]
     assert [(p.passo, p.status) for p in passos[:2]] == [("conferir", "concluido"), ("classificar", "concluido")]
     assert passos[0].processo == "proc1" and passos[0].saida["fornecedor_novo"] is True
+
+
+def test_agente_da_empresa_usa_a_acao_de_leitura_como_ferramenta():
+    """rpc.financeiro.acao (core/processes.py): a mesma ação do passo, para um agente da empresa (svc-agentes)."""
+    async def cenario(app):
+        criado = await app.user(*OWNER).post("/fornecedores", json={"nome": "Moinho Sul", "cnpj": DOC["cnpj"], "valor_contrato": 1000})
+        acao = app.handlers[action_subject(SERVICE)]
+        conferido = {}
+        for org in ("acme", "beta"):
+            with acting_as(system("svc-agentes", org)):
+                conferido[org] = await acao(ActionCall(acao="conferir_pedido", entrada=DOC))
+        with acting_as(system("svc-agentes", "acme")):
+            sem_valor = await acao(ActionCall(acao="conferir_pedido", entrada={**DOC, "valor": None}))
+            try:
+                await acao(ActionCall(acao="agendar_pagamento", entrada={"valor": 1250, "vencimento": "2099-10-15"}))
+            except ServiceError as exc:
+                irreversivel = (exc.code, exc.status)
+        return criado.status_code, conferido, sem_valor, irreversivel, app.requests
+
+    criado, conferido, sem_valor, irreversivel, pedidos = service_app(cenario)
+    assert criado == 200
+    assert conferido["acme"].ok and conferido["acme"].resultado["divergente"] is True  # 1250 contra o contrato de 1000
+    assert conferido["beta"].resultado["fornecedor_novo"] is True  # na beta, o Moinho Sul não existe: só a organização do agente
+    assert (sem_valor.ok, sem_valor.motivo) == (False, "O documento não trouxe o valor: não dá para conferir.")
+    assert irreversivel == ("ERRO_PROCESSOS_ACAO_IRREVERSIVEL", 403)
+    assert not [s for s, _ in pedidos if s == AGENDAR_SUBJECT]  # o banco nem foi chamado
 
 
 def test_agendar_no_banco_e_conciliar_o_titulo():

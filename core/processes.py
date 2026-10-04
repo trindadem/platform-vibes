@@ -10,7 +10,8 @@
     await processes.emit("pedido_proposta", Pedido(...))  # um acontecimento do pacote inicia processos (vendas.pedido_proposta)
 
     async with processes.worker(SERVICE, ACTIONS, svc):  # main.py: cada ação roda o método de mesmo nome do service.py
-        ...                                              # (conferir_pedido(self, data: Documento) -> Conferencia)
+        ...                                              # (conferir_pedido(self, data: Documento) -> Conferencia);
+                                                         # rpc.<pacote>.acao: a mesma ação para um agente da empresa
 
     xml = to_bpmn(fluxo, process_id=process_id("acme", "contas"), name="Contas a pagar", actions=catalogo)
     definicao = await camunda.deploy(xml, "p_acme_contas")                     # só o svc-processos implanta e inicia
@@ -38,6 +39,10 @@ Trilhos:
   campo (o mais perto antes dele; senão, do gatilho); a saída validada vai para <passo>. Ação que não pode seguir
   levanta Handoff(motivo) (ou um ServiceError de negócio, status < 500): com caminho de exceção, vira a tarefa do staff;
   sem ele, incidente. Erro de infraestrutura volta ao motor para nova tentativa. Módulo fora do plano vira handoff.
+- Ação como ferramenta (alinhamento pós-N7, item 6): o worker com ações atende rpc.<pacote>.acao (ActionCall {acao,
+  entrada} → ActionResult {ok, resultado, motivo}). Só o svc-agentes chama, na organização do agente; a ação roda como
+  o pacote nessa organização, com a mesma conferência do job (plano, entrada). Irreversível: 403, só num passo do
+  processo. Handoff ou erro de negócio voltam como ok=false com o motivo; ação que o pacote não tem, 404.
 - O que cada worker fez num passo sai em events.processos.passo (o acompanhamento no svc-processos). O svc-processos
   também atende os jobs que o BPMN gera para ele: começo da execução, tarefa de pessoa criada, espera e fim.
 - Mensagens no motor levam a organização no nome (<organização>.<mensagem>): uma organização não acorda a outra.
@@ -71,7 +76,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from core.envelope import ServiceError
 from core.nats_bus import bus
 from core.plans import plans
-from core.security import acting_as, system
+from core.security import SYSTEM_PREFIX, acting_as, current, system
 
 __all__ = [
     "Action", "ActionCatalog", "Alternative", "CatalogAction", "CatalogModel", "Condition", "Flow", "Fluxo", "ProcessEvent",
@@ -79,6 +84,7 @@ __all__ = [
     "process_id", "parse_process_id", "build_catalog", "CATALOG_SUBJECT", "STEP_SUBJECT", "EVENT_SUBJECT", "START",
     "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END", "Indicator", "CatalogIndicator",
     "IndicatorRequest", "IndicatorValues", "IndicatorWindow", "INDICATOR_TZ", "indicators_subject", "END", "exception_merge",
+    "ActionCall", "ActionResult", "ACTION_CALLER", "action_subject",
 ]
 
 CATALOG_SUBJECT = "events.processos.catalogo"
@@ -221,7 +227,28 @@ class CatalogAction(BaseModel):
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
-Calculo = Literal["contagem", "soma", "media", "percentual", "razao", "tempo", "pacote"]
+ACTION_CALLER = "svc-agentes"  # o único que chama rpc.<pacote>.acao: um agente da empresa usa a ação como ferramenta
+
+
+def action_subject(service: str) -> str:
+    """O RPC em que o pacote roda uma ação para um agente da empresa: rpc.<pacote>.acao."""
+    return f"rpc.{service.removeprefix('svc-')}.acao"
+
+
+class ActionCall(BaseModel):
+    """rpc.<pacote>.acao: uma ação do pacote como ferramenta de um agente da empresa, na organização do agente."""
+
+    acao: str = Field(..., pattern=_ID, description="O nome da ação no pacote, sem o prefixo (ex.: conferir_pedido)")
+    entrada: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionResult(BaseModel):
+    ok: bool
+    resultado: dict[str, Any] = Field(default_factory=dict, description="A saída da ação, quando ok")
+    motivo: str | None = Field(None, description="Por que não seguiu (Handoff ou erro de negócio): o agente lê e decide")
+
+
+Calculo =Literal["contagem", "soma", "media", "percentual", "razao", "tempo", "pacote"]
 Unidade = Literal["numero", "moeda", "percentual", "dias", "horas"]
 _FIELD = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
 
@@ -484,6 +511,7 @@ class Outcome(BaseModel):
 
 
 JobHandler = Callable[[Job], Awaitable[dict[str, Any] | None]]
+ActionRunner = Callable[[Mapping[str, Any]], Awaitable[BaseModel]]
 _jobs_counter = metrics.get_meter("core.processes").create_counter(
     "cv.processos.jobs", unit="{job}", description="Jobs do motor de processos tratados, por tipo e resultado")
 
@@ -537,11 +565,14 @@ class Processes:
     ) -> AsyncIterator[None]:
         """No lifespan: pega no motor os jobs das ações deste pacote (cada uma roda implementation.<nome>, conferida
         aqui: um parâmetro do tipo da entrada, retorno do tipo da saída) e os jobs de jobs= (tipo → função(Job)).
-        Um laço de espera longa por tipo; até concurrency jobs ao mesmo tempo."""
+        Um laço de espera longa por tipo; até concurrency jobs ao mesmo tempo. Com ações, atende também
+        rpc.<pacote>.acao: um agente da empresa usa a ação como ferramenta (_action_responder)."""
         prefix = service.removeprefix("svc-")
         handlers: dict[str, JobHandler] = {}
         for action in actions:
             handlers[f"{prefix}.{action.name}"] = self._action_handler(prefix, action, implementation)
+        if actions:
+            await bus.respond(action_subject(service), self._action_responder(service, actions, implementation), model=ActionCall)
         handlers.update(jobs or {})
         if not handlers:
             yield None
@@ -556,7 +587,9 @@ class Processes:
                 loop.cancel()
             await asyncio.gather(*loops, return_exceptions=True)
 
-    def _action_handler(self, prefix: str, action: Action, implementation: object | None) -> JobHandler:
+    def _action_runner(self, prefix: str, action: Action, implementation: object | None) -> ActionRunner:
+        """A ação pronta para rodar, no job do motor e no rpc.<pacote>.acao: o método é conferido aqui (no boot); a cada
+        chamada, o módulo no plano e a entrada (o que falta vira Handoff)."""
         method = getattr(implementation, action.name, None)
         if method is None or not inspect.iscoroutinefunction(method):
             raise RuntimeError(f"processes.worker: a ação {action.name!r} precisa de um método async {action.name}() no service.py")
@@ -565,18 +598,59 @@ class Processes:
         if len(params) != 1 or hints.get(params[0].name) is not action.input or hints.get("return") is not action.output:
             raise RuntimeError(f"processes.worker: {action.name}(self, data: {action.input.__name__}) -> {action.output.__name__}")
 
-        async def handle(job: Job) -> dict[str, Any]:
+        async def run(entrada: Mapping[str, Any]) -> BaseModel:
             if not await plans.enabled(prefix):
                 raise Handoff(f"O módulo {prefix} não está no plano da organização.")
             try:
-                data = action.input.model_validate(job.variables.get("entrada") or {})
+                data = action.input.model_validate(entrada)
             except ValidationError as exc:
                 faltam = ", ".join(str(e["loc"][0]) for e in exc.errors() if e.get("loc"))
                 raise Handoff(f"Faltam dados para {action.title.lower()}: {faltam or 'entrada inválida'}.") from None
-            result = await method(data)
+            return await method(data)
+
+        return run
+
+    def _action_handler(self, prefix: str, action: Action, implementation: object | None) -> JobHandler:
+        run = self._action_runner(prefix, action, implementation)
+
+        async def handle(job: Job) -> dict[str, Any]:
+            result = await run(job.variables.get("entrada") or {})
             return {"resultado": result.model_dump(mode="json")}
 
         return handle
+
+    def _action_responder(
+        self, service: str, actions: Sequence[Action], implementation: object | None,
+    ) -> Callable[[ActionCall], Awaitable[ActionResult]]:
+        """rpc.<pacote>.acao: a ação como ferramenta de um agente da empresa. Só o svc-agentes chama, na organização do
+        agente; a ação roda como o próprio pacote nessa organização, com a mesma conferência do job. Irreversível só
+        roda num passo do processo (o desenho passa pela revisão do staff); Handoff ou erro de negócio voltam ao agente
+        como motivo (ok=false), e erro de infraestrutura como erro do RPC."""
+        prefix = service.removeprefix("svc-")
+        runners = {a.name: (a, self._action_runner(prefix, a, implementation)) for a in actions}
+
+        async def respond(call: ActionCall) -> ActionResult:
+            who = current()
+            if who is None or who.sub != f"{SYSTEM_PREFIX}{ACTION_CALLER}" or not who.tenant:
+                raise ServiceError("ERRO_PROCESSOS_ACAO_FORBIDDEN", "Só um agente da empresa usa uma ação como ferramenta.", status=403)
+            if call.acao not in runners:
+                raise ServiceError("ERRO_PROCESSOS_ACAO_NAO_ENCONTRADA", f"O pacote {prefix} não tem a ação {call.acao}.", status=404)
+            action, run = runners[call.acao]
+            if action.risk == "irreversivel":
+                raise ServiceError("ERRO_PROCESSOS_ACAO_IRREVERSIVEL",
+                                   f"{action.title} é irreversível: só roda num passo do processo.", status=403)
+            with acting_as(system(service, who.tenant)):
+                try:
+                    result = await run(call.entrada)
+                except Handoff as exc:
+                    return ActionResult(ok=False, motivo=exc.motivo)
+                except ServiceError as exc:
+                    if exc.status >= 500:  # infraestrutura: o agente vê a falha da ferramenta, não um motivo de negócio
+                        raise
+                    return ActionResult(ok=False, motivo=exc.message)
+            return ActionResult(ok=True, resultado=result.model_dump(mode="json"))
+
+        return respond
 
     async def run_job(self, service: str, handler: JobHandler, job: Job) -> Outcome:
         """Roda um job como a organização do processo e diz como ele termina (o kit de testes usa direto)."""

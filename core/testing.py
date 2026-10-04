@@ -18,6 +18,7 @@ O lifespan do main.py roda inteiro, com o que ele declara (tabelas, índices, mi
 - Temporal em memória: start_workflow vai para app.workflows (os agendamentos não rodam);
 - motor de processos em memória (app.motor): implantar, iniciar, mensagens e tarefas concluídas vão para listas; os
   workers não pegam jobs sozinhos: app.job(tipo, ...) passa um job pelo handler de verdade e devolve como ele termina;
+  rpc.<pacote>.acao (a ação como ferramenta de agente) fica em app.handlers, como os outros RPCs;
 - armazenamento de arquivos desligado; tokens assinados com chaves de teste (app.user(sub, organização, *papéis)).
 Trilho: toda rota HTTP do manifesto do serviço (gateway/endpoints/<nome>.yaml) precisa existir no main.py; faltou,
 o teste para dizendo qual (no ar, o gateway devolveria 404).
@@ -182,12 +183,14 @@ class ServiceApp:
     @asynccontextmanager
     async def _process_worker(self, service: str, actions: Any = (), implementation: object | None = None, *,
                               jobs: Any = None, concurrency: int = 4, lock_seconds: int = 300):
-        from core.processes import processes
+        from core.processes import action_subject, processes
 
         prefix = service.removeprefix("svc-")
         self._worker_service = service
         self.jobs = {f"{prefix}.{a.name}": processes._action_handler(prefix, a, implementation) for a in actions}
         self.jobs.update(jobs or {})
+        if actions:  # rpc.<pacote>.acao: a ação como ferramenta de um agente da empresa
+            self.handlers[action_subject(service)] = processes._action_responder(service, actions, implementation)
         yield None
 
 
