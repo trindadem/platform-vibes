@@ -2,8 +2,11 @@
 
     ACTIONS = [Action("conferir_pedido", "Conferir com o pedido", "Compara o documento com o pedido ou o contrato",
                       Documento, Conferencia, risk="leitura", example=Conferencia(divergente=False))]
-    MODELS = [ProcessModel("contas-a-pagar", Fluxo(...))]   # o fluxo de partida de um modelo da biblioteca (briefing §10)
+    MODELS = [ProcessModel("contas-a-pagar", Fluxo(...),    # o fluxo de partida de um modelo da biblioteca (briefing §10)
+                           indicadores=[Indicator("valor_pago", "Valor pago", "soma", campo="ler_documento.valor",
+                                                  resultado="pago", unidade="moeda")])]
     await processes.declare(ACTIONS, MODELS)            # main.py, no lifespan: o catálogo vai para o svc-processos
+    await processes.declare(ACTIONS, MODELS, indicators=svc.indicadores)  # com indicador "pacote": o pacote calcula
     await processes.emit("pedido_proposta", Pedido(...))  # um acontecimento do pacote inicia processos (vendas.pedido_proposta)
 
     async with processes.worker(SERVICE, ACTIONS, svc):  # main.py: cada ação roda o método de mesmo nome do service.py
@@ -37,6 +40,10 @@ Trilhos:
 - O que cada worker fez num passo sai em events.processos.passo (o acompanhamento no svc-processos). O svc-processos
   também atende os jobs que o BPMN gera para ele: começo da execução, tarefa de pessoa criada, espera e fim.
 - Mensagens no motor levam a organização no nome (<organização>.<mensagem>): uma organização não acorda a outra.
+- Indicadores (alinhamento pós-N7, item 7): cada modelo declara os indicadores de negócio do mês junto com o fluxo; o
+  svc-processos os calcula das execuções do mês (contagem, soma, média, percentual, razão, tempo entre passos) e a tela
+  Resultados e o resumo mensal os mostram. O que a execução não sabe (contratos vigentes, certidões válidas) é calculo
+  "pacote": o próprio pacote responde rpc.<pacote>.indicadores com os dados dele (indicators= no declare).
 - O motor fica atrás deste arquivo: trocar o Camunda por outro motor BPMN muda to_bpmn e o cliente, não os serviços.
 
 Variáveis: CAMUNDA_URL (API REST do Orchestration Cluster; padrão http://localhost:8080).
@@ -68,13 +75,15 @@ __all__ = [
     "Action", "ActionCatalog", "Alternative", "CatalogAction", "CatalogModel", "Condition", "Flow", "Fluxo", "ProcessEvent",
     "ProcessModel", "Step", "Trigger", "Deployed", "Started", "Job", "Handoff", "StepEvent", "camunda", "processes", "to_bpmn",
     "process_id", "parse_process_id", "build_catalog", "CATALOG_SUBJECT", "STEP_SUBJECT", "EVENT_SUBJECT", "START",
-    "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END",
+    "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END", "Indicator", "CatalogIndicator",
+    "IndicatorRequest", "IndicatorValues", "indicators_subject", "END",
 ]
 
 CATALOG_SUBJECT = "events.processos.catalogo"
 STEP_SUBJECT = "events.processos.passo"  # o que um worker fez num passo (concluiu, handoff, incidente)
 EVENT_SUBJECT = "events.processos.evento"  # um acontecimento de um pacote (vendas.pedido_proposta) para os processos
 START = "inicio"  # id reservado: o começo do fluxo (o gatilho)
+END = "fim"  # nos indicadores de tempo: o fim da execução
 HANDOFF_ERROR = "handoff"  # código do erro BPMN que leva um passo à tarefa do staff
 HANDOFF_HOURS = 4  # prazo da tarefa de exceção do staff
 # Jobs que o BPMN gera para o svc-processos (o acompanhamento): passo de agente e os ouvintes de execução e de tarefa.
@@ -210,23 +219,127 @@ class CatalogAction(BaseModel):
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
+Calculo = Literal["contagem", "soma", "media", "percentual", "razao", "tempo", "pacote"]
+Unidade = Literal["numero", "moeda", "percentual", "dias", "horas"]
+_FIELD = re.compile(r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class Indicator:
+    """Um indicador de negócio do mês que o modelo declara junto com o fluxo (a tela Resultados e o resumo mensal).
+
+    Conta as execuções que terminaram no mês (base="iniciadas": as que começaram nele), só as que chegaram ao fim
+    resultado= (ex.: pago) e passam na condicao= (uma saída: Condition(campo="ler_documento.valor", operador=">", valor=0)).
+      contagem: quantas; soma e media: de campo= (<passo>.<saída>); percentual: quantas passam no filtro sobre todas da
+      base; razao: soma de campo= sobre soma de sobre= (em %); tempo: média entre de= e ate= (o passo concluído, ou
+      inicio e fim), em dias ou horas.
+      pacote: o pacote calcula com os dados dele (rpc.<pacote>.indicadores), para o que a execução não sabe.
+    unidade diz como mostrar: numero, moeda (R$), percentual, dias ou horas.
+    """
+
+    nome: str
+    titulo: str
+    calculo: Calculo
+    unidade: Unidade = "numero"
+    campo: str | None = None
+    sobre: str | None = None
+    resultado: str | None = None
+    condicao: Condition | None = None
+    de: str | None = None
+    ate: str | None = None
+    base: Literal["concluidas", "iniciadas"] = "concluidas"
+    descricao: str = ""
+
+    def __post_init__(self) -> None:
+        nome = f"Indicator {self.nome!r}"
+        if not re.match(r"^[a-z][a-z0-9_]{1,40}$", self.nome):
+            raise ValueError(f"{nome}: nome em snake_case (ex.: valor_pago)")
+        if not 3 <= len(self.titulo) <= 60 or len(self.descricao) > 200:
+            raise ValueError(f"{nome}: título de 3 a 60 caracteres, descrição até 200")
+        for campo in (self.campo, self.sobre):
+            if campo is not None and not _FIELD.match(campo):
+                raise ValueError(f"{nome}: campo {campo!r} é <passo>.<saída>")
+        precisa = {"soma": ("campo",), "media": ("campo",), "razao": ("campo", "sobre"), "tempo": ("de", "ate")}.get(self.calculo, ())
+        if faltam := [p for p in precisa if getattr(self, p) is None]:
+            raise ValueError(f"{nome}: {self.calculo} precisa de {', '.join(faltam)}=")
+        if self.calculo == "tempo" and self.unidade not in ("dias", "horas"):
+            raise ValueError(f"{nome}: tempo é em dias ou horas")
+        if self.calculo in ("percentual", "razao") and self.unidade != "percentual":
+            raise ValueError(f"{nome}: {self.calculo} é em percentual")
+        if self.calculo == "percentual" and self.resultado is None and self.condicao is None:
+            raise ValueError(f"{nome}: percentual precisa do filtro (resultado= ou condicao=) sobre todas da base")
+        if self.calculo == "pacote" and any(v is not None for v in (self.campo, self.sobre, self.resultado, self.condicao, self.de, self.ate)):
+            raise ValueError(f"{nome}: pacote é calculado pelo pacote (sem campo, filtro nem tempo)")
+
+
+class CatalogIndicator(BaseModel):
+    nome: str
+    titulo: str
+    calculo: Calculo
+    unidade: Unidade = "numero"
+    campo: str | None = None
+    sobre: str | None = None
+    resultado: str | None = None
+    condicao: Condition | None = None
+    de: str | None = None
+    ate: str | None = None
+    base: Literal["concluidas", "iniciadas"] = "concluidas"
+    descricao: str = ""
+
+
+class IndicatorRequest(BaseModel):
+    """rpc.<pacote>.indicadores: os indicadores "pacote" de um modelo, no mês, na organização de quem pede."""
+
+    modelo: str
+    mes: str = Field(..., pattern=r"^\d{4}-\d{2}$", description="AAAA-MM (o mês em Brasília)")
+    nomes: list[str] = Field(default_factory=list)
+
+
+class IndicatorValues(BaseModel):
+    valores: dict[str, float | None] = Field(default_factory=dict, description="nome → valor (null: sem dado no mês)")
+
+
+def indicators_subject(service: str) -> str:
+    """O RPC em que o pacote calcula os indicadores dele: rpc.<pacote>.indicadores."""
+    return f"rpc.{service.removeprefix('svc-')}.indicadores"
+
+
 @dataclass(frozen=True)
 class ProcessModel:
     """O fluxo de partida de um modelo da biblioteca (briefing.md §10) que o pacote da área executa: o desenho de cada
-    organização que aceita o modelo começa daqui. id é o do modelo na biblioteca (ex.: contas-a-pagar)."""
+    organização que aceita o modelo começa daqui. id é o do modelo na biblioteca (ex.: contas-a-pagar). indicadores: os
+    de negócio do mês (Indicator), conferidos contra o fluxo na declaração."""
 
     id: str
     fluxo: Fluxo
+    indicadores: Sequence[Indicator] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "indicadores", tuple(self.indicadores))
         if not re.match(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$", self.id) or len(self.id) > 60:
             raise ValueError(f"ProcessModel: id inválido {self.id!r} (o id do modelo na biblioteca, ex.: contas-a-pagar)")
+        nomes = [i.nome for i in self.indicadores]
+        if len(nomes) != len(set(nomes)):
+            raise ValueError(f"ProcessModel {self.id}: indicador repetido")
+        passos = {s.id for s in self.fluxo.passos}
+        fins = {s.resultado or s.nome for s in self.fluxo.passos if s.tipo == "fim"}
+        for i in self.indicadores:
+            campos = [c for c in (i.campo, i.sobre) if c] + ([a.campo for a in i.condicao.alternatives()] if i.condicao else [])
+            for campo in campos:
+                if campo.split(".")[0] not in passos | {START, "gatilho"}:
+                    raise ValueError(f"ProcessModel {self.id}: o indicador {i.nome} usa {campo}, de um passo que o fluxo não tem")
+            for ponto in (i.de, i.ate):
+                if ponto is not None and ponto not in passos | {START, END}:
+                    raise ValueError(f"ProcessModel {self.id}: o indicador {i.nome} mede o tempo de/até {ponto!r}, que o fluxo não tem")
+            if i.resultado is not None and i.resultado not in fins:
+                raise ValueError(f"ProcessModel {self.id}: o indicador {i.nome} filtra o fim {i.resultado!r}, que o fluxo não tem")
 
 
 class CatalogModel(BaseModel):
     id: str = Field(..., description="Modelo da biblioteca")
     service: str
     fluxo: Fluxo
+    indicadores: list[CatalogIndicator] = Field(default_factory=list, description="Os indicadores de negócio do mês do modelo")
 
 
 class ActionCatalog(BaseModel):
@@ -266,7 +379,9 @@ def build_catalog(service: str, actions: Sequence[Action], models: Sequence[Proc
                       example=a.example.model_dump(mode="json"), input_schema=a.input.model_json_schema(),
                       output_schema=a.output.model_json_schema())
         for a in actions
-    ], models=[CatalogModel(id=m.id, service=service, fluxo=m.fluxo) for m in models])
+    ], models=[CatalogModel(id=m.id, service=service, fluxo=m.fluxo,
+                            indicadores=[CatalogIndicator(**{k: getattr(i, k) for k in CatalogIndicator.model_fields}) for i in m.indicadores])
+               for m in models])
 
 
 class Job(BaseModel):
@@ -345,13 +460,22 @@ class Processes:
     def __init__(self) -> None:
         self._declared: dict[str, Action] = {}
 
-    async def declare(self, actions: Sequence[Action], models: Sequence[ProcessModel] = ()) -> None:
+    async def declare(
+        self, actions: Sequence[Action], models: Sequence[ProcessModel] = (), *,
+        indicators: Callable[[IndicatorRequest], Awaitable[IndicatorValues]] | None = None,
+    ) -> None:
         """No boot: publica para o svc-processos as ações que este pacote oferece e os fluxos de partida dos modelos da
-        biblioteca que ele executa (o catálogo do desenho)."""
+        biblioteca que ele executa (o catálogo do desenho). indicators: o método que calcula os indicadores "pacote" dos
+        modelos (atende rpc.<pacote>.indicadores); modelo com indicador "pacote" sem ele impede o boot."""
         service = bus.service
         if not service:
             raise RuntimeError("processes.declare: chame dentro de bus.connected(SERVICE)")
         catalog = build_catalog(service, actions, models)
+        do_pacote = [f"{m.id}.{i.nome}" for m in models for i in m.indicadores if i.calculo == "pacote"]
+        if do_pacote and indicators is None:
+            raise RuntimeError(f"processes.declare: {', '.join(do_pacote)} são calculados pelo pacote: passe indicators=svc.indicadores")
+        if indicators is not None:
+            await bus.respond(indicators_subject(service), indicators, model=IndicatorRequest)
         prefix = service.removeprefix("svc-")
         self._declared = {f"{prefix}.{a.name}": a for a in actions}
         digest = hashlib.sha256(catalog.model_dump_json().encode()).hexdigest()[:24]

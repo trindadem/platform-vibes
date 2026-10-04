@@ -14,6 +14,7 @@ import unicodedata
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nats.errors import Error as NatsError
 from pydantic import BaseModel, Field, create_model
@@ -24,7 +25,12 @@ from core.nats_bus import bus
 from core.plans import plans
 from core.notify import notify
 from core.processes import (
+    END,
     START,
+    CatalogIndicator,
+    IndicatorRequest,
+    IndicatorValues,
+    indicators_subject,
     ActionCatalog,
     CatalogAction,
     Condition,
@@ -45,6 +51,17 @@ from core.temporal_runner import activities, runner
 
 from schemas import (
     BLOQUEIOS,
+    FUSO,
+    FimAlcancado,
+    MarcaVersao,
+    MesAutonomia,
+    ResultadoProcesso,
+    Resultados,
+    ResultadosPedido,
+    ResultadosQuery,
+    ResumoMensal,
+    ResumoMensalIn,
+    ValorIndicador,
     PLANS_SERVICE,
     CancelarExecucao,
     IniciarModelo,
@@ -293,7 +310,8 @@ class ProcessosService:
             if modelo.id in _MODELOS:
                 await db.query_shared(f"DELETE FROM {MODELOS} WHERE modelo = $modelo", modelo=modelo.id)  # mudou de pacote
                 await db.query_shared(f"CREATE {MODELOS} CONTENT $m", m={"modelo": modelo.id, "service": data.service,
-                                                                        "fluxo": modelo.fluxo.model_dump(mode="json")})
+                                                                        "fluxo": modelo.fluxo.model_dump(mode="json"),
+                                                                        "indicadores": [i.model_dump(mode="json") for i in modelo.indicadores]})
         return Empty()
 
     async def catalogo(self, data: Empty) -> CatalogoAcoes:
@@ -745,6 +763,36 @@ class ProcessosService:
             autonomia=_autonomia(execucoes).autonomia, processos=list(processos.values()),
             aceitos=len(aceitos), publicados=sum(1 for p in aceitos if p.get("publicada")))
 
+    # ── Resultados (alinhamento pós-N7, item 7) ──────────────────────────────
+
+    async def resultados(self, data: ResultadosQuery) -> Resultados:
+        """A tela Resultados: para cada processo publicado, a autonomia mês a mês com as versões marcadas, as execuções do
+        mês por fim alcançado e os indicadores de negócio que o modelo declara. Todo membro."""
+        return await _resultados(data.mes or _mes_atual(), data.meses)
+
+    async def resultados_staff(self, data: ResultadosPedido) -> Resultados:
+        """rpc.processos.resultados (só o svc-staff): os mesmos números, para a carteira do staff."""
+        _da_fila()
+        return await _resultados(data.mes or _mes_atual(), data.meses)
+
+    async def resumo_mensal(self, data: ResumoMensalIn) -> ResumoMensal:
+        """Agendado no dia 1 (ou com o mês): o resumo do mês que acabou ao dono de cada organização com processo publicado
+        (tela e e-mail): execuções, autonomia e os indicadores de cada processo. Conta encerrada não recebe."""
+        mes = data.mes or _mes_anterior(_mes_atual())
+        organizacoes = enviados = 0
+        for org in await db.tenants(PROCESSOS):
+            with acting_as(system(SERVICE, org)):
+                resultados = await _resultados(mes, 1)
+                if not resultados.processos:
+                    continue
+                organizacoes += 1
+                if await plans.situacao() == "encerrada":
+                    continue
+                await notify.roles("owner", title=f"Resultados de {_mes_extenso(mes)}", body=_texto_resumo(resultados),
+                                   link=f"/processos/resultados?mes={mes}", action="Ver resultados", key=f"resumo-{mes}")
+                enviados += 1
+        return ResumoMensal(mes=mes, organizacoes=organizacoes, enviados=enviados)
+
     async def registrar_passo(self, data: PassoFeito) -> Empty:
         """events.processos.passo: o worker de um pacote concluiu um passo, mandou ao staff ou abriu incidente."""
         nome = await _nome_do_passo(data.processo, data.motor_versao, data.passo)
@@ -807,7 +855,7 @@ class ProcessosService:
             gatilho = job.variables.get("gatilho") or {}
             origem = gatilho.get("origem") if gatilho.get("origem") in ("manual", "processo", "agenda") else ("evento" if gatilho else "agenda")
             bloqueio = await _bloqueio(processo) if origem == "agenda" and not gatilho else None
-            await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=bloqueio)
+            await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=bloqueio, gatilho=gatilho)
             if bloqueio:
                 await camunda.cancel(job.instance)
                 agora = datetime.now(UTC)
@@ -2079,19 +2127,22 @@ async def _iniciar(processo: Processo, versao: dict[str, Any], *, origem: str, g
     await plans.check("execucoes")
     iniciada = await camunda.start(_motor_id(processo.id), {"gatilho": gatilho})
     execucao = await _registrar_execucao(processo, iniciada.instance, iniciada.version, origem=origem, resumo=resumo, gatilho_id=chave,
-                                         pai=pai)
+                                         pai=pai, gatilho=gatilho)
     await plans.use("execucoes", 1, key=f"execucao-{iniciada.instance}")
     return execucao
 
 
 async def _registrar_execucao(processo: Processo, instancia: str, motor_versao: int, *, origem: str, resumo: str | None,
-                              gatilho_id: str | None = None, pai: Execucao | None = None) -> Execucao:
+                              gatilho_id: str | None = None, pai: Execucao | None = None,
+                              gatilho: dict[str, Any] | None = None) -> Execucao:
     versao = await _versao_do_motor(processo.id, motor_versao)
     dados = {"instancia": instancia, "processo": processo.id, "titulo": processo.titulo, "versao": versao["numero"] if versao else None,
              "motor_versao": motor_versao, "status": "andamento", "origem": origem, "resumo": resumo, "handoffs": 0, "saidas": {},
              "marcos": [Marco(passo=START, nome="Início", status="iniciada", em=datetime.now(UTC), motivo=resumo).model_dump(mode="json")]}
     if gatilho_id:
         dados["gatilho_id"] = gatilho_id
+    if gatilho:  # os dados com que começou (os indicadores podem usar gatilho.<campo>)
+        dados["gatilho"] = {k: v for k, v in gatilho.items() if isinstance(v, str | int | float | bool) or v is None}
     if pai is not None:  # a cadeia: a primeira execução dela é o projeto
         dados |= {"pai": pai.id, "projeto": pai.projeto or pai.id, "nivel": pai.nivel + 1}
         if pai.projeto is None:
@@ -2102,7 +2153,8 @@ async def _registrar_execucao(processo: Processo, instancia: str, motor_versao: 
         if exc.code != "ERRO_RECORD_DUPLICATE":
             raise
         rows = await db.query(f"UPDATE {EXECUCOES} MERGE $m WHERE tenant = $tenant AND instancia = $i RETURN AFTER", i=instancia,
-                              m={k: v for k, v in dados.items() if k in ("origem", "resumo", "gatilho_id", "pai", "projeto", "nivel") and v is not None})
+                              m={k: v for k, v in dados.items() if k in ("origem", "resumo", "gatilho_id", "pai", "projeto", "nivel", "gatilho")
+                                 and v is not None})
         row = rows[0]
     execucao = Execucao.model_validate(row)
     await bus.live(LIVE_EXECUCOES, ExecucaoMudou(id=execucao.id, action="iniciada"))
@@ -2291,3 +2343,201 @@ def _valores_da_excecao(tarefa: Tarefa, data: Resposta) -> dict[str, Any]:
     if data.comentario:
         valores["comentario"] = data.comentario
     return valores
+
+
+# ── Resultados: autonomia por mês, fins alcançados e indicadores ────────────
+
+async def _resultados(mes: str, meses: int) -> Resultados:
+    """Os números de um mês (e a autonomia dos meses antes dele) dos processos publicados da organização atual."""
+    lista = _meses_ate(mes, meses)
+    inicio, fim = _limites(lista[0])[0], _limites(mes)[1]
+    processos = [p for p in await _todos() if p.publicada is not None]
+    execucoes = await db.query(
+        f"SELECT processo, status, resultado, handoffs, created_at, concluida_em, marcos, saidas, gatilho FROM {EXECUCOES} "
+        "WHERE tenant = $tenant AND ((created_at >= $inicio AND created_at < $fim) OR (concluida_em >= $inicio AND concluida_em < $fim) "
+        "OR status = 'andamento')", inicio=inicio, fim=fim)
+    versoes = await db.query(
+        f"SELECT processo, numero, publicada_em FROM {VERSOES} WHERE tenant = $tenant AND publicada_em != NONE "
+        "AND publicada_em >= $inicio AND publicada_em < $fim ORDER BY publicada_em", inicio=inicio, fim=fim)
+    modelos = {row["modelo"]: row for row in await db.query_shared(
+        f"SELECT modelo, service, indicadores FROM {MODELOS} WHERE modelo IN $m", m=[p.modelo for p in processos if p.modelo])}
+    itens = []
+    for processo in processos:
+        delas = [e for e in execucoes if e["processo"] == processo.id]
+        itens.append(await _resultado_processo(processo, delas, [v for v in versoes if v["processo"] == processo.id], mes, lista,
+                                               modelos.get(processo.modelo or "")))
+    concluidas_mes = [e for e in execucoes if any(e["processo"] == p.id for p in processos) and _no_mes(e, "concluida_em", mes)
+                      and e["status"] == "concluida"]
+    autonomia = _autonomia(concluidas_mes)
+    return Resultados(mes=mes, meses=lista, concluidas=autonomia.concluidas, sem_handoff=autonomia.sem_handoff,
+                      autonomia=autonomia.autonomia, processos=itens)
+
+
+async def _resultado_processo(processo: Processo, execucoes: list[dict[str, Any]], versoes: list[dict[str, Any]], mes: str,
+                              lista: list[str], modelo: dict[str, Any] | None) -> ResultadoProcesso:
+    concluidas = [e for e in execucoes if e["status"] == "concluida" and _no_mes(e, "concluida_em", mes)]
+    por_mes = []
+    for m in lista:
+        a = _autonomia([e for e in execucoes if e["status"] == "concluida" and _no_mes(e, "concluida_em", m)])
+        por_mes.append(MesAutonomia(mes=m, concluidas=a.concluidas, sem_handoff=a.sem_handoff, autonomia=a.autonomia))
+    fins: dict[str, int] = {}
+    for e in concluidas:
+        fins[e.get("resultado") or "concluída"] = fins.get(e.get("resultado") or "concluída", 0) + 1
+    declarados = [CatalogIndicator.model_validate(i) for i in (modelo or {}).get("indicadores") or []]
+    valores = {i.nome: _calcular(i, execucoes, mes) for i in declarados if i.calculo != "pacote"}
+    if do_pacote := [i.nome for i in declarados if i.calculo == "pacote"]:
+        valores |= await _do_pacote(modelo["service"], processo.modelo or "", mes, do_pacote)
+    return ResultadoProcesso(
+        processo=processo.id, titulo=processo.titulo, modelo=processo.modelo, area=processo.area, publicada=processo.publicada,
+        pausado=processo.pausado, meses=por_mes,
+        versoes=[MarcaVersao(numero=v["numero"], mes=_mes_de(_quando(v["publicada_em"])), publicada_em=_quando(v["publicada_em"]))
+                 for v in versoes],
+        iniciadas=sum(1 for e in execucoes if _no_mes(e, "created_at", mes)), concluidas=len(concluidas),
+        canceladas=sum(1 for e in execucoes if e["status"] == "cancelada" and _no_mes(e, "concluida_em", mes)),
+        em_andamento=sum(1 for e in execucoes if e["status"] == "andamento"),
+        fins=[FimAlcancado(resultado=r, quantidade=n) for r, n in sorted(fins.items(), key=lambda x: -x[1])],
+        indicadores=[ValorIndicador(nome=i.nome, titulo=i.titulo, unidade=i.unidade, valor=valores.get(i.nome), descricao=i.descricao)
+                     for i in declarados])
+
+
+def _calcular(indicador: CatalogIndicator, execucoes: list[dict[str, Any]], mes: str) -> float | None:
+    """Um indicador declarado, das execuções do mês (core/processes.py: Indicator)."""
+    if indicador.base == "iniciadas":
+        base = [e for e in execucoes if _no_mes(e, "created_at", mes)]
+    else:
+        base = [e for e in execucoes if e["status"] == "concluida" and _no_mes(e, "concluida_em", mes)]
+    filtradas = [e for e in base if _passa(indicador, e)]
+    calculo = indicador.calculo
+    if calculo == "contagem":
+        return float(len(filtradas))
+    if calculo == "percentual":
+        return round(100 * len(filtradas) / len(base), 1) if base else None
+    if calculo in ("soma", "media", "razao"):
+        valores = [v for e in filtradas if (v := _numero(_campo(e, indicador.campo or ""))) is not None]
+        if calculo == "soma":
+            return round(sum(valores), 2) if valores or not filtradas else None
+        if calculo == "media":
+            return round(sum(valores) / len(valores), 2) if valores else None
+        total = sum(v for e in filtradas if (v := _numero(_campo(e, indicador.sobre or ""))) is not None)
+        return round(100 * sum(valores) / total, 1) if total else None
+    if calculo == "tempo":
+        duracoes = [d for e in filtradas if (d := _duracao(e, indicador.de or START, indicador.ate or END)) is not None]
+        if not duracoes:
+            return None
+        media = sum(duracoes) / len(duracoes)
+        return round(media / 86_400 if indicador.unidade == "dias" else media / 3_600, 1)
+    return None
+
+
+def _passa(indicador: CatalogIndicator, execucao: dict[str, Any]) -> bool:
+    if indicador.resultado is not None and _normal(execucao.get("resultado") or "") != _normal(indicador.resultado):
+        return False
+    if indicador.condicao is not None:
+        return _avaliar(indicador.condicao, _variaveis(execucao))
+    return True
+
+
+def _variaveis(execucao: dict[str, Any]) -> dict[str, Any]:
+    return {**(execucao.get("saidas") or {}), "gatilho": execucao.get("gatilho") or {}}
+
+
+def _campo(execucao: dict[str, Any], campo: str) -> Any:
+    passo, _, nome = campo.partition(".")
+    return (_variaveis(execucao).get(passo) or {}).get(nome)
+
+
+def _numero(valor: Any) -> float | None:
+    if isinstance(valor, bool) or valor is None:
+        return None
+    if isinstance(valor, int | float):
+        return float(valor)
+    try:
+        return float(str(valor).replace(".", "").replace(",", ".")) if "," in str(valor) else float(str(valor))
+    except ValueError:
+        return None
+
+
+def _duracao(execucao: dict[str, Any], de: str, ate: str) -> float | None:
+    """Segundos entre dois pontos da execução: inicio (a criação), fim (concluida_em) ou o passo concluído."""
+    def quando(ponto: str) -> datetime | None:
+        if ponto == START:
+            return _quando(execucao.get("created_at"))
+        if ponto == END:
+            return _quando(execucao.get("concluida_em"))
+        return next((_quando(m.get("em")) for m in execucao.get("marcos") or []
+                     if m.get("passo") == ponto and m.get("status") in ("concluido", "resolvido")), None)
+
+    a, b = quando(de), quando(ate)
+    return (b - a).total_seconds() if a and b and b >= a else None
+
+
+async def _do_pacote(service: str, modelo: str, mes: str, nomes: list[str]) -> dict[str, float | None]:
+    """Os indicadores que o pacote calcula com os dados dele (rpc.<pacote>.indicadores); fora do ar: sem dado."""
+    try:
+        with acting_as(system(SERVICE, current_tenant())):
+            resposta = await bus.request(indicators_subject(service), IndicatorRequest(modelo=modelo, mes=mes, nomes=nomes),
+                                         IndicatorValues, timeout=5)
+    except (NatsError, TimeoutError, ServiceError) as exc:
+        log.warning("indicadores de %s (%s) sem resposta: %s", modelo, service, type(exc).__name__)
+        return {}
+    return {nome: resposta.valores.get(nome) for nome in nomes}
+
+
+def _texto_resumo(resultados: Resultados) -> str:
+    """O resumo do mês em texto (o e-mail e o aviso na tela)."""
+    autonomia = f"{round(resultados.autonomia * 100)}%" if resultados.autonomia is not None else "sem execuções concluídas"
+    linhas = [f"No mês, {resultados.concluidas} execução(ões) concluída(s); rodaram sozinhas: {autonomia}.", ""]
+    for p in resultados.processos:
+        m = p.meses[-1]
+        sozinha = f", {round(m.autonomia * 100)}% sozinhas" if m.autonomia is not None else ""
+        linhas.append(f"{p.titulo}: {p.concluidas} concluída(s){sozinha}" + (" (pausado)" if p.pausado else ""))
+        for i in p.indicadores:
+            if i.valor is not None:
+                linhas.append(f"  · {i.titulo}: {_formatar(i.valor, i.unidade)}")
+    return "\n".join(linhas)[:3900]
+
+
+def _formatar(valor: float, unidade: str) -> str:
+    numero = f"{valor:,.2f}" if unidade == "moeda" else (f"{valor:,.1f}" if not float(valor).is_integer() else f"{valor:,.0f}")
+    numero = numero.replace(",", "_").replace(".", ",").replace("_", ".")
+    return {"moeda": f"R$ {numero}", "percentual": f"{numero}%", "dias": f"{numero} dia(s)", "horas": f"{numero} h"}.get(unidade, numero)
+
+
+def _mes_atual() -> str:
+    return datetime.now(ZoneInfo(FUSO)).strftime("%Y-%m")
+
+
+def _mes_anterior(mes: str) -> str:
+    ano, numero = (int(x) for x in mes.split("-"))
+    return f"{ano - 1}-12" if numero == 1 else f"{ano}-{numero - 1:02d}"
+
+
+def _meses_ate(mes: str, quantos: int) -> list[str]:
+    lista = [mes]
+    while len(lista) < quantos:
+        lista.insert(0, _mes_anterior(lista[0]))
+    return lista
+
+
+def _limites(mes: str) -> tuple[datetime, datetime]:
+    """Começo e fim (exclusivo) do mês em Brasília, em UTC."""
+    ano, numero = (int(x) for x in mes.split("-"))
+    seguinte = (ano + 1, 1) if numero == 12 else (ano, numero + 1)
+    fuso = ZoneInfo(FUSO)
+    return datetime(ano, numero, 1, tzinfo=fuso).astimezone(UTC), datetime(*seguinte, 1, tzinfo=fuso).astimezone(UTC)
+
+
+def _mes_de(quando: datetime | None) -> str:
+    return quando.astimezone(ZoneInfo(FUSO)).strftime("%Y-%m") if quando else ""
+
+
+def _no_mes(execucao: dict[str, Any], campo: str, mes: str) -> bool:
+    return _mes_de(_quando(execucao.get(campo))) == mes
+
+
+_MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+
+
+def _mes_extenso(mes: str) -> str:
+    ano, numero = mes.split("-")
+    return f"{_MESES[int(numero) - 1]} de {ano}"

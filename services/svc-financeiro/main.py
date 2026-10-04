@@ -4,6 +4,7 @@ Declara o módulo (plano), as ações do pacote e os modelos que ele executa (co
 fechamento: o catálogo do desenho de processos) e roda o worker das ações no motor.
 HTTP /fornecedores... → cadastro declarado (core/resources.py). HTTP /titulos → contas a pagar agendadas.
 HTTP /faturas → contas a receber (faturamento e cobrança). Temporal: a régua de cobrança, todo dia.
+NATS rpc.financeiro.indicadores → os indicadores "pacote" dos modelos (pagos em atraso, valor em atraso).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-financeiro main:app --port 8100 --env-file .env
 """
@@ -38,7 +39,9 @@ async def lifespan(app: FastAPI):
         processes.worker(SERVICE, ACTIONS, svc),  # os jobs financeiro.<ação> do motor (core/processes.py)
     ):
         await plans.declare(MODULE)
-        await processes.declare(ACTIONS, MODELS)  # o catálogo de ações e os modelos vão para o svc-processos
+        # o catálogo de ações e os modelos (com os indicadores) vão para o svc-processos; os indicadores "pacote"
+        # saem de svc.indicadores (rpc.financeiro.indicadores)
+        await processes.declare(ACTIONS, MODELS, indicators=svc.indicadores)
         yield
 
 

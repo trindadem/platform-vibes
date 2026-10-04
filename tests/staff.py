@@ -354,3 +354,31 @@ def test_conta_encerrada_tira_o_staff_da_carteira_e_a_exclusao_apaga_a_fila_do_c
     assert [c["organizacao"] for c in carteiras] == ["beta"]
     assert [i["organizacao"] for i in fila] == ["beta"]  # o que esperava no encerrado fecha
     assert [i["organizacao"] for i in toda] == ["beta"]  # 30 dias depois, o histórico do cliente sai também
+
+
+def test_staff_ve_os_resultados_de_um_cliente_da_carteira_sem_trocar_de_organizacao():
+    from schemas import RESULTADOS_SUBJECT
+
+    async def cenario(app):
+        _identidade(app, [])
+        pedidos = []
+
+        def resultados(pedido):
+            pedidos.append((service.current_tenant(), service.current().sub, pedido.mes))
+            return {"mes": "2026-10", "meses": ["2026-09", "2026-10"], "concluidas": 3, "sem_handoff": 2, "autonomia": 0.667,
+                    "processos": [{"processo": "p1", "titulo": "Contas a pagar", "area": "financeiro", "meses": [],
+                                   "indicadores": [{"nome": "valor_pago", "titulo": "Valor pago", "unidade": "moeda", "valor": 8200.0}]}]}
+
+        app.respond(RESULTADOS_SUBJECT, resultados)
+        gina, otto, zoe = app.user(*GESTORA), app.user(*OTTO), app.user(*ZOE)
+        await gina.post("/carteiras", json={"pessoa": "otto", "organizacao": "acme"})
+        da_carteira = (await otto.get("/carteira/resultados", params={"organizacao": "acme", "mes": "2026-10"})).json()["data"]
+        fora = await zoe.get("/carteira/resultados", params={"organizacao": "acme"})
+        do_gestor = (await gina.get("/carteira/resultados", params={"organizacao": "beta"})).json()["data"]
+        a_propria = await gina.get("/carteira/resultados", params={"organizacao": "cogni"})
+        return da_carteira, fora, do_gestor, a_propria, pedidos
+
+    da_carteira, fora, do_gestor, a_propria, pedidos = service_app(cenario)
+    assert (da_carteira["nome"], da_carteira["autonomia"], da_carteira["processos"][0]["indicadores"][0]["valor"]) == ("Acme", 0.667, 8200.0)
+    assert fora.status_code == 403 and do_gestor["nome"] == "Beta" and a_propria.status_code == 404
+    assert pedidos == [("acme", "system:svc-staff", "2026-10"), ("beta", "system:svc-staff", None)]  # agindo no cliente

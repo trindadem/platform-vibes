@@ -1152,3 +1152,90 @@ def test_na_propria_cogniventure_o_dono_e_o_admin_fazem_o_papel_do_staff(monkeyp
     publicado, resumo, membro = service_app(cenario)
     assert publicado.status_code == 200 and publicado.json()["data"]["versao"]["status"] == "publicada"
     assert resumo["staff"] is True and membro["staff"] is False
+
+
+# ── Resultados (alinhamento pós-N7, item 7): autonomia por mês, fins e indicadores declarados pelo modelo ─
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+from core.notify import SEND_SUBJECT as AVISO_SUBJECT  # noqa: E402
+from core.processes import CatalogIndicator, CatalogModel, Condition  # noqa: E402
+
+from schemas import EXECUCOES, RESULTADOS_SUBJECT, VERSOES, ResultadosPedido, ResumoMensalIn  # noqa: E402
+
+INDICADORES = [
+    CatalogIndicator(nome="valor_pago", titulo="Valor pago", calculo="soma", campo="ler_documento.valor", resultado="pago", unidade="moeda"),
+    CatalogIndicator(nome="pagos", titulo="Boletos pagos", calculo="contagem", resultado="pago"),
+    CatalogIndicator(nome="pagos_pct", titulo="Pagos (%)", calculo="percentual", resultado="pago", unidade="percentual"),
+    CatalogIndicator(nome="grandes", titulo="Acima de R$ 5 mil", calculo="contagem",
+                     condicao=Condition(campo="ler_documento.valor", operador=">", valor=5000)),
+    CatalogIndicator(nome="ticket", titulo="Valor médio", calculo="media", campo="ler_documento.valor", unidade="moeda"),
+    CatalogIndicator(nome="ate_agendar", titulo="Até agendar", calculo="tempo", de="inicio", ate="agendar", unidade="horas"),
+    CatalogIndicator(nome="recebidos", titulo="Boletos recebidos", calculo="contagem", base="iniciadas"),
+    CatalogIndicator(nome="em_atraso", titulo="Pagos em atraso", calculo="pacote"),
+]
+
+
+def test_resultados_mostram_autonomia_por_mes_versoes_fins_e_indicadores_e_o_resumo_vai_ao_dono():
+    import service
+
+    agora = datetime.now(UTC)
+    mes, anterior = service._mes_atual(), service._mes_anterior(service._mes_atual())
+    pedidos = []
+
+    def pacote(pedido):
+        pedidos.append((pedido.modelo, pedido.mes, pedido.nomes, service.current().sub))
+        return {"valores": {"em_atraso": 2}}
+
+    async def cenario(app):
+        app.respond("rpc.financeiro.indicadores", pacote)
+        modelo = next(m for m in ACOES.models if m.id == "contas-a-pagar")
+        catalogo = ACOES.model_copy(update={"models": [CatalogModel(id=modelo.id, service="svc-financeiro", fluxo=modelo.fluxo,
+                                                                    indicadores=INDICADORES)]})
+        pid = await _publicado(app)
+        sozinho = await _aceito(app, modelo="conciliacao-bancaria")  # aceito e não publicado: fora dos resultados
+        await app.handlers[CATALOG_SUBJECT](catalogo)  # o pacote declarou os indicadores (o _aceito redeclara o catálogo)
+        with acting_as(ACME):
+            await db.query(f"UPDATE {VERSOES} SET publicada_em = $em WHERE tenant = $tenant AND processo = $p", em=agora - timedelta(days=40), p=pid)
+            seeds = [  # (status, resultado, handoffs, concluída em, valor)
+                ("concluida", "pago", 0, agora - timedelta(minutes=5), 7200.0),
+                ("concluida", "pago", 1, agora - timedelta(minutes=4), 1000.0),
+                ("concluida", "recusado", 0, agora - timedelta(minutes=3), 300.0),
+                ("concluida", "pago", 0, agora - timedelta(days=agora.day + 1), 50.0),  # mês passado
+                ("cancelada", None, 0, agora - timedelta(minutes=2), 10.0),
+                ("andamento", None, 0, None, 99.0),
+            ]
+            for i, (status, resultado, handoffs, quando, valor) in enumerate(seeds):
+                marcos = [{"passo": "inicio", "nome": "Início", "status": "iniciada", "em": agora.isoformat()},
+                          {"passo": "agendar", "nome": "Agendar", "status": "concluido", "em": (agora + timedelta(hours=2)).isoformat()}]
+                await db.create(EXECUCOES, {"instancia": f"77{i}", "processo": pid, "titulo": "Contas a pagar", "versao": 1, "motor_versao": 1,
+                                            "status": status, "resultado": resultado, "handoffs": handoffs, "concluida_em": quando,
+                                            "origem": "evento", "marcos": marcos, "saidas": {"ler_documento": {"valor": valor}}})
+        resultados = (await app.user("mel", "acme", "member").get("/resultados", params={"mes": mes, "meses": 3})).json()["data"]
+        with acting_as(Principal(sub="system:svc-staff", tenant="acme", roles=frozenset({"system"}))):
+            pelo_staff = await app.handlers[RESULTADOS_SUBJECT](ResultadosPedido(mes=mes, meses=3))
+        with acting_as(Principal(sub="system:svc-outro", tenant="acme", roles=frozenset({"system"}))), pytest.raises(Exception) as outro:
+            await app.handlers[RESULTADOS_SUBJECT](ResultadosPedido(mes=mes))
+        with acting_as(Principal(sub="system:svc-processos", roles=frozenset({"system"}))):
+            resumo = await service.ProcessosService().resumo_mensal(ResumoMensalIn(mes=mes))
+        avisos = [m for s, m in app.published if s == AVISO_SUBJECT and m.title.startswith("Resultados de")]
+        return pid, sozinho, resultados, pelo_staff, outro.value, resumo, avisos
+
+    pid, sozinho, resultados, pelo_staff, outro, resumo, avisos = service_app(cenario)
+    assert [p["processo"] for p in resultados["processos"]] == [pid]  # só os publicados
+    p = resultados["processos"][0]
+    assert resultados["meses"][-1] == mes and len(resultados["meses"]) == 3
+    assert [(m["mes"], m["concluidas"], m["sem_handoff"]) for m in p["meses"]][-2:] == [(anterior, 1, 1), (mes, 3, 2)]
+    assert (resultados["concluidas"], resultados["autonomia"]) == (3, 0.667)
+    assert [(v["numero"], v["mes"]) for v in p["versoes"]] == [(1, service._mes_de(datetime.now(UTC) - timedelta(days=40)))]
+    assert (p["concluidas"], p["canceladas"], p["em_andamento"]) == (3, 1, 1)
+    assert p["fins"] == [{"resultado": "pago", "quantidade": 2}, {"resultado": "recusado", "quantidade": 1}]
+    valores = {i["nome"]: i["valor"] for i in p["indicadores"]}
+    assert valores == {"valor_pago": 8200.0, "pagos": 2.0, "pagos_pct": 66.7, "grandes": 1.0, "ticket": 2833.33, "ate_agendar": 2.0,
+                       "recebidos": 6.0, "em_atraso": 2.0}
+    assert pedidos == [("contas-a-pagar", mes, ["em_atraso"], "system:svc-processos")] * 3  # a tela, a carteira e o resumo
+    assert pelo_staff.processos[0].indicadores == [type(pelo_staff.processos[0].indicadores[0]).model_validate(i) for i in p["indicadores"]]
+    assert outro.code == "ERRO_PROCESSOS_FORBIDDEN"
+    assert (resumo.mes, resumo.organizacoes, resumo.enviados) == (mes, 1, 1)
+    assert avisos[0].roles == ["owner"] and avisos[0].link == f"/processos/resultados?mes={mes}"
+    assert "Contas a pagar: 3 concluída(s), 67% sozinhas" in avisos[0].body and "Valor pago: R$ 8.200,00" in avisos[0].body
