@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.plans import Limit, Module
-from core.processes import CatalogAction, Condition, Fluxo, Step
+from core.processes import CatalogAction, CatalogIndicator, Condition, Fluxo, IndicatorRequest, IndicatorValues, Step
 from core.surreal import ListQuery, Page
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
@@ -30,6 +30,9 @@ LIVE_REGRAS = "processos.regras"
 EVENT_SUBJECT = "events.integracoes.evento"  # do svc-integracoes: documento recebido, pagamento confirmado
 DOCUMENTO_SUBJECT = "rpc.integracoes.documento"  # do svc-integracoes: o texto de um documento recebido
 INICIAR_MODELO_SUBJECT = "rpc.processos.iniciar_modelo"  # svc-plans: o fechamento do mês inicia o faturamento da Cogniventure
+RESULTADOS_SUBJECT = "rpc.processos.resultados"  # svc-staff: os resultados de um cliente da carteira (os mesmos da tela)
+MESES_RESULTADOS = 6  # meses no gráfico de autonomia da tela Resultados
+FUSO = "America/Sao_Paulo"  # o mês dos resultados e do resumo é o de Brasília
 PLANS_SERVICE = "svc-plans"
 # Nada novo começa: o processo pausado, a conta suspensa (atraso) ou encerrada (alinhamento pós-N7, itens 2, 8 e 13).
 BLOQUEIOS = frozenset({"ERRO_PROCESSOS_PAUSADO", "ERRO_PROCESSOS_CONTA_SUSPENSA", "ERRO_PROCESSOS_CONTA_ENCERRADA"})
@@ -1000,3 +1003,80 @@ class ExecucaoDeAgente(BaseModel):
 class UsoDeAgente(_Input):
     passo: str = Field(..., description="O passo (de ação ou de agente) que o agente da empresa vai fazer")
     agente: str | None = Field(None, description="Id do agente da empresa (lista no contexto); vazio volta ao agente da Cogniventure")
+
+
+
+# ── Resultados (alinhamento pós-N7, item 7): autonomia mês a mês, fins alcançados e indicadores ──
+
+class ResultadosQuery(_Input):
+    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
+    meses: int = Field(MESES_RESULTADOS, ge=1, le=24, description="Quantos meses no gráfico de autonomia, até o mês pedido")
+
+
+class ResultadosPedido(BaseModel):
+    """rpc.processos.resultados (só o svc-staff, agindo na organização do cliente)."""
+
+    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$")
+    meses: int = Field(MESES_RESULTADOS, ge=1, le=24)
+
+
+class MesAutonomia(BaseModel):
+    mes: str = Field(..., description="AAAA-MM")
+    concluidas: int
+    sem_handoff: int
+    autonomia: float | None = Field(None, description="Concluídas sem exceção para o staff ÷ concluídas (0 a 1)")
+
+
+class MarcaVersao(BaseModel):
+    numero: int
+    mes: str = Field(..., description="AAAA-MM em que foi publicada")
+    publicada_em: datetime
+
+
+class FimAlcancado(BaseModel):
+    resultado: str
+    quantidade: int
+
+
+class ValorIndicador(BaseModel):
+    nome: str
+    titulo: str
+    unidade: Literal["numero", "moeda", "percentual", "dias", "horas"]
+    valor: float | None = Field(None, description="null: sem dado no mês")
+    descricao: str = ""
+
+
+class ResultadoProcesso(BaseModel):
+    processo: str
+    titulo: str
+    modelo: str | None = None
+    area: str
+    publicada: int | None = None
+    pausado: bool = False
+    meses: list[MesAutonomia] = Field(..., description="Do mais antigo ao mês pedido")
+    versoes: list[MarcaVersao] = Field(default_factory=list, description="Publicadas no período do gráfico")
+    iniciadas: int = Field(0, description="Execuções que começaram no mês")
+    concluidas: int = Field(0, description="Execuções que terminaram no mês")
+    canceladas: int = 0
+    em_andamento: int = Field(0, description="Rodando agora")
+    fins: list[FimAlcancado] = Field(default_factory=list, description="As concluídas no mês, por fim alcançado")
+    indicadores: list[ValorIndicador] = Field(default_factory=list, description="Os que o modelo declara (processo só da empresa: nenhum)")
+
+
+class Resultados(BaseModel):
+    mes: str
+    meses: list[str]
+    concluidas: int
+    sem_handoff: int
+    autonomia: float | None
+    processos: list[ResultadoProcesso]
+
+
+class ResumoMensalIn(_Input):
+    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM (vazio: o mês que acabou)")
+
+
+class ResumoMensal(BaseModel):
+    mes: str
+    organizacoes: int = Field(..., description="Organizações com processo publicado")
+    enviados: int = Field(..., description="Resumos enviados aos donos")

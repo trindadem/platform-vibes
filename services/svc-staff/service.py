@@ -37,6 +37,7 @@ from schemas import (
     FILA_TAREFA_SUBJECT,
     PEDIDO_SUBJECT,
     RESPONDER_SUBJECT,
+    RESULTADOS_SUBJECT,
     FILA,
     GESTORES,
     LIVE_CARTEIRAS,
@@ -88,6 +89,9 @@ from schemas import (
     RefRevisao,
     RefTarefa,
     ResolucaoStaff,
+    ResultadosCliente,
+    ResultadosPedido,
+    ResultadosQuery,
     ResolverExcecao,
     ResponderPedido,
     RespostaStaff,
@@ -174,6 +178,24 @@ class StaffService:
                 saude = saude.model_copy(update={"disponivel": False})
             itens.append(saude)
         return MinhaCarteira(gestor=bool(GESTORES & who.roles), itens=itens)
+
+    async def resultados(self, data: ResultadosQuery) -> ResultadosCliente:
+        """Os resultados de um cliente da carteira (o gestor vê de qualquer um): os mesmos números da tela Resultados
+        dele, sem trocar de organização."""
+        who = _staff()
+        nome = next((c.organizacao_nome for c in (await self.carteiras(Empty())).itens if c.organizacao == data.organizacao), None)
+        if nome is None:
+            if not GESTORES & who.roles:
+                raise ServiceError("ERRO_STAFF_FORBIDDEN", "Esta organização não está na sua carteira.", 403)
+            nome = next((o.name for o in await _organizacoes() if o.id == data.organizacao), None)
+            if nome is None or data.organizacao == settings.platform_tenant:
+                raise ServiceError("ERRO_STAFF_ORGANIZACAO", "Organização cliente não encontrada.", 404)
+        try:
+            with acting_as(system(SERVICE, data.organizacao)):
+                resultados = await bus.request(RESULTADOS_SUBJECT, ResultadosPedido(mes=data.mes), ResultadosCliente, timeout=15)
+        except (NatsError, TimeoutError):
+            raise ServiceError("ERRO_STAFF_CLIENTE", "Os números deste cliente não responderam. Tente de novo em instantes.", 503) from None
+        return resultados.model_copy(update={"organizacao": data.organizacao, "nome": nome})
 
     async def saiu(self, data: MemberLeft) -> Empty:
         """events.identity.member-left: quem sai da Cogniventure sai de todas as carteiras e perde o papel operador nos

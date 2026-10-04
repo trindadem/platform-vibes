@@ -35,6 +35,7 @@ from core.temporal_runner import runner
 from schemas import (
     ACOMPANHAMENTO_SUBJECT,
     INICIAR_MODELO_SUBJECT,
+    RESULTADOS_SUBJECT,
     FILA_DECIDIR_SUBJECT,
     FILA_RESOLVER_SUBJECT,
     FILA_REVISAO_SUBJECT,
@@ -78,11 +79,13 @@ from schemas import (
     ProcessoQuery,
     ProcessoRef,
     ProjetoQuery,
+    ResultadosPedido,
+    ResultadosQuery,
     SimulacaoIn,
     VoltarVersao,
 )
 from service import MIGRATIONS, ProcessosService
-from workflows import SCHEDULES, AvaliarRegraWorkflow
+from workflows import SCHEDULES, AvaliarRegraWorkflow, ResumoMensalWorkflow
 
 svc = ProcessosService()
 
@@ -92,7 +95,7 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TABLES, shared=SHARED, unique=UNIQUE, search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
-        runner.worker(TASK_QUEUE, workflows=[AvaliarRegraWorkflow], service=svc, schedules=SCHEDULES),
+        runner.worker(TASK_QUEUE, workflows=[AvaliarRegraWorkflow, ResumoMensalWorkflow], service=svc, schedules=SCHEDULES),
         processes.worker(SERVICE, jobs={JOB_AGENT: svc._job_agente, JOB_START: svc._job_inicio, JOB_TASK: svc._job_tarefa,
                                         JOB_WAIT: svc._job_espera, JOB_END: svc._job_fim}, lock_seconds=600),
     ):
@@ -106,6 +109,7 @@ async def lifespan(app: FastAPI):
         await bus.respond(FILA_REVISAO_SUBJECT, svc.fila_revisao, model=RevisaoRef)
         await bus.respond(FILA_DECIDIR_SUBJECT, svc.fila_decidir, model=DecisaoStaff)
         await bus.respond(INICIAR_MODELO_SUBJECT, svc.iniciar_modelo, model=IniciarModelo)  # svc-plans: o fechamento do mês
+        await bus.respond(RESULTADOS_SUBJECT, svc.resultados_staff, model=ResultadosPedido)  # svc-staff: a carteira
         await plans.declare(MODULE)  # módulo no catálogo dos planos; desligado para a organização, o core recusa
         yield
     await camunda.close()
@@ -214,6 +218,11 @@ async def descartar(data: DesenhoRef) -> ResponseEnvelope:
 @app.post("/desenho/voltar", response_model=ResponseEnvelope)
 async def voltar(data: VoltarVersao) -> ResponseEnvelope:
     return _ok(await svc.voltar(data))
+
+
+@app.get("/resultados", response_model=ResponseEnvelope)
+async def resultados(data: Annotated[ResultadosQuery, Query()]) -> ResponseEnvelope:
+    return _ok(await svc.resultados(data))
 
 
 @app.get("/execucoes", response_model=ResponseEnvelope)

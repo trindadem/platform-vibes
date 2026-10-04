@@ -2841,6 +2841,76 @@ export interface ProcessosIniciar {
   dados?: Record<string, string | number | boolean>;
 }
 
+export interface ProcessosFimAlcancado {
+  resultado: string;
+  quantidade: number;
+}
+
+export interface ProcessosMarcaVersao {
+  numero: number;
+  /** AAAA-MM em que foi publicada */
+  mes: string;
+  publicada_em: string;
+}
+
+export interface ProcessosMesAutonomia {
+  /** AAAA-MM */
+  mes: string;
+  concluidas: number;
+  sem_handoff: number;
+  /** Concluídas sem exceção para o staff ÷ concluídas (0 a 1) */
+  autonomia: number | null;
+}
+
+export interface ProcessosResultadoProcesso {
+  processo: string;
+  titulo: string;
+  modelo: string | null;
+  area: string;
+  publicada: number | null;
+  pausado: boolean;
+  /** Do mais antigo ao mês pedido */
+  meses: ProcessosMesAutonomia[];
+  /** Publicadas no período do gráfico */
+  versoes: ProcessosMarcaVersao[];
+  /** Execuções que começaram no mês */
+  iniciadas: number;
+  /** Execuções que terminaram no mês */
+  concluidas: number;
+  canceladas: number;
+  /** Rodando agora */
+  em_andamento: number;
+  /** As concluídas no mês, por fim alcançado */
+  fins: ProcessosFimAlcancado[];
+  /** Os que o modelo declara (processo só da empresa: nenhum) */
+  indicadores: ProcessosValorIndicador[];
+}
+
+export interface ProcessosValorIndicador {
+  nome: string;
+  titulo: string;
+  unidade: "numero" | "moeda" | "percentual" | "dias" | "horas";
+  /** null: sem dado no mês */
+  valor: number | null;
+  descricao: string;
+}
+
+export interface ProcessosResultados {
+  mes: string;
+  meses: string[];
+  concluidas: number;
+  sem_handoff: number;
+  autonomia: number | null;
+  processos: ProcessosResultadoProcesso[];
+}
+
+export interface ProcessosResultadosQuery {
+  /** AAAA-MM, em Brasília (vazio: o mês atual) */
+  mes?: string | null;
+  /** Quantos meses no gráfico de autonomia, até o mês pedido */
+  meses?: number;
+}
+
 export interface ProcessosCancelarExecucao {
   id: string;
   /** Fica na linha do tempo */
@@ -3112,6 +3182,9 @@ export const processos = {
   /** POST /api/v1/processos/execucoes/iniciar · http · exige token */
   iniciar: (body: ProcessosIniciar, options?: RequestOptions) =>
     request<ProcessosExecucao>("POST", "/api/v1/processos/execucoes/iniciar", body, options),
+  /** GET /api/v1/processos/resultados · http · exige token */
+  resultados: (query?: ProcessosResultadosQuery, options?: RequestOptions) =>
+    request<ProcessosResultados>("GET", withQuery("/api/v1/processos/resultados", query), undefined, options),
   /** POST /api/v1/processos/execucoes/cancelar · http · exige token */
   cancelar: (body: ProcessosCancelarExecucao, options?: RequestOptions) =>
     request<ProcessosExecucao>("POST", "/api/v1/processos/execucoes/cancelar", body, options),
@@ -3309,6 +3382,67 @@ export interface StaffSaude {
 export interface StaffMinhaCarteira {
   gestor: boolean;
   itens: StaffSaude[];
+}
+
+export interface StaffFimAlcancado {
+  resultado: string;
+  quantidade: number;
+}
+
+export interface StaffMarcaVersao {
+  numero: number;
+  mes: string;
+  publicada_em: string;
+}
+
+export interface StaffMesAutonomia {
+  mes: string;
+  concluidas: number;
+  sem_handoff: number;
+  autonomia: number | null;
+}
+
+export interface StaffResultadoProcesso {
+  processo: string;
+  titulo: string;
+  modelo: string | null;
+  area: string;
+  publicada: number | null;
+  pausado: boolean;
+  meses: StaffMesAutonomia[];
+  versoes: StaffMarcaVersao[];
+  iniciadas: number;
+  concluidas: number;
+  canceladas: number;
+  em_andamento: number;
+  fins: StaffFimAlcancado[];
+  indicadores: StaffValorIndicador[];
+}
+
+export interface StaffValorIndicador {
+  nome: string;
+  titulo: string;
+  unidade: "numero" | "moeda" | "percentual" | "dias" | "horas";
+  valor: number | null;
+  descricao: string;
+}
+
+/** Os resultados de um cliente da carteira (rpc.processos.resultados): os mesmos números da tela dele. */
+export interface StaffResultadosCliente {
+  organizacao: string;
+  nome: string;
+  mes: string;
+  meses: string[];
+  concluidas: number;
+  sem_handoff: number;
+  autonomia: number | null;
+  processos: StaffResultadoProcesso[];
+}
+
+export interface StaffResultadosQuery {
+  organizacao: string;
+  /** AAAA-MM, em Brasília (vazio: o mês atual) */
+  mes?: string | null;
 }
 
 export interface StaffItemFila {
@@ -3517,6 +3651,9 @@ export const staff = {
   /** GET /api/v1/staff/carteira · http · exige token */
   carteira: (options?: RequestOptions) =>
     request<StaffMinhaCarteira>("GET", "/api/v1/staff/carteira", undefined, options),
+  /** GET /api/v1/staff/carteira/resultados · http · exige token */
+  resultadosCliente: (query?: StaffResultadosQuery, options?: RequestOptions) =>
+    request<StaffResultadosCliente>("GET", withQuery("/api/v1/staff/carteira/resultados", query), undefined, options),
   /** GET /api/v1/staff/fila · http · exige token */
   fila: (query?: StaffFilaQuery, options?: RequestOptions) =>
     request<StaffFilaPage>("GET", withQuery("/api/v1/staff/fila", query), undefined, options),

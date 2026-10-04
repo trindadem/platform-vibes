@@ -4,10 +4,13 @@ Trilho (validado no import por @activities): todo método público é async, rec
 modelo de schemas.py. As ações do pacote (schemas.ACTIONS) são métodos de mesmo nome: o worker do motor de processos
 (core/processes.py) as chama como a organização do processo, com a entrada vinda dos passos anteriores.
 O banco e o e-mail são do svc-integracoes (rpc.integracoes.*): sem a conexão, o 409 de lá vira a exceção do staff.
+Os indicadores "pacote" dos modelos (schemas.MODELS) saem de indicadores (rpc.financeiro.indicadores): o que as
+execuções não sabem, com os títulos e as faturas da organização.
 """
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nats.errors import Error as NatsError
 from pydantic import BaseModel
@@ -30,6 +33,7 @@ from schemas import (
     EXTRATO_SUBJECT,
     FATURAS,
     FORNECEDORES,
+    FUSO,
     LIVE_FATURAS,
     LIVE_TITULOS,
     PRAZO_PADRAO,
@@ -65,6 +69,8 @@ from schemas import (
     FaturaMudou,
     FaturaPage,
     FaturaQuery,
+    IndicatorRequest,
+    IndicatorValues,
     Fornecedor,
     Janela,
     Mes,
@@ -304,6 +310,19 @@ class FinanceiroService:
                                            link="/financeiro/receber", action="Ver a cobrança", key=f"atraso-{fatura.id}")
         return Regua(lembretes=enviados)
 
+    # ── Indicadores "pacote" (rpc.financeiro.indicadores; o svc-processos pede como system na organização) ──
+
+    async def indicadores(self, data: IndicatorRequest) -> IndicatorValues:
+        """Os indicadores do mês (em Brasília) que as execuções não sabem: pagos em atraso (contas a pagar) e valor em
+        atraso (faturamento e cobrança). Nome desconhecido, mês inválido ou que ainda não começou: null."""
+        calculos = {("contas-a-pagar", "pagos_em_atraso"): _pagos_em_atraso, ("faturamento-cobranca", "valor_em_atraso"): _valor_em_atraso}
+        limites = _limites_do_mes(data.mes)
+        valores: dict[str, float | None] = {}
+        for nome in data.nomes:
+            calculo = calculos.get((data.modelo, nome))
+            valores[nome] = await calculo(data.mes, limites[1]) if calculo and limites and limites[0] <= datetime.now(UTC) else None
+        return IndicatorValues(valores=valores)
+
     # ── Telas ────────────────────────────────────────────────────────────────
 
     async def titulos(self, data: TituloQuery) -> TituloPage:
@@ -372,6 +391,48 @@ async def _faturas_do_mes(referencia: str) -> list[Fatura]:
     """As faturas abertas no mês (a receita do mês é o que foi faturado nele)."""
     rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant ORDER BY created_at")
     return [f for f in (Fatura.model_validate(r) for r in rows) if f.created_at and f.created_at.strftime("%Y-%m") == referencia]
+
+
+def _limites_do_mes(mes: str) -> tuple[datetime, datetime] | None:
+    """Começo e fim (exclusivo) do mês civil em Brasília, em UTC; mês inválido: None."""
+    try:
+        ano, numero = (int(x) for x in mes.split("-"))
+        fuso = ZoneInfo(FUSO)
+        inicio = datetime(ano, numero, 1, tzinfo=fuso)
+        fim = datetime(ano + (numero == 12), 1 if numero == 12 else numero + 1, 1, tzinfo=fuso)
+    except ValueError:
+        return None
+    return inicio.astimezone(UTC), fim.astimezone(UTC)
+
+
+async def _pagos_em_atraso(mes: str, fim: datetime) -> float:
+    """Títulos pagos (comprovante ou extrato) com a data do pagamento no mês e depois do vencimento: o banco agenda
+    para hoje o boleto que chega vencido. É a situação de agora: título do mês ainda sem comprovante não entra."""
+    rows = await db.query(f"SELECT * FROM {TITULOS} WHERE tenant = $tenant AND status = 'pago' AND string::starts_with(data, $mes)", mes=mes)
+    dia = re.compile(r"\d{4}-\d{2}-\d{2}")
+    return float(sum(1 for r in rows if dia.fullmatch(str(r.get("data"))) and dia.fullmatch(str(r.get("vencimento")))
+                     and r["data"] > r["vencimento"]))
+
+
+async def _valor_em_atraso(mes: str, fim: datetime) -> float:
+    """Faturas cobradas (boleto emitido) vencidas e não recebidas no fim do mês (no mês corrente, agora): vencimento
+    antes do dia de corte e sem recebimento até ele (recebido_em guarda quando a fatura foi paga)."""
+    corte = min(datetime.now(UTC), fim)
+    dia = corte.astimezone(ZoneInfo(FUSO)).date().isoformat()
+    rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant AND cobranca_id != NONE AND cobranca_id != NULL "
+                          "AND vencimento < $dia", dia=dia)
+    total = 0.0
+    for fatura in (Fatura.model_validate(r) for r in rows):
+        if fatura.created_at and _utc(fatura.created_at) >= corte:
+            continue  # ainda não existia
+        if fatura.status == "paga" and (fatura.recebido_em is None or _utc(fatura.recebido_em) < corte):
+            continue
+        total += fatura.valor
+    return round(total, 2)
+
+
+def _utc(quando: datetime) -> datetime:
+    return quando if quando.tzinfo else quando.replace(tzinfo=UTC)
 
 
 def _reais(valor: float) -> str:

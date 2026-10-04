@@ -103,6 +103,17 @@ endpoints:
     target_url: http://svc-staff:8000/carteira
     timeout: 30
 
+  # Os resultados de um cliente da carteira (alinhamento pós-N7, item 7): os mesmos números da tela dele.
+  - path: /carteira/resultados
+    name: resultadosCliente
+    method: GET
+    auth: client_jwt
+    query: ResultadosQuery
+    response: ResultadosCliente
+    target_type: http
+    target_url: http://svc-staff:8000/carteira/resultados
+    timeout: 30
+
   - path: /fila
     method: GET
     auth: client_jwt

@@ -49,6 +49,7 @@ from schemas import (
     NovaCarteira,
     NovoCliente,
     NumerosQuery,
+    ResultadosQuery,
     SituacaoCliente,
     ResolverExcecao,
     ResponderPedido,
@@ -102,6 +103,11 @@ async def novo_cliente(data: NovoCliente) -> ResponseEnvelope:
 @app.post("/clientes/convite", response_model=ResponseEnvelope)
 async def convidar_dono(data: ClienteRef) -> ResponseEnvelope:
     return _ok(await svc.convidar_dono(data))
+
+
+@app.get("/carteira/resultados", response_model=ResponseEnvelope)
+async def resultados(data: Annotated[ResultadosQuery, Query()]) -> ResponseEnvelope:
+    return _ok(await svc.resultados(data))
 
 
 @app.post("/clientes/cobranca", response_model=ResponseEnvelope)

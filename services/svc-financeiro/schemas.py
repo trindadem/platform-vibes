@@ -5,7 +5,18 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.plans import Module
-from core.processes import Action, Condition, Flow, Fluxo, ProcessModel, Step, Trigger
+from core.processes import (  # IndicatorRequest e IndicatorValues: o contrato de rpc.financeiro.indicadores
+    Action,
+    Condition,
+    Flow,
+    Fluxo,
+    Indicator,
+    IndicatorRequest,
+    IndicatorValues,
+    ProcessModel,
+    Step,
+    Trigger,
+)
 from core.resources import Fields, Money, Resource
 from core.surreal import ListQuery, Page
 
@@ -26,6 +37,7 @@ LIVE_FATURAS = "financeiro.faturas"
 PRAZO_PADRAO = 15  # dias até o vencimento de uma fatura, quando o processo não diz
 ALIQUOTA_PADRAO = 6.0  # % do Simples Nacional (anexo III, primeira faixa), quando o processo não diz
 REGUA = {"D-3": "vence em 3 dias", "D+1": "venceu ontem", "D+7": "está vencida há uma semana"}  # lembretes da cobrança
+FUSO = "America/Sao_Paulo"  # o mês dos indicadores é o civil em Brasília
 
 MODULE = Module("Financeiro", "Pacote de ações financeiras do BPO: contas a pagar, conciliação, cobrança e fechamento",
                 category="Pacotes")
@@ -387,7 +399,7 @@ ACTIONS = [
            example=Dre(referencia="2026-09", receita=4800.0, despesas=3100.0, resultado=1700.0, resumo="Lucro de R$ 1.700,00.")),
 ]
 
-C, F, P = Condition, Flow, Step
+C, F, I, P = Condition, Flow, Indicator, Step
 MODELS = [
     ProcessModel("contas-a-pagar", Fluxo(
         gatilho=Trigger(tipo="evento", evento="documento.recebido", descricao="Boleto ou NF chega"),
@@ -428,7 +440,14 @@ MODELS = [
             F(de="classificar", para="agendar"), F(de="agendar", para="aguardar"), F(de="aguardar", para="conciliar"),
             F(de="conciliar", para="pago"),
         ],
-    )),
+    ), indicadores=[
+        I("valor_pago", "Valor pago", "soma", unidade="moeda", campo="ler_documento.valor", resultado="pago",
+          descricao="Soma do valor lido dos documentos das contas pagas no mês"),
+        I("pagos_em_atraso", "Pagos em atraso", "pacote",
+          descricao="Pagamentos com data no mês, já confirmados pelo banco, que saíram depois do vencimento"),
+        I("tempo_ate_agendar", "Tempo do boleto ao agendamento", "tempo", unidade="horas", de="inicio", ate="agendar",
+          resultado="pago", descricao="Média, nas contas pagas no mês, da chegada do documento ao agendamento no banco"),
+    ]),
     ProcessModel("conciliacao-bancaria", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 11 * * *", descricao="Todo dia"),
         parametros={"tolerancia": 50},
@@ -445,7 +464,13 @@ MODELS = [
             F(de="sobrou", para="revisar", condicao=C(campo="conciliar_dia.valor_sem_par", operador=">", valor="parametros.tolerancia")),
             F(de="sobrou", para="conciliado"), F(de="revisar", para="revisado"),
         ],
-    )),
+    ), indicadores=[
+        I("conciliados_sozinhos", "Lançamentos conciliados sozinhos", "razao", unidade="percentual",
+          campo="conciliar_dia.conciliados", sobre="conciliar_dia.lancamentos",
+          descricao="Lançamentos do extrato que casaram com um título ou uma fatura, sobre todos os do mês"),
+        I("valor_sem_par", "Valor sem par acima da tolerância", "soma", unidade="moeda", campo="conciliar_dia.valor_sem_par",
+          resultado="revisado", descricao="Soma dos lançamentos sem par nos dias em que passou da tolerância e foi ao staff"),
+    ]),
     ProcessModel("faturamento-cobranca", Fluxo(
         gatilho=Trigger(tipo="processo", processo="proposta-comercial", resultado="aceita", descricao="Proposta aceita"),
         parametros={"prazo_pagamento": PRAZO_PADRAO},
@@ -466,7 +491,14 @@ MODELS = [
             F(de="pago", para="recebido", condicao=C(campo="baixar.recebido", operador="verdadeiro")),
             F(de="pago", para="inadimplente"),
         ],
-    )),
+    ), indicadores=[
+        I("valor_recebido", "Valor recebido", "soma", unidade="moeda", campo="baixar.valor", resultado="recebido",
+          descricao="Soma das faturas recebidas no mês"),
+        I("valor_em_atraso", "Valor em atraso", "pacote", unidade="moeda",
+          descricao="Cobranças vencidas e não recebidas no fim do mês (no mês corrente, hoje), pelas faturas do pacote"),
+        I("prazo_recebimento", "Prazo médio de recebimento", "tempo", unidade="dias", de="faturar", ate="baixar",
+          resultado="recebido", descricao="Média, nas faturas recebidas no mês, do faturamento à baixa do recebimento"),
+    ]),
     ProcessModel("fechamento-mes", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 11 1 * *", descricao="Dia 1"),
         parametros={"email_contador": "", "aliquota": ALIQUOTA_PADRAO},
@@ -494,5 +526,10 @@ MODELS = [
             F(de="aprovado", para="pagar_das", condicao=C(campo="aprovar_das.aprovado", operador="verdadeiro")),
             F(de="aprovado", para="dre"), F(de="pagar_das", para="dre"), F(de="dre", para="fechado"),
         ],
-    )),
+    ), indicadores=[
+        I("dias_para_fechar", "Dias para fechar o mês", "tempo", unidade="dias", de="inicio", ate="fim",
+          descricao="Do dia 1, quando começa o fechamento do mês anterior, até a DRE sair"),
+        I("documentos_faltantes", "Documentos que faltaram", "soma", campo="pendencias.pendencias",
+          descricao="Pagamentos sem comprovante e faturas sem nota no levantamento do fechamento"),
+    ]),
 ]

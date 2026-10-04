@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (50)
+## Índice (52)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -35,9 +35,11 @@
 - [DataTable](#datatable): Tabela de dados tipada. `columns, rows, rowKey, empty?, caption?, sort?, onSort?`
 - [JourneySteps](#journeysteps): Jornada em passos numerados: o que já foi feito, o passo de agora em destaque e os próximos, com o caminho de cada um. `steps`
 - [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items, stacked?`
+- [MonthlyBars](#monthlybars): Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada. `label, items`
 - [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
 - [Picture](#picture): Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). `src, alt, size?`
 - [ProjectChain](#projectchain): Projeto: a cadeia de processos que um começou (uma proposta aceita inicia o contrato e o faturamento), com cada execução, o que ela espera e o caminho para abri-la. `title, status, steps, description?`
+- [ResultsCard](#resultscard): Os resultados de um processo num mês: a taxa mês a mês com as marcas, os números do mês, como terminaram e os indicadores. `title, months, monthsLabel, counts, ends, indicators, description?, badges?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
 - [UsageMeter](#usagemeter): Barra de uso de um limite: quanto foi usado de quanto é permitido, em alerta a partir de 80% e cheia em 100%. `label, used, limit, format?, hint?`
 
@@ -466,6 +468,26 @@ Lista de pares rótulo/valor para detalhes de um registro. _(Dados)_
 
 ---
 
+## MonthlyBars
+
+Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada. _(Dados)_
+
+```tsx
+<MonthlyBars
+  label="Autonomia por mês"
+  items={[
+    { label: "set/26", value: 0.5, detail: "4 concluídas" },
+    { label: "out/26", value: 0.8, detail: "10 concluídas", marker: "v2" },
+    { label: "nov/26", value: null, detail: "nada concluído" },
+  ]}
+/>
+```
+
+- `label`: `string`: O que as barras medem (leitor de tela e título).
+- `items`: `MonthlyBarsItem[]`: Os meses, do mais antigo ao mais novo.
+
+---
+
 ## Pagination
 
 Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. _(Dados)_
@@ -518,6 +540,34 @@ Projeto: a cadeia de processos que um começou (uma proposta aceita inicia o con
 - `description?`: `string`: O que começou o projeto (ex.: "Proposta para Padaria Pão Quente").
 - `status`: `"andamento" | "concluido" | "atencao"`: andamento, concluido ou atencao (alguma etapa com incidente).
 - `steps`: `ProjectChainStep[]`: As etapas na ordem em que começaram.
+
+---
+
+## ResultsCard
+
+Os resultados de um processo num mês: a taxa mês a mês com as marcas, os números do mês, como terminaram e os indicadores. _(Dados)_
+
+```tsx
+<ResultsCard
+  title="Contas a pagar"
+  description="Versão 2 publicada"
+  badges={["Pausado"]}
+  monthsLabel="Autonomia por mês"
+  months={[{ label: "set/26", value: 0.5 }, { label: "out/26", value: 0.8, marker: "v2" }]}
+  counts={[{ label: "Concluídas", value: 10 }, { label: "Em andamento", value: 2 }]}
+  ends={[{ label: "pago", value: 9 }, { label: "recusado", value: 1 }]}
+  indicators={[{ label: "Valor pago", value: "R$ 42.000,00" }]}
+/>
+```
+
+- `title`: `string`: O que se acompanha (ex.: o processo).
+- `description?`: `string`: Uma linha abaixo do título (ex.: "Versão 3 publicada").
+- `badges?`: `string[]`: Selos ao lado (ex.: "Pausado").
+- `months`: `MonthlyBarsItem[]`: A taxa mês a mês (ex.: autonomia), com as marcas.
+- `monthsLabel`: `string`: Rótulo do gráfico.
+- `counts`: `{ label: string; value: ReactNode }[]`: Números do mês (ex.: concluídas, canceladas).
+- `ends`: `{ label: string; value: number }[]`: Como as execuções do mês terminaram (fim → quantas).
+- `indicators`: `{ label: string; value: ReactNode }[]`: Os indicadores de negócio do mês, já formatados.
 
 ---
 

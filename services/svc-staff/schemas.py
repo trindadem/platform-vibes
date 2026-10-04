@@ -19,6 +19,7 @@ ACOMPANHAMENTO_SUBJECT = "rpc.processos.acompanhamento"  # svc-processos: a saú
 CLIENTE_SUBJECT = "rpc.identity.cliente"  # svc-identity: abre a organização do cliente e convida o dono
 CONVITE_DONO_SUBJECT = "rpc.identity.convite_dono"  # svc-identity: o convite do dono de novo
 MEMBER_LEFT_SUBJECT = "events.identity.member-left"  # svc-identity: alguém saiu de uma organização
+RESULTADOS_SUBJECT = "rpc.processos.resultados"  # svc-processos: os resultados de um cliente (os mesmos da tela dele)
 CONTA_SUBJECT = "rpc.plans.conta"  # svc-plans: mensalidade, vencimento e situação do cliente (agindo nele)
 ENCERRADA_SUBJECT = "events.plans.encerrada"  # svc-plans: a conta do cliente encerrou (o staff sai da carteira)
 CONTEXTO_SUBJECT = "rpc.conhecimento.contexto"  # svc-conhecimento: o briefing da empresa (concluído ou não)
@@ -279,6 +280,86 @@ class Saude(BaseModel):
     ajudas: int = 0
     pedidos: int = Field(0, description="Pedidos de ajuda (Falar com a Cogniventure) abertos")
     disponivel: bool = Field(True, description="Falso quando a organização não respondeu agora")
+
+
+class ResultadosQuery(_Input):
+    organizacao: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
+
+
+class ResultadosPedido(BaseModel):
+    """rpc.processos.resultados (contrato do svc-processos)."""
+
+    mes: str | None = None
+    meses: int = 6
+
+
+class MesAutonomia(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mes: str
+    concluidas: int
+    sem_handoff: int
+    autonomia: float | None = None
+
+
+class MarcaVersao(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    numero: int
+    mes: str
+    publicada_em: datetime
+
+
+class FimAlcancado(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    resultado: str
+    quantidade: int
+
+
+class ValorIndicador(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    nome: str
+    titulo: str
+    unidade: Literal["numero", "moeda", "percentual", "dias", "horas"]
+    valor: float | None = None
+    descricao: str = ""
+
+
+class ResultadoProcesso(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    processo: str
+    titulo: str
+    modelo: str | None = None
+    area: str
+    publicada: int | None = None
+    pausado: bool = False
+    meses: list[MesAutonomia]
+    versoes: list[MarcaVersao] = Field(default_factory=list)
+    iniciadas: int = 0
+    concluidas: int = 0
+    canceladas: int = 0
+    em_andamento: int = 0
+    fins: list[FimAlcancado] = Field(default_factory=list)
+    indicadores: list[ValorIndicador] = Field(default_factory=list)
+
+
+class ResultadosCliente(BaseModel):
+    """Os resultados de um cliente da carteira (rpc.processos.resultados): os mesmos números da tela dele."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    organizacao: str = ""
+    nome: str = ""
+    mes: str
+    meses: list[str]
+    concluidas: int
+    sem_handoff: int
+    autonomia: float | None = None
+    processos: list[ResultadoProcesso]
 
 
 class MinhaCarteira(BaseModel):

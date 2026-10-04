@@ -213,6 +213,17 @@ endpoints:
     target_url: http://svc-processos:8000/execucoes/iniciar
     timeout: 30
 
+  # Resultados (alinhamento pós-N7, item 7): autonomia mês a mês, fins alcançados e indicadores do mês.
+  - path: /resultados
+    name: resultados
+    method: GET
+    auth: client_jwt
+    query: ResultadosQuery
+    response: Resultados
+    target_type: http
+    target_url: http://svc-processos:8000/resultados
+    timeout: 30
+
   - path: /execucoes/cancelar
     name: cancelar
     method: POST
