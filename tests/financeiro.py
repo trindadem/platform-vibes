@@ -5,28 +5,36 @@ Pelo kit do core (core/testing.py): o main.py de verdade em memória. As ações
 
 Rodar (da raiz): PYTHONPATH=services/svc-financeiro uv run python -m pytest tests/financeiro.py
 """
+from datetime import date, timedelta
+
 from core.envelope import ServiceError
 from core.processes import CATALOG_SUBJECT, STEP_SUBJECT
 from core.testing import service_app
 
-from schemas import ACTIONS, AGENDAR_SUBJECT
+from schemas import ACTIONS, AGENDAR_SUBJECT, COBRAR_SUBJECT, EMAIL_SUBJECT, EXTRATO_SUBJECT
 
 OWNER = ("ana", "acme", "owner")
 DOC = {"fornecedor": "Moinho Sul", "cnpj": "12.345.678/0001-90", "valor": 1250.0, "vencimento": "2026-10-15"}
 
 
-def test_pacote_declara_as_acoes_do_contas_a_pagar_no_boot():
+def test_pacote_declara_as_acoes_e_os_modelos_do_financeiro_no_boot():
     async def cenario(app):
         return [m for s, m in app.published if s == CATALOG_SUBJECT], sorted(app.jobs)
 
     catalogos, jobs = service_app(cenario)
     assert len(catalogos) == 1 and catalogos[0].service == "svc-financeiro"
     acoes = {a.name: a for a in catalogos[0].actions}
-    assert set(acoes) == {"financeiro.conferir_pedido", "financeiro.classificar", "financeiro.agendar_pagamento", "financeiro.conciliar"}
+    assert {"financeiro.conferir_pedido", "financeiro.classificar", "financeiro.agendar_pagamento", "financeiro.conciliar",
+            "financeiro.conciliar_extrato", "financeiro.faturar", "financeiro.emitir_nota", "financeiro.cobrar", "financeiro.baixar",
+            "financeiro.pendencias_do_mes", "financeiro.enviar_ao_contador", "financeiro.apurar_das", "financeiro.montar_dre"} == set(acoes)
     assert acoes["financeiro.agendar_pagamento"].risk == "irreversivel" and acoes["financeiro.agendar_pagamento"].connections == ["Banco"]
     assert "divergente" in acoes["financeiro.conferir_pedido"].output_fields
     assert all(a.example for a in ACTIONS)
     assert jobs == sorted(acoes)  # o worker pega os jobs de cada ação declarada
+    modelos = {m.id: m.fluxo for m in catalogos[0].models}
+    assert set(modelos) == {"contas-a-pagar", "conciliacao-bancaria", "faturamento-cobranca", "fechamento-mes"}
+    assert modelos["faturamento-cobranca"].gatilho.processo == "proposta-comercial"  # a cadeia: proposta aceita → faturamento
+    assert modelos["fechamento-mes"].gatilho.agenda == "0 11 1 * *"
 
 
 def test_conferir_e_classificar_pelo_cadastro_de_fornecedores():
@@ -90,3 +98,85 @@ def test_agendar_no_banco_e_conciliar_o_titulo():
     status = [(m.status, m.motivo) for s, m in publicados if s == STEP_SUBJECT]
     assert status[1] == ("handoff", "Conecte o banco da empresa em Integrações.")  # com exceção no passo: staff
     assert status[2][0] == "incidente"  # sem caminho de exceção: incidente
+
+
+def test_faturar_emitir_nota_com_o_staff_cobrar_e_baixar_pelo_extrato():
+    enviados, extrato = [], {"itens": []}
+
+    def cobrar(pedido):
+        return {"cobranca_id": "CB-1A2B3C4D", "linha_digitavel": "34191.79001 01043.510047", "vencimento": pedido.vencimento}
+
+    def email(pedido):
+        enviados.append(pedido)
+        return {"mensagem_id": "m1", "de": "acme.1a2b3c4d@entrada.localhost"}
+
+    async def cenario(app):
+        app.respond(COBRAR_SUBJECT, cobrar)
+        app.respond(EMAIL_SUBJECT, email)
+        app.respond(EXTRATO_SUBJECT, lambda pedido: extrato)
+        venda = {"cliente": "Padaria Pão Quente", "email": "compras@paoquente.com.br", "descricao": "Pães por 3 meses", "valor": 4800.0,
+                 "prazo_pagamento": 10, "proposta_id": "pp1"}
+        faturado = await app.job("financeiro.faturar", element="faturar", variables={"entrada": venda})
+        sem_valor = await app.job("financeiro.faturar", variables={"entrada": {**venda, "valor": None}})
+        fatura_id = faturado.variables["resultado"]["fatura_id"]
+        nota = await app.job("financeiro.emitir_nota", element="emitir", variables={"entrada": {"fatura_id": fatura_id}}, headers={"excecao": "sim"})
+        cobrado = await app.job("financeiro.cobrar", variables={"entrada": {"fatura_id": fatura_id, "nota_numero": "2026/000123"}})
+        antes = await app.job("financeiro.baixar", variables={"entrada": {"cobranca_id": "CB-1A2B3C4D"}})
+        extrato["itens"] = [{"tipo": "recebimento", "id": "CB-1A2B3C4D", "valor": 4800.0, "data": "2026-10-05"}]
+        depois = await app.job("financeiro.baixar", variables={"entrada": {"cobranca_id": "CB-1A2B3C4D"}})
+        faturas = (await app.user(*OWNER).get("/faturas")).json()["data"]["items"]
+        return faturado, sem_valor, nota, cobrado, antes, depois, faturas
+
+    faturado, sem_valor, nota, cobrado, antes, depois, faturas = service_app(cenario)
+    vencimento = (date.today() + timedelta(days=10)).isoformat()
+    assert faturado.variables["resultado"]["vencimento"] == vencimento and sem_valor.status == "handoff"
+    assert nota.status == "handoff" and "R$ 4.800,00" in nota.message and "prefeitura" in nota.message  # NFS-e: o staff emite
+    assert cobrado.variables["resultado"]["enviada"] is True and enviados[0].para == "compras@paoquente.com.br"
+    assert "2026/000123" in enviados[0].texto and "34191.79001" in enviados[0].texto
+    assert antes.variables["resultado"] == {"recebido": False, "valor": 0} and depois.variables["resultado"] == {"recebido": True, "valor": 4800.0}
+    assert [(f["status"], f["nota_numero"], f["cobranca_id"]) for f in faturas] == [("paga", "2026/000123", "CB-1A2B3C4D")]
+
+
+def test_conciliar_o_extrato_e_fechar_o_mes(monkeypatch):
+    import service
+
+    avisos, enviados = [], []
+
+    async def roles(*papeis, **aviso):
+        avisos.append(aviso)
+
+    monkeypatch.setattr(service.notify, "roles", roles)
+    referencia = date.today().strftime("%Y-%m")
+
+    async def cenario(app):
+        app.respond(AGENDAR_SUBJECT, lambda p: {"pagamento_id": "PG-1", "data": date.today().isoformat()})
+        app.respond(COBRAR_SUBJECT, lambda p: {"cobranca_id": "CB-1", "linha_digitavel": "1", "vencimento": p.vencimento})
+        app.respond(EMAIL_SUBJECT, lambda p: enviados.append(p) or {"mensagem_id": "m", "de": "x@y"})
+        app.respond(EXTRATO_SUBJECT, lambda p: {"itens": [
+            {"tipo": "pagamento", "id": "PG-1", "valor": -1000.0, "data": "2026-10-05"},
+            {"tipo": "recebimento", "id": "CB-1", "valor": 5000.0, "data": "2026-10-05"},
+            {"tipo": "recebimento", "id": "PIX-DESCONHECIDO", "valor": 75.5, "data": "2026-10-05"}]})
+        await app.job("financeiro.agendar_pagamento", variables={"entrada": {"valor": 1000.0, "vencimento": date.today().isoformat(),
+                                                                            "fornecedor": "Moinho Sul"}})
+        fatura = await app.job("financeiro.faturar", variables={"entrada": {"cliente": "Café Central", "valor": 5000.0}})
+        await app.job("financeiro.cobrar", variables={"entrada": {"fatura_id": fatura.variables["resultado"]["fatura_id"]}})
+        conciliado = await app.job("financeiro.conciliar_extrato", variables={"entrada": {"dias": 1}})
+        pendencias = await app.job("financeiro.pendencias_do_mes", variables={"entrada": {"referencia": referencia}})
+        sem_contador = await app.job("financeiro.enviar_ao_contador", variables={"entrada": {"email_contador": "", "referencia": referencia}})
+        contador = await app.job("financeiro.enviar_ao_contador", variables={"entrada": {"email_contador": "fiscal@contabil.com", "referencia": referencia}})
+        das = await app.job("financeiro.apurar_das", variables={"entrada": {"referencia": referencia, "aliquota": 6.0}})
+        dre = await app.job("financeiro.montar_dre", variables={"entrada": {"referencia": referencia}})
+        titulos = (await app.user(*OWNER).get("/titulos")).json()["data"]["items"]
+        return conciliado, pendencias, sem_contador, contador, das, dre, titulos
+
+    conciliado, pendencias, sem_contador, contador, das, dre, titulos = service_app(cenario)
+    assert conciliado.variables["resultado"] == {"lancamentos": 3, "conciliados": 2, "sem_par": 1, "valor_sem_par": 75.5}
+    assert titulos[0]["status"] == "pago" and titulos[0]["conciliado"] is True
+    assert pendencias.variables["resultado"] == {"referencia": referencia, "pendencias": 1, "resumo": "1 fatura(s) sem nota fiscal"}
+    assert sem_contador.status == "handoff" and "email_contador" in sem_contador.message
+    assert contador.status == "concluido" and enviados[-1].para == "fiscal@contabil.com" and "Café Central" in enviados[-1].texto
+    ano, mes = (int(p) for p in referencia.split("-"))
+    vence = date(ano + (mes == 12), 1 if mes == 12 else mes + 1, 20).isoformat()
+    assert das.variables["resultado"] == {"valor": 300.0, "vencimento": vence, "fornecedor": "Receita Federal — DAS", "linha_digitavel": None}
+    assert dre.variables["resultado"]["resultado"] == 4000.0 and dre.variables["resultado"]["resumo"].startswith("Lucro de R$ 4.000,00")
+    assert avisos[-1]["title"] == f"DRE de {referencia}" and avisos[-1]["key"] == f"dre-{referencia}"

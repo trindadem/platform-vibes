@@ -1,7 +1,9 @@
 """svc-financeiro · boot do pacote. Fonte da verdade: specs/financeiro.md
 
-Declara o módulo (plano) e as ações do pacote (catálogo do desenho de processos) e roda o worker delas no motor.
+Declara o módulo (plano), as ações do pacote e os modelos que ele executa (contas a pagar, conciliação, faturamento e
+fechamento: o catálogo do desenho de processos) e roda o worker das ações no motor.
 HTTP /fornecedores... → cadastro declarado (core/resources.py). HTTP /titulos → contas a pagar agendadas.
+HTTP /faturas → contas a receber (faturamento e cobrança). Temporal: a régua de cobrança, todo dia.
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-financeiro main:app --port 8100 --env-file .env
 """
@@ -20,9 +22,9 @@ from core.surreal import db
 from core.telemetry import install_telemetry
 from core.temporal_runner import runner
 
-from schemas import ACTIONS, MODULE, RESOURCES, SERVICE, TABLES, TASK_QUEUE, UNIQUE, TituloQuery
+from schemas import ACTIONS, MODELS, MODULE, RESOURCES, SERVICE, TABLES, TASK_QUEUE, UNIQUE, FaturaQuery, TituloQuery
 from service import MIGRATIONS, FinanceiroService
-from workflows import SCHEDULES
+from workflows import SCHEDULES, ReguaWorkflow
 
 svc = FinanceiroService()
 
@@ -32,11 +34,11 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TABLES, unique=UNIQUE, resources=RESOURCES, migrations=MIGRATIONS, service=SERVICE),
-        runner.worker(TASK_QUEUE, workflows=[], service=svc, schedules=SCHEDULES),
+        runner.worker(TASK_QUEUE, workflows=[ReguaWorkflow], service=svc, schedules=SCHEDULES),
         processes.worker(SERVICE, ACTIONS, svc),  # os jobs financeiro.<ação> do motor (core/processes.py)
     ):
         await plans.declare(MODULE)
-        await processes.declare(ACTIONS)  # o catálogo de ações vai para o svc-processos
+        await processes.declare(ACTIONS, MODELS)  # o catálogo de ações e os modelos vão para o svc-processos
         yield
 
 
@@ -50,3 +52,8 @@ resources.mount(app, RESOURCES)  # as rotas dos fornecedores (README §5.19)
 @app.get("/titulos", response_model=ResponseEnvelope)
 async def titulos(data: Annotated[TituloQuery, Query()]) -> ResponseEnvelope:
     return ResponseEnvelope.success(data=await svc.titulos(data), service=SERVICE)
+
+
+@app.get("/faturas", response_model=ResponseEnvelope)
+async def faturas(data: Annotated[FaturaQuery, Query()]) -> ResponseEnvelope:
+    return ResponseEnvelope.success(data=await svc.faturas(data), service=SERVICE)

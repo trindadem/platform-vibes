@@ -39,6 +39,15 @@ function andamento(deltas: ProcessosPassoAgente[]): ChatProgress[] {
   return passos;
 }
 
+/** O gatilho em uma frase: evento, agenda (em UTC; Brasília é UTC−3), à mão ou outro processo que termina. */
+function gatilho(t: ProcessosDesenho["versao"]["fluxo"]["gatilho"]): string {
+  const descricao = t.descricao ? `${t.descricao} · ` : "";
+  if (t.tipo === "evento") return `${descricao}evento ${t.evento ?? "?"}`;
+  if (t.tipo === "agenda") return `${descricao}agenda ${t.agenda ?? "?"} (UTC)`;
+  if (t.tipo === "processo") return `${descricao}quando o processo ${t.processo ?? "?"} termina${t.resultado ? ` como ${t.resultado}` : ""}`;
+  return `${descricao}iniciado à mão`;
+}
+
 export default function DesenhoDoProcesso() {
   const { id = "" } = useParams();
   const desenho = useLiveQuery("processos.desenho", processos.abrirDesenho, { processo: id });
@@ -273,6 +282,22 @@ function Desenho({ desenho: consultado, reload }: { desenho: ProcessosDesenho; r
               {avisos.map((p) => p.texto).join(" ")}
             </Alert>
           )}
+          <Card title="Quando começa" description={gatilho(versao.fluxo.gatilho)}>
+            {desenho.inicia.length > 0 && (
+              <Stack gap="sm">
+                <Text size="sm" tone="muted">
+                  Ao terminar, inicia (a cadeia aparece no workspace como um projeto):
+                </Text>
+                {desenho.inicia.map((p) => (
+                  <Row key={p.id} gap="sm">
+                    <TextLink to={`/processos/${p.id}`}>{p.titulo}</TextLink>
+                    {p.resultado && <Badge>quando termina como {p.resultado}</Badge>}
+                    {!p.publicada && <Badge tone="warning">ainda não publicado</Badge>}
+                  </Row>
+                ))}
+              </Stack>
+            )}
+          </Card>
           <Card title="Versões">
             {desenho.versoes.map((v) => (
               <Row key={v.numero} justify="between" wrap={false}>

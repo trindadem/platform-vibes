@@ -52,6 +52,8 @@ from schemas import (
     UsoDeAgente,
     ACOES,
     BIBLIOTECA,
+    CADEIA,
+    MODELOS,
     BUSCA_SUBJECT,
     CONTEXTO_SUBJECT,
     DESCOBERTA_INSTRUCOES,
@@ -61,7 +63,6 @@ from schemas import (
     DOCUMENTO_SUBJECT,
     EXECUCAO_INSTRUCOES,
     EXECUCOES,
-    FLUXOS,
     HISTORY,
     LIVE_DESENHO,
     LIVE_EXECUCOES,
@@ -82,6 +83,13 @@ from schemas import (
     VERSOES,
     WRITERS,
     Achados,
+    AdicionarModelo,
+    EtapaProjeto,
+    ModeloDeclarado,
+    Projeto,
+    ProjetoPage,
+    ProjetoQuery,
+    ProcessoLigado,
     Acompanhamento,
     AcompanhamentoProcesso,
     AjudaIn,
@@ -230,16 +238,39 @@ class ProcessosService:
     async def aceitar(self, data: ProcessoRef) -> Processo:
         return await _mudar(data.id, "aceito")
 
+    async def adicionar(self, data: AdicionarModelo) -> Processo:
+        """A empresa escolhe um modelo direto da biblioteca: o processo nasce aceito (o que já existia desse modelo,
+        sugerido ou recusado, passa a aceito)."""
+        _writer()
+        modelo = _MODELOS[data.modelo]
+        rows = await db.query(f"SELECT * FROM {PROCESSOS} WHERE tenant = $tenant AND modelo = $modelo LIMIT 1", modelo=modelo.id)
+        if rows:
+            if rows[0]["status"] == "aceito":
+                return _processo(rows[0])
+            return await _mudar(_short(rows[0]["id"]), "aceito")
+        row = await db.create(PROCESSOS, {"modelo": modelo.id, "area": modelo.area, "titulo": modelo.titulo, "descricao": modelo.resumo,
+                                          "motivo": None, "origem": "biblioteca", "status": "aceito", "prioridade": "media"})
+        processo = _processo(row)
+        await bus.live(LIVE_PROCESSOS, ProcessoMudou(id=processo.id, action="aceito"))
+        return processo
+
     async def recusar(self, data: ProcessoRef) -> Processo:
         return await _mudar(data.id, "recusado")
 
     # ── Catálogo de ações dos pacotes ────────────────────────────────────────
 
     async def registrar_catalogo(self, data: ActionCatalog) -> Empty:
-        """events.processos.catalogo: o pacote declarou as ações no boot; troca as dele no catálogo."""
+        """events.processos.catalogo: o pacote declarou as ações e os fluxos de partida dos modelos no boot; troca os
+        dele no catálogo. Modelo que não está na biblioteca fica de fora (a biblioteca é o que a Cogniventure vende)."""
         await db.query_shared(f"DELETE FROM {ACOES} WHERE service = $service", service=data.service)
         for acao in data.actions:
             await db.query_shared(f"CREATE {ACOES} CONTENT $acao", acao=acao.model_dump(mode="json"))
+        await db.query_shared(f"DELETE FROM {MODELOS} WHERE service = $service", service=data.service)
+        for modelo in data.models:
+            if modelo.id in _MODELOS:
+                await db.query_shared(f"DELETE FROM {MODELOS} WHERE modelo = $modelo", modelo=modelo.id)  # mudou de pacote
+                await db.query_shared(f"CREATE {MODELOS} CONTENT $m", m={"modelo": modelo.id, "service": data.service,
+                                                                        "fluxo": modelo.fluxo.model_dump(mode="json")})
         return Empty()
 
     async def catalogo(self, data: Empty) -> CatalogoAcoes:
@@ -256,7 +287,7 @@ class ProcessosService:
             _desenhista()
             try:
                 await db.create(VERSOES, {"processo": processo.id, "numero": 1, "status": "rascunho",
-                                          "fluxo": _partida(processo).model_dump(mode="json"), "anteriores": [], "alteracoes": 0})
+                                          "fluxo": (await _partida(processo)).model_dump(mode="json"), "anteriores": [], "alteracoes": 0})
             except ServiceError as exc:  # duas abas abrindo ao mesmo tempo: a outra criou o rascunho 1
                 if exc.code != "ERRO_RECORD_DUPLICATE":
                     raise
@@ -461,7 +492,7 @@ class ProcessosService:
         """events.integracoes.evento: inicia os processos publicados cujo gatilho é este evento e, com chave, entrega a
         mensagem à execução que espera por ela (ex.: banco.pago com o id do pagamento)."""
         origem = bus.message_id()
-        resumo = data.dados.get("nome") or data.dados.get("assunto")
+        resumo = data.dados.get("resumo") or data.dados.get("nome") or data.dados.get("assunto")
         for processo, versao in await _publicados_por_evento(data.nome):
             await _iniciar(processo, versao, origem="evento", gatilho=data.dados, resumo=str(resumo) if resumo else data.nome,
                            chave=f"{origem}:{processo.id}" if origem else None)
@@ -498,7 +529,20 @@ class ProcessosService:
         ligacoes = re.findall(r'<bpmn:sequenceFlow id="([^"]+)" sourceRef="([^"]+)" targetRef="([^"]+)"', bpmn)
         caminho = [*dict.fromkeys(visitados), *(fid for fid, de, para in ligacoes if de in concluidos and para in visitados)]
         atuais = [e["id"] for e in elementos if e["estado"] == "ACTIVE"]
-        return ExecucaoDetalhe(execucao=execucao, bpmn=bpmn, caminho=caminho, atuais=atuais)
+        cadeia = await _etapas(execucao.projeto) if execucao.projeto else []
+        return ExecucaoDetalhe(execucao=execucao, bpmn=bpmn, caminho=caminho, atuais=atuais, cadeia=cadeia)
+
+    async def projetos(self, data: ProjetoQuery) -> ProjetoPage:
+        """As cadeias de processos (um que terminou e iniciou outros), cada uma como um projeto com as execuções dela."""
+        raizes = await db.page(EXECUCOES, data, ExecucaoPage, where="raiz = true")
+        etapas = await _etapas_de([e.id for e in raizes.items])
+        itens = []
+        for raiz in raizes.items:
+            delas = etapas.get(raiz.id) or [EtapaProjeto.model_validate(raiz.model_dump())]
+            status = "atencao" if any(e.status == "incidente" for e in delas) else (
+                "andamento" if any(e.status == "andamento" for e in delas) else "concluido")
+            itens.append(Projeto(id=raiz.id, titulo=raiz.titulo, resumo=raiz.resumo, status=status, etapas=delas, created_at=raiz.created_at))
+        return ProjetoPage(items=itens, total=raizes.total, page=raizes.page, size=raizes.size, pages=raizes.pages)
 
     async def tarefas(self, data: TarefaQuery) -> TarefaPage:
         return await db.page(TAREFAS, data, TarefaPage)
@@ -618,7 +662,8 @@ class ProcessosService:
         """A execução começou (qualquer gatilho): garante o registro dela (a de agenda só se sabe aqui)."""
         if await _execucao_por_instancia(job.instance) is None:
             processo = await _processo_por_id(job.processo)
-            origem = "agenda" if not job.variables.get("gatilho") else "evento"
+            gatilho = job.variables.get("gatilho") or {}
+            origem = gatilho.get("origem") if gatilho.get("origem") in ("manual", "processo") else ("evento" if gatilho else "agenda")
             await _registrar_execucao(processo, job.instance, job.version, origem=origem, resumo=None)
         return None
 
@@ -689,13 +734,19 @@ class ProcessosService:
         return None
 
     async def _job_fim(self, job: Job) -> None:
-        """A execução chegou a um fim: concluída, com o resultado desse fim."""
+        """A execução chegou a um fim: concluída, com o resultado desse fim. Os processos da empresa que começam quando
+        este termina (gatilho por outro processo) são iniciados com as saídas dele: a cadeia vira um projeto."""
         versao = await _versao_do_motor(job.processo, job.version)
         step = Fluxo.model_validate(versao["fluxo"]).step(job.element) if versao else None
         resultado = (step.resultado or step.nome) if step else job.element
         agora = datetime.now(UTC)
-        await _marcar(job.instance, Marco(passo=job.element, nome=step.nome if step else job.element, status="fim", em=agora),
-                      aguardando=None, atual=(None, None), final={"status": "concluida", "resultado": resultado, "concluida_em": agora})
+        antes = await _execucao_por_instancia(job.instance)
+        if antes is None or antes.status != "concluida":  # o ouvinte entregue de novo não repete o marco
+            await _marcar(job.instance, Marco(passo=job.element, nome=step.nome if step else job.element, status="fim", em=agora),
+                          aguardando=None, atual=(None, None), final={"status": "concluida", "resultado": resultado, "concluida_em": agora})
+        execucao = await _execucao_por_instancia(job.instance)
+        if execucao is not None:
+            await _disparar(execucao, resultado, job.variables)
         return None
 
     async def _job_agente(self, job: Job) -> dict[str, Any]:
@@ -867,7 +918,8 @@ async def _publicar(processo: Processo, rascunho: dict[str, Any]) -> Desenho:
     tinha aberto para este desenho (revisão, ajuda)."""
     fluxo = Fluxo.model_validate(rascunho["fluxo"])
     catalogo = await _catalogo()
-    erros = [p for p in _problemas(fluxo, catalogo, await _agentes(obrigatorio=any(s.agente_id for s in fluxo.passos))) if p.nivel == "erro"]
+    erros = [p for p in [*_problemas(fluxo, catalogo, await _agentes(obrigatorio=any(s.agente_id for s in fluxo.passos))),
+                         *await _problemas_da_cadeia(fluxo, processo, await _todos())] if p.nivel == "erro"]
     if erros:
         raise ServiceError("ERRO_PROCESSOS_FLUXO_INVALIDO", "O fluxo tem problemas: " + "; ".join(e.texto for e in erros[:3]), 409)
     motor_id = _motor_id(processo.id)
@@ -1146,18 +1198,20 @@ async def _desenho(processo_id: str) -> Desenho:
     catalogo = await _catalogo()
     versao = Versao.model_validate({**aberta, "pode_desfazer": bool(aberta.get("anteriores"))})
     publicada = next((Fluxo.model_validate(v["fluxo"]) for v in versoes if v["status"] == "publicada"), None)
+    outros = [p for p in await _todos() if p.id != processo.id and p.status == "aceito"]
     return Desenho(
         processo=processo,
         versao=versao,
         versoes=[VersaoResumo(numero=v["numero"], status=v["status"], publicada_em=v.get("publicada_em"),
                               motor_versao=(v.get("motor") or {}).get("versao")) for v in versoes],
         bpmn=to_bpmn(fluxo, process_id=_motor_id(processo_id), name=processo.titulo, actions=catalogo),
-        problemas=_problemas(fluxo, catalogo, await _agentes()),
+        problemas=[*_problemas(fluxo, catalogo, await _agentes()), *await _problemas_da_cadeia(fluxo, processo, outros)],
         mensagens=[MensagemDesenho(id=_short(m["id"]), papel=m["papel"], autor=m.get("autor"), texto=m["texto"],
                                    passos=m.get("passos") or [], created_at=m.get("created_at")) for m in await _mensagens(processo_id)],
         exige_revisao=aberta["status"] != "publicada" and _exige_revisao(fluxo, catalogo, publicada),
-        mudancas=_mudancas(publicada or _partida(processo), fluxo) if aberta["status"] != "publicada" else [],
+        mudancas=_mudancas(publicada or await _partida(processo), fluxo) if aberta["status"] != "publicada" else [],
         regras=await _regras(processo_id),
+        inicia=await _seguintes(processo, outros),
     )
 
 
@@ -1172,16 +1226,19 @@ async def _agentes(*, obrigatorio: bool = False) -> dict[str, AgenteDaEmpresa] |
         return None
 
 
-def _partida(processo: Processo) -> Fluxo:
-    """O fluxo de partida: o modelo da biblioteca, quando há um desenhado; senão, um agente faz o processo."""
-    if processo.modelo in FLUXOS:
-        return FLUXOS[processo.modelo].model_copy(deep=True)
+async def _partida(processo: Processo) -> Fluxo:
+    """O fluxo de partida: o do modelo da biblioteca, como o pacote da área declarou (processos_modelos); sem ele (o
+    pacote não subiu, ou o processo é só da empresa), um agente faz o processo."""
+    if processo.modelo:
+        rows = await db.query_shared(f"SELECT * FROM {MODELOS} WHERE modelo = $modelo LIMIT 1", modelo=processo.modelo)
+        if rows:
+            return ModeloDeclarado.model_validate(rows[0]).fluxo
     modelo = next((m for m in BIBLIOTECA if m.id == processo.modelo), None)
     gatilho = Trigger(tipo="manual", descricao=(modelo.gatilho if modelo else "Pedido do cliente")[:200])
     if modelo and modelo.gatilho.lower().startswith("todo dia"):
-        gatilho = Trigger(tipo="agenda", agenda="0 8 * * *", descricao=modelo.gatilho)
+        gatilho = Trigger(tipo="agenda", agenda="0 11 * * *", descricao=modelo.gatilho)  # 8h em Brasília
     elif modelo and (modelo.gatilho.lower().startswith("todo mês") or modelo.gatilho.lower() == "dia 1"):
-        gatilho = Trigger(tipo="agenda", agenda="0 8 1 * *", descricao=modelo.gatilho)
+        gatilho = Trigger(tipo="agenda", agenda="0 11 1 * *", descricao=modelo.gatilho)
     objetivo = (modelo.roda_sozinho if modelo else processo.descricao)[:600]
     return Fluxo(gatilho=gatilho,
                  passos=[Step(id="executar", tipo="agente", nome=processo.titulo[:80], objetivo=objetivo, excecao=True),
@@ -1217,11 +1274,16 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction], agentes: dict[s
         erro("Gatilho por evento sem o nome do evento.")
     if t.tipo == "agenda" and not t.agenda:
         erro("Gatilho por agenda sem a agenda (cron).")
+    elif t.tipo == "agenda" and len(t.agenda.split()) != 5:
+        erro("A agenda é um cron de 5 campos em UTC: minuto hora dia mês dia-da-semana (ex.: 0 11 * * * = 8h em Brasília).")
+    if t.tipo == "processo" and not t.processo:
+        erro("Gatilho por outro processo sem dizer qual (o modelo da biblioteca ou o id do processo).")
     for f in fluxo.ligacoes:
         if f.para not in ids or (f.de != START and f.de not in ids):
             erro(f"Ligação {f.de} → {f.para} aponta para passo que não existe.", f.de)
     if not any(s.tipo == "fim" for s in fluxo.passos):
         erro("O fluxo precisa de pelo menos um fim.")
+    juncoes = _juncoes(fluxo)
     alcancados, fila = set(), [f.para for f in inicio]
     while fila:
         atual = fila.pop()
@@ -1239,7 +1301,23 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction], agentes: dict[s
             continue
         if not saindo:
             erro(f"{s.nome} não tem caminho depois.", s.id)
-        if s.tipo == "decisao":
+        if s.tipo == "paralelo":
+            entrando = [f for f in fluxo.ligacoes if f.para == s.id]
+            if any(f.condicao for f in saindo):
+                erro(f"{s.nome} é paralelo: os caminhos dele não têm condição (condições só saem de decisões).", s.id)
+            if len(saindo) > 1 and len(entrando) > 1:
+                erro(f"{s.nome} abre e junta ramos ao mesmo tempo: use um paralelo para abrir e outro para juntar.", s.id)
+            elif len(saindo) > 1:
+                juncao = juncoes.get(s.id)
+                if juncao is None:
+                    erro(f"Os ramos de {s.nome} não se juntam num mesmo paralelo (cada ramo precisa chegar nele, sem passar por um fim).", s.id)
+                else:
+                    chegando = sum(1 for f in fluxo.ligacoes if f.para == juncao)
+                    if chegando != len(saindo):
+                        erro(f"{fluxo.step(juncao).nome} espera {chegando} caminhos, mas {s.nome} abre {len(saindo)}: a execução pararia ali.", s.id)
+            elif len(entrando) <= 1:
+                aviso(f"{s.nome} é paralelo mas não abre nem junta ramos.", s.id)
+        elif s.tipo == "decisao":
             padroes = [f for f in saindo if f.condicao is None]
             if len(saindo) < 2:
                 erro(f"A decisão {s.nome} precisa de pelo menos dois caminhos.", s.id)
@@ -1304,6 +1382,93 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction], agentes: dict[s
     return out
 
 
+def _juncoes(fluxo: Fluxo) -> dict[str, str]:
+    """Para cada paralelo que abre ramos, o paralelo onde todos eles se juntam: o primeiro que cada ramo alcança sem
+    passar por um fim (um paralelo aninhado num ramo é atravessado até a junção dele). Sem um comum, fica de fora."""
+    entram: dict[str, int] = {}
+    for f in fluxo.ligacoes:
+        entram[f.para] = entram.get(f.para, 0) + 1
+    memo: dict[str, str | None] = {}
+
+    def juncao(abre: str, pilha: frozenset[str]) -> str | None:
+        if abre in memo or abre in pilha:
+            return memo.get(abre)
+        comuns: list[str] | None = None
+        for f in fluxo.outgoing(abre):
+            achadas = ramo(f.para, pilha | {abre})
+            comuns = achadas if comuns is None else [j for j in comuns if j in achadas]
+        memo[abre] = comuns[0] if comuns else None
+        return memo[abre]
+
+    def ramo(inicio: str, pilha: frozenset[str]) -> list[str]:
+        achadas, vistos, fila = [], set(), [inicio]
+        while fila:
+            no = fila.pop(0)
+            step = fluxo.step(no)
+            if no in vistos or step is None:
+                continue
+            vistos.add(no)
+            if step.tipo == "fim":
+                return []  # um ramo que termina antes de se juntar: a junção esperaria para sempre
+            if step.tipo == "paralelo" and entram.get(no, 0) > 1:
+                achadas.append(no)
+                continue
+            if step.tipo == "paralelo" and len(fluxo.outgoing(no)) > 1:
+                interna = juncao(no, pilha)
+                fila += [g.para for g in fluxo.outgoing(interna)] if interna else []
+                continue
+            fila += [g.para for g in fluxo.outgoing(no)]
+        return achadas
+
+    return {s.id: j for s in fluxo.passos if s.tipo == "paralelo" and len(fluxo.outgoing(s.id)) > 1 and (j := juncao(s.id, frozenset()))}
+
+
+async def _fluxo_vigente(processo: Processo) -> Fluxo:
+    """O fluxo que vale para a cadeia: o publicado; sem ele, o rascunho (ou o fluxo de partida, antes de desenhar)."""
+    versoes = await _versoes(processo.id)
+    for status in ("publicada", "revisao", "rascunho"):
+        if found := next((v for v in versoes if v["status"] == status), None):
+            return Fluxo.model_validate(found["fluxo"])
+    return await _partida(processo)
+
+
+def _fins(fluxo: Fluxo) -> list[str]:
+    return [s.resultado or s.nome for s in fluxo.passos if s.tipo == "fim"]
+
+
+async def _problemas_da_cadeia(fluxo: Fluxo, processo: Processo, processos: list[Processo]) -> list[Problema]:
+    """O gatilho por outro processo aponta para um processo da empresa que existe, não é ele mesmo e termina com o
+    resultado pedido (senão este nunca começa)."""
+    t = fluxo.gatilho
+    if t.tipo != "processo" or not t.processo:
+        return []
+    if t.processo in (processo.id, processo.modelo):
+        return [Problema(nivel="erro", texto="O processo não pode começar quando ele mesmo termina.")]
+    origem = next((p for p in processos if p.id != processo.id and t.processo in (p.id, p.modelo) and p.status == "aceito"), None)
+    nome = origem.titulo if origem else (_MODELOS[t.processo].titulo if t.processo in _MODELOS else t.processo)
+    if origem is None:
+        return [Problema(nivel="aviso", texto=f"{nome} não está entre os processos aceitos da empresa: este só começa quando ele terminar.")]
+    out = []
+    if origem.publicada is None:
+        out.append(Problema(nivel="aviso", texto=f"{nome} ainda não está publicado: este processo só começa quando ele terminar."))
+    fins = _fins(await _fluxo_vigente(origem))
+    if t.resultado and _normal(t.resultado) not in {_normal(f) for f in fins}:
+        out.append(Problema(nivel="aviso", texto=f"{nome} nunca termina como {t.resultado} (os fins dele: {', '.join(fins) or 'nenhum'})."))
+    return out
+
+
+async def _seguintes(processo: Processo, processos: list[Processo]) -> list[ProcessoLigado]:
+    """Os processos aceitos da empresa que começam quando este termina: a cadeia que o desenho mostra."""
+    out = []
+    for outro in processos:
+        if outro.id == processo.id or outro.status != "aceito":
+            continue
+        gatilho = (await _fluxo_vigente(outro)).gatilho
+        if gatilho.tipo == "processo" and gatilho.processo in (processo.id, processo.modelo):
+            out.append(ProcessoLigado(id=outro.id, titulo=outro.titulo, resultado=gatilho.resultado, publicada=outro.publicada))
+    return out
+
+
 def _tipo_do_valor(valor: Any) -> str:
     return "sim_nao" if isinstance(valor, bool) else "numero" if isinstance(valor, int | float) else "texto"
 
@@ -1363,7 +1528,8 @@ def _exige_revisao(fluxo: Fluxo, catalogo: dict[str, CatalogAction], publicada: 
 
 def _resumo_fluxo(fluxo: Fluxo) -> str:
     t = fluxo.gatilho
-    linhas = [f"Gatilho: {t.tipo}" + (f" ({t.evento or t.agenda})" if t.evento or t.agenda else "") + (f" — {t.descricao}" if t.descricao else "")]
+    origem = t.evento or t.agenda or (f"{t.processo} termina{' como ' + t.resultado if t.resultado else ''}" if t.processo else None)
+    linhas = [f"Gatilho: {t.tipo}" + (f" ({origem})" if origem else "") + (f" — {t.descricao}" if t.descricao else "")]
     if fluxo.parametros:
         linhas.append("Parâmetros: " + ", ".join(f"{k} = {v}" for k, v in fluxo.parametros.items()))
     linhas.append("Passos:")
@@ -1456,6 +1622,8 @@ def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction], agentes: 
                     raise ValueError(f"não existe o passo {dados.depois_de}")
                 if anterior is not None and anterior.tipo == "decisao":
                     raise ValueError("depois de uma decisão, use ligar com a condição do caminho")
+                if anterior is not None and anterior.tipo == "paralelo" and len(fluxo.outgoing(anterior.id)) > 1:
+                    raise ValueError("depois de um paralelo que abre ramos, use ligar para pôr o passo num ramo")
                 saindo = fluxo.outgoing(dados.depois_de)
                 for f in saindo:
                     fluxo.ligacoes.remove(f)
@@ -1502,7 +1670,8 @@ def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction], agentes: 
                 if dados.condicao is not None:
                     raise ValueError(f"condições só saem de decisões: ponha uma decisão depois de {dados.de} "
                                      "(adicionar_passo tipo decisao com depois_de) e a condição nos caminhos dela")
-                if outro := next((f.para for f in fluxo.outgoing(dados.de) if f.para != dados.para), None):
+                outro = next((f.para for f in fluxo.outgoing(dados.de) if f.para != dados.para), None)
+                if outro and not (origem is not None and origem.tipo == "paralelo"):
                     raise ValueError(f"{dados.de} já segue para {outro} e só tem um caminho; para trocar, desligue antes; "
                                      "para escolher entre caminhos, use uma decisão")
             fluxo.ligacoes = [f for f in fluxo.ligacoes if not (f.de == dados.de and f.para == dados.para)]
@@ -1605,53 +1774,83 @@ def _avaliar_uma(condicao: Any, variaveis: dict[str, Any]) -> bool:
 
 
 def _simular(fluxo: Fluxo, catalogo: dict[str, CatalogAction], cenario: Cenario) -> Simulacao:
-    """Percorre o fluxo como o motor faria, com as saídas de exemplo; devolve o caminho para pintar no diagrama."""
+    """Percorre o fluxo como o motor faria, com as saídas de exemplo; devolve o caminho para pintar no diagrama. Um
+    paralelo percorre os ramos um depois do outro até a junção e segue dali."""
     variaveis: dict[str, Any] = {"parametros": dict(fluxo.parametros)}
     caminho: list[str] = [START]
     passos: list[PassoSimulado] = []
     problemas = [p.texto for p in _problemas(fluxo, catalogo) if p.nivel == "erro"]
-    proximo = next((f.para for f in fluxo.outgoing(START)), None)
-    if proximo:
-        caminho.append(f"f_{START}_{proximo}")
+    juncoes = _juncoes(fluxo)
+    voltas = [0]
     sobrepor = lambda passo, saida: {**saida, **{k.partition(".")[2]: v for k, v in cenario.valores.items() if k.partition(".")[0] == passo}}  # noqa: E731
-    for _ in range(200):
-        step = fluxo.step(proximo) if proximo else None
-        if step is None:
-            return Simulacao(caminho=caminho, passos=passos, fim=None, problemas=problemas or ["O caminho parou num passo que não existe."])
-        caminho.append(step.id)
-        nota, seguinte = "", next((f.para for f in fluxo.outgoing(step.id)), None)
-        if step.tipo == "acao":
-            saida = sobrepor(step.id, dict(catalogo[step.acao].example) if step.acao in catalogo else {})
-            variaveis[step.id], nota = saida, ", ".join(f"{k} = {v}" for k, v in saida.items())
-        elif step.tipo == "agente":
-            saida = sobrepor(step.id, {k: step.exemplo.get(k) for k in step.saidas})
-            variaveis[step.id], nota = saida, ", ".join(f"{k} = {v}" for k, v in saida.items() if v is not None)
-        elif step.tipo == "tarefa":
-            aprovado = step.id not in cenario.recusas
-            variaveis[step.id], nota = {"aprovado": aprovado}, f"{step.responsavel or 'pessoa'} respondeu {'sim' if aprovado else 'não'}"
-        elif step.tipo == "decisao":
-            escolhido = next((f for f in fluxo.outgoing(step.id) if f.condicao and _avaliar(f.condicao, variaveis)), None)
-            escolhido = escolhido or next((f for f in fluxo.outgoing(step.id) if f.condicao is None), None)
-            seguinte = escolhido.para if escolhido else None
-            nota = f"seguiu para {fluxo.step(seguinte).nome if seguinte and fluxo.step(seguinte) else '?'}"
-        elif step.tipo == "espera":
-            nota = f"chegou {step.mensagem}" if step.espera == "mensagem" else f"esperou {step.horas or 0:g} h"
-        if step.tipo in ("acao", "agente") and step.id in cenario.excecoes and step.excecao:
-            caminho += [f"{step.id}__erro", f"f_{step.id}__erro", f"{step.id}__excecao"]
-            nota = "caiu na exceção: o staff resolveu"
-            if seguinte:
-                caminho.append(f"f_{step.id}__excecao_{seguinte}")
-                passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=nota))
-                proximo = seguinte
+
+    def andar(proximo: str | None, parar: str | None = None) -> tuple[str, str | None]:
+        """Anda até parar (a junção de um paralelo) ou até um fim: ("parou" | "fim" | "erro", resultado ou problema)."""
+        while True:
+            voltas[0] += 1
+            if voltas[0] > 200:
+                return "erro", "O fluxo voltou muitas vezes (laço sem saída)."
+            if parar is not None and proximo == parar:
+                return "parou", None
+            step = fluxo.step(proximo) if proximo else None
+            if step is None:
+                return "erro", "O caminho parou num passo que não existe."
+            caminho.append(step.id)
+            saindo = fluxo.outgoing(step.id)
+            nota, seguinte = "", next((f.para for f in saindo), None)
+            if step.tipo == "paralelo" and len(saindo) > 1:
+                passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=f"abriu {len(saindo)} ramos ao mesmo tempo"))
+                juncao = juncoes.get(step.id)
+                if juncao is None:
+                    return "erro", f"Os ramos de {step.nome} não se juntam."
+                for f in saindo:
+                    caminho.append(f"f_{step.id}_{f.para}")
+                    como, texto = andar(f.para, parar=juncao)
+                    if como != "parou":
+                        return como, texto
+                proximo = juncao
                 continue
-        passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=nota))
-        if step.tipo == "fim":
-            return Simulacao(caminho=caminho, passos=passos, fim=step.resultado or step.nome, problemas=problemas)
-        if not seguinte:
-            return Simulacao(caminho=caminho, passos=passos, fim=None, problemas=problemas or [f"{step.nome} não tem caminho depois."])
-        caminho.append(f"f_{step.id}_{seguinte}")
-        proximo = seguinte
-    return Simulacao(caminho=caminho, passos=passos, fim=None, problemas=["O fluxo voltou muitas vezes (laço sem saída)."])
+            if step.tipo == "acao":
+                saida = sobrepor(step.id, dict(catalogo[step.acao].example) if step.acao in catalogo else {})
+                variaveis[step.id], nota = saida, ", ".join(f"{k} = {v}" for k, v in saida.items())
+            elif step.tipo == "agente":
+                saida = sobrepor(step.id, {k: step.exemplo.get(k) for k in step.saidas})
+                variaveis[step.id], nota = saida, ", ".join(f"{k} = {v}" for k, v in saida.items() if v is not None)
+            elif step.tipo == "tarefa":
+                aprovado = step.id not in cenario.recusas
+                variaveis[step.id], nota = {"aprovado": aprovado}, f"{step.responsavel or 'pessoa'} respondeu {'sim' if aprovado else 'não'}"
+            elif step.tipo == "decisao":
+                escolhido = next((f for f in saindo if f.condicao and _avaliar(f.condicao, variaveis)), None)
+                escolhido = escolhido or next((f for f in saindo if f.condicao is None), None)
+                seguinte = escolhido.para if escolhido else None
+                nota = f"seguiu para {fluxo.step(seguinte).nome if seguinte and fluxo.step(seguinte) else '?'}"
+            elif step.tipo == "espera":
+                nota = f"chegou {step.mensagem}" if step.espera == "mensagem" else f"esperou {step.horas or 0:g} h"
+            elif step.tipo == "paralelo":
+                nota = "todos os ramos chegaram"
+            if step.tipo in ("acao", "agente") and step.id in cenario.excecoes and step.excecao:
+                caminho.extend([f"{step.id}__erro", f"f_{step.id}__erro", f"{step.id}__excecao"])
+                nota = "caiu na exceção: o staff resolveu"
+                if seguinte:
+                    caminho.append(f"f_{step.id}__excecao_{seguinte}")
+                    passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=nota))
+                    proximo = seguinte
+                    continue
+            passos.append(PassoSimulado(id=step.id, nome=step.nome, tipo=step.tipo, nota=nota))
+            if step.tipo == "fim":
+                return "fim", step.resultado or step.nome
+            if not seguinte:
+                return "erro", f"{step.nome} não tem caminho depois."
+            caminho.append(f"f_{step.id}_{seguinte}")
+            proximo = seguinte
+
+    primeiro = next((f.para for f in fluxo.outgoing(START)), None)
+    if primeiro:
+        caminho.append(f"f_{START}_{primeiro}")
+    como, texto = andar(primeiro)
+    if como == "fim":
+        return Simulacao(caminho=caminho, passos=passos, fim=texto, problemas=problemas)
+    return Simulacao(caminho=caminho, passos=passos, fim=None, problemas=problemas or [texto or "O caminho parou."])
 
 
 async def _publicados_por_evento(evento: str) -> list[tuple[Processo, dict[str, Any]]]:
@@ -1670,34 +1869,40 @@ async def _publicados_por_evento(evento: str) -> list[tuple[Processo, dict[str, 
 
 
 async def _iniciar(processo: Processo, versao: dict[str, Any], *, origem: str, gatilho: dict[str, Any], resumo: str | None,
-                   chave: str | None = None) -> Execucao:
-    """Inicia no motor (com o limite do plano conferido antes) e registra a execução."""
+                   chave: str | None = None, pai: Execucao | None = None) -> Execucao:
+    """Inicia no motor (com o limite do plano conferido antes) e registra a execução; pai: a execução do processo que
+    terminou e iniciou esta (a cadeia)."""
     if chave:
         existente = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND gatilho_id = $g LIMIT 1", g=chave)
         if existente:
             return Execucao.model_validate(existente[0])  # o mesmo evento entregue de novo
     await plans.check("execucoes")
     iniciada = await camunda.start(_motor_id(processo.id), {"gatilho": gatilho})
-    execucao = await _registrar_execucao(processo, iniciada.instance, iniciada.version, origem=origem, resumo=resumo, gatilho_id=chave)
+    execucao = await _registrar_execucao(processo, iniciada.instance, iniciada.version, origem=origem, resumo=resumo, gatilho_id=chave,
+                                         pai=pai)
     await plans.use("execucoes", 1, key=f"execucao-{iniciada.instance}")
     return execucao
 
 
 async def _registrar_execucao(processo: Processo, instancia: str, motor_versao: int, *, origem: str, resumo: str | None,
-                              gatilho_id: str | None = None) -> Execucao:
+                              gatilho_id: str | None = None, pai: Execucao | None = None) -> Execucao:
     versao = await _versao_do_motor(processo.id, motor_versao)
     dados = {"instancia": instancia, "processo": processo.id, "titulo": processo.titulo, "versao": versao["numero"] if versao else None,
              "motor_versao": motor_versao, "status": "andamento", "origem": origem, "resumo": resumo, "handoffs": 0, "saidas": {},
              "marcos": [Marco(passo=START, nome="Início", status="iniciada", em=datetime.now(UTC), motivo=resumo).model_dump(mode="json")]}
     if gatilho_id:
         dados["gatilho_id"] = gatilho_id
+    if pai is not None:  # a cadeia: a primeira execução dela é o projeto
+        dados |= {"pai": pai.id, "projeto": pai.projeto or pai.id, "nivel": pai.nivel + 1}
+        if pai.projeto is None:
+            await db.merge(f"{EXECUCOES}:{pai.id}", {"projeto": pai.id, "raiz": True})
     try:
         row = await db.create(EXECUCOES, dados)
     except ServiceError as exc:  # o ouvinte do começo registrou antes: completa o que ele não sabia
         if exc.code != "ERRO_RECORD_DUPLICATE":
             raise
         rows = await db.query(f"UPDATE {EXECUCOES} MERGE $m WHERE tenant = $tenant AND instancia = $i RETURN AFTER", i=instancia,
-                              m={k: v for k, v in dados.items() if k in ("origem", "resumo", "gatilho_id") and v is not None})
+                              m={k: v for k, v in dados.items() if k in ("origem", "resumo", "gatilho_id", "pai", "projeto", "nivel") and v is not None})
         row = rows[0]
     execucao = Execucao.model_validate(row)
     await bus.live(LIVE_EXECUCOES, ExecucaoMudou(id=execucao.id, action="iniciada"))
@@ -1707,6 +1912,53 @@ async def _registrar_execucao(processo: Processo, instancia: str, motor_versao: 
 async def _execucao_por_instancia(instancia: str) -> Execucao | None:
     rows = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND instancia = $i LIMIT 1", i=instancia)
     return Execucao.model_validate(rows[0]) if rows else None
+
+
+async def _disparar(execucao: Execucao, resultado: str, variaveis: dict[str, Any]) -> None:
+    """A execução terminou: inicia cada processo publicado da organização cujo gatilho é este processo (pelo modelo ou
+    pelo id) com este resultado, com as saídas dela no gatilho. Uma vez por processo (o ouvinte pode vir de novo); a
+    cadeia para em CADEIA processos (um laço entre processos não roda para sempre)."""
+    origem = await _processo_por_id(execucao.processo)
+    if execucao.nivel + 1 >= CADEIA:
+        return
+    dados = dict(variaveis.get("gatilho") or {})
+    for nome, valor in variaveis.items():
+        if isinstance(valor, dict) and nome not in ("gatilho", "parametros", "entrada", "mensagem"):
+            dados |= {k: v for k, v in valor.items() if isinstance(v, str | int | float | bool)}
+    dados |= {"origem": "processo", "execucao_origem": execucao.id, "processo_origem": origem.titulo, "resultado_origem": resultado}
+    for processo in await _todos():
+        if processo.publicada is None or processo.id == origem.id:
+            continue
+        publicada = next((v for v in await _versoes(processo.id) if v["status"] == "publicada"), None)
+        gatilho = Fluxo.model_validate(publicada["fluxo"]).gatilho if publicada else None
+        if gatilho is None or gatilho.tipo != "processo" or gatilho.processo not in (origem.id, origem.modelo):
+            continue
+        if gatilho.resultado and _normal(gatilho.resultado) != _normal(resultado):
+            continue
+        resumo = f"{origem.titulo}: {resultado}" + (f" ({execucao.resumo})" if execucao.resumo else "")
+        try:
+            await _iniciar(processo, publicada, origem="processo", gatilho=dados, resumo=resumo[:300],
+                           chave=f"{execucao.instancia}:{processo.id}", pai=execucao)
+        except ServiceError as exc:
+            if exc.status >= 500:
+                raise  # o motor fora do ar: o ouvinte volta e tenta de novo (a chave impede iniciar duas vezes)
+            await _marcar(execucao.instancia, Marco(passo=START, nome=f"Não iniciou {processo.titulo}", status="incidente",
+                                                    em=datetime.now(UTC), motivo=exc.message))
+
+
+async def _etapas_de(projetos: list[str]) -> dict[str, list[EtapaProjeto]]:
+    """As execuções de cada projeto, na ordem em que começaram."""
+    if not projetos:
+        return {}
+    rows = await db.query(f"SELECT * FROM {EXECUCOES} WHERE tenant = $tenant AND projeto IN $p ORDER BY created_at", p=projetos)
+    out: dict[str, list[EtapaProjeto]] = {}
+    for row in rows:
+        out.setdefault(row["projeto"], []).append(EtapaProjeto.model_validate(row))
+    return out
+
+
+async def _etapas(projeto: str) -> list[EtapaProjeto]:
+    return (await _etapas_de([projeto])).get(projeto, [])
 
 
 async def _marcar(instancia: str, marco: Marco, *, saida: tuple[str, dict[str, Any]] | None = None, aguardando: Any = ...,
@@ -1771,7 +2023,17 @@ def _quando(valor: Any) -> datetime | None:
 
 _ROTULOS = {"fornecedor": "Fornecedor", "cnpj": "CNPJ", "valor": "Valor", "vencimento": "Vencimento", "linha_digitavel": "Linha digitável",
             "nome": "Documento", "de": "De", "assunto": "Assunto", "divergente": "Diverge do pedido", "diferenca": "Diferença",
-            "fornecedor_novo": "Fornecedor novo", "pedido": "Pedido ou contrato", "conta": "Conta", "pagamento_id": "Pagamento", "data": "Data"}
+            "fornecedor_novo": "Fornecedor novo", "pedido": "Pedido ou contrato", "conta": "Conta", "pagamento_id": "Pagamento", "data": "Data",
+            # N7: os pacotes de área
+            "processo_origem": "Iniciado por", "cliente": "Cliente", "email": "E-mail", "descricao": "Descrição", "desconto": "Desconto (%)",
+            "validade": "Validade", "parte": "Parte", "objeto": "Objeto", "pontos": "Pontos de atenção", "risco_alto": "Risco alto",
+            "inicio": "Início", "fim": "Fim", "cargo": "Cargo", "colaborador": "Colaborador", "item": "Item", "quantidade": "Quantidade",
+            "melhor_fornecedor": "Melhor cotação", "melhor_valor": "Valor da melhor cotação", "recebidas": "Cotações recebidas",
+            "prazo_dias": "Prazo de entrega (dias)", "referencia": "Mês", "pendencias": "Pendências", "resumo": "Resumo",
+            "novas": "Intimações novas", "prazo_final": "Prazo final", "positivas": "Certidões positivas", "proximos": "Vencimentos próximos",
+            "exige_presenca": "Exigem presença ou vistoria", "qualificado": "Qualificado", "quer_humano": "Pediu atendimento humano",
+            "interesse": "Interesse", "telefone": "Telefone", "nota_numero": "Nota fiscal", "valor_sem_par": "Valor sem par", "sem_par": "Lançamentos sem par"}
+_DINHEIRO = ("valor", "diferenca", "melhor_valor", "valor_sem_par")
 
 
 def _contexto_tarefa(dados: dict[str, Any]) -> list[Item]:
@@ -1780,7 +2042,7 @@ def _contexto_tarefa(dados: dict[str, Any]) -> list[Item]:
     for campo, valor in dados.items():
         if campo in _ROTULOS and valor not in (None, "", {}):
             texto = ("Sim" if valor else "Não") if isinstance(valor, bool) else (
-                f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if campo in ("valor", "diferenca") and isinstance(valor, (int, float)) else str(valor))
+                f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if campo in _DINHEIRO and isinstance(valor, (int, float)) else str(valor))
             itens.append(Item(rotulo=_ROTULOS[campo], valor=texto[:200]))
     return itens
 

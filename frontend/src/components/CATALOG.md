@@ -6,7 +6,7 @@
 > `src/components/<Nome>.tsx` com JSDoc (frase, `@category`, `@example`) e `<Nome>Props` documentado.
 > Os exemplos usam dados fictícios (`faturas`, `lista`, `fatura`, `criar`, `nome`...) e o TypeScript confere cada um.
 
-## Índice (49)
+## Índice (50)
 
 **Receitas**: telas e dados prontos: comece por aqui
 
@@ -37,6 +37,7 @@
 - [KeyValue](#keyvalue): Lista de pares rótulo/valor para detalhes de um registro. `items, stacked?`
 - [Pagination](#pagination): Rodapé de lista paginada: quais itens estão na tela, de quantos, e os botões de página anterior e seguinte. `page, pages, total, size, onPage, noun?`
 - [Picture](#picture): Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, miniatura). `src, alt, size?`
+- [ProjectChain](#projectchain): Projeto: a cadeia de processos que um começou (uma proposta aceita inicia o contrato e o faturamento), com cada execução, o que ela espera e o caminho para abri-la. `title, status, steps, description?`
 - [Stat](#stat): Indicador em destaque: rótulo, valor grande e contexto. `label, value, hint?, tone?`
 - [UsageMeter](#usagemeter): Barra de uso de um limite: quanto foi usado de quanto é permitido, em alerta a partir de 80% e cheia em 100%. `label, used, limit, format?, hint?`
 
@@ -385,7 +386,7 @@ Abas que dividem uma tela em partes do mesmo assunto. A aba aberta fica no fragm
 />
 ```
 
-- `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada.
+- `tabs`: `{ id: string; label: string; content: ReactNode }[]`: Abas na ordem: { id, label, content }. O id vira o fragmento da URL (/tela#id); só a aba aberta fica montada, e trocar de aba limpa os parâmetros da lista (?page=&q=...).
 
 ---
 
@@ -496,6 +497,30 @@ Imagem quadrada que se ajusta ao espaço sem distorcer (logo, foto de perfil, mi
 
 ---
 
+## ProjectChain
+
+Projeto: a cadeia de processos que um começou (uma proposta aceita inicia o contrato e o faturamento), com cada execução, o que ela espera e o caminho para abri-la. _(Dados)_
+
+```tsx
+<ProjectChain
+  title="Proposta comercial"
+  description="Proposta para Padaria Pão Quente"
+  status="andamento"
+  steps={[
+    { key: "e1", title: "Proposta comercial", status: "concluida", detail: "Terminou: aceita", to: "/processos/execucoes/e1" },
+    { key: "e2", title: "Gestão de contratos", status: "andamento", detail: "Com o staff: Coletar as assinaturas", level: 1 },
+    { key: "e3", title: "Faturamento e cobrança", status: "andamento", detail: "Aguardando o pagamento", level: 1 },
+  ]}
+/>
+```
+
+- `title`: `string`: Nome do projeto (o processo que começou a cadeia).
+- `description?`: `string`: O que começou o projeto (ex.: "Proposta para Padaria Pão Quente").
+- `status`: `"andamento" | "concluido" | "atencao"`: andamento, concluido ou atencao (alguma etapa com incidente).
+- `steps`: `ProjectChainStep[]`: As etapas na ordem em que começaram.
+
+---
+
 ## Stat
 
 Indicador em destaque: rótulo, valor grande e contexto. Use dentro de Grid. _(Dados)_
@@ -561,7 +586,7 @@ Data e hora em pt-BR; a data completa aparece ao passar o mouse. _(Formatação)
 <DateTime value="2026-10-01T14:30:00Z" format="relative" />
 ```
 
-- `value`: `string | Date | null | undefined`: Data ISO (como vem do backend) ou Date; vazia ou inválida vira "—".
+- `value`: `string | Date | null | undefined`: Data ISO (como vem do backend) ou Date; vazia ou inválida vira "—". Só a data (2026-10-01) é o dia no fuso de quem vê.
 - `format?`: `"date" | "datetime" | "time" | "relative"`: date (01/10/2026), datetime (01/10/2026 14:30), time (14:30) ou relative (há 5 minutos). Padrão: datetime.
 
 ---

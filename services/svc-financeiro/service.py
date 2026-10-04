@@ -3,35 +3,78 @@
 Trilho (validado no import por @activities): todo método público é async, recebe 1 modelo de schemas.py e retorna 1
 modelo de schemas.py. As ações do pacote (schemas.ACTIONS) são métodos de mesmo nome: o worker do motor de processos
 (core/processes.py) as chama como a organização do processo, com a entrada vinda dos passos anteriores.
+O banco e o e-mail são do svc-integracoes (rpc.integracoes.*): sem a conexão, o 409 de lá vira a exceção do staff.
 """
 import re
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from nats.errors import Error as NatsError
+from pydantic import BaseModel
 
 from core.envelope import ServiceError
 from core.nats_bus import bus
+from core.notify import notify
 from core.processes import Handoff
 from core.resources import resources
+from core.security import acting_as, system
 from core.surreal import Migration, db
 from core.temporal_runner import activities
 
 from schemas import (
     AGENDAR_SUBJECT,
+    ALIQUOTA_PADRAO,
+    COBRAR_SUBJECT,
     CONTA_PADRAO,
+    EMAIL_SUBJECT,
+    EXTRATO_SUBJECT,
+    FATURAS,
     FORNECEDORES,
+    LIVE_FATURAS,
     LIVE_TITULOS,
+    PRAZO_PADRAO,
+    REGUA,
+    SERVICE,
     TITULOS,
     Agendamento,
     AgendarPagamento,
+    Apuracao,
+    Baixa,
     Classificacao,
+    Cobranca,
+    CobrancaEmitida,
+    CobrancaIn,
+    CobrarNoBanco,
     Comprovante,
     Conciliacao,
+    ConciliacaoDia,
     Conferencia,
+    Das,
     Documento,
+    Dre,
+    EmailEnviado,
+    Empty,
+    EnviarEmail,
+    Envio,
+    EnvioContador,
+    Extrato,
+    ExtratoPedido,
+    Fatura,
+    FaturaAberta,
+    Faturamento,
+    FaturaMudou,
+    FaturaPage,
+    FaturaQuery,
     Fornecedor,
+    Janela,
+    Mes,
+    Nota,
+    NotaIn,
     Pagamento,
     PagamentoAgendado,
+    Pendencias,
+    Recebimento,
+    Regua,
     Titulo,
     TituloMudou,
     TituloPage,
@@ -75,14 +118,12 @@ class FinanceiroService:
 
     async def agendar_pagamento(self, data: Pagamento) -> Agendamento:
         """Agenda no banco conectado da organização (svc-integracoes) e abre o título a pagar."""
-        try:
-            agendado = await bus.request(AGENDAR_SUBJECT, AgendarPagamento(
-                valor=data.valor, vencimento=data.vencimento, fornecedor=data.fornecedor, linha_digitavel=data.linha_digitavel,
-            ), PagamentoAgendado, timeout=10)
-        except NatsError:
-            raise ServiceError("ERRO_FINANCEIRO_BANCO_FORA", "O serviço de integrações não respondeu.", 503) from None
+        agendado = await _integracoes(AGENDAR_SUBJECT, AgendarPagamento(
+            valor=data.valor, vencimento=data.vencimento, fornecedor=data.fornecedor, linha_digitavel=data.linha_digitavel,
+        ), PagamentoAgendado)
         row = await db.create(TITULOS, {"fornecedor": data.fornecedor, "valor": data.valor, "vencimento": data.vencimento,
-                                        "data": agendado.data, "pagamento_id": agendado.pagamento_id, "status": "agendado"})
+                                        "data": agendado.data, "pagamento_id": agendado.pagamento_id, "status": "agendado",
+                                        "conciliado": False})
         await bus.live(LIVE_TITULOS, TituloMudou(id=Titulo.model_validate(row).id, action="agendado"))
         return Agendamento(pagamento_id=agendado.pagamento_id, data=agendado.data)
 
@@ -97,10 +138,172 @@ class FinanceiroService:
             await bus.live(LIVE_TITULOS, TituloMudou(id=titulo.id, action="pago"))
         return Conciliacao(conciliado=True, diferenca=0)
 
-    # ── Tela ─────────────────────────────────────────────────────────────────
+    # ── Conciliação bancária ─────────────────────────────────────────────────
+
+    async def conciliar_extrato(self, data: Janela) -> ConciliacaoDia:
+        """Casa cada lançamento do extrato com um título (pagamento) ou uma fatura (recebimento) da empresa; o que não
+        casa é sem par (o staff classifica quando passa da tolerância)."""
+        desde = (date.today() - timedelta(days=max(1, data.dias or 1))).isoformat()
+        extrato = await _integracoes(EXTRATO_SUBJECT, ExtratoPedido(desde=desde), Extrato)
+        conciliados, sem_par, valor_sem_par = 0, 0, 0.0
+        for item in extrato.itens:
+            if item.tipo == "pagamento":
+                rows = await db.query(f"SELECT * FROM {TITULOS} WHERE tenant = $tenant AND pagamento_id = $id LIMIT 1", id=item.id)
+                if rows:
+                    titulo = Titulo.model_validate(rows[0])
+                    await db.merge(f"{TITULOS}:{titulo.id}", {"status": "pago", "conciliado": True})
+                    await bus.live(LIVE_TITULOS, TituloMudou(id=titulo.id, action="conciliado"))
+            else:
+                rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant AND cobranca_id = $id LIMIT 1", id=item.id)
+                if rows:
+                    fatura = Fatura.model_validate(rows[0])
+                    await db.merge(f"{FATURAS}:{fatura.id}", {"conciliada": True})
+            if rows:
+                conciliados += 1
+            else:
+                sem_par += 1
+                valor_sem_par += abs(item.valor)
+        return ConciliacaoDia(lancamentos=len(extrato.itens), conciliados=conciliados, sem_par=sem_par, valor_sem_par=round(valor_sem_par, 2))
+
+    # ── Faturamento e cobrança ───────────────────────────────────────────────
+
+    async def faturar(self, data: Faturamento) -> FaturaAberta:
+        """Abre a fatura da venda: quem paga, o quê, quanto e quando vence (hoje + o prazo do processo)."""
+        faltam = [nome for nome, valor in (("cliente", data.cliente), ("valor", data.valor)) if valor in (None, "")]
+        if faltam or (data.valor or 0) <= 0:
+            raise Handoff(f"Faltam dados para faturar: {', '.join(faltam) or 'valor maior que zero'}.")
+        vencimento = (date.today() + timedelta(days=data.prazo_pagamento or PRAZO_PADRAO)).isoformat()
+        row = await db.create(FATURAS, {"cliente": data.cliente, "cnpj": data.cnpj, "email": data.email, "descricao": data.descricao,
+                                        "valor": round(float(data.valor), 2), "vencimento": vencimento, "status": "aberta",
+                                        "regua": [], "conciliada": False, "proposta_id": data.proposta_id})
+        fatura = Fatura.model_validate(row)
+        await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="aberta"))
+        return FaturaAberta(fatura_id=fatura.id, vencimento=vencimento)
+
+    async def emitir_nota(self, data: NotaIn) -> Nota:
+        """A NFS-e sai pela prefeitura do cliente, e a integração ainda não foi escolhida (briefing.md §14, decisão 6):
+        o staff emite no portal e informa o número, que segue para a cobrança."""
+        fatura = await _fatura(data.fatura_id)
+        if fatura.nota_numero:
+            return Nota(nota_numero=fatura.nota_numero)
+        raise Handoff(f"A emissão de NFS-e ainda não tem integração: emita a nota de {fatura.cliente} ({_reais(fatura.valor)}) "
+                      "no portal da prefeitura e informe o número.")
+
+    async def cobrar(self, data: CobrancaIn) -> Cobranca:
+        """Emite o boleto no banco e envia a cobrança por e-mail ao cliente (se ele tem e-mail e a caixa de entrada
+        está conectada; senão, a cobrança fica emitida e enviada = falso)."""
+        fatura = await _fatura(data.fatura_id)
+        if fatura.cobranca_id and fatura.linha_digitavel:
+            return Cobranca(cobranca_id=fatura.cobranca_id, linha_digitavel=fatura.linha_digitavel, vencimento=fatura.vencimento)
+        emitida = await _integracoes(COBRAR_SUBJECT, CobrarNoBanco(valor=fatura.valor, vencimento=fatura.vencimento, pagador=fatura.cliente,
+                                                                  descricao=fatura.descricao), CobrancaEmitida)
+        nota = data.nota_numero or fatura.nota_numero
+        row = await db.merge(f"{FATURAS}:{fatura.id}", {"cobranca_id": emitida.cobranca_id, "linha_digitavel": emitida.linha_digitavel,
+                                                        "nota_numero": nota, "status": "cobrada"})
+        fatura = Fatura.model_validate(row)
+        enviada = False
+        if fatura.email:
+            texto = (f"Olá, {fatura.cliente}.\n\nSegue a cobrança de {fatura.descricao or 'nossa venda'}"
+                     + (f" (nota fiscal {nota})" if nota else "") + f".\n\nValor: {_reais(fatura.valor)}\nVencimento: {_data_br(fatura.vencimento)}\n"
+                     f"Linha digitável: {emitida.linha_digitavel}\n\nObrigado!")
+            enviada = await _email(fatura.email, f"Cobrança: {fatura.descricao or 'venda'}"[:200], texto, obrigatorio=False)
+        await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="cobrada"))
+        return Cobranca(cobranca_id=emitida.cobranca_id, linha_digitavel=emitida.linha_digitavel, vencimento=emitida.vencimento, enviada=enviada)
+
+    async def baixar(self, data: Recebimento) -> Baixa:
+        """A espera do processo acordou (o banco avisou) ou o prazo venceu e o staff negociou: confere no extrato do
+        banco se a cobrança foi recebida e, se foi, a fatura fica paga; senão, recebido = falso."""
+        rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant AND cobranca_id = $c LIMIT 1", c=data.cobranca_id)
+        if not rows:
+            raise Handoff(f"A cobrança {data.cobranca_id} não está nas faturas.")
+        fatura = Fatura.model_validate(rows[0])
+        if fatura.status != "paga":
+            desde = (fatura.created_at or datetime.now(UTC)).date().isoformat()
+            extrato = await _integracoes(EXTRATO_SUBJECT, ExtratoPedido(desde=desde), Extrato)
+            if not any(i.tipo == "recebimento" and i.id == data.cobranca_id for i in extrato.itens):
+                return Baixa(recebido=False, valor=0)
+            await db.merge(f"{FATURAS}:{fatura.id}", {"status": "paga", "recebido_em": datetime.now(UTC)})
+            await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="paga"))
+        return Baixa(recebido=True, valor=fatura.valor)
+
+    # ── Fechamento do mês ────────────────────────────────────────────────────
+
+    async def pendencias_do_mes(self, data: Mes) -> Pendencias:
+        """O que falta para fechar o mês: pagamentos agendados sem comprovante e faturas sem nota fiscal."""
+        referencia = _referencia(data.referencia)
+        titulos = [t for t in await _titulos_do_mes(referencia) if t.status != "pago"]
+        faturas = [f for f in await _faturas_do_mes(referencia) if not f.nota_numero]
+        partes = [f"{len(titulos)} pagamento(s) sem comprovante" if titulos else "", f"{len(faturas)} fatura(s) sem nota fiscal" if faturas else ""]
+        resumo = "; ".join(p for p in partes if p) or "Nada pendente."
+        return Pendencias(referencia=referencia, pendencias=len(titulos) + len(faturas), resumo=resumo)
+
+    async def enviar_ao_contador(self, data: EnvioContador) -> Envio:
+        """O resumo do mês e os lançamentos vão por e-mail ao escritório contábil (o endereço é parâmetro do processo)."""
+        if not data.email_contador or "@" not in data.email_contador:
+            raise Handoff("Falta o e-mail do contador: diga no desenho do processo qual é (parâmetro email_contador).")
+        referencia = _referencia(data.referencia)
+        titulos, faturas = await _titulos_do_mes(referencia), await _faturas_do_mes(referencia)
+        linhas = [f"Fechamento de {referencia}", "", f"Receitas (faturas): {_reais(sum(f.valor for f in faturas))}",
+                  f"Despesas (pagamentos): {_reais(sum(t.valor for t in titulos))}", "", "Faturas:"]
+        linhas += [f"- {_data_br(f.vencimento)} {f.cliente}: {_reais(f.valor)} · nota {f.nota_numero or 'sem nota'}" for f in faturas] or ["- nenhuma"]
+        linhas += ["", "Pagamentos:"]
+        linhas += [f"- {_data_br(t.data)} {t.fornecedor or 'sem fornecedor'}: {_reais(t.valor)} · {t.status}" for t in titulos] or ["- nenhum"]
+        await _email(data.email_contador, f"Fechamento de {referencia}", "\n".join(linhas))
+        return Envio(enviado_em=date.today().isoformat())
+
+    async def apurar_das(self, data: Apuracao) -> Das:
+        """DAS do Simples: a receita do mês (faturas) vezes a alíquota efetiva; vence no dia 20 do mês seguinte."""
+        referencia = _referencia(data.referencia)
+        receita = sum(f.valor for f in await _faturas_do_mes(referencia))
+        ano, mes = (int(p) for p in referencia.split("-"))
+        vencimento = date(ano + (mes == 12), 1 if mes == 12 else mes + 1, 20).isoformat()
+        aliquota = data.aliquota if data.aliquota is not None else ALIQUOTA_PADRAO
+        return Das(valor=round(receita * aliquota / 100, 2), vencimento=vencimento)
+
+    async def montar_dre(self, data: Mes) -> Dre:
+        """A DRE gerencial do mês (receitas das faturas, despesas dos pagamentos) e o aviso à empresa com o resumo."""
+        referencia = _referencia(data.referencia)
+        receita = round(sum(f.valor for f in await _faturas_do_mes(referencia)), 2)
+        despesas = round(sum(t.valor for t in await _titulos_do_mes(referencia)), 2)
+        resultado = round(receita - despesas, 2)
+        resumo = f"{'Lucro' if resultado >= 0 else 'Prejuízo'} de {_reais(abs(resultado))} (receitas {_reais(receita)}, despesas {_reais(despesas)})."
+        await notify.roles("owner", "admin", title=f"DRE de {referencia}", body=resumo, link="/financeiro/receber", key=f"dre-{referencia}")
+        return Dre(referencia=referencia, receita=receita, despesas=despesas, resultado=resultado, resumo=resumo)
+
+    # ── Agendamento: a régua de cobrança (D-3, D+1, D+7) ─────────────────────
+
+    async def regua(self, data: Empty) -> Regua:
+        """Agendado (todo dia): lembra por e-mail o cliente da fatura cobrada e ainda não paga, 3 dias antes do
+        vencimento, um dia depois e uma semana depois (cada lembrete uma vez)."""
+        enviados = 0
+        hoje = date.today()
+        for org in await db.tenants(FATURAS):
+            with acting_as(system(SERVICE, org)):
+                rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant AND status = 'cobrada' AND email != NONE AND email != NULL")
+                for fatura in (Fatura.model_validate(r) for r in rows):
+                    dias = (date.fromisoformat(fatura.vencimento) - hoje).days
+                    etapa = "D+7" if dias <= -7 else "D+1" if dias <= -1 else "D-3" if dias <= 3 else None
+                    if etapa is None or etapa in fatura.regua:
+                        continue
+                    texto = (f"Olá, {fatura.cliente}.\n\nLembrete: a cobrança de {_reais(fatura.valor)} {REGUA[etapa]} "
+                             f"({_data_br(fatura.vencimento)}).\nLinha digitável: {fatura.linha_digitavel or '-'}\n\n"
+                             "Se já pagou, desconsidere. Obrigado!")
+                    try:
+                        await _email(fatura.email or "", f"Lembrete de pagamento: {fatura.descricao or 'cobrança'}"[:200], texto)
+                    except ServiceError:
+                        continue  # sem caixa de entrada ou sem provedor: tenta no dia seguinte
+                    await db.merge(f"{FATURAS}:{fatura.id}", {"regua": [*fatura.regua, etapa]})
+                    await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="lembrete"))
+                    enviados += 1
+        return Regua(lembretes=enviados)
+
+    # ── Telas ────────────────────────────────────────────────────────────────
 
     async def titulos(self, data: TituloQuery) -> TituloPage:
         return await db.page(TITULOS, data, TituloPage)
+
+    async def faturas(self, data: FaturaQuery) -> FaturaPage:
+        return await db.page(FATURAS, data, FaturaPage)
 
 
 async def _fornecedor(data: Documento) -> dict[str, Any] | None:
@@ -116,3 +319,57 @@ async def _fornecedor(data: Documento) -> dict[str, Any] | None:
                               n=data.fornecedor.strip().lower())
         return rows[0] if rows else None
     return None
+
+
+async def _integracoes(subject: str, pedido: BaseModel, modelo: type[Any]) -> Any:
+    """Pede ao svc-integracoes (banco, e-mail) na organização de quem age. Fora do ar: 503 (o motor tenta de novo);
+    o 409 de lá (sem conexão) sobe e vira a exceção do staff."""
+    try:
+        return await bus.request(subject, pedido, modelo, timeout=15)
+    except (NatsError, TimeoutError):
+        raise ServiceError("ERRO_FINANCEIRO_INTEGRACOES_FORA", "O serviço de integrações não respondeu.", 503) from None
+
+
+async def _email(para: str, assunto: str, texto: str, *, obrigatorio: bool = True) -> bool:
+    """E-mail pela caixa de entrada da organização. obrigatorio=False: sem conexão ou sem provedor, devolve False."""
+    try:
+        await _integracoes(EMAIL_SUBJECT, EnviarEmail(para=para, assunto=assunto, texto=texto), EmailEnviado)
+        return True
+    except ServiceError as exc:
+        if obrigatorio or exc.status >= 500:
+            raise
+        return False
+
+
+async def _fatura(fatura_id: str) -> Fatura:
+    row = await db.select(f"{FATURAS}:{fatura_id}") if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", fatura_id or "") else None
+    if row is None:
+        raise Handoff(f"A fatura {fatura_id} não foi encontrada.")
+    return Fatura.model_validate(row)
+
+
+def _referencia(valor: str | None) -> str:
+    """AAAA-MM; vazio (ou fora do formato): o mês passado."""
+    if valor and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", valor):
+        return valor
+    passado = date.today().replace(day=1) - timedelta(days=1)
+    return passado.strftime("%Y-%m")
+
+
+async def _titulos_do_mes(referencia: str) -> list[Titulo]:
+    rows = await db.query(f"SELECT * FROM {TITULOS} WHERE tenant = $tenant AND string::starts_with(data, $mes) ORDER BY data", mes=referencia)
+    return [Titulo.model_validate(r) for r in rows]
+
+
+async def _faturas_do_mes(referencia: str) -> list[Fatura]:
+    """As faturas abertas no mês (a receita do mês é o que foi faturado nele)."""
+    rows = await db.query(f"SELECT * FROM {FATURAS} WHERE tenant = $tenant ORDER BY created_at")
+    return [f for f in (Fatura.model_validate(r) for r in rows) if f.created_at and f.created_at.strftime("%Y-%m") == referencia]
+
+
+def _reais(valor: float) -> str:
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _data_br(valor: str | None) -> str:
+    return "/".join(reversed(valor.split("-"))) if valor and re.fullmatch(r"\d{4}-\d{2}-\d{2}", valor) else (valor or "-")

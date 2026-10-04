@@ -178,23 +178,29 @@ def test_modelos_de_entrada_recusam_o_que_nao_e_da_biblioteca_ou_nao_declarado()
 
 # ── Desenho: catálogo, rascunho, simulação, agente de desenho, versões e publicação ─
 
-from core.processes import ActionCatalog, CatalogAction  # noqa: E402
+import importlib.util  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from core.processes import ActionCatalog, CatalogAction, build_catalog  # noqa: E402
 from core.security import Principal, acting_as  # noqa: E402
 from core.surreal import db  # noqa: E402
 
 from schemas import CATALOG_SUBJECT, PROCESSOS  # noqa: E402
 
 ACME = Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))
-ACOES = ActionCatalog(service="svc-financeiro", actions=[
-    CatalogAction(name="financeiro.conferir_pedido", service="svc-financeiro", title="Conferir", description="Confere", risk="leitura",
-                  output_fields=["divergente", "diferenca"], example={"divergente": False, "diferenca": 0}),
-    CatalogAction(name="financeiro.classificar", service="svc-financeiro", title="Classificar", description="Classifica", risk="escrita",
-                  output_fields=["conta"], example={"conta": "2.1.01"}),
-    CatalogAction(name="financeiro.agendar_pagamento", service="svc-financeiro", title="Agendar", description="Agenda", risk="irreversivel",
-                  connections=["Banco"], output_fields=["pagamento_id", "data"], example={"pagamento_id": "PG-1", "data": "2026-10-15"}),
-    CatalogAction(name="financeiro.conciliar", service="svc-financeiro", title="Conciliar", description="Concilia", risk="escrita",
-                  connections=["Banco"], output_fields=["conciliado"], example={"conciliado": True}),
-])
+PACOTES = ("financeiro", "juridico", "administrativo", "vendas")
+
+
+def _pacote(nome: str) -> ActionCatalog:
+    """O catálogo que o pacote publica no boot (ações e modelos), lido do schemas.py dele: o mesmo que chega aqui."""
+    caminho = Path(__file__).resolve().parent.parent / "services" / f"svc-{nome}" / "schemas.py"
+    spec = importlib.util.spec_from_file_location(f"pacote_{nome}_schemas", caminho)
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return build_catalog(modulo.SERVICE, modulo.ACTIONS, modulo.MODELS)
+
+
+ACOES = _pacote("financeiro")
 
 
 async def _aceito(app, modelo="contas-a-pagar", status="aceito") -> str:
@@ -232,7 +238,7 @@ def test_desenho_abre_o_fluxo_de_partida_e_simula_os_caminhos():
     assert padrao["fim"] == "pago" and "f_precisa_aprovacao_classificar" in padrao["caminho"]
     assert caro_recusado["fim"] == "recusado" and "aprovar" in caro_recusado["caminho"]
     assert "ler_documento__excecao" in ilegivel["caminho"] and ilegivel["fim"] == "pago"
-    assert nao_aceito.status_code == 409 and len(catalogo) == 4
+    assert nao_aceito.status_code == 409 and len(catalogo) == len(ACOES.actions)
 
 
 def _desenhista(estado):
@@ -407,10 +413,8 @@ def test_fluxo_com_erro_nao_publica_e_os_problemas_dizem_o_que_falta():
     # Condição que o motor não consegue avaliar (achado na stack: "agendar.pagamento_id é verdadeiro" virou incidente).
     from core.processes import Condition
 
-    from schemas import FLUXOS
-
     catalogo = {a.name: a for a in ACOES.actions}
-    partida = FLUXOS["contas-a-pagar"]
+    partida = next(m.fluxo for m in ACOES.models if m.id == "contas-a-pagar")
     assert not [p for p in _problemas(partida, catalogo) if p.nivel == "erro"]
     tipos_errados = partida.model_copy(deep=True)
     condicionais = [f for f in tipos_errados.ligacoes if f.condicao is not None]
@@ -765,7 +769,8 @@ def test_passo_feito_por_um_agente_da_empresa_passa_pela_revisao_e_roda_no_svc_a
 
     desenho, dono_publica, voltou, publicado, conferido, aprovar, fora = service_app(cenario)
     conferir = next(p for p in desenho["versao"]["fluxo"]["passos"] if p["id"] == "conferir")
-    assert (conferir["tipo"], conferir["agente_id"], conferir["saidas"], conferir["excecao"]) == ("agente", "ag1", ["divergente", "diferenca"], True)
+    assert (conferir["tipo"], conferir["agente_id"], conferir["excecao"]) == ("agente", "ag1", True)
+    assert conferir["saidas"] == ["divergente", "diferenca", "pedido", "fornecedor_novo"]  # as da ação: as condições adiante valem
     assert conferir["acao"] == "financeiro.conferir_pedido"  # o contrato que o agente cumpre (e para onde volta sem ele)
     respostas_ferramentas = [m["content"] for m in provedor["pedidos"][1]["messages"] if m["role"] == "tool"]
     assert "ainda não passou na suíte" in respostas_ferramentas[0] and "agora é feito pelo agente Conferente" in respostas_ferramentas[1]
@@ -775,10 +780,12 @@ def test_passo_feito_por_um_agente_da_empresa_passa_pela_revisao_e_roda_no_svc_a
     assert publicado["versao"]["status"] == "publicada"
     contexto = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
     assert "ag1 — Conferente de pedidos" in contexto  # o agente de desenho conhece os agentes da empresa
-    assert conferido.status == "concluido" and conferido.variables["resultado"] == {"divergente": False, "diferenca": 0}
+    assert conferido.status == "concluido"  # as obrigatórias que ele deu e o padrão da ação no resto
+    assert conferido.variables["resultado"] == {"divergente": False, "diferenca": 0, "fornecedor_novo": False}
     assert (aprovar.status, aprovar.message) == ("handoff", "A política do agente pede aprovação de uma pessoa para usar consultar_pedido (ERP da Acme) com {\"cnpj\": \"12.345.678/0001-90\"}.")
     assert fora.status == "handoff" and "não respondeu" in fora.message
-    assert pedidos[0].agente == "ag1" and pedidos[0].saidas == {"divergente": "sim_nao", "diferenca": "numero"}
+    assert pedidos[0].agente == "ag1" and pedidos[0].saidas == {"divergente": "sim_nao", "diferenca": "numero", "pedido": "texto",
+                                                                "fornecedor_novo": "sim_nao"}
     assert "Dados da execução" in pedidos[0].contexto and "Moinho Sul" in pedidos[0].contexto
 
 
@@ -803,3 +810,164 @@ def test_agente_no_lugar_de_uma_acao_cumpre_o_contrato_dela():
     proprio = no_lugar.model_copy(update={"acao": None})
     assert _contrato(no_lugar, {acao.name: acao}) == (["divergente"], {"diferenca": 0, "pedido": None, "fornecedor_novo": False})
     assert _contrato(proprio, {acao.name: acao}) == (["divergente", "diferenca", "pedido"], {})  # agente próprio: as que têm exemplo
+
+
+# ── N7: os 13 modelos dos pacotes, paralelo, cadeia entre processos e projetos ──
+
+from schemas import BIBLIOTECA, PACOTE_SUBJECT  # noqa: E402
+
+CATALOGOS = [_pacote(nome) for nome in PACOTES]
+
+
+async def _pacotes(app) -> None:
+    for catalogo in CATALOGOS:  # os quatro pacotes declararam ações e modelos no boot
+        await app.handlers[CATALOG_SUBJECT](catalogo)
+
+
+def test_os_13_modelos_da_biblioteca_abrem_do_pacote_e_simulam_ate_um_fim():
+    async def cenario(app):
+        await _pacotes(app)
+        ana = app.user(*OWNER)
+        resultados = {}
+        for modelo in BIBLIOTECA:
+            processo = (await ana.post("/processos/adicionar", json={"modelo": modelo.id})).json()["data"]
+            desenho = (await ana.post("/desenho/abrir", json={"processo": processo["id"]})).json()["data"]
+            simulado = (await ana.post("/desenho/simular", json={"processo": processo["id"]})).json()["data"]
+            resultados[modelo.id] = (processo, desenho, simulado)
+        de_novo = (await ana.post("/processos/adicionar", json={"modelo": "contas-a-pagar"})).json()["data"]
+        membro = await app.user("mel", "acme", "member").post("/processos/adicionar", json={"modelo": "contas-a-pagar"})
+        total = (await ana.get("/processos")).json()["data"]["total"]
+        return resultados, de_novo, membro, total
+
+    resultados, de_novo, membro, total = service_app(cenario)
+    assert len(resultados) == 13 and total == 13 and membro.status_code == 403
+    assert de_novo["id"] == resultados["contas-a-pagar"][0]["id"]  # adicionar de novo não duplica
+    for modelo, (processo, desenho, simulado) in resultados.items():
+        assert processo["origem"] == "biblioteca" and processo["status"] == "aceito", modelo
+        assert len(desenho["versao"]["fluxo"]["passos"]) > 2, modelo  # o fluxo do pacote, não o agente genérico
+        erros = [p["texto"] for p in desenho["problemas"] if p["nivel"] == "erro"]
+        assert erros == [], (modelo, erros)
+        assert simulado["fim"] and not simulado["problemas"], (modelo, simulado)
+        assert 'id="p_acme_' in desenho["bpmn"], modelo
+    admissao = resultados["admissao-colaborador"][2]
+    assert [p["id"] for p in admissao["passos"]][3:9] == ["abrir", "esocial", "contrato", "exame", "acessos", "juntar"]
+    assert admissao["caminho"].count("juntar") == 1 and admissao["fim"] == "admitido"  # os quatro ramos e a junção uma vez
+    assert "parallelGateway" in resultados["admissao-colaborador"][1]["bpmn"]
+    assert resultados["proposta-comercial"][2]["fim"] == "aceita"
+    assert resultados["fechamento-mes"][1]["versao"]["fluxo"]["gatilho"]["agenda"] == "0 11 1 * *"
+
+
+def test_paralelo_mal_formado_e_erro_e_a_simulacao_percorre_os_ramos():
+    from core.processes import Flow, Fluxo, Step
+
+    from service import _problemas, _simular
+    from schemas import Cenario
+
+    catalogo = {a.name: a for c in CATALOGOS for a in c.actions}
+    admissao = next(m.fluxo for c in CATALOGOS for m in c.models if m.id == "admissao-colaborador")
+    assert not [p for p in _problemas(admissao, catalogo) if p.nivel == "erro"]
+    sem_juntar = admissao.model_copy(deep=True)
+    sem_juntar.ligacoes = [f for f in sem_juntar.ligacoes if not (f.de == "exame" and f.para == "juntar")]
+    sem_juntar.ligacoes.append(Flow(de="exame", para="pendente"))  # um ramo que termina antes de se juntar
+    textos = [p.texto for p in _problemas(sem_juntar, catalogo) if p.nivel == "erro"]
+    assert any("não se juntam" in t for t in textos), textos
+    a_mais = admissao.model_copy(deep=True)
+    a_mais.ligacoes.append(Flow(de="validos", para="juntar", condicao={"campo": "validar.comentario", "operador": "=", "valor": "x"}))
+    textos = [p.texto for p in _problemas(a_mais, catalogo) if p.nivel == "erro"]
+    assert any("Tudo pronto espera 5 caminhos, mas Ao mesmo tempo abre 4" in t for t in textos), textos
+    torto = Fluxo(passos=[Step(id="p", tipo="paralelo", nome="Os dois"), Step(id="a", tipo="tarefa", nome="Passo A", responsavel="cliente"),
+                          Step(id="b", tipo="tarefa", nome="Passo B", responsavel="cliente"), Step(id="fim", tipo="fim", nome="Fim")],
+                  ligacoes=[Flow(de="inicio", para="a"), Flow(de="a", para="p"), Flow(de="b", para="p"), Flow(de="p", para="fim"),
+                            Flow(de="p", para="b")])
+    textos = [p.texto for p in _problemas(torto, catalogo) if p.nivel == "erro"]
+    assert any("abre e junta ramos ao mesmo tempo" in t for t in textos), textos
+    simulado = _simular(admissao, catalogo, Cenario(excecoes=["esocial"]))
+    assert "esocial__excecao" in simulado.caminho and "f_esocial__excecao_juntar" in simulado.caminho and simulado.fim == "admitido"
+    recusado = _simular(admissao, catalogo, Cenario(recusas=["validar"]))
+    assert recusado.fim == "pendente" and "abrir" not in recusado.caminho
+
+
+async def _publicar_cadeia(app) -> dict[str, str]:
+    """Proposta, contrato e faturamento aceitos e publicados pelo staff (o contrato e o faturamento esperam a proposta)."""
+    await _pacotes(app)
+    ana, otto = app.user(*OWNER), app.user(*OPERADOR)
+    ids = {}
+    for modelo in ("proposta-comercial", "gestao-contratos", "faturamento-cobranca"):
+        ids[modelo] = (await ana.post("/processos/adicionar", json={"modelo": modelo})).json()["data"]["id"]
+        await ana.post("/desenho/abrir", json={"processo": ids[modelo]})
+        publicado = await otto.post("/desenho/publicar", json={"processo": ids[modelo]})
+        assert publicado.status_code == 200, publicado.text
+    return ids
+
+
+def test_proposta_aceita_inicia_contrato_e_faturamento_e_a_cadeia_vira_um_projeto():
+    venda = {"cliente": "Padaria Pão Quente", "email": "compras@paoquente.com.br", "descricao": "Pães por 3 meses", "valor": 4800.0,
+             "desconto": 5.0}
+
+    async def cenario(app):
+        ids = await _publicar_cadeia(app)
+        ana = app.user(*OWNER)
+        desenho = (await ana.post("/desenho/abrir", json={"processo": ids["proposta-comercial"]})).json()["data"]
+        # O svc-vendas registrou o pedido e emitiu vendas.pedido_proposta: o processo de proposta começa.
+        pedido = EventoExterno(nome="vendas.pedido_proposta", dados={"proposta_id": "pp1", "cliente": venda["cliente"],
+                                                                     "pedido": "40 kg por semana", "resumo": "Proposta para Padaria Pão Quente"})
+        await app.deliver(PACOTE_SUBJECT, pedido, who=ACME, msg_id="ev-1")
+        instancia = str(app.motor._seq)
+        variaveis = {"gatilho": pedido.dados, "montar": venda, "registrar": {"proposta_id": "pp1", "validade": "2026-10-20"},
+                     "resposta": {"aprovado": True, "comentario": ""}, "desfecho": {"status": "aceita", "aceita": True},
+                     "parametros": {"desconto_maximo": 10}}
+        fim = {"processo": ids["proposta-comercial"], "instance": instancia, "kind": "EXECUTION_LISTENER", "listener": "START", "variables": variaveis}
+        await app.job(JOB_END, element="aceita", **fim)
+        await app.job(JOB_END, element="aceita", **fim)  # o ouvinte entregue de novo: não inicia de novo
+        iniciados = list(app.motor.started)
+        projetos = (await ana.get("/projetos")).json()["data"]
+        execucoes = (await ana.get("/execucoes", params={"projeto": projetos["items"][0]["id"]})).json()["data"]["items"]
+        filha = next(e for e in execucoes if e["pai"])
+        detalhe = (await ana.get("/execucoes/item", params={"id": filha["id"]})).json()["data"]
+        return ids, desenho, iniciados, projetos, execucoes, detalhe
+
+    ids, desenho, iniciados, projetos, execucoes, detalhe = service_app(cenario)
+    titulos = {i["titulo"]: i for i in desenho["inicia"]}
+    assert set(titulos) == {"Gestão de contratos", "Faturamento e cobrança"} and titulos["Gestão de contratos"]["resultado"] == "aceita"
+    assert [p for p, _ in iniciados] == [f"p_acme_{ids['proposta-comercial']}", f"p_acme_{ids['gestao-contratos']}",
+                                         f"p_acme_{ids['faturamento-cobranca']}"]
+    gatilho = iniciados[1][1]["gatilho"]
+    assert (gatilho["cliente"], gatilho["valor"], gatilho["proposta_id"], gatilho["origem"]) == ("Padaria Pão Quente", 4800.0, "pp1", "processo")
+    assert gatilho["processo_origem"] == "Proposta comercial" and gatilho["resultado_origem"] == "aceita"
+    assert projetos["total"] == 1
+    projeto = projetos["items"][0]
+    assert (projeto["titulo"], projeto["resumo"], projeto["status"]) == ("Proposta comercial", "Proposta para Padaria Pão Quente", "andamento")
+    assert [(e["titulo"], e["status"], e["resultado"]) for e in projeto["etapas"]] == [
+        ("Proposta comercial", "concluida", "aceita"), ("Gestão de contratos", "andamento", None), ("Faturamento e cobrança", "andamento", None)]
+    assert len(execucoes) == 3 and all(e["projeto"] == projeto["id"] for e in execucoes)
+    assert {e["origem"] for e in execucoes if e["pai"]} == {"processo"} and all(e["nivel"] == 1 for e in execucoes if e["pai"])
+    assert [e["titulo"] for e in detalhe["cadeia"]] == ["Proposta comercial", "Gestão de contratos", "Faturamento e cobrança"]
+
+
+def test_proposta_recusada_nao_inicia_nada_e_o_gatilho_por_processo_e_conferido_no_desenho():
+    async def cenario(app):
+        ids = await _publicar_cadeia(app)
+        ana = app.user(*OWNER)
+        await app.deliver(PACOTE_SUBJECT, EventoExterno(nome="vendas.pedido_proposta", dados={"proposta_id": "pp2"}), who=ACME, msg_id="ev-2")
+        await app.job(JOB_END, element="recusada", processo=ids["proposta-comercial"], instance=str(app.motor._seq), kind="EXECUTION_LISTENER",
+                      listener="START", variables={"gatilho": {"proposta_id": "pp2"}})
+        iniciados = len(app.motor.started)
+        projetos = (await ana.get("/projetos")).json()["data"]["total"]
+        sozinho = (await ana.post("/processos/adicionar", json={"modelo": "faturamento-cobranca"})).json()["data"]
+        with acting_as(ACME):  # um rascunho que espera um fim que a proposta não tem, e outro que espera a si mesmo
+            await ana.post("/desenho/ajustar", json={"processo": sozinho["id"]})
+            await db.query("UPDATE processos_versoes SET fluxo.gatilho.resultado = 'ganha' WHERE tenant = $tenant AND status = 'rascunho' "
+                           "AND processo = $p", p=sozinho["id"])
+        fim_errado = (await ana.post("/desenho/abrir", json={"processo": sozinho["id"]})).json()["data"]
+        with acting_as(ACME):
+            await db.query("UPDATE processos_versoes SET fluxo.gatilho.processo = 'faturamento-cobranca' WHERE tenant = $tenant "
+                           "AND status = 'rascunho' AND processo = $p", p=sozinho["id"])
+        ele_mesmo = (await ana.post("/desenho/abrir", json={"processo": sozinho["id"]})).json()["data"]
+        publicar = await app.user(*OPERADOR).post("/desenho/publicar", json={"processo": sozinho["id"]})
+        return iniciados, projetos, fim_errado, ele_mesmo, publicar
+
+    iniciados, projetos, fim_errado, ele_mesmo, publicar = service_app(cenario)
+    assert iniciados == 1 and projetos == 0  # recusada: o contrato e o faturamento esperam "aceita"
+    assert any("nunca termina como ganha" in p["texto"] for p in fim_errado["problemas"] if p["nivel"] == "aviso")
+    assert any("ele mesmo termina" in p["texto"] for p in ele_mesmo["problemas"] if p["nivel"] == "erro")
+    assert publicar.json()["error"]["code"] == "ERRO_PROCESSOS_FLUXO_INVALIDO"

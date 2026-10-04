@@ -1,14 +1,25 @@
 import type { PageMeta } from "@/App";
 import { Alert } from "@/components/Alert";
 import { Grid } from "@/components/Grid";
+import { Heading } from "@/components/Heading";
 import { type JourneyStep, JourneySteps } from "@/components/JourneySteps";
 import { Page } from "@/components/Page";
+import { ProjectChain, type ProjectChainStep } from "@/components/ProjectChain";
 import { Quantity } from "@/components/Quantity";
 import { Spinner } from "@/components/Spinner";
+import { Stack } from "@/components/Stack";
 import { Stat } from "@/components/Stat";
+import { Text } from "@/components/Text";
 import { useLive, useLiveQuery } from "@/core/api";
 import { useSession } from "@/core/auth";
-import { type ConhecimentoResumo, conhecimento, type ProcessosAcompanhamento, type ProcessosResumo, processos } from "@/core/contracts";
+import {
+  type ConhecimentoResumo,
+  conhecimento,
+  type ProcessosAcompanhamento,
+  type ProcessosEtapaProjeto,
+  type ProcessosResumo,
+  processos,
+} from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Workspace", order: 0 };
 
@@ -77,6 +88,19 @@ function passos(r: ConhecimentoResumo | null, p: ProcessosResumo | null, a: Proc
   ];
 }
 
+const ESPERA = { cliente: "Esperando você", staff: "Com o staff", evento: "Aguardando" };
+
+/** As execuções de um projeto como etapas da cadeia: quem iniciou quem, onde cada uma está ou como terminou. */
+function etapas(itens: ProcessosEtapaProjeto[]): ProjectChainStep[] {
+  const nivel: Record<string, number> = {};
+  return itens.map((e) => {
+    nivel[e.id] = e.pai ? (nivel[e.pai] ?? 0) + 1 : 0;
+    const onde = e.aguardando ? `${ESPERA[e.aguardando]}: ${e.passo_nome ?? "próximo passo"}` : e.passo_nome ? `Em: ${e.passo_nome}` : "Começando";
+    const detail = e.status === "concluida" ? `Terminou: ${e.resultado ?? "concluída"}` : e.status === "incidente" ? "Incidente: o staff está vendo" : onde;
+    return { key: e.id, title: e.titulo, status: e.status, detail, level: nivel[e.id], to: `/processos/execucoes/${e.id}` };
+  });
+}
+
 export default function Workspace() {
   const session = useSession();
   const resumo = useLiveQuery("conhecimento.briefing", conhecimento.resumo);
@@ -84,6 +108,7 @@ export default function Workspace() {
   useLive("conhecimento.itens", () => resumo.reload());
   const descoberta = useLiveQuery("processos.processos", processos.resumo);
   const acompanhamento = useLiveQuery("processos.execucoes", processos.acompanhamento);
+  const projetos = useLiveQuery("processos.execucoes", processos.projetos, { size: 3 });
   useLive("processos.tarefas", () => acompanhamento.reload());
   const r = resumo.data;
   const a = acompanhamento.data;
@@ -109,6 +134,15 @@ export default function Workspace() {
           <Stat label="Conhecimento" value={r ? <Quantity value={r.itens} /> : "—"} hint="itens que os agentes consultam" />
           <Stat label="Processos aceitos" value={descoberta.data ? <Quantity value={descoberta.data.aceitos} /> : "—"} hint={descoberta.data?.sugeridos ? `${descoberta.data.sugeridos} sugestões esperando você` : "seguem para o desenho"} />
         </Grid>
+      )}
+      {projetos.data && projetos.data.items.length > 0 && (
+        <Stack>
+          <Heading>Projetos</Heading>
+          <Text tone="muted">Quando um processo termina e inicia outros (uma proposta aceita abre o contrato e o faturamento), a cadeia é acompanhada como um projeto.</Text>
+          {projetos.data.items.map((p) => (
+            <ProjectChain key={p.id} title={p.titulo} description={p.resumo ?? undefined} status={p.status} steps={etapas(p.etapas)} />
+          ))}
+        </Stack>
       )}
       {resumo.loading && !r ? <Spinner label="Carregando a jornada" /> : <JourneySteps steps={passos(r, descoberta.data, a)} />}
     </Page>

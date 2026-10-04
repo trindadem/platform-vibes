@@ -27,13 +27,15 @@ export const meta: PageMeta = { title: "Integrações", module: "integracoes" };
 
 export default function Integracoes() {
   return (
-    <Page title="Integrações" description="Por onde os documentos chegam, o banco onde os pagamentos são agendados e os sistemas da empresa que os agentes usam.">
+    <Page title="Integrações" description="Por onde os documentos chegam e os e-mails saem, o banco dos pagamentos e das cobranças e os sistemas da empresa que os agentes usam.">
       <Tabs
         tabs={[
           { id: "conexoes", label: "Conexões", content: <Conexoes /> },
           { id: "mcp", label: "Servidores MCP", content: <ServidoresMcp /> },
           { id: "documentos", label: "Documentos recebidos", content: <Documentos /> },
           { id: "pagamentos", label: "Pagamentos", content: <Pagamentos /> },
+          { id: "cobrancas", label: "Cobranças", content: <Cobrancas /> },
+          { id: "enviados", label: "E-mails enviados", content: <Enviados /> },
         ]}
       />
     </Page>
@@ -58,7 +60,7 @@ function Conexoes() {
             <Grid cols={2}>
               <Card
                 title="Caixa de entrada"
-                description="Encaminhe para este endereço os boletos e as notas dos fornecedores: cada anexo vira um documento e inicia o contas a pagar."
+                description="Encaminhe para este endereço os boletos e as notas dos fornecedores: cada anexo vira um documento e inicia o contas a pagar. Propostas, cobranças e pedidos saem dele."
                 footer={
                   pode && (caixa ? (
                     <ConfirmButton size="sm" confirmLabel="Desconectar a caixa" loading={desconectar.running} onConfirm={() => void desconectar.run({ id: caixa.id })}>
@@ -79,7 +81,7 @@ function Conexoes() {
               </Card>
               <Card
                 title="Banco (simulado)"
-                description="Até escolhermos o banco da empresa, os pagamentos são agendados num banco de simulação, que confirma cada um alguns segundos depois."
+                description="Até escolhermos o banco da empresa, pagamentos e cobranças passam por um banco de simulação, que confirma cada um alguns segundos depois."
                 footer={
                   pode && (banco ? (
                     <ConfirmButton size="sm" confirmLabel="Desconectar o banco" loading={desconectar.running} onConfirm={() => void desconectar.run({ id: banco.id })}>
@@ -93,7 +95,7 @@ function Conexoes() {
                 }
               >
                 <Text tone={banco ? "success" : "muted"}>
-                  {banco ? `Conectado: confirma os pagamentos ${banco.confirmar_apos ?? 30} s depois de agendados.` : "Ainda não conectado."}
+                  {banco ? `Conectado: confirma pagamentos e cobranças ${banco.confirmar_apos ?? 30} s depois de emitidos.` : "Ainda não conectado."}
                 </Text>
               </Card>
             </Grid>
@@ -298,5 +300,62 @@ function Pagamentos() {
         ]}
       />
     </Stack>
+  );
+}
+
+function Cobrancas() {
+  const lista = useListQuery(integracoes.cobrancas, { live: "integracoes.cobrancas" });
+  const session = useSession();
+  const pode = hasAnyRole(session, "owner", "admin", "operador");
+  const confirmar = useAction(integracoes.confirmarCobranca, { onSuccess: lista.reload });
+  return (
+    <Stack>
+      {confirmar.error && <Alert tone="danger">{confirmar.error.message}</Alert>}
+      <ListView
+        list={lista}
+        rowKey={(c) => c.id}
+        noun="cobranças"
+        empty="Nenhuma cobrança emitida ainda."
+        filters={[{ name: "status", label: "Status", options: [{ value: "aberta", label: "Aberta" }, { value: "recebida", label: "Recebida" }] }]}
+        columns={[
+          { key: "cobranca_id", header: "Cobrança" },
+          { key: "pagador", header: "Pagador", render: (c) => c.pagador ?? "—" },
+          { key: "valor", header: "Valor", sort: "valor", render: (c) => <Money value={c.valor} /> },
+          { key: "vencimento", header: "Vencimento", sort: "vencimento" },
+          { key: "status", header: "Status", render: (c) => <StatusBadge value={c.status} labels={{ aberta: "Aberta", recebida: "Recebida" }} /> },
+          {
+            key: "acao",
+            header: "",
+            render: (c) =>
+              pode && c.status === "aberta" ? (
+                <Row>
+                  <Button size="sm" variant="secondary" loading={confirmar.running} onClick={() => void confirmar.run({ id: c.id })}>
+                    Confirmar recebimento
+                  </Button>
+                </Row>
+              ) : null,
+          },
+        ]}
+      />
+    </Stack>
+  );
+}
+
+function Enviados() {
+  const lista = useListQuery(integracoes.enviados, { live: "integracoes.enviados" });
+  return (
+    <ListView
+      list={lista}
+      rowKey={(e) => e.id}
+      noun="e-mails"
+      search="destinatário ou assunto"
+      empty="Nenhum e-mail enviado ainda: propostas, cobranças, pedidos de cotação e campanhas saem pela caixa de entrada."
+      columns={[
+        { key: "para", header: "Para" },
+        { key: "assunto", header: "Assunto" },
+        { key: "de", header: "De" },
+        { key: "created_at", header: "Enviado", sort: "created_at", render: (e) => (e.created_at ? <DateTime value={e.created_at} /> : "—") },
+      ]}
+    />
   );
 }

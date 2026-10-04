@@ -258,3 +258,86 @@ def test_ferramenta_que_muda_no_servidor_vai_para_quarentena_ate_alguem_atualiza
     assert (oculta["nome"], oculta["risco"]) == ("apagar", "irreversivel") and "invisível" in oculta["quarentena"]
     assert producao.json()["error"]["code"] == "ERRO_INTEGRACOES_URL"  # http e rede interna só no ambiente local
     assert ("integracoes.servidores", "quarentena") in [(t, a) for t, _, a in vivos]  # a tela de Integrações mostra na hora
+
+
+# ── N7: e-mail que sai da caixa de entrada, cobranças e extrato no banco simulado ──
+
+from schemas import COBRAR_SUBJECT, EMAIL_SUBJECT, EXTRATO_SUBJECT, CobrarNoBanco, EnviarEmail, ExtratoPedido  # noqa: E402
+
+SISTEMA = Principal(sub="system:svc-financeiro", tenant="acme", roles=frozenset({"system"}))
+
+
+def test_email_sai_da_caixa_de_entrada_pelo_mailpit_e_sem_caixa_ou_provedor_e_409(monkeypatch):
+    enviados = []
+
+    async def post(url, **kwargs):
+        assert url == "http://mailpit:8025/api/v1/send" and kwargs.get("allow_private") and kwargs.get("allow_http")
+        enviados.append(kwargs["json"])
+        return httpx.Response(200, json={"ID": f"mp{len(enviados)}"})
+
+    monkeypatch.setattr(http, "post", post)
+
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        pedido = EnviarEmail(para="compras@paoquente.com.br", assunto="Proposta comercial", texto="Segue a proposta.")
+        with acting_as(SISTEMA):
+            try:
+                await app.handlers[EMAIL_SUBJECT](pedido)
+            except Exception as exc:  # noqa: BLE001
+                sem_caixa = exc
+        caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
+        monkeypatch.setattr(service.settings, "mailpit_url", None)
+        with acting_as(SISTEMA):
+            try:
+                await app.handlers[EMAIL_SUBJECT](pedido)
+            except Exception as exc:  # noqa: BLE001
+                sem_provedor = exc
+        monkeypatch.setattr(service.settings, "mailpit_url", "http://mailpit:8025")
+        with acting_as(SISTEMA):
+            enviado = await app.handlers[EMAIL_SUBJECT](pedido)
+        lista = (await ana.get("/enviados", params={"q": "paoquente"})).json()["data"]
+        return sem_caixa, sem_provedor, caixa, enviado, lista, app.live
+
+    sem_caixa, sem_provedor, caixa, enviado, lista, live = service_app(cenario)
+    assert (sem_caixa.code, sem_caixa.status) == ("ERRO_INTEGRACOES_SEM_CAIXA", 409)
+    assert (sem_provedor.code, sem_provedor.status) == ("ERRO_INTEGRACOES_SEM_PROVEDOR", 409)
+    assert enviado.de == caixa["endereco"] and enviado.mensagem_id == "mp1"  # sai do endereço da organização
+    assert enviados == [{"From": {"Email": caixa["endereco"]}, "To": [{"Email": "compras@paoquente.com.br"}],
+                         "Subject": "Proposta comercial", "Text": "Segue a proposta."}]
+    assert lista["total"] == 1 and lista["items"][0]["assunto"] == "Proposta comercial"
+    assert ("integracoes.enviados", lista["items"][0]["id"], "enviado") in live
+
+
+def test_cobranca_no_banco_simulado_recebe_avisa_os_processos_e_entra_no_extrato():
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        with acting_as(SISTEMA):
+            try:
+                await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Padaria Pão Quente"))
+            except Exception as exc:  # noqa: BLE001
+                sem_banco = exc
+        await ana.post("/conexoes", json={"tipo": "banco_simulado", "confirmar_apos": 5})
+        with acting_as(SISTEMA):
+            emitida = await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Padaria Pão Quente"))
+            pago = await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=1250.0, vencimento="2020-01-01", fornecedor="Moinho Sul"))
+        cobrancas = (await ana.get("/cobrancas")).json()["data"]["items"]
+        membro = await app.user("mel", "acme", "member").post("/cobrancas/confirmar", json={"id": cobrancas[0]["id"]})
+        recebida = (await app.user("otto", "acme", "operador").post("/cobrancas/confirmar", json={"id": cobrancas[0]["id"]})).json()["data"]
+        de_novo = (await ana.post("/cobrancas/confirmar", json={"id": cobrancas[0]["id"]})).json()["data"]
+        pagamentos = (await ana.get("/pagamentos")).json()["data"]["items"]
+        await ana.post("/pagamentos/confirmar", json={"id": pagamentos[0]["id"]})
+        with acting_as(SISTEMA):
+            extrato = await app.handlers[EXTRATO_SUBJECT](ExtratoPedido(desde="2026-01-01"))
+        resumo = (await ana.get("/resumo")).json()["data"]
+        eventos = [m for s, m in app.published if s == EVENT_SUBJECT]
+        return sem_banco, emitida, pago, membro, recebida, de_novo, extrato, resumo, eventos, app.workflows
+
+    sem_banco, emitida, pago, membro, recebida, de_novo, extrato, resumo, eventos, workflows = service_app(cenario)
+    assert (sem_banco.code, sem_banco.status) == ("ERRO_INTEGRACOES_SEM_BANCO", 409)
+    assert emitida.cobranca_id.startswith("CB-") and len(emitida.linha_digitavel.replace(".", "").replace(" ", "")) == 47
+    assert emitida.linha_digitavel.endswith("0000480000")  # o valor no fim da linha
+    assert membro.status_code == 403 and recebida["status"] == "recebida" and de_novo["recebido_em"] == recebida["recebido_em"]
+    recebimentos = [e for e in eventos if e.nome == "banco.recebido"]
+    assert len(recebimentos) == 1 and recebimentos[0].chave == emitida.cobranca_id  # acorda a execução que espera
+    assert [(i.tipo, i.id, i.valor) for i in extrato.itens] == [("pagamento", pago.pagamento_id, -1250.0), ("recebimento", emitida.cobranca_id, 4800.0)]
+    assert resumo["cobrancas"] == 0 and [w[0] for w in workflows] == ["CobrancaSimuladaWorkflow.run", "PagamentoSimuladoWorkflow.run"]

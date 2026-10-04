@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import ClassVar, Literal
 
@@ -2849,11 +2850,14 @@ def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
     fila = [[_job_bruto()], [_job_bruto(jobKey=78, customHeaders={"excecao": "sim"}, variables={"entrada": {}})],
             [_job_bruto(jobKey=79, variables={"entrada": {}})]]
 
+    devolvidos = {}
+
     def motor(request):
         corpo = json.loads(request.content) if request.content else {}
         chamadas.append((request.url.path, corpo))
         if request.url.path == "/v2/jobs/activation":
             return httpx.Response(200, json={"jobs": fila.pop(0) if fila else []})
+        devolvidos[request.url.path] = datetime.now(UTC)
         return httpx.Response(204)
 
     async def publish(subject, message, msg_id=None):
@@ -2884,6 +2888,10 @@ def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
     assert ativacao["type"] == "financeiro.agendar" and ativacao["worker"] == "svc-financeiro"
     assert sorted(m.status for _, m in publicados) == ["concluido", "handoff", "incidente"]
     assert all(subject == "events.processos.passo" and m.instancia == "501" and m.processo == "contas" for subject, m in publicados)
+    # A hora do passo é a de quando o worker terminou, antes de devolver o job: o motor segue (e o fim chega ao
+    # svc-processos) logo depois da devolução, e a linha do tempo fica na ordem certa.
+    concluido = next(m for _, m in publicados if m.status == "concluido")
+    assert concluido.em <= devolvidos["/v2/jobs/77/completion"]
     assert Handoff("x").motivo == "x"
 
 
@@ -2945,3 +2953,105 @@ def test_conflito_de_escrita_entre_transacoes_e_repetido_pelo_core():
 
     assert asyncio.run(cenario(2)) == ([{"ok": True}], 3)  # repetiu e passou
     assert asyncio.run(cenario(9)) == ("falhou", 4)  # desiste depois de 3 repetições
+
+
+# ── N7: modelos dos pacotes, paralelo, gatilho por outro processo e eventos de pacote ──
+
+def test_modelo_do_pacote_vai_ao_catalogo_e_acao_nao_declarada_impede_o_boot(monkeypatch):
+    from core.processes import ProcessModel
+
+    publicados = []
+
+    async def publish(subject, message, msg_id=None):
+        publicados.append((subject, message, msg_id))
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-financeiro")
+    fluxo = Fluxo(gatilho=Trigger(tipo="processo", processo="proposta-comercial", resultado="aceita", descricao="Proposta aceita"),
+                  passos=[Step(id="agendar", tipo="acao", nome="Agendar", acao="financeiro.agendar"),
+                          Step(id="avisar", tipo="acao", nome="Avisar", acao="vendas.avisar"),  # de outro pacote: não dá para conferir aqui
+                          Step(id="fim", tipo="fim", nome="Fim")],
+                  ligacoes=[Flow(de="inicio", para="agendar"), Flow(de="agendar", para="avisar"), Flow(de="avisar", para="fim")])
+    asyncio.run(processes_module.processes.declare([_AGENDAR], [ProcessModel("faturamento-cobranca", fluxo)]))
+    subject, catalogo, _ = publicados[0]
+    assert subject == "events.processos.catalogo" and [a.name for a in catalogo.actions] == ["financeiro.agendar"]
+    assert [(m.id, m.service) for m in catalogo.models] == [("faturamento-cobranca", "svc-financeiro")]
+    assert catalogo.models[0].fluxo.gatilho.resultado == "aceita"
+    errado = fluxo.model_copy(deep=True)
+    errado.passos[0].acao = "financeiro.agendr"  # erro de digitação na ação do próprio pacote: não sobe
+    with pytest.raises(ValueError, match="financeiro.agendr"):
+        asyncio.run(processes_module.processes.declare([_AGENDAR], [ProcessModel("faturamento-cobranca", errado)]))
+    with pytest.raises(ValueError, match="modelo repetido"):
+        asyncio.run(processes_module.processes.declare([_AGENDAR], [ProcessModel("x-y", fluxo), ProcessModel("x-y", fluxo)]))
+    with pytest.raises(ValueError):
+        ProcessModel("Contas a pagar", fluxo)  # o id é o do modelo na biblioteca
+
+
+def test_paralelo_vira_parallel_gateway_e_a_entrada_vem_do_parametro():
+    from core.processes import CatalogAction
+
+    fluxo = Fluxo(
+        gatilho=Trigger(tipo="processo", processo="proposta-comercial", resultado="aceita", descricao="Proposta aceita"),
+        parametros={"prazo_pagamento": 15},
+        passos=[Step(id="abrir", tipo="paralelo", nome="Ao mesmo tempo"),
+                Step(id="faturar", tipo="acao", nome="Faturar", acao="financeiro.faturar"),
+                Step(id="exame", tipo="tarefa", nome="Exame", responsavel="cliente"),
+                Step(id="juntar", tipo="paralelo", nome="Tudo pronto"),
+                Step(id="fim", tipo="fim", nome="Fim")],
+        ligacoes=[Flow(de="inicio", para="abrir"), Flow(de="abrir", para="faturar"), Flow(de="abrir", para="exame"),
+                  Flow(de="faturar", para="juntar"), Flow(de="exame", para="juntar"), Flow(de="juntar", para="fim")])
+    entrada = {"properties": {"cliente": {"type": "string"}, "prazo_pagamento": {"type": "integer"}}}
+    catalogo = {"financeiro.faturar": CatalogAction(name="financeiro.faturar", service="svc-financeiro", title="Faturar",
+                                                    description="Fatura", risk="escrita", output_fields=["fatura_id"], input_schema=entrada)}
+    raiz = _ET.fromstring(to_bpmn(fluxo, process_id="p_acme_fat", name="Faturar", actions=catalogo))
+    processo = raiz.find("bpmn:process", _NS)
+    paralelos = {g.get("id") for g in processo.findall("bpmn:parallelGateway", _NS)}
+    assert paralelos == {"abrir", "juntar"} and not processo.findall("bpmn:exclusiveGateway", _NS)
+    inicio = processo.find("bpmn:startEvent", _NS)
+    assert inicio.get("name") == "Proposta aceita" and inicio.find("bpmn:timerEventDefinition", _NS) is None  # o svc-processos inicia
+    faturar = next(t for t in processo.findall("bpmn:serviceTask", _NS) if t.get("id") == "faturar")
+    entradas = {i.get("target"): i.get("source") for i in faturar.findall(".//zeebe:input", _NS)}
+    assert entradas == {"entrada.cliente": "=gatilho.cliente", "entrada.prazo_pagamento": "=parametros.prazo_pagamento"}
+    caminhos = {f.get("id") for f in processo.findall("bpmn:sequenceFlow", _NS)}
+    assert {"f_abrir_faturar", "f_abrir_exame", "f_faturar_juntar", "f_exame_juntar", "f_juntar_fim"} <= caminhos
+    assert all(f.find("bpmn:conditionExpression", _NS) is None for f in processo.findall("bpmn:sequenceFlow", _NS))
+    desenhados = {s.get("bpmnElement"): s for s in raiz.findall(".//bpmndi:BPMNShape", _NS)}
+    y = lambda no: float(desenhados[no].find("{http://www.omg.org/spec/DD/20100524/DC}Bounds").get("y"))  # noqa: E731
+    assert y("faturar") != y("exame")  # os ramos ficam um embaixo do outro
+    with pytest.raises(ValidationError):
+        Trigger(tipo="processo", processo="proposta comercial")
+
+
+def test_evento_de_pacote_sai_com_o_nome_do_pacote(monkeypatch):
+    publicados = []
+
+    async def publish(subject, message, msg_id=None):
+        publicados.append((subject, message, msg_id))
+
+    class _Pedido(BaseModel):
+        proposta_id: str
+        valor: float
+
+    monkeypatch.setattr(nats_bus.bus, "publish", publish)
+    monkeypatch.setattr(nats_bus.bus, "_service", "svc-vendas")
+    asyncio.run(processes_module.processes.emit("pedido_proposta", _Pedido(proposta_id="p1", valor=10), key="p1"))
+    asyncio.run(processes_module.processes.emit("proposta_respondida", {"aceita": True}, chave="p1"))
+    (s1, e1, id1), (s2, e2, id2) = publicados
+    assert s1 == s2 == "events.processos.evento"
+    assert (e1.nome, e1.dados, e1.chave, id1) == ("vendas.pedido_proposta", {"proposta_id": "p1", "valor": 10.0}, None,
+                                                   "evento-vendas-pedido_proposta-p1")
+    assert (e2.nome, e2.chave, id2) == ("vendas.proposta_respondida", "p1", None)
+    with pytest.raises(ValueError):
+        asyncio.run(processes_module.processes.emit("Pedido Proposta", {}))
+
+
+def test_agenda_vira_o_cron_de_seis_campos_do_motor():
+    """Achado do N7: o Camunda 8 lê o cron do Spring (com segundos); com os 5 campos do fluxo, recusava o BPMN."""
+    from core.processes import cron
+
+    assert cron("0 11 * * 1-5") == "0 0 11 * * 1-5" and cron("0 0 11 * * *") == "0 0 11 * * *"
+    fluxo = Fluxo(gatilho=Trigger(tipo="agenda", agenda="0 11 1 * *", descricao="Dia 1"),
+                  passos=[Step(id="fim", tipo="fim", nome="Fim")], ligacoes=[Flow(de="inicio", para="fim")])
+    raiz = _ET.fromstring(to_bpmn(fluxo, process_id="p_acme_fechar", name="Fechar"))
+    ciclo = raiz.find("bpmn:process/bpmn:startEvent/bpmn:timerEventDefinition/bpmn:timeCycle", _NS)
+    assert ciclo.text == "0 0 11 1 * *"
