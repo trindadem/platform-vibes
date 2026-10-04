@@ -9,6 +9,8 @@ live:
     model: DocumentoMudou
   - topic: pagamentos               # o banco agendou ou confirmou um pagamento
     model: PagamentoMudou
+  - topic: servidores               # servidor MCP conectado, atualizado, removido ou com ferramenta em quarentena
+    model: ServidorMudou
 
 endpoints:
   - path: /conexoes
@@ -76,3 +78,46 @@ endpoints:
     response: Pagamento
     target_type: http
     target_url: http://svc-integracoes:8000/pagamentos/confirmar
+
+  - path: /catalogo
+    method: GET
+    auth: client_jwt
+    response: Catalogo
+    target_type: http
+    target_url: http://svc-integracoes:8000/catalogo
+
+  - path: /servidores
+    method: GET
+    auth: client_jwt
+    response: ServidoresMcp
+    target_type: http
+    target_url: http://svc-integracoes:8000/servidores
+
+  - path: /servidores
+    name: conectarServidor
+    method: POST
+    auth: client_jwt
+    request: NovoServidorMcp
+    response: ServidorMcp
+    timeout: 60                     # conecta e lista as ferramentas do servidor
+    target_type: http
+    target_url: http://svc-integracoes:8000/servidores
+
+  - path: /servidores/atualizar
+    name: atualizarServidor
+    method: POST
+    auth: client_jwt
+    request: ServidorRef
+    response: ServidorMcp
+    timeout: 60
+    target_type: http
+    target_url: http://svc-integracoes:8000/servidores/atualizar
+
+  - path: /servidores/remover
+    name: removerServidor
+    method: POST
+    auth: client_jwt
+    request: ServidorRef
+    response: ServidorMcp
+    target_type: http
+    target_url: http://svc-integracoes:8000/servidores/remover

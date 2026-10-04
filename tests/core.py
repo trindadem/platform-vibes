@@ -1187,6 +1187,32 @@ def test_agente_recebe_de_volta_o_erro_de_validacao_e_o_erro_de_negocio_para_cor
     assert "falha interna" in feito.text and "segredo" not in feito.text
 
 
+def test_agente_usa_ferramenta_descrita_por_schema_como_as_de_um_servidor_mcp(ia):
+    from core.llm import SchemaTool
+
+    llm, sent, _, _, _ = ia
+    recebidos = []
+    schema = {"type": "object", "properties": {"nome": {"type": "string", "title": "Nome", "description": "Quem buscar"}},
+              "required": ["nome"]}
+
+    async def chamar(argumentos):
+        recebidos.append((argumentos, security.current_tenant()))
+        if argumentos.get("nome") == "Acme":
+            return {"pedidos": [{"numero": "PC-1", "valor": 7200}]}
+        raise ServiceError("ERRO_X", "não achei")
+
+    remota = SchemaTool("mcp_erp_consultar", "Consulta pedidos no ERP do cliente.", schema, chamar)
+    feito = asyncio.run(llm.run_agent("local/rapido", "ache a Acme", instructions="x", tools=[remota]))
+    assert recebidos == [({"nome": "Acme"}, "acme")]  # o dict como o modelo mandou, no loop, como a organização
+    assert feito.text == 'Ferramenta disse: {"pedidos": [{"numero": "PC-1", "valor": 7200}]}'
+    definicao = sent[0]["tools"][0]["function"]
+    assert (definicao["name"], definicao["description"]) == ("mcp_erp_consultar", "Consulta pedidos no ERP do cliente.")
+    assert definicao["parameters"]["properties"]["nome"] == {"type": "string", "description": "Quem buscar"}
+    assert schema["properties"]["nome"]["title"] == "Nome"  # o schema de quem chamou não muda
+    with pytest.raises(TypeError, match="snake_case"):
+        asyncio.run(llm.run_agent("local/rapido", "x", instructions="x", tools=[SchemaTool("Ruim-Nome", "d", schema, chamar)]))
+
+
 def test_agente_sobe_o_erro_do_provedor_e_do_plano_sem_ecoar_a_mensagem(ia):
     from core.plans import LimitState, plans
 

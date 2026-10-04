@@ -421,13 +421,14 @@ PASSOS_DESENHO = {
     "definir_gatilho": "Definindo o gatilho",
     "definir_parametro": "Definindo um parâmetro",
     "simular": "Simulando o processo",
+    "usar_agente": "Usando um agente da empresa",
 }
 
 DESENHO_INSTRUCOES = """Você é o agente de desenho de processos da Cogniventure (BPO). Você conversa com o cliente e edita o fluxo do processo pelas ferramentas; o diagrama ao lado muda a cada operação. Você nunca escreve BPMN.
 
 O fluxo tem um gatilho (evento, agenda ou manual) e passos ligados:
 - acao: uma ação do catálogo (use o nome exato, ex.: financeiro.conferir_pedido); a saída dela fica sob o id do passo.
-- agente: um agente de IA faz o passo (objetivo, saidas que devolve e exemplo para simular); todo agente tem excecao=true (cai para o staff quando não pode decidir).
+- agente: um agente de IA faz o passo (objetivo, saidas que devolve e exemplo para simular); todo agente tem excecao=true (cai para o staff quando não pode decidir). Sem agente da empresa, quem faz é o agente da Cogniventure.
 - tarefa: uma pessoa decide (responsavel cliente ou staff, pergunta; a saída é aprovado = verdadeiro ou falso).
 - decisao: caminhos com condição (campo, operador, valor) e exatamente um caminho padrão sem condição.
 - espera: por mensagem (mensagem e chave) ou por tempo (horas).
@@ -438,6 +439,7 @@ Como trabalhar:
 - Entenda o que o cliente quer mudar e faça as operações necessárias, poucas e certas. Valores que são regras do cliente (limites, prazos) viram parâmetros: mudar um limite que já existe é só definir_parametro.
 - Faça só o que o cliente pediu. Não acrescente passos, aprovações ou caminhos que ele não pediu; se achar que falta algo, sugira na resposta e espere ele confirmar.
 - O staff da Cogniventure também escreve na conversa quando ajuda no setup: trate o pedido dele como o do cliente.
+- Quando o cliente pedir que um agente da empresa (da lista no contexto) faça um passo, use usar_agente com o id dele: o passo de ação vira um passo desse agente, com as mesmas saídas. Só agentes verificados ou confiáveis entram num processo.
 - Depois de mudar, confira os problemas que as ferramentas devolvem e corrija os erros antes de responder.
 - Depois de mudar uma regra de caminho, chame simular com um cenário que a teste (ex.: valores {"ler_documento.valor": 4200}) e confira que o caminho passa por onde o cliente quer; se não passar, corrija.
 - Ação irreversível (pagar, enviar, assinar) deve ter aprovação antes quando o cliente pedir controle.
@@ -841,3 +843,53 @@ class RegraMudou(BaseModel):
 
 Processo.model_rebuild()
 Desenho.model_rebuild()
+
+
+# ── Agentes da empresa nos passos (svc-agentes, N6) ──────────────────────────
+
+AGENTES_LISTA_SUBJECT = "rpc.agentes.lista"
+AGENTES_EXECUTAR_SUBJECT = "rpc.agentes.executar"
+
+
+class AgenteDaEmpresa(BaseModel):
+    """rpc.agentes.lista (contrato do svc-agentes, repetido aqui por quem consome)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    nome: str
+    descricao: str = ""
+    status: Literal["rascunho", "verificado", "confiavel"]
+    ferramentas: list[str] = Field(default_factory=list)
+
+
+class AgentesDaEmpresa(BaseModel):
+    itens: list[AgenteDaEmpresa]
+
+
+class ExecutarAgente(BaseModel):
+    """rpc.agentes.executar: o passo, as saídas e as regras do staff; o agente da empresa roda no svc-agentes."""
+
+    agente: str
+    tarefa: str
+    contexto: str = ""
+    saidas: dict[str, Literal["texto", "numero", "sim_nao"]]
+    leitura: bool = False
+    regras: list[str] = Field(default_factory=list)
+    obrigatorias: list[str] | None = None
+
+
+class ExecucaoDeAgente(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    saidas: dict[str, Any] = Field(default_factory=dict)
+    fontes: dict[str, str] = Field(default_factory=dict)
+    ajuda: str | None = None
+    aprovacao: str | None = None
+    ferramentas: list[str] = Field(default_factory=list)
+    lidos: list[str] = Field(default_factory=list)
+
+
+class UsoDeAgente(_Input):
+    passo: str = Field(..., description="O passo (de ação ou de agente) que o agente da empresa vai fazer")
+    agente: str | None = Field(None, description="Id do agente da empresa (lista no contexto); vazio volta ao agente da Cogniventure")

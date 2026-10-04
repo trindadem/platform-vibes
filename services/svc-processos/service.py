@@ -43,6 +43,13 @@ from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
 
 from schemas import (
+    AGENTES_EXECUTAR_SUBJECT,
+    AGENTES_LISTA_SUBJECT,
+    AgenteDaEmpresa,
+    AgentesDaEmpresa,
+    ExecucaoDeAgente,
+    ExecutarAgente,
+    UsoDeAgente,
     ACOES,
     BIBLIOTECA,
     BUSCA_SUBJECT,
@@ -269,6 +276,7 @@ class ProcessosService:
         await db.create(MENSAGENS, {"processo": processo.id, "papel": _papel(who), "autor": who.sub, "texto": data.texto, "passos": []})
         await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo.id, action="mensagem"))
         catalogo = await _catalogo()
+        agentes = await _agentes()
         fila: asyncio.Queue[AgentStep | None] = asyncio.Queue()
         feitos: list[str] = []
 
@@ -279,8 +287,8 @@ class ProcessosService:
 
         async def rodar(tarefa: str) -> str:
             rascunho_agora = await _rascunho(processo.id)
-            contexto = _contexto_desenho(processo, Fluxo.model_validate(rascunho_agora["fluxo"]), catalogo, empresa, historico)
-            argumentos = dict(instructions=DESENHO_INSTRUCOES, tools=_ferramentas(processo.id, catalogo), context=contexto,
+            contexto = _contexto_desenho(processo, Fluxo.model_validate(rascunho_agora["fluxo"]), catalogo, empresa, historico, agentes)
+            argumentos = dict(instructions=DESENHO_INSTRUCOES, tools=_ferramentas(processo.id, catalogo, agentes), context=contexto,
                               on_step=passo, max_turns=16)
             try:
                 return (await llm.run_agent(settings.desenho_model, tarefa, **argumentos)).text.strip()
@@ -711,10 +719,73 @@ class ProcessosService:
 # ── Ajudantes ────────────────────────────────────────────────────────────────
 
 async def _executar_agente(processo: Processo, step: Step, variaveis: dict[str, Any], regras: list[Regra]) -> dict[str, Any]:
-    """Roda o agente de um passo com os dados da execução e as regras ativas; devolve as saídas ou levanta Handoff."""
+    """Roda o agente de um passo com os dados da execução e as regras ativas; devolve as saídas ou levanta Handoff. Com
+    agente da empresa (step.agente_id), quem roda é o svc-agentes; a conferência do resultado é a mesma."""
+    lidos = [json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)]  # onde as saídas podem estar
+    contexto = "\n".join([
+        f"Processo: {processo.titulo}. Passo: {step.nome}.", f"Objetivo: {step.objetivo or step.nome}",
+        f"Saídas: {', '.join(f'{c} (ex.: {step.exemplo.get(c)!r})' for c in step.saidas)}",
+        "Dados da execução: " + json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)[:4000],
+    ])
+    ensinadas = [f"{r.texto} (no caso que gerou a regra, a saída certa foi: {json.dumps(r.esperado, ensure_ascii=False)})" for r in regras]
+    tarefa = f"Execute o passo \"{step.nome}\" e conclua com as saídas."
+    obrigatorias, padroes = _contrato(step, await _catalogo())
+    if step.agente_id:
+        resultado, ajuda = await _agente_da_empresa(step, tarefa, contexto, ensinadas, lidos, obrigatorias)
+    else:
+        resultado, ajuda = await _agente_da_plataforma(step, tarefa, contexto, ensinadas, lidos)
+    if ajuda:
+        raise Handoff(ajuda[0])
+    if not resultado:
+        raise Handoff(f"O agente não concluiu {step.nome.lower()}.")
+    fontes = resultado.pop("fontes", None) or {}
+    if step.leitura:  # não chuta: cada saída lida aponta o trecho de onde saiu, e o trecho está no que ele leu e diz o mesmo
+        sem_fonte = [c for c, v in resultado.items() if v not in (None, "") and not _tem_fonte(v, str(fontes.get(c) or ""), lidos, bool(regras))]
+        if sem_fonte:
+            parcial = {c: v for c, v in resultado.items() if c not in sem_fonte and v not in (None, "")}
+            raise Handoff(f"O agente não mostrou no documento de onde tirou: {', '.join(sem_fonte)}.", parcial=parcial)
+    for campo, padrao in padroes.items():  # o que a ação substituída tem por padrão: as condições adiante nunca veem vazio
+        if resultado.get(campo) is None:
+            resultado[campo] = padrao
+    faltam = [c for c in obrigatorias if resultado.get(c) in (None, "")]
+    if faltam:
+        raise Handoff(f"O agente não encontrou: {', '.join(faltam)}.", parcial={c: v for c, v in resultado.items() if v not in (None, "")})
+    return resultado
+
+
+def _contrato(step: Step, catalogo: dict[str, CatalogAction]) -> tuple[list[str], dict[str, Any]]:
+    """O que o passo precisa devolver. No lugar de uma ação (usar_agente), o contrato da ação: as saídas obrigatórias
+    dela e os padrões das outras. Senão, as saídas que têm exemplo."""
+    acao = catalogo.get(step.acao or "")
+    if acao is None:
+        return [c for c in step.exemplo if c in step.saidas], {}
+    propriedades = acao.output_schema.get("properties", {})
+    obrigatorias = [c for c in acao.output_schema.get("required", []) if c in step.saidas]
+    return obrigatorias, {c: p["default"] for c, p in propriedades.items() if c in step.saidas and "default" in p}
+
+
+async def _agente_da_empresa(step: Step, tarefa: str, contexto: str, regras: list[str], lidos: list[str],
+                             obrigatorias: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """O agente da organização roda no svc-agentes (instrução, ferramentas MCP e política dele); a política que pede
+    aprovação vira a exceção do staff, como o pedido de ajuda."""
+    pedido = ExecutarAgente(agente=step.agente_id or "", tarefa=tarefa, contexto=contexto, leitura=step.leitura, regras=regras,
+                            saidas={c: _tipo_do_valor(step.exemplo.get(c, "")) for c in step.saidas}, obrigatorias=obrigatorias)
+    try:
+        feito = await bus.request(AGENTES_EXECUTAR_SUBJECT, pedido, ExecucaoDeAgente, timeout=300)
+    except (NatsError, TimeoutError):
+        raise Handoff(f"O agente da empresa do passo {step.nome} não respondeu agora.") from None
+    except ServiceError as exc:
+        raise Handoff(f"O agente da empresa do passo {step.nome} não pôde rodar: {exc.message}") from None
+    lidos += feito.lidos
+    if feito.aprovacao:
+        return {}, [f"A política do agente pede aprovação de uma pessoa para usar {feito.aprovacao}."]
+    return ({**feito.saidas, "fontes": feito.fontes} if feito.saidas else {}), [feito.ajuda] if feito.ajuda else []
+
+
+async def _agente_da_plataforma(step: Step, tarefa: str, contexto: str, regras: list[str], lidos: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """O agente da Cogniventure: ler o documento do gatilho, consultar o conhecimento, concluir ou pedir ajuda."""
     resultado: dict[str, Any] = {}
     ajuda: list[str] = []
-    lidos = [json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)]  # onde as saídas podem estar
     campos: dict[str, Any] = {campo: (_tipo_do_exemplo(step.exemplo.get(campo)) | None, None) for campo in step.saidas}
     if step.leitura:
         campos["fontes"] = (dict[str, str], Field(default_factory=dict, description=(
@@ -748,30 +819,11 @@ async def _executar_agente(processo: Processo, step: Step, variaveis: dict[str, 
         ajuda.append(dados.motivo)
         return "Pedido de ajuda registrado."
 
-    contexto = "\n".join([
-        f"Processo: {processo.titulo}. Passo: {step.nome}.", f"Objetivo: {step.objetivo or step.nome}",
-        f"Saídas: {', '.join(f'{c} (ex.: {step.exemplo.get(c)!r})' for c in step.saidas)}",
-        "Dados da execução: " + json.dumps({k: v for k, v in variaveis.items() if k != "entrada"}, ensure_ascii=False)[:4000],
-    ])
     if regras:
-        contexto += "\n\nRegras que o staff da Cogniventure ensinou para este passo (siga-as):\n" + "\n".join(
-            f"- {r.texto} (no caso que gerou a regra, a saída certa foi: {json.dumps(r.esperado, ensure_ascii=False)})" for r in regras)
-    await llm.run_agent(settings.model, f"Execute o passo \"{step.nome}\" e conclua com as saídas.", instructions=EXECUCAO_INSTRUCOES,
+        contexto += "\n\nRegras que o staff da Cogniventure ensinou para este passo (siga-as):\n" + "\n".join(f"- {r}" for r in regras)
+    await llm.run_agent(settings.model, tarefa, instructions=EXECUCAO_INSTRUCOES,
                         tools=[ler_documento, _buscar_conhecimento, concluir, pedir_ajuda], context=contexto, max_turns=6)
-    if ajuda:
-        raise Handoff(ajuda[0])
-    if not resultado:
-        raise Handoff(f"O agente não concluiu {step.nome.lower()}.")
-    fontes = resultado.pop("fontes", None) or {}
-    if step.leitura:  # não chuta: cada saída lida aponta o trecho de onde saiu, e o trecho está no que ele leu e diz o mesmo
-        sem_fonte = [c for c, v in resultado.items() if v not in (None, "") and not _tem_fonte(v, str(fontes.get(c) or ""), lidos, bool(regras))]
-        if sem_fonte:
-            parcial = {c: v for c, v in resultado.items() if c not in sem_fonte and v not in (None, "")}
-            raise Handoff(f"O agente não mostrou no documento de onde tirou: {', '.join(sem_fonte)}.", parcial=parcial)
-    faltam = [c for c in step.exemplo if c in step.saidas and resultado.get(c) in (None, "")]
-    if faltam:
-        raise Handoff(f"O agente não encontrou: {', '.join(faltam)}.", parcial={c: v for c, v in resultado.items() if v not in (None, "")})
-    return resultado
+    return resultado, ajuda
 
 
 def _tem_fonte(valor: Any, trecho: str, lidos: list[str], tem_regra: bool) -> bool:
@@ -815,7 +867,7 @@ async def _publicar(processo: Processo, rascunho: dict[str, Any]) -> Desenho:
     tinha aberto para este desenho (revisão, ajuda)."""
     fluxo = Fluxo.model_validate(rascunho["fluxo"])
     catalogo = await _catalogo()
-    erros = [p for p in _problemas(fluxo, catalogo) if p.nivel == "erro"]
+    erros = [p for p in _problemas(fluxo, catalogo, await _agentes(obrigatorio=any(s.agente_id for s in fluxo.passos))) if p.nivel == "erro"]
     if erros:
         raise ServiceError("ERRO_PROCESSOS_FLUXO_INVALIDO", "O fluxo tem problemas: " + "; ".join(e.texto for e in erros[:3]), 409)
     motor_id = _motor_id(processo.id)
@@ -1100,13 +1152,24 @@ async def _desenho(processo_id: str) -> Desenho:
         versoes=[VersaoResumo(numero=v["numero"], status=v["status"], publicada_em=v.get("publicada_em"),
                               motor_versao=(v.get("motor") or {}).get("versao")) for v in versoes],
         bpmn=to_bpmn(fluxo, process_id=_motor_id(processo_id), name=processo.titulo, actions=catalogo),
-        problemas=_problemas(fluxo, catalogo),
+        problemas=_problemas(fluxo, catalogo, await _agentes()),
         mensagens=[MensagemDesenho(id=_short(m["id"]), papel=m["papel"], autor=m.get("autor"), texto=m["texto"],
                                    passos=m.get("passos") or [], created_at=m.get("created_at")) for m in await _mensagens(processo_id)],
         exige_revisao=aberta["status"] != "publicada" and _exige_revisao(fluxo, catalogo, publicada),
         mudancas=_mudancas(publicada or _partida(processo), fluxo) if aberta["status"] != "publicada" else [],
         regras=await _regras(processo_id),
     )
+
+
+async def _agentes(*, obrigatorio: bool = False) -> dict[str, AgenteDaEmpresa] | None:
+    """Os agentes da organização (svc-agentes). Fora do ar: None (o desenho segue sem conferir); para publicar um passo
+    com agente da empresa, é obrigatório conferir."""
+    try:
+        return {a.id: a for a in (await bus.request(AGENTES_LISTA_SUBJECT, Empty(), AgentesDaEmpresa, timeout=5)).itens}
+    except (NatsError, TimeoutError, ServiceError):
+        if obrigatorio:
+            raise ServiceError("ERRO_PROCESSOS_AGENTES", "O serviço de agentes não respondeu: tente publicar de novo em instantes.", 503) from None
+        return None
 
 
 def _partida(processo: Processo) -> Fluxo:
@@ -1137,8 +1200,9 @@ def _saidas(step: Step, catalogo: dict[str, CatalogAction]) -> list[str]:
     return []
 
 
-def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> list[Problema]:
-    """O que impede publicar (erro) e o que merece atenção (aviso)."""
+def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction], agentes: dict[str, AgenteDaEmpresa] | None = None) -> list[Problema]:
+    """O que impede publicar (erro) e o que merece atenção (aviso). agentes: os da organização (svc-agentes), quando
+    quem chama os tem à mão (desenho, publicação); sem eles, o agente da empresa de um passo não é conferido."""
     out: list[Problema] = []
     erro = lambda texto, passo=None: out.append(Problema(nivel="erro", passo=passo, texto=texto))  # noqa: E731
     aviso = lambda texto, passo=None: out.append(Problema(nivel="aviso", passo=passo, texto=texto))  # noqa: E731
@@ -1200,6 +1264,12 @@ def _problemas(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> list[Problem
                 erro(f"O agente {s.nome} precisa de um objetivo.", s.id)
             if not s.excecao:
                 erro(f"O agente {s.nome} precisa de caminho de exceção (excecao).", s.id)
+            if s.agente_id and agentes is not None:
+                agente = agentes.get(s.agente_id)
+                if agente is None:
+                    erro(f"O agente da empresa do passo {s.nome} não existe mais.", s.id)
+                elif agente.status == "rascunho":
+                    erro(f"O agente {agente.nome} (passo {s.nome}) ainda não passou na suíte de avaliação.", s.id)
         if s.tipo == "tarefa" and not s.responsavel:
             erro(f"A tarefa {s.nome} precisa de um responsável (cliente ou staff).", s.id)
         if s.tipo == "espera":
@@ -1280,8 +1350,10 @@ def _aprovado_antes(fluxo: Fluxo, alvo: str) -> bool:
 
 
 def _sensiveis(fluxo: Fluxo, catalogo: dict[str, CatalogAction]) -> set[str]:
-    """As ações do fluxo que pedem revisão: irreversíveis ou com conexão a sistemas de fora."""
-    return {s.acao for s in fluxo.passos if s.tipo == "acao" and (a := catalogo.get(s.acao or "")) and (a.risk == "irreversivel" or a.connections)}
+    """O que pede revisão: ações irreversíveis ou com conexão a sistemas de fora, e agentes da empresa (ferramentas de
+    sistemas do cliente, servidores MCP) entrando num passo."""
+    acoes = {s.acao for s in fluxo.passos if s.tipo == "acao" and (a := catalogo.get(s.acao or "")) and (a.risk == "irreversivel" or a.connections)}
+    return {*(a for a in acoes if a), *(f"agente:{s.agente_id}" for s in fluxo.passos if s.tipo == "agente" and s.agente_id)}
 
 
 def _exige_revisao(fluxo: Fluxo, catalogo: dict[str, CatalogAction], publicada: Fluxo | None = None) -> bool:
@@ -1296,7 +1368,8 @@ def _resumo_fluxo(fluxo: Fluxo) -> str:
         linhas.append("Parâmetros: " + ", ".join(f"{k} = {v}" for k, v in fluxo.parametros.items()))
     linhas.append("Passos:")
     for s in fluxo.passos:
-        extra = {"acao": s.acao, "agente": f"objetivo: {s.objetivo}; saidas: {', '.join(s.saidas)}", "tarefa": f"{s.responsavel}: {s.pergunta}",
+        extra = {"acao": s.acao, "agente": f"objetivo: {s.objetivo}; saidas: {', '.join(s.saidas)}" + (f"; agente da empresa: {s.agente_id}" if s.agente_id else ""),
+                 "tarefa": f"{s.responsavel}: {s.pergunta}",
                  "espera": f"{s.espera} {s.mensagem or ''} {s.chave or ''} {s.horas or ''}".strip(), "fim": s.resultado}.get(s.tipo)
         linhas.append(f"- {s.id} [{s.tipo}] {s.nome}" + (f" ({extra})" if extra else "") + (" [exceção]" if s.excecao else ""))
     linhas.append("Ligações:")
@@ -1335,7 +1408,7 @@ def _mudancas(antes: Fluxo, depois: Fluxo) -> list[str]:
 
 
 def _contexto_desenho(processo: Processo, fluxo: Fluxo, catalogo: dict[str, CatalogAction], empresa: ContextoEmpresa | None,
-                      historico: list[dict[str, Any]]) -> str:
+                      historico: list[dict[str, Any]], agentes: dict[str, AgenteDaEmpresa] | None = None) -> str:
     linhas = [f"Processo: {processo.titulo} ({processo.area}). {processo.descricao}"]
     if processo.motivo:
         linhas.append(f"Por que foi sugerido: {processo.motivo}")
@@ -1344,14 +1417,17 @@ def _contexto_desenho(processo: Processo, fluxo: Fluxo, catalogo: dict[str, Cata
     linhas += ["", "Catálogo de ações (nome — o que faz; risco; saídas; conexões):"]
     linhas += [f"- {a.name} — {a.title}: {a.description}; {a.risk}; saídas: {', '.join(a.output_fields)}"
                + (f"; conexões: {', '.join(a.connections)}" if a.connections else "") for a in catalogo.values()] or ["- (vazio)"]
+    if agentes:
+        linhas += ["", "Agentes da empresa (usar_agente com o id; só verificado ou confiável entra num processo):"]
+        linhas += [f"- {a.id} — {a.nome}: {a.descricao or 'sem descrição'}; {a.status}" for a in agentes.values()]
     linhas += ["", "Fluxo atual:", _resumo_fluxo(fluxo), "", "Problemas agora:"]
-    linhas += [f"- {p.nivel}: {p.texto}" for p in _problemas(fluxo, catalogo)] or ["- nenhum"]
+    linhas += [f"- {p.nivel}: {p.texto}" for p in _problemas(fluxo, catalogo, agentes)] or ["- nenhum"]
     quem = {"cliente": "Cliente", "staff": "Staff da Cogniventure", "agente": "Agente"}
     linhas += ["", "Conversa até aqui:"] + [f"{quem.get(m['papel'], 'Agente')}: {m['texto']}" for m in historico]
     return "\n".join(linhas)
 
 
-def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction]) -> list[Any]:
+def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction], agentes: dict[str, AgenteDaEmpresa] | None = None) -> list[Any]:
     """As operações tipadas do agente de desenho: cada uma muda o rascunho e devolve os problemas."""
 
     async def aplicar(mudar: Callable[[Fluxo], str]) -> str:
@@ -1365,7 +1441,7 @@ def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction]) -> list[A
         await db.merge(_ref(VERSOES, rascunho), {"fluxo": fluxo.model_dump(mode="json"), "anteriores": anteriores,
                                                  "alteracoes": int(rascunho.get("alteracoes") or 0) + 1})
         await bus.live(LIVE_DESENHO, DesenhoMudou(processo=processo_id, action="alterado"))
-        problemas = _problemas(fluxo, catalogo)
+        problemas = _problemas(fluxo, catalogo, agentes)
         return resumo + ". Problemas: " + ("; ".join(f"{p.nivel}: {p.texto}" for p in problemas) or "nenhum") + "."
 
     async def adicionar_passo(dados: NovoPasso) -> str:
@@ -1465,7 +1541,39 @@ def _ferramentas(processo_id: str, catalogo: dict[str, CatalogAction]) -> list[A
         return json.dumps({"caminho": [f"{p.nome}: {p.nota}" for p in resultado.passos], "fim": resultado.fim,
                            "problemas": resultado.problemas}, ensure_ascii=False)
 
-    return [adicionar_passo, alterar_passo, remover_passo, ligar, desligar, definir_gatilho, definir_parametro, simular]
+    async def usar_agente(dados: UsoDeAgente) -> str:
+        """Põe um agente da empresa (verificado ou confiável) para fazer um passo de ação ou de agente, com as mesmas
+        saídas; sem agente, o passo volta ao agente da Cogniventure."""
+        def mudar(fluxo: Fluxo) -> str:
+            step = fluxo.step(dados.passo)
+            if step is None or step.tipo not in ("acao", "agente"):
+                raise ValueError(f"o passo {dados.passo} precisa existir e ser de ação ou de agente")
+            if dados.agente is None:
+                if step.tipo != "agente":
+                    raise ValueError("só um passo de agente deixa de usar o agente da empresa")
+                if step.acao in catalogo:  # era uma ação: volta a ser a ação do pacote
+                    fluxo.passos[fluxo.passos.index(step)] = Step(id=step.id, tipo="acao", nome=step.nome, acao=step.acao, excecao=step.excecao)
+                    return f"Passo {step.nome} volta a ser a ação {step.acao}"
+                fluxo.passos[fluxo.passos.index(step)] = step.model_copy(update={"agente_id": None})
+                return f"Passo {step.nome} volta ao agente da Cogniventure"
+            agente = (agentes or {}).get(dados.agente)
+            if agente is None:
+                raise ValueError(f"não há agente da empresa com id {dados.agente}")
+            if agente.status == "rascunho":
+                raise ValueError(f"o agente {agente.nome} ainda não passou na suíte (está em rascunho)")
+            if step.tipo == "acao":  # vira passo de agente com as mesmas saídas: as condições adiante continuam valendo
+                acao = catalogo.get(step.acao or "")
+                saidas = list(acao.output_fields) if acao else []
+                exemplo = {k: v for k, v in (acao.example if acao else {}).items() if isinstance(v, str | int | float | bool)}
+                novo = Step(id=step.id, tipo="agente", nome=step.nome, objetivo=(acao.description if acao else step.nome)[:600],
+                            acao=step.acao, saidas=saidas, exemplo=exemplo, excecao=True, agente_id=agente.id)  # acao: o contrato que ele cumpre
+            else:
+                novo = step.model_copy(update={"agente_id": agente.id, "excecao": True})
+            fluxo.passos[fluxo.passos.index(step)] = novo
+            return f"Passo {step.nome} agora é feito pelo agente {agente.nome}"
+        return await aplicar(mudar)
+
+    return [adicionar_passo, alterar_passo, remover_passo, ligar, desligar, definir_gatilho, definir_parametro, simular, usar_agente]
 
 
 def _valor(variaveis: dict[str, Any], campo: str) -> Any:

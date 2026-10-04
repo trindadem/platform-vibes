@@ -39,6 +39,161 @@ export const gateway = {
   health: (options?: RequestOptions) => request<GatewayHealth>("GET", "/health", undefined, options),
 };
 
+export interface AgentesAgente {
+  id: string;
+  nome: string;
+  descricao: string;
+  instrucao: string;
+  modelo: string;
+  ferramentas: AgentesFerramentaAgente[];
+  casos: AgentesCaso[];
+  /** verificado: passou na suíte; confiável: o staff decidiu */
+  status: "rascunho" | "verificado" | "confiavel";
+  /** Sobe a cada mudança no que o agente faz; a avaliação vale para uma versão */
+  versao: number;
+  avaliando: boolean;
+  avaliacao: AgentesAvaliacao | null;
+  confiavel_por: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AgentesAvaliacao {
+  versao: number;
+  ok: boolean;
+  resultados: AgentesResultadoCaso[];
+  em: string;
+}
+
+/** Um caso da suíte: dada a tarefa e os dados, o agente devolve o esperado. */
+export interface AgentesCaso {
+  id: string;
+  nome: string;
+  tarefa: string;
+  /** O que o passo teria à mão (ex.: ler_documento.*) */
+  dados: Record<string, unknown>;
+  /** Campo → valor que o agente precisa devolver */
+  esperado: Record<string, string | number | boolean>;
+}
+
+export interface AgentesFerramentaAgente {
+  ref: string;
+  /** perguntar: o agente não usa sozinho; o passo vai para uma pessoa aprovar */
+  modo: "permitir" | "perguntar";
+}
+
+export interface AgentesResultadoCaso {
+  caso: string;
+  ok: boolean;
+  saida: Record<string, unknown>;
+  detalhes: string[];
+  /** O que o agente chamou */
+  ferramentas: string[];
+}
+
+export interface AgentesAgentes {
+  itens: AgentesAgente[];
+}
+
+export interface AgentesAgenteRef {
+  id: string;
+}
+
+export interface AgentesNovoAgente {
+  nome: string;
+  descricao?: string;
+  instrucao: string;
+  modelo?: string;
+  ferramentas?: AgentesFerramentaAgente[];
+  casos?: AgentesCaso[];
+}
+
+export interface AgentesEdicaoAgente {
+  id: string;
+  nome?: string | null;
+  descricao?: string | null;
+  instrucao?: string | null;
+  modelo?: string | null;
+  ferramentas?: AgentesFerramentaAgente[] | null;
+  casos?: AgentesCaso[] | null;
+}
+
+/** Experimentar o agente na tela, com uma tarefa e dados quaisquer. */
+export interface AgentesTeste {
+  id: string;
+  tarefa: string;
+  dados?: Record<string, unknown>;
+  /** Campo → tipo do que ele devolve */
+  saidas: Record<string, "texto" | "numero" | "sim_nao">;
+}
+
+export interface AgentesExecucao {
+  saidas: Record<string, unknown>;
+  fontes: Record<string, string>;
+  /** O agente pediu ajuda: o motivo */
+  ajuda: string | null;
+  /** A política pede aprovação de uma pessoa para o que ele ia fazer */
+  aprovacao: string | null;
+  /** O que ele chamou, na ordem */
+  ferramentas: string[];
+  /** O que ele leu (documentos e respostas das ferramentas) */
+  lidos: string[];
+  texto: string;
+}
+
+export interface AgentesFerramentaCatalogo {
+  /** conhecimento, documento ou mcp:<servidor>:<ferramenta> */
+  ref: string;
+  nome: string;
+  descricao: string;
+  origem: "plataforma" | "mcp";
+  servidor_nome: string | null;
+  risco: "leitura" | "escrita" | "externa" | "irreversivel";
+  parametros: Record<string, unknown>;
+}
+
+export interface AgentesCatalogoFerramentas {
+  itens: AgentesFerramentaCatalogo[];
+  /** Falso quando o svc-integracoes não respondeu (só as da plataforma) */
+  integracoes: boolean;
+}
+
+export interface AgentesAgenteMudou {
+  id: string;
+  action: "criado" | "alterado" | "avaliando" | "avaliado" | "confiavel" | "removido";
+}
+
+/** svc-agentes · /api/v1/agentes */
+export const agentes = {
+  /** GET /api/v1/agentes/agentes · http · exige token */
+  lista: (options?: RequestOptions) =>
+    request<AgentesAgentes>("GET", "/api/v1/agentes/agentes", undefined, options),
+  /** GET /api/v1/agentes/agentes/item · http · exige token */
+  agente: (query?: AgentesAgenteRef, options?: RequestOptions) =>
+    request<AgentesAgente>("GET", withQuery("/api/v1/agentes/agentes/item", query), undefined, options),
+  /** POST /api/v1/agentes/agentes · http · exige token */
+  criar: (body: AgentesNovoAgente, options?: RequestOptions) =>
+    request<AgentesAgente>("POST", "/api/v1/agentes/agentes", body, options),
+  /** POST /api/v1/agentes/agentes/editar · http · exige token */
+  editar: (body: AgentesEdicaoAgente, options?: RequestOptions) =>
+    request<AgentesAgente>("POST", "/api/v1/agentes/agentes/editar", body, options),
+  /** POST /api/v1/agentes/agentes/remover · http · exige token */
+  remover: (body: AgentesAgenteRef, options?: RequestOptions) =>
+    request<AgentesAgente>("POST", "/api/v1/agentes/agentes/remover", body, options),
+  /** POST /api/v1/agentes/agentes/avaliar · http · exige token */
+  avaliar: (body: AgentesAgenteRef, options?: RequestOptions) =>
+    request<AgentesAgente>("POST", "/api/v1/agentes/agentes/avaliar", body, options),
+  /** POST /api/v1/agentes/agentes/confiar · http · exige token */
+  confiar: (body: AgentesAgenteRef, options?: RequestOptions) =>
+    request<AgentesAgente>("POST", "/api/v1/agentes/agentes/confiar", body, options),
+  /** POST /api/v1/agentes/agentes/testar · http · exige token */
+  testar: (body: AgentesTeste, options?: RequestOptions) =>
+    request<AgentesExecucao>("POST", "/api/v1/agentes/agentes/testar", body, options),
+  /** GET /api/v1/agentes/ferramentas · http · exige token */
+  ferramentas: (options?: RequestOptions) =>
+    request<AgentesCatalogoFerramentas>("GET", "/api/v1/agentes/ferramentas", undefined, options),
+};
+
 export interface AiProvider {
   id: string;
   name: string;
@@ -970,6 +1125,64 @@ export interface IntegracoesPagamentoRef {
   id: string;
 }
 
+export interface IntegracoesItemCatalogo {
+  tipo: string;
+  nome: string;
+  descricao: string;
+  disponivel: boolean;
+  /** A organização pode ter mais de uma */
+  varias: boolean;
+}
+
+export interface IntegracoesCatalogo {
+  itens: IntegracoesItemCatalogo[];
+}
+
+/** Uma ferramenta anunciada pelo servidor, sanitizada e pinada (a impressão de nome, descrição e schema). */
+export interface IntegracoesFerramentaMcp {
+  nome: string;
+  titulo: string | null;
+  descricao: string;
+  /** JSON schema da entrada */
+  parametros: Record<string, unknown>;
+  /** Piso externa: o que o servidor diz de si só sobe o risco */
+  risco: "leitura" | "escrita" | "externa" | "irreversivel";
+  digest: string;
+  /** Por que a ferramenta não pode ser usada (mudou, texto oculto...) */
+  quarentena: string | null;
+}
+
+export interface IntegracoesServidorMcp {
+  id: string;
+  nome: string;
+  url: string;
+  /** Cabeçalho que leva a credencial (ex.: Authorization) */
+  cabecalho: string | null;
+  tem_segredo: boolean;
+  ferramentas: IntegracoesFerramentaMcp[];
+  /** Nome e versão que o servidor informou */
+  servidor: string | null;
+  atualizado_em: string | null;
+  created_at: string | null;
+}
+
+export interface IntegracoesServidoresMcp {
+  itens: IntegracoesServidorMcp[];
+}
+
+export interface IntegracoesNovoServidorMcp {
+  nome: string;
+  /** Endereço MCP (Streamable HTTP), https */
+  url: string;
+  cabecalho?: string | null;
+  /** Valor do cabeçalho (ex.: Bearer abc...): guardado cifrado */
+  segredo?: string | null;
+}
+
+export interface IntegracoesServidorRef {
+  id: string;
+}
+
 export interface IntegracoesConexaoMudou {
   id: string;
   action: "conectada" | "removida";
@@ -983,6 +1196,11 @@ export interface IntegracoesDocumentoMudou {
 export interface IntegracoesPagamentoMudou {
   id: string;
   action: "agendado" | "pago";
+}
+
+export interface IntegracoesServidorMudou {
+  id: string;
+  action: "conectado" | "atualizado" | "removido" | "quarentena";
 }
 
 /** svc-integracoes · /api/v1/integracoes */
@@ -1011,6 +1229,21 @@ export const integracoes = {
   /** POST /api/v1/integracoes/pagamentos/confirmar · http · exige token */
   confirmarPagamento: (body: IntegracoesPagamentoRef, options?: RequestOptions) =>
     request<IntegracoesPagamento>("POST", "/api/v1/integracoes/pagamentos/confirmar", body, options),
+  /** GET /api/v1/integracoes/catalogo · http · exige token */
+  catalogo: (options?: RequestOptions) =>
+    request<IntegracoesCatalogo>("GET", "/api/v1/integracoes/catalogo", undefined, options),
+  /** GET /api/v1/integracoes/servidores · http · exige token */
+  servidores: (options?: RequestOptions) =>
+    request<IntegracoesServidoresMcp>("GET", "/api/v1/integracoes/servidores", undefined, options),
+  /** POST /api/v1/integracoes/servidores · http · exige token */
+  conectarServidor: (body: IntegracoesNovoServidorMcp, options?: RequestOptions) =>
+    request<IntegracoesServidorMcp>("POST", "/api/v1/integracoes/servidores", body, options),
+  /** POST /api/v1/integracoes/servidores/atualizar · http · exige token */
+  atualizarServidor: (body: IntegracoesServidorRef, options?: RequestOptions) =>
+    request<IntegracoesServidorMcp>("POST", "/api/v1/integracoes/servidores/atualizar", body, options),
+  /** POST /api/v1/integracoes/servidores/remover · http · exige token */
+  removerServidor: (body: IntegracoesServidorRef, options?: RequestOptions) =>
+    request<IntegracoesServidorMcp>("POST", "/api/v1/integracoes/servidores/remover", body, options),
 };
 
 export interface NotifyNotification {
@@ -1524,6 +1757,8 @@ export interface ProcessosStep {
   excecao: boolean;
   /** agente: as saídas são lidas de um documento; cada uma precisa do trecho de onde saiu (ou de uma regra do staff), senão o passo vai para o staff */
   leitura: boolean;
+  /** agente: um agente da organização (svc-agentes); sem ele, o da Cogniventure */
+  agente_id: string | null;
   /** fim: como termina (ex.: pago, recusado) */
   resultado: string | null;
 }
@@ -2236,6 +2471,8 @@ export const webhooks = {
 
 /** Eventos ao vivo (live: dos manifestos): tópico → o que o evento carrega. Use com useLive/useLiveQuery. */
 export interface LiveTopics {
+  /** svc-agentes · bus.live("agentes.agentes", ...) */
+  "agentes.agentes": AgentesAgenteMudou;
   /** svc-ai · bus.live("ai.uso", ...) */
   "ai.uso": AiRecorded;
   /** svc-conhecimento · bus.live("conhecimento.briefing", ...) */
@@ -2258,6 +2495,8 @@ export interface LiveTopics {
   "integracoes.documentos": IntegracoesDocumentoMudou;
   /** svc-integracoes · bus.live("integracoes.pagamentos", ...) */
   "integracoes.pagamentos": IntegracoesPagamentoMudou;
+  /** svc-integracoes · bus.live("integracoes.servidores", ...) */
+  "integracoes.servidores": IntegracoesServidorMudou;
   /** svc-notify · bus.live("notify.nova", ...) */
   "notify.nova": NotifyNotification;
   /** svc-plans · bus.live("plans.uso", ...) */
@@ -2282,11 +2521,12 @@ export interface LiveTopics {
 
 /** Módulos (o MODULE de cada services/svc-<nome>/schemas.py): o meta.module das telas e os grupos do menu. */
 export const appModules = {
+  agentes: { title: "Agentes", description: "Agentes da empresa: instrução, ferramentas do catálogo, política e suíte de avaliação", category: "Sua empresa", core: false },
   ai: { title: "IA", description: "Modelos de IA, chaves e consumo", category: "Integrações", core: true },
   conhecimento: { title: "Conhecimento", description: "Briefing da empresa e a base de conhecimento que os agentes consultam", category: "Sua empresa", core: false },
   financeiro: { title: "Financeiro", description: "Pacote de ações financeiras do BPO: contas a pagar, conciliação, cobrança e fechamento", category: "Pacotes", core: false },
   identity: { title: "Pessoas e acesso", description: "Contas, organizações, membros e convites", category: "Organização", core: true },
-  integracoes: { title: "Integrações", description: "Conexões da empresa com o mundo de fora: a caixa de entrada de documentos e o banco", category: "Integrações", core: false },
+  integracoes: { title: "Integrações", description: "Conexões da empresa com o mundo de fora: caixa de entrada de documentos, banco e servidores MCP", category: "Integrações", core: false },
   notify: { title: "Avisos", description: "Avisos na tela e por e-mail", category: "Organização", core: true },
   plans: { title: "Plano", description: "Plano, módulos e consumo da organização", category: "Organização", core: true },
   processos: { title: "Processos", description: "Os processos que a Cogniventure executa para a empresa: sugeridos, descritos, desenhados e publicados", category: "Sua empresa", core: false },

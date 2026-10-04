@@ -3,8 +3,10 @@
 HTTP /conexoes...        → conexões da organização (caixa de entrada, banco simulado).
 HTTP /documentos...      → documentos recebidos e o link para abrir cada um.
 HTTP /pagamentos...      → pagamentos no banco simulado; confirmar à mão.
+HTTP /servidores...      → servidores MCP da organização (ferramentas para os agentes); /catalogo, o que dá para conectar.
 HTTP POST /entrada/mailpit → só na rede interna, no ambiente local: o Mailpit avisa que chegou um e-mail (spec §2).
 NATS rpc.integracoes.documento e rpc.integracoes.banco_agendar → texto do documento (agentes) e agendamento (ações).
+NATS rpc.integracoes.ferramentas e rpc.integracoes.mcp_chamar → ferramentas MCP e a chamada com a credencial (svc-agentes).
 
 Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-integracoes main:app --port 8100 --env-file .env
 """
@@ -25,6 +27,8 @@ from core.temporal_runner import runner
 from schemas import (
     AGENDAR_SUBJECT,
     DOCUMENTO_SUBJECT,
+    FERRAMENTAS_SUBJECT,
+    MCP_SUBJECT,
     MODULE,
     SEARCH,
     SERVICE,
@@ -33,15 +37,18 @@ from schemas import (
     UNIQUE,
     AgendarPagamento,
     AvisoEmail,
+    ChamadaMcp,
     ConexaoRef,
     DocumentoQuery,
     DocumentoRef,
     Empty,
     NovaConexao,
+    NovoServidorMcp,
     PagamentoQuery,
     PagamentoRef,
+    ServidorRef,
 )
-from service import MIGRATIONS, IntegracoesService
+from service import MIGRATIONS, IntegracoesService, _aead
 from workflows import SCHEDULES, PagamentoSimuladoWorkflow
 
 svc = IntegracoesService()
@@ -49,6 +56,7 @@ svc = IntegracoesService()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _aead()  # sem INTEGRACOES_SECRETS_KEY válida o serviço não sobe (as credenciais MCP ficariam sem cifra)
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TABLES, unique=UNIQUE, search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
@@ -57,6 +65,8 @@ async def lifespan(app: FastAPI):
         await storage.connected(SERVICE)  # os documentos recebidos (README §5.14)
         await bus.respond(DOCUMENTO_SUBJECT, svc.documento_texto, model=DocumentoRef)  # agentes dos processos
         await bus.respond(AGENDAR_SUBJECT, svc.agendar_pagamento, model=AgendarPagamento)  # ação do svc-financeiro
+        await bus.respond(FERRAMENTAS_SUBJECT, svc.ferramentas, model=Empty)  # catálogo de ferramentas dos agentes
+        await bus.respond(MCP_SUBJECT, svc.chamar_mcp, model=ChamadaMcp)  # a credencial não sai deste serviço
         await plans.declare(MODULE)
         yield
 
@@ -114,3 +124,28 @@ async def confirmar(data: PagamentoRef) -> ResponseEnvelope:
 @app.post("/entrada/mailpit", response_model=ResponseEnvelope)
 async def mailpit(data: AvisoEmail) -> ResponseEnvelope:
     return _ok(await svc.receber_email(data))
+
+
+@app.get("/catalogo", response_model=ResponseEnvelope)
+async def catalogo() -> ResponseEnvelope:
+    return _ok(await svc.catalogo(Empty()))
+
+
+@app.get("/servidores", response_model=ResponseEnvelope)
+async def servidores() -> ResponseEnvelope:
+    return _ok(await svc.servidores(Empty()))
+
+
+@app.post("/servidores", response_model=ResponseEnvelope)
+async def conectar_mcp(data: NovoServidorMcp) -> ResponseEnvelope:
+    return _ok(await svc.conectar_mcp(data))
+
+
+@app.post("/servidores/atualizar", response_model=ResponseEnvelope)
+async def atualizar_mcp(data: ServidorRef) -> ResponseEnvelope:
+    return _ok(await svc.atualizar_mcp(data))
+
+
+@app.post("/servidores/remover", response_model=ResponseEnvelope)
+async def remover_mcp(data: ServidorRef) -> ResponseEnvelope:
+    return _ok(await svc.remover_mcp(data))

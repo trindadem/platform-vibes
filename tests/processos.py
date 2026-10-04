@@ -718,3 +718,88 @@ def test_excecao_de_agente_vira_regra_avaliada_que_entra_no_agente(provedor):
     assert lido.status == "concluido" and "dia 15 do mês seguinte" in contexto_execucao and "primeiro dia" not in contexto_execucao
     assert desligada["status"] == "desativada" and [r["status"] for r in desenho["regras"]] == ["desativada", "reprovada"]
     assert itens.count(("excecao", "aberta")) == 2 and itens.count(("excecao", "concluida")) == 2
+
+
+# ── Agentes da empresa nos passos (N6): usar_agente, revisão, validação e execução pelo svc-agentes ──
+
+from schemas import AGENTES_EXECUTAR_SUBJECT, AGENTES_LISTA_SUBJECT  # noqa: E402
+
+LISTA_AGENTES = {"itens": [
+    {"id": "ag1", "nome": "Conferente de pedidos", "descricao": "Confere o boleto com o pedido de compra no ERP", "status": "verificado",
+     "ferramentas": ["mcp:erp1:consultar_pedido"]},
+    {"id": "ag2", "nome": "Rascunho", "descricao": "", "status": "rascunho", "ferramentas": []},
+]}
+
+
+def test_passo_feito_por_um_agente_da_empresa_passa_pela_revisao_e_roda_no_svc_agentes(provedor):
+    provedor["chamadas"] = [("usar_agente", {"passo": "conferir", "agente": "ag2"}), ("usar_agente", {"passo": "conferir", "agente": "ag1"})]
+    agentes = json.loads(json.dumps(LISTA_AGENTES))
+    pedidos, respostas = [], [{"saidas": {"divergente": False, "diferenca": 0}, "ferramentas": ["consultar_pedido"],
+                               "lidos": ['{"pedidos": [{"numero": "PC-1001", "valor": 7200.0}]}']}]
+
+    def executar(pedido):
+        pedidos.append(pedido)
+        return respostas[min(len(pedidos), len(respostas)) - 1]
+
+    async def cenario(app):
+        _servicos(app)
+        app.respond(AGENTES_LISTA_SUBJECT, lambda _: agentes)
+        app.respond(AGENTES_EXECUTAR_SUBJECT, executar)
+        ana, otto = app.user(*OWNER), app.user(*OPERADOR)
+        pid = await _publicado(app)
+        await ana.post("/desenho/ajustar", json={"processo": pid})
+        conversa = _sse((await ana.post("/desenho/mensagem", json={"processo": pid, "texto": "Use o Conferente de pedidos para conferir com o pedido."})).text)
+        desenho = conversa[-1][1]["data"]
+        dono_publica = await ana.post("/desenho/publicar", json={"processo": pid})  # agente novo num passo: o staff revisa
+        agentes["itens"][0]["status"] = "rascunho"
+        voltou = (await ana.post("/desenho/abrir", json={"processo": pid})).json()["data"]
+        agentes["itens"][0]["status"] = "verificado"
+        publicado = (await otto.post("/desenho/publicar", json={"processo": pid})).json()["data"]
+        variaveis = {"gatilho": GATILHO, "ler_documento": LIDO}
+        conferido = await app.job(JOB_AGENT, processo=pid, element="conferir", variables=variaveis, headers={"excecao": "sim"}, version=2)
+        respostas.append({"saidas": {}, "aprovacao": "consultar_pedido (ERP da Acme) com {\"cnpj\": \"12.345.678/0001-90\"}"})
+        aprovar = await app.job(JOB_AGENT, processo=pid, element="conferir", variables=variaveis, headers={"excecao": "sim"}, version=2)
+        app.respond(AGENTES_EXECUTAR_SUBJECT, lambda _: (_ for _ in ()).throw(TimeoutError()))
+        fora = await app.job(JOB_AGENT, processo=pid, element="conferir", variables=variaveis, headers={"excecao": "sim"}, version=2)
+        return desenho, dono_publica, voltou, publicado, conferido, aprovar, fora
+
+    desenho, dono_publica, voltou, publicado, conferido, aprovar, fora = service_app(cenario)
+    conferir = next(p for p in desenho["versao"]["fluxo"]["passos"] if p["id"] == "conferir")
+    assert (conferir["tipo"], conferir["agente_id"], conferir["saidas"], conferir["excecao"]) == ("agente", "ag1", ["divergente", "diferenca"], True)
+    assert conferir["acao"] == "financeiro.conferir_pedido"  # o contrato que o agente cumpre (e para onde volta sem ele)
+    respostas_ferramentas = [m["content"] for m in provedor["pedidos"][1]["messages"] if m["role"] == "tool"]
+    assert "ainda não passou na suíte" in respostas_ferramentas[0] and "agora é feito pelo agente Conferente" in respostas_ferramentas[1]
+    assert desenho["exige_revisao"] and "Passo alterado: Conferir com o pedido" in desenho["mudancas"]
+    assert dono_publica.json()["error"]["code"] == "ERRO_PROCESSOS_REVISAO"
+    assert any("Conferente de pedidos (passo Conferir com o pedido) ainda não passou na suíte" in p["texto"] for p in voltou["problemas"])
+    assert publicado["versao"]["status"] == "publicada"
+    contexto = json.dumps(provedor["pedidos"][0]["messages"], ensure_ascii=False)
+    assert "ag1 — Conferente de pedidos" in contexto  # o agente de desenho conhece os agentes da empresa
+    assert conferido.status == "concluido" and conferido.variables["resultado"] == {"divergente": False, "diferenca": 0}
+    assert (aprovar.status, aprovar.message) == ("handoff", "A política do agente pede aprovação de uma pessoa para usar consultar_pedido (ERP da Acme) com {\"cnpj\": \"12.345.678/0001-90\"}.")
+    assert fora.status == "handoff" and "não respondeu" in fora.message
+    assert pedidos[0].agente == "ag1" and pedidos[0].saidas == {"divergente": "sim_nao", "diferenca": "numero"}
+    assert "Dados da execução" in pedidos[0].contexto and "Moinho Sul" in pedidos[0].contexto
+
+
+def test_agente_no_lugar_de_uma_acao_cumpre_o_contrato_dela():
+    """Só as saídas obrigatórias da ação são exigidas; as outras recebem o padrão dela (a condição adiante nunca vê vazio)."""
+    from pydantic import BaseModel, Field
+
+    from core.processes import CatalogAction, Step
+
+    from service import _contrato
+
+    class Conferencia(BaseModel):
+        divergente: bool
+        diferenca: float = 0
+        pedido: str | None = None
+        fornecedor_novo: bool = Field(False)
+
+    acao = CatalogAction(name="financeiro.conferir_pedido", service="svc-financeiro", title="Conferir", description="Confere",
+                         risk="leitura", output_fields=list(Conferencia.model_fields), output_schema=Conferencia.model_json_schema())
+    no_lugar = Step(id="conferir", tipo="agente", nome="Conferir", objetivo="x", acao=acao.name, agente_id="ag1",
+                    saidas=list(Conferencia.model_fields), exemplo={"divergente": False, "diferenca": 0, "pedido": "PC-1"}, excecao=True)
+    proprio = no_lugar.model_copy(update={"acao": None})
+    assert _contrato(no_lugar, {acao.name: acao}) == (["divergente"], {"diferenca": 0, "pedido": None, "fornecedor_novo": False})
+    assert _contrato(proprio, {acao.name: acao}) == (["divergente", "diferenca", "pedido"], {})  # agente próprio: as que têm exemplo

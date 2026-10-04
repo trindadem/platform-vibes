@@ -1,0 +1,87 @@
+# svc-agentes · rotas públicas no Gateway. Fonte da verdade: specs/agentes.md §2
+service: agentes
+base_path: /api/v1/agentes
+
+live:
+  - topic: agentes                  # um agente criado, alterado, avaliado, marcado confiável ou removido
+    model: AgenteMudou
+
+endpoints:
+  - path: /agentes
+    name: lista
+    method: GET
+    auth: client_jwt
+    response: Agentes
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes
+
+  - path: /agentes/item
+    name: agente
+    method: GET
+    auth: client_jwt
+    query: AgenteRef
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/item
+
+  - path: /agentes
+    name: criar
+    method: POST
+    auth: client_jwt
+    request: NovoAgente
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes
+
+  - path: /agentes/editar
+    name: editar
+    method: POST
+    auth: client_jwt
+    request: EdicaoAgente
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/editar
+
+  - path: /agentes/remover
+    name: remover
+    method: POST
+    auth: client_jwt
+    request: AgenteRef
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/remover
+
+  - path: /agentes/avaliar
+    name: avaliar
+    method: POST
+    auth: client_jwt
+    request: AgenteRef
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/avaliar
+
+  - path: /agentes/confiar
+    name: confiar
+    method: POST
+    auth: client_jwt
+    request: AgenteRef
+    response: Agente
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/confiar
+
+  - path: /agentes/testar
+    name: testar
+    method: POST
+    auth: client_jwt
+    request: Teste
+    response: Execucao
+    timeout: 120                    # o agente roda de verdade (modelo e ferramentas)
+    target_type: http
+    target_url: http://svc-agentes:8000/agentes/testar
+
+  - path: /ferramentas
+    method: GET
+    auth: client_jwt
+    response: CatalogoFerramentas
+    target_type: http
+    target_url: http://svc-agentes:8000/ferramentas

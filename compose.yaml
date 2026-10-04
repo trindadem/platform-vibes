@@ -233,6 +233,18 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # Só no ambiente local: o ERP de exemplo de uma empresa cliente, falando MCP (tests/mcp_erp.py), para conectar em
+  # Integrações e dar ferramentas aos agentes: http://mcp-erp:8000/mcp com Authorization "Bearer erp-dev-token".
+  mcp-erp:
+    image: python:3.13-slim
+    command: ["python", "/app/mcp_erp.py"]
+    volumes: ["./tests/mcp_erp.py:/app/mcp_erp.py:ro"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/saude')"]
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+
   # Observabilidade local (README §5.18): Grafana com traces (Tempo), métricas (Prometheus) e logs (Loki) em
   # http://localhost:3000. Recebe OTLP do gateway e dos serviços pela rede interna (e do host em 127.0.0.1:4318).
   # Os dados somem quando o container é recriado. Em produção, OTEL_EXPORTER_OTLP_ENDPOINT aponta para o seu backend.
@@ -330,6 +342,8 @@ services:
       INTEGRACOES_DOMINIO: ${INTEGRACOES_DOMINIO:-entrada.localhost}  # endereços das caixas de entrada
       # Local: o Mailpit avisa (webhook) e entrega o e-mail recebido; em produção, um provedor de entrada (spec §3).
       INTEGRACOES_MAILPIT_URL: http://mailpit:8025
+      # Só este serviço cifra e abre as credenciais dos servidores MCP (as chamadas MCP saem daqui).
+      INTEGRACOES_SECRETS_KEY: ${INTEGRACOES_SECRETS_KEY:?rode uv run python -m core.security keygen}
 
   svc-staff:
     <<: *service
@@ -338,3 +352,8 @@ services:
     environment:
       <<: *service-env
       PLATFORM_TENANT: ${PLATFORM_TENANT:-}  # a organização da Cogniventure: quem é dela é staff (specs/staff.md)
+
+  svc-agentes:
+    <<: *service
+    build: { <<: *service-build, args: { SERVICE: agentes } }
+    profiles: [modules, agentes]  # módulo de negócio: sobe com COMPOSE_PROFILES (README §9)

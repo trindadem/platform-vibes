@@ -133,6 +133,7 @@ class Step(BaseModel):
     excecao: bool = Field(False, description="acao e agente: caminho de handoff para o staff")
     leitura: bool = Field(False, description="agente: as saídas são lidas de um documento; cada uma precisa do trecho de onde "
                                              "saiu (ou de uma regra do staff), senão o passo vai para o staff")
+    agente_id: str | None = Field(None, description="agente: um agente da organização (svc-agentes); sem ele, o da Cogniventure")
     resultado: str | None = Field(None, max_length=40, description="fim: como termina (ex.: pago, recusado)")
 
 

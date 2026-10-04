@@ -9,6 +9,7 @@
     agente  = await llm.agent("openrouter/claude", tools=[...])              # Agent do Agno para casos avançados
     feito   = await llm.run_agent("cv/agente", tarefa, instructions=INSTRUCAO, tools=[registrar, buscar],
                                   context=historico, on_step=passos.put_nowait)  # agente com ferramentas (AgentExo)
+    remota  = SchemaTool("mcp_erp_consultar_pedido", "Consulta pedidos no ERP", schema, chamar)  # ferramenta por schema
 
 Trilhos:
 - O modelo é "<provedor>/<modelo>" como cadastrado no svc-ai (apelido ou id). O svc-ai resolve, na organização de
@@ -28,7 +29,9 @@ Agentes (run_agent) rodam no laço do AgentExo (exovision-agent, o SDK agêntico
 toca a plataforma continua no core: o modelo vem do svc-ai, cada volta passa pelo mesmo cliente HTTP (sem redirect,
 sem cookie, endereço conferido), o plano é conferido a cada volta e o uso de cada volta vai para events.ai.usage.
 As ferramentas são funções async do serviço (docstring = descrição; parâmetros tipados = schema, validado pelo
-Pydantic antes da chamada) e rodam no loop do serviço, em nome de quem age. Erro de validação ou ServiceError volta
+Pydantic antes da chamada) e rodam no loop do serviço, em nome de quem age. Ferramenta só conhecida em tempo de
+execução (a de um servidor MCP) entra como SchemaTool: nome, descrição e JSON schema como vieram, e a função recebe os
+argumentos num dict (quem a escreve valida, ou deixa o destino validar). Erro de validação ou ServiceError volta
 ao modelo como resultado de erro, para ele corrigir; outra exceção vira "falha interna", sem detalhe. O contexto
 (histórico, estado) entra pela porta de memória do AgentExo; o histórico e os documentos ficam nas tabelas do serviço.
 """
@@ -40,6 +43,7 @@ import os
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 os.environ.setdefault("AGNO_TELEMETRY", "false")  # antes de importar o Agno: nada sai para os servidores dele
@@ -65,8 +69,8 @@ from core.plans import plans
 from core.security import assert_public_url, current_tenant
 
 __all__ = [
-    "AgentResult", "AgentStep", "Image", "llm", "Llm", "Resolved", "ResolveRequest", "UsageEvent", "RESOLVE_SUBJECT",
-    "USAGE_SUBJECT",
+    "AgentResult", "AgentStep", "Image", "llm", "Llm", "Resolved", "ResolveRequest", "SchemaTool", "UsageEvent",
+    "RESOLVE_SUBJECT", "USAGE_SUBJECT",
 ]
 
 RESOLVE_SUBJECT = "rpc.ai.resolve"
@@ -113,6 +117,19 @@ class UsageEvent(BaseModel):
     output_tokens: int = 0
     price_input: float = 0.0
     price_output: float = 0.0
+
+
+@dataclass(frozen=True)
+class SchemaTool:
+    """Ferramenta descrita por JSON schema, para o que só se conhece em tempo de execução (ex.: a de um servidor MCP).
+
+    call recebe os argumentos como o modelo mandou (um dict) e roda no loop do serviço, como as funções tipadas.
+    """
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    call: Callable[[dict[str, Any]], Awaitable[Any]]
 
 
 class AgentStep(BaseModel):
@@ -211,7 +228,7 @@ class Llm:
         task: str,
         *,
         instructions: str,
-        tools: Sequence[Callable[..., Awaitable[Any]]] = (),
+        tools: Sequence[Callable[..., Awaitable[Any]] | SchemaTool] = (),
         context: str = "",
         max_turns: int = 8,
         on_step: Callable[[AgentStep], None] | None = None,
@@ -219,12 +236,12 @@ class Llm:
         """Agente com ferramentas até terminar a tarefa (ou o orçamento de voltas acabar), no laço do AgentExo.
 
         tools: funções async do serviço com docstring e parâmetros tipados (ou um único parâmetro que é modelo Pydantic:
-        os campos dele viram os argumentos). context: o que o agente precisa saber antes (histórico da conversa, estado
+        os campos dele viram os argumentos), ou SchemaTool. context: o que o agente precisa saber antes (histórico da conversa, estado
         atual). on_step: chamado no loop do serviço a cada ferramenta que começa e termina.
         """
         resolved = await self._resolve(model, "chat")
         loop = asyncio.get_running_loop()
-        registry = Registry([_loop_tool(fn, loop) for fn in tools])
+        registry = Registry([_schema_tool(t, loop) if isinstance(t, SchemaTool) else _loop_tool(t, loop) for t in tools])
         provider = _MeteredProvider(self, model, resolved, loop)
 
         def step(event: Any) -> None:
@@ -458,19 +475,42 @@ def _loop_tool(fn: Callable[..., Awaitable[Any]], loop: asyncio.AbstractEventLoo
         except ValidationError as exc:
             problems = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'argumentos'}: {e['msg']}" for e in exc.errors())
             return ToolResult.error(f"argumentos inválidos: {problems}", code=422)
-        coro = fn(parsed) if whole else fn(**{p.name: getattr(parsed, p.name) for p in params})
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        try:
-            value = future.result(timeout=TOOL_SECONDS)
-        except ServiceError as exc:
-            return ToolResult.error(f"{exc.code}: {exc.message}", code=exc.status)
-        except Exception:
-            future.cancel()
-            log.exception("ferramenta %s falhou", name)
-            return ToolResult.error("falha interna na ferramenta; tente outro caminho ou avise a pessoa", code=500)
-        return ToolResult(text=_tool_text(value))
+        return _run_in_loop(name, fn(parsed) if whole else fn(**{p.name: getattr(parsed, p.name) for p in params}), loop)
 
     return Tool(name=name, description=description, fn=call, input_schema=_inline(arguments_model.model_json_schema()))
+
+
+def _schema_tool(spec: SchemaTool, loop: asyncio.AbstractEventLoop) -> Tool:
+    """SchemaTool → ferramenta do AgentExo: o schema vai como veio (sem $ref) e a chamada roda no loop do serviço."""
+    if not _TOOL_NAME.match(spec.name) or not inspect.iscoroutinefunction(spec.call):
+        raise TypeError(f"ferramenta {spec.name!r}: nome em snake_case e call async")
+    if not spec.description.strip():
+        raise TypeError(f"ferramenta {spec.name!r} sem descrição: o modelo escolhe a ferramenta pela descrição")
+    schema: dict[str, Any] = {"type": "object", "properties": {}}
+    if spec.input_schema.get("type") == "object":
+        try:
+            schema = _inline(dict(spec.input_schema))
+        except (KeyError, TypeError):  # referência fora de $defs ou recursiva: vai como veio, o destino valida
+            schema = dict(spec.input_schema)
+
+    def call(**arguments: Any) -> ToolResult:
+        return _run_in_loop(spec.name, spec.call(arguments), loop)
+
+    return Tool(name=spec.name, description=spec.description.strip(), fn=call, input_schema=schema)
+
+
+def _run_in_loop(name: str, coro: Coroutine[Any, Any, Any], loop: asyncio.AbstractEventLoop) -> ToolResult:
+    """Roda a ferramenta no loop do serviço (em nome de quem age); erro de negócio volta ao modelo, o resto não vaza."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        value = future.result(timeout=TOOL_SECONDS)
+    except ServiceError as exc:
+        return ToolResult.error(f"{exc.code}: {exc.message}", code=exc.status)
+    except Exception:
+        future.cancel()
+        log.exception("ferramenta %s falhou", name)
+        return ToolResult.error("falha interna na ferramenta; tente outro caminho ou avise a pessoa", code=500)
+    return ToolResult(text=_tool_text(value))
 
 
 def _tool_text(value: Any) -> str:

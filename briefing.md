@@ -196,7 +196,9 @@ modelo da biblioteca pedir.
 - **De onde vem a entrada (N4):** cada campo da entrada da ação vem do passo mais perto antes dela que devolve um campo
   com esse nome (senão, do gatilho), ligado na compilação para BPMN. Dado faltando vira handoff, não erro mudo.
 - Integração com terceiros é sempre uma ação nossa, com a credencial guardada no `svc-integracoes` (como as chaves de
-  IA no `svc-ai`) e chamada pelo `core/http_client.py` com a proteção de SSRF. O BPMN só leva o id da conexão. Na v1
+  IA no `svc-ai`) e chamada pelo `core/http_client.py` com a proteção de SSRF. No N6, os sistemas da empresa entram
+  também como servidores MCP: as ferramentas deles vão para os agentes, chamadas pelo `svc-integracoes` com a
+  credencial cifrada, pinadas (mudou, quarentena até alguém conferir). O BPMN só leva o id da conexão. Na v1
   não usamos o runtime de Connectors do Camunda: credencial e isolamento por organização ficam nos nossos trilhos.
 
 ### 5.7 Execução: agentes e handoff
@@ -257,6 +259,15 @@ modelo da biblioteca pedir.
   de documentos (extração), de atendimento (vendas no WhatsApp), de cobrança, de contratos.
 - **Agentes do cliente** nascem como rascunho; viram verificados quando a suíte passa; confiáveis só por decisão do
   staff. Ferramenta nova criada pelo cliente segue o mesmo caminho.
+- **No N6** (`svc-agentes`): ferramentas da plataforma (ler o documento, buscar no conhecimento) e as dos servidores
+  MCP conectados; política por ferramenta (usar sozinho ou pedir aprovação, que num processo vira a exceção do staff);
+  suíte de casos rodando o agente de verdade. Um agente verificado entra num passo pela conversa de desenho
+  (`usar_agente`), no lugar de uma ação (cumprindo o contrato dela) ou de outro agente, e a primeira vez passa pela
+  revisão do staff. As ações dos pacotes como ferramenta de agente ficam para quando houver ações de leitura (N7).
+- **Achados do N6** com o modelo real: às vezes ele escreve a resposta ("concluir(divergente=false)", ou o JSON) em
+  vez de chamar a ferramenta; o agente ganha uma segunda chance e, se a resposta for um JSON com todas as saídas, vale
+  (validado como se tivesse chamado). E a suíte pegou uma regra mal aplicada (diferença de 50 dada como sem
+  divergência) até a instrução trazer a conta e um exemplo: é para isso que ela existe.
 
 ### 7.2 Motor: AgentExo no lugar do Agno (recomendação)
 

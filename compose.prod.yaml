@@ -117,6 +117,9 @@ services:
   otel:
     profiles: [local]
 
+  mcp-erp:
+    profiles: [local]
+
   svc-notify:
     environment:
       SMTP_URL: ${SMTP_URL:?defina SMTP_URL no .env (servidor de e-mail de verdade)}

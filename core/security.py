@@ -458,6 +458,8 @@ STORAGE_SECRET_KEY={storage_secret_key}
 AI_SECRETS_KEY={ai_secrets_key}
 # Webhooks (README §5.16): chave que criptografa os segredos de assinatura dos endereços; só o svc-webhooks a recebe.
 WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
+# Integrações: chave que criptografa as credenciais dos servidores MCP; só o svc-integracoes a recebe.
+INTEGRACOES_SECRETS_KEY={integracoes_secrets_key}
 # Organização dona da plataforma (provedores de IA para todas): o id dela, depois de criada pela tela de cadastro.
 # PLATFORM_TENANT=
 # Módulos de negócio instalados (README §9): vazio = todos os do repositório; COMPOSE_PROFILES sobe os containers.
@@ -488,6 +490,7 @@ STORAGE_PUBLIC_URL=https://files.{domain}
 STORAGE_CORS_ORIGINS=https://{domain}
 AI_SECRETS_KEY={ai_secrets_key}
 WEBHOOKS_SECRETS_KEY={webhooks_secrets_key}
+INTEGRACOES_SECRETS_KEY={integracoes_secrets_key}
 # Payloads do Temporal cifrados (AES-256-GCM): trocar esta chave torna ilegíveis os workflows em andamento.
 TEMPORAL_PAYLOAD_KEY={temporal_payload_key}
 # NATS com autenticação: um usuário para os serviços e outro, restrito, para o gateway.
@@ -535,6 +538,7 @@ def _keygen(env_file: Path, domain: str | None = None, modules: str | None = Non
         surreal_root_password=new_secret(24),
         ai_secrets_key=new_secret(32),
         webhooks_secrets_key=new_secret(32),
+        integracoes_secrets_key=new_secret(32),
         temporal_payload_key=new_secret(32),
         nats_services_password=new_secret(24),
         nats_gateway_password=new_secret(24),
