@@ -23,6 +23,13 @@ Ações (`processes.declare` e `processes.worker`), cada uma o método de mesmo 
 - `financeiro.montar_dre` (escrita): `Mes` → `Dre {referencia, receita, despesas, resultado, resumo}`.
 Modelos (`processes.declare`): `contas-a-pagar` (evento `documento.recebido`), `conciliacao-bancaria` (todo dia, 8h em
 Brasília), `faturamento-cobranca` (gatilho: a proposta comercial que termina aceita) e `fechamento-mes` (dia 1).
+Indicadores do mês (alinhamento pós-N7, item 7; declarados nos modelos, o svc-processos calcula das execuções):
+contas a pagar: valor pago (soma do valor lido nas pagas), pagos em atraso (pacote) e tempo do boleto ao agendamento
+(horas); conciliação: lançamentos conciliados sozinhos (conciliados ÷ lançamentos, %) e valor sem par nos dias que
+foram ao staff; faturamento: valor recebido, valor em atraso (pacote) e prazo médio do faturamento à baixa (dias);
+fechamento: dias do dia 1 à DRE e documentos que faltaram. RPC `rpc.financeiro.indicadores` (`IndicatorRequest` →
+`IndicatorValues`): pagos em atraso = títulos pagos com a data no mês e depois do vencimento; valor em atraso = faturas
+cobradas vencidas e não recebidas no corte (o fim do mês; no corrente, agora).
 Rotas:
 - Cadastro declarado `fornecedores` (README §5.19): `Fornecedor {nome (único), cnpj, conta (padrão 2.1.01 Fornecedores), centro_custo, valor_contrato}`; escrevem dono, admin e operador.
 - `GET /titulos?page&size&sort&status` → `TituloPage` de `Titulo {id, fornecedor, valor, vencimento, data, pagamento_id, status: agendado|pago, conciliado, created_at}`.
@@ -47,3 +54,5 @@ Rotas:
 - NFS-e sem integração → handoff com o cliente e o valor; enviar ao contador sem `email_contador` → handoff.
 - Comprovante ou cobrança que não está nos títulos ou nas faturas → handoff. Fornecedor com o mesmo nome cadastrado ao mesmo tempo por outro processo: segue com a conta padrão.
 - Exemplo de saída que não confere com o modelo de saída, ação sem método no service.py ou modelo que cita ação não declarada: o serviço não sobe.
+- Indicadores: mês inválido ou que ainda não começou, ou nome que o pacote não calcula → null (sem dado no mês); a
+  tela mostra "—". Indicador "pacote" declarado sem `indicators=` no `processes.declare`: o serviço não sobe.

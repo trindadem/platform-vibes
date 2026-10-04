@@ -1759,9 +1759,14 @@ def test_aviso_vai_para_o_svc_notify_com_quem_age_e_id_estavel(avisos):
             await notify.roles("owner", "admin", title="Limite de IA", link="/ia")
         await notify.email("Pessoa@X.com", "Convite para Acme", link="/convite?codigo=abc", action="Ver convite")
 
+        with security.acting_as(BETA):  # a mesma key em outra organização é outro aviso (rotina que percorre todas)
+            await notify.roles("owner", title="Resumo", key="fatura-123-paga")
+        await notify.email("outra@x.com", "Senha", key="reset-abc")
+
     asyncio.run(go())
-    (s1, r1, id1, who1), (_, r2, id2, _), (_, r3, _, _), (_, r4, id4, who4) = avisos
-    assert (s1, r1.service, r1.users, r1.link, id1) == (SEND_SUBJECT, "svc-faturas", ["bia"], "/faturas?id=123", "notify-svc-faturas-fatura-123-paga")
+    (s1, r1, id1, who1), (_, r2, id2, _), (_, r3, _, _), (_, r4, id4, who4), (_, _, id5, _), (_, _, id6, _) = avisos
+    assert (s1, r1.service, r1.users, r1.link, id1) == (SEND_SUBJECT, "svc-faturas", ["bia"], "/faturas?id=123", "notify-svc-faturas-acme-fatura-123-paga")
+    assert id5 == "notify-svc-faturas-beta-fatura-123-paga" and id6 == "notify-svc-faturas-reset-abc"  # e-mail avulso: sem organização
     assert who1.tenant == "acme"  # a organização viaja no cabeçalho, nunca no pedido
     assert (r2.users, r2.send_email) == (["bia", "caio"], False) and id2.startswith("notify-") and id2 != id1
     assert r3.roles == ["owner", "admin"]
@@ -2699,7 +2704,7 @@ def test_organizacao_que_sai_exporta_em_paginas_e_apaga_so_a_dela(tmp_path, monk
 from xml.etree import ElementTree as _ET  # noqa: E402
 
 from core import processes as processes_module  # noqa: E402
-from core.processes import Action, Condition, Flow, Fluxo, Step, Trigger, feel, to_bpmn  # noqa: E402
+from core.processes import Action, Condition, Flow, Fluxo, Step, Trigger, exception_merge, feel, to_bpmn  # noqa: E402
 
 _NS = {"bpmn": "http://www.omg.org/spec/BPMN/20100524/MODEL", "zeebe": "http://camunda.org/schema/zeebe/1.0",
        "bpmndi": "http://www.omg.org/spec/BPMN/20100524/DI"}
@@ -3104,6 +3109,38 @@ def test_paralelo_vira_parallel_gateway_e_a_entrada_vem_do_parametro():
     assert y("faturar") != y("exame")  # os ramos ficam um embaixo do outro
     with pytest.raises(ValidationError):
         Trigger(tipo="processo", processo="proposta comercial")
+
+
+def test_excecao_antes_de_um_paralelo_se_junta_ao_passo_antes_de_chegar():
+    """O paralelo espera um token por caminho chegando: sem o ponto de encontro, o passo e a exceção dele seriam dois
+    caminhos e a junção (ou a abertura) esperaria para sempre."""
+    fluxo = Fluxo(
+        passos=[Step(id="ler", tipo="agente", nome="Ler", objetivo="Ler", saidas=["ok"], excecao=True),
+                Step(id="abrir", tipo="paralelo", nome="Ao mesmo tempo"),
+                Step(id="esocial", tipo="acao", nome="eSocial", acao="adm.esocial", excecao=True),
+                Step(id="exame", tipo="tarefa", nome="Exame", responsavel="cliente"),
+                Step(id="juntar", tipo="paralelo", nome="Tudo pronto"),
+                Step(id="fim", tipo="fim", nome="Fim")],
+        ligacoes=[Flow(de="inicio", para="ler"), Flow(de="ler", para="abrir"), Flow(de="abrir", para="esocial"),
+                  Flow(de="abrir", para="exame"), Flow(de="esocial", para="juntar"), Flow(de="exame", para="juntar"),
+                  Flow(de="juntar", para="fim")])
+    raiz = _ET.fromstring(to_bpmn(fluxo, process_id="p_acme_adm", name="Admissão"))
+    processo = raiz.find("bpmn:process", _NS)
+    caminhos = [(f.get("id"), f.get("sourceRef"), f.get("targetRef")) for f in processo.findall("bpmn:sequenceFlow", _NS)]
+    chegando = lambda no: sorted(de for _, de, para in caminhos if para == no)  # noqa: E731
+    assert chegando("juntar") == ["esocial__retoma", "exame"]  # um token por ramo, com ou sem exceção
+    assert chegando("abrir") == ["ler__retoma"]  # a abertura também
+    assert chegando("esocial__retoma") == ["esocial", "esocial__excecao"]
+    assert {g.get("id") for g in processo.findall("bpmn:exclusiveGateway", _NS)} == {"esocial__retoma", "ler__retoma"}
+    assert ("f_esocial_juntar", "esocial", "esocial__retoma") in caminhos  # o id da ligação do desenho continua
+    assert ("f_esocial__retoma_juntar", "esocial__retoma", "juntar") in caminhos
+    assert exception_merge(fluxo, fluxo.step("esocial")) == "esocial__retoma" and exception_merge(fluxo, fluxo.step("exame")) is None
+    desenhados = {s.get("bpmnElement") for s in raiz.findall(".//bpmndi:BPMNShape", _NS)}
+    assert {"esocial__retoma", "ler__retoma"} <= desenhados
+    assert len(raiz.findall(".//bpmndi:BPMNEdge", _NS)) == len(caminhos)
+    sem_paralelo = Fluxo(passos=[fluxo.step("ler"), Step(id="fim", tipo="fim", nome="Fim")],
+                         ligacoes=[Flow(de="inicio", para="ler"), Flow(de="ler", para="fim")])
+    assert "__retoma" not in to_bpmn(sem_paralelo, process_id="p_acme_ler", name="Ler")  # sem paralelo, segue direto
 
 
 def test_evento_de_pacote_sai_com_o_nome_do_pacote(monkeypatch):

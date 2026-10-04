@@ -42,6 +42,10 @@ disso, toda rota responde 403 (menos `/resumo`, que responde `staff: false`).
   - `GET /carteira` → `MinhaCarteira {gestor, itens[Saude {organizacao, nome, andamento, concluidas, incidentes,
     autonomia, excecoes, revisoes, ajudas, disponivel}]}`: cada cliente da carteira de quem pede, com a saúde (do
     svc-processos) e o que está aberto na fila.
+  - `GET /carteira/resultados?organizacao&mes` → `ResultadosCliente {organizacao, nome, mes, meses[], concluidas,
+    sem_handoff, autonomia, processos[...]}`: os mesmos números da tela Resultados do cliente (alinhamento pós-N7, item
+    7), pedidos ao `rpc.processos.resultados` na organização dele, sem trocar de organização. Cliente da carteira de
+    quem pede; o gestor vê qualquer cliente. Na tela: o botão Resultados de cada cliente da Carteira abre o painel.
 - Fila:
   - `GET /fila?page&size&sort=prazo|created_at&tipo&status&escalada&organizacao&todas` → `FilaPage` de
     `ItemFila {id, organizacao, organizacao_nome, tipo: excecao|revisao|ajuda, ref, titulo, detalhe, prazo, status:
@@ -94,6 +98,8 @@ disso, toda rota responde 403 (menos `/resumo`, que responde `staff: false`).
 ## 4. Casos de Borda e Erros Mapeados
 - Quem não é da Cogniventure (ou está na sessão de um cliente) → 403 `ERRO_STAFF_FORBIDDEN`; montar carteira,
   ver todas e atribuir são só do gestor (403 para o resto do staff); assumir item de organização fora da carteira → 403.
+- Resultados de um cliente fora da carteira (sem ser gestor) → 403 `ERRO_STAFF_FORBIDDEN`; o svc-processos não
+  respondeu em 15 s → 503 `ERRO_STAFF_CLIENTE`.
 - Organização inexistente ou a própria Cogniventure → 404 `ERRO_STAFF_ORGANIZACAO`; pessoa que não é do staff →
   404 `ERRO_STAFF_PESSOA`; mesma organização de novo na carteira da pessoa → 409 `ERRO_STAFF_JA_NA_CARTEIRA`.
 - Carteira ou item inexistente → 404 `ERRO_STAFF_NAO_ENCONTRADO`.

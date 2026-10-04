@@ -4,6 +4,6 @@ base_path: /api/v1/juridico
 
 # Cadastros do schemas.py (core/resources.py, README §5.19): cada um publica 5 rotas e o aviso ao vivo
 # juridico.<cadastro>, e vira juridico.<cadastro> no frontend.
-resources: [contratos, certidoes]
+resources: [contratos, certidoes, prazos]
 
 endpoints: []

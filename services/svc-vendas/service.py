@@ -8,6 +8,7 @@ processos deles (processes.emit). E-mails saem pela caixa de entrada da organiza
 import re
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from nats.errors import Error as NatsError
 from pydantic import ValidationError
@@ -15,7 +16,7 @@ from pydantic import ValidationError
 from core.envelope import ServiceError
 from core.nats_bus import bus
 from core.notify import notify
-from core.processes import Handoff, processes
+from core.processes import INDICATOR_TZ, Handoff, processes
 from core.resources import ResourceRef, resources
 from core.security import acting_as, current, system
 from core.surreal import Migration, db
@@ -42,6 +43,8 @@ from schemas import (
     EnviarEmail,
     FollowUps,
     Inatividade,
+    IndicatorRequest,
+    IndicatorValues,
     Inativos,
     Lead,
     LeadIn,
@@ -64,6 +67,7 @@ from schemas import (
 )
 
 MIGRATIONS: list[Migration] = []
+_FUSO = ZoneInfo(INDICATOR_TZ)  # o mês dos indicadores é o civil em Brasília
 
 
 @activities("vendas")
@@ -203,6 +207,30 @@ class VendasService:
             enviados += 1
         return CampanhaEnviada(enviados=enviados)
 
+    # ── Indicadores "pacote" (rpc.vendas.indicadores; o svc-processos pede como system na organização) ──
+
+    async def indicadores(self, data: IndicatorRequest) -> IndicatorValues:
+        """O que as execuções não sabem: propostas que saíram no mês, a taxa de aceite das respondidas no mês e os
+        clientes que voltaram a comprar depois da campanha. Desconhecido ou mês que ainda não começou: null."""
+        janela = data.janela()
+        valores: dict[str, float | None] = {nome: None for nome in data.nomes}
+        if janela is None:
+            return IndicatorValues(valores=valores)
+        if data.modelo == "proposta-comercial":
+            rows = await db.query(f"SELECT status, enviada_em, respondida_em FROM {PROPOSTAS} WHERE tenant = $tenant")
+            no_mes = lambda campo: [r for r in rows if (q := _quando(r.get(campo))) and janela.inicio <= q < janela.fim]  # noqa: E731
+            respondidas = [r for r in no_mes("respondida_em") if r["status"] in ("aceita", "recusada")]
+            aceitas = sum(1 for r in respondidas if r["status"] == "aceita")
+            valores |= {k: v for k, v in (("propostas_enviadas", float(len(no_mes("enviada_em")))),
+                                          ("taxa_aceite", round(100 * aceitas / len(respondidas), 1) if respondidas else None)) if k in data.nomes}
+        if data.modelo == "reativacao-carteira" and "voltaram_a_comprar" in data.nomes:
+            rows = await db.query(f"SELECT ultima_compra, campanha_em FROM {CLIENTES.table} WHERE tenant = $tenant "
+                                  "AND campanha_em != NONE AND campanha_em != NULL")
+            de, ate = janela.inicio.astimezone(_FUSO).date().isoformat(), janela.dia.isoformat()
+            valores["voltaram_a_comprar"] = float(sum(1 for r in rows if r.get("ultima_compra") and de <= str(r["ultima_compra"])[:10] <= ate
+                                                      and str(r["ultima_compra"])[:10] >= str(r["campanha_em"])[:10]))
+        return IndicatorValues(valores=valores)
+
     # ── Agendamento: follow-ups das propostas sem resposta ───────────────────
 
     async def follow_up(self, data: Empty) -> FollowUps:
@@ -235,6 +263,17 @@ def _escritor() -> None:
     who = current()
     if who is None or not (who.is_system or WRITERS & who.roles):
         raise ServiceError("ERRO_VENDAS_FORBIDDEN", "Só donos, administradores e operadores registram isto.", 403)
+
+
+def _quando(valor: Any) -> datetime | None:
+    """Data do banco (datetime ou texto ISO) → datetime com fuso; vazio ou inválido: None."""
+    if isinstance(valor, datetime):
+        return valor if valor.tzinfo else valor.replace(tzinfo=UTC)
+    try:
+        quando = datetime.fromisoformat(str(valor)) if valor else None
+    except ValueError:
+        return None
+    return quando.replace(tzinfo=UTC) if quando and not quando.tzinfo else quando
 
 
 def _chave(value: Any) -> str:

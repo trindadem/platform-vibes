@@ -1,3 +1,5 @@
+import { useLayoutEffect, useRef } from "react";
+
 export interface MonthlyBarsItem {
   /** Rótulo do mês (ex.: "out/26"). */
   label: string;
@@ -17,7 +19,8 @@ export interface MonthlyBarsProps {
 }
 
 /**
- * Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada.
+ * Barras de uma taxa mês a mês (0 a 100%), com a marca do que mudou em cada mês, como a versão publicada. Sem largura
+ * para todos os meses (um painel lateral, o celular), rola de lado e começa no mês mais novo.
  *
  * @category Dados
  * @example
@@ -31,10 +34,15 @@ export interface MonthlyBarsProps {
  * />
  */
 export function MonthlyBars({ label, items }: MonthlyBarsProps) {
+  const scroller = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (el) el.scrollLeft = el.scrollWidth; // o mês mais novo é o que importa: à vista primeiro
+  }, [items.length]);
   return (
     <figure aria-label={label} className="flex flex-col gap-2">
       <figcaption className="text-sm font-medium text-foreground">{label}</figcaption>
-      <div className="flex items-end gap-2 overflow-x-auto pb-1">
+      <div ref={scroller} className="flex items-end gap-2 overflow-x-auto pb-1">
         {items.map((item) => {
           const percent = item.value === null ? null : Math.round(Math.max(0, Math.min(1, item.value)) * 100);
           return (

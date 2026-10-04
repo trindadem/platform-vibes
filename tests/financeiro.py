@@ -182,3 +182,53 @@ def test_conciliar_o_extrato_e_fechar_o_mes(monkeypatch):
     assert das.variables["resultado"] == {"valor": 300.0, "vencimento": vence, "fornecedor": "Receita Federal — DAS", "linha_digitavel": None}
     assert dre.variables["resultado"]["resultado"] == 4000.0 and dre.variables["resultado"]["resumo"].startswith("Lucro de R$ 4.000,00")
     assert avisos[-1]["title"] == f"DRE de {referencia}" and avisos[-1]["key"] == f"dre-{referencia}"
+
+
+def test_modelos_declaram_os_indicadores_e_o_pacote_calcula_os_dele():
+    """Item 7 do alinhamento pós-N7: cada modelo declara os indicadores do mês; os que as execuções não sabem (pagos em
+    atraso, valor em atraso) o pacote calcula com os títulos e as faturas (rpc.financeiro.indicadores)."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from core.processes import IndicatorRequest, indicators_subject
+    from core.security import acting_as, system
+    from core.surreal import db
+
+    from schemas import FATURAS, TITULOS
+
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    mes = hoje.strftime("%Y-%m")
+    ontem, amanha = (hoje - timedelta(days=1)).isoformat(), (hoje + timedelta(days=1)).isoformat()
+
+    async def cenario(app):
+        with acting_as(system("svc-financeiro", "acme")):
+            for data, vencimento, status in ((hoje.isoformat(), ontem, "pago"),  # pago depois do vencimento
+                                             (hoje.isoformat(), amanha, "pago"),  # em dia
+                                             (hoje.isoformat(), "2000-01-01", "agendado")):  # ainda sem comprovante: não entra
+                await db.create(TITULOS, {"fornecedor": "Moinho Sul", "valor": 100.0, "vencimento": vencimento, "data": data,
+                                          "pagamento_id": f"PG-{data}-{vencimento}-{status}", "status": status})
+            for valor, vencimento, status, recebido in ((700.0, ontem, "cobrada", None),  # vencida e não recebida: em atraso
+                                                        (300.0, ontem, "paga", datetime.now(UTC)),  # recebida: não entra
+                                                        (900.0, amanha, "cobrada", None)):  # ainda não venceu
+                await db.create(FATURAS, {"cliente": "Café Central", "valor": valor, "vencimento": vencimento, "status": status,
+                                          "cobranca_id": f"CB-{valor}", "recebido_em": recebido})
+        responder = app.handlers[indicators_subject("svc-financeiro")]
+        with acting_as(system("svc-processos", "acme")):  # o svc-processos pede na organização do cliente
+            a_pagar = await responder(IndicatorRequest(modelo="contas-a-pagar", mes=mes, nomes=["pagos_em_atraso", "valor_pago"]))
+            a_receber = await responder(IndicatorRequest(modelo="faturamento-cobranca", mes=mes, nomes=["valor_em_atraso"]))
+            futuro = await responder(IndicatorRequest(modelo="contas-a-pagar", mes="2099-01", nomes=["pagos_em_atraso"]))
+        with acting_as(system("svc-processos", "beta")):  # outra organização não vê os títulos da acme
+            outra = await responder(IndicatorRequest(modelo="faturamento-cobranca", mes=mes, nomes=["valor_em_atraso"]))
+        return [m for s, m in app.published if s == CATALOG_SUBJECT], a_pagar, a_receber, futuro, outra
+
+    catalogos, a_pagar, a_receber, futuro, outra = service_app(cenario)
+    indicadores = {m.id: [(i.nome, i.calculo, i.unidade) for i in m.indicadores] for m in catalogos[0].models}
+    assert indicadores == {
+        "contas-a-pagar": [("valor_pago", "soma", "moeda"), ("pagos_em_atraso", "pacote", "numero"), ("tempo_ate_agendar", "tempo", "horas")],
+        "conciliacao-bancaria": [("conciliados_sozinhos", "razao", "percentual"), ("valor_sem_par", "soma", "moeda")],
+        "faturamento-cobranca": [("valor_recebido", "soma", "moeda"), ("valor_em_atraso", "pacote", "moeda"), ("prazo_recebimento", "tempo", "dias")],
+        "fechamento-mes": [("dias_para_fechar", "tempo", "dias"), ("documentos_faltantes", "soma", "numero")],
+    }
+    assert a_pagar.valores == {"pagos_em_atraso": 1.0, "valor_pago": None}  # valor_pago é das execuções, não do pacote
+    assert a_receber.valores == {"valor_em_atraso": 700.0}
+    assert futuro.valores == {"pagos_em_atraso": None} and outra.valores == {"valor_em_atraso": 0.0}

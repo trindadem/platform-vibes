@@ -5,7 +5,18 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.plans import Module
-from core.processes import Action, Condition, Flow, Fluxo, ProcessModel, Step, Trigger
+from core.processes import (  # IndicatorRequest e IndicatorValues: o contrato de rpc.vendas.indicadores
+    Action,
+    Condition,
+    Flow,
+    Fluxo,
+    Indicator,
+    IndicatorRequest,
+    IndicatorValues,
+    ProcessModel,
+    Step,
+    Trigger,
+)
 from core.resources import Email, Fields, Phone, Resource, Text
 from core.surreal import ListQuery, Page
 
@@ -245,7 +256,7 @@ ACTIONS = [
            Campanha, CampanhaEnviada, risk="externa", connections=("Caixa de entrada",), example=CampanhaEnviada(enviados=4)),
 ]
 
-C, F, P = Condition, Flow, Step
+C, F, I, P = Condition, Flow, Indicator, Step
 MODELS = [
     ProcessModel("qualificacao-leads", Fluxo(
         gatilho=Trigger(tipo="evento", evento="vendas.lead", descricao="Lead no site, Instagram ou WhatsApp"),
@@ -273,7 +284,14 @@ MODELS = [
             F(de="quente", para="reuniao", condicao=C(campo="qualificar.qualificado", operador="verdadeiro")),
             F(de="quente", para="nutrir"), F(de="reuniao", para="reuniao_marcada"), F(de="nutrir", para="nutricao"),
         ],
-    )),
+    ), indicadores=[
+        I("leads_recebidos", "Leads recebidos", "contagem", base="iniciadas", descricao="Leads que chegaram no mês"),
+        I("qualificados", "Qualificados", "percentual", unidade="percentual",
+          condicao=C(campo="qualificar.qualificado", operador="verdadeiro"),
+          descricao="Dos leads encaminhados no mês, os que o agente qualificou como cliente do perfil"),
+        I("tempo_primeira_resposta", "Tempo até a primeira resposta", "tempo", unidade="horas", de="inicio", ate="fim",
+          descricao="Média, nos leads encaminhados no mês, da chegada ao encaminhamento: reunião marcada, nutrição ou vendedor"),
+    ]),
     ProcessModel("proposta-comercial", Fluxo(
         gatilho=Trigger(tipo="evento", evento="vendas.pedido_proposta", descricao="Pedido de proposta"),
         parametros={"desconto_maximo": 10},
@@ -309,7 +327,13 @@ MODELS = [
             F(de="foi_aceita", para="aceita", condicao=C(campo="desfecho.aceita", operador="verdadeiro")),
             F(de="foi_aceita", para="recusada"),
         ],
-    )),
+    ), indicadores=[
+        I("propostas_enviadas", "Propostas enviadas", "pacote", descricao="Propostas que saíram para o cliente no mês"),
+        I("taxa_aceite", "Taxa de aceite", "pacote", unidade="percentual",
+          descricao="Das propostas respondidas no mês, as aceitas"),
+        I("valor_aceito", "Valor aceito", "soma", unidade="moeda", campo="montar.valor", resultado="aceita",
+          descricao="Soma das propostas aceitas no mês"),
+    ]),
     ProcessModel("reativacao-carteira", Fluxo(
         gatilho=Trigger(tipo="agenda", agenda="0 12 * * 1", descricao="Toda segunda"),
         parametros={"dias_sem_comprar": INATIVIDADE_PADRAO},
@@ -329,5 +353,10 @@ MODELS = [
             F(de="tem_inativos", para="escrever", condicao=C(campo="selecionar.clientes", operador=">", valor=0)),
             F(de="tem_inativos", para="sem_inativos"), F(de="escrever", para="enviar"), F(de="enviar", para="enviada"),
         ],
-    )),
+    ), indicadores=[
+        I("clientes_contatados", "Clientes contatados", "soma", campo="enviar.enviados",
+          descricao="Clientes parados que receberam a campanha no mês"),
+        I("voltaram_a_comprar", "Voltaram a comprar", "pacote",
+          descricao="Clientes que compraram no mês depois de receber a campanha (proposta aceita depois dela)"),
+    ]),
 ]

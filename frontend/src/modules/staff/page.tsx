@@ -18,6 +18,7 @@ import { Grid } from "@/components/Grid";
 import { KeyValue } from "@/components/KeyValue";
 import { Money } from "@/components/Money";
 import { Page } from "@/components/Page";
+import { ProcessResults } from "@/components/ProcessResults";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
 import { SelectField } from "@/components/SelectField";
@@ -360,6 +361,7 @@ function NumerosDoStaff() {
 function Carteira() {
   const carteira = useLiveQuery("staff.carteiras", staff.carteira);
   const entrar = useEntrar();
+  const [resultados, setResultados] = useState<{ organizacao: string; nome: string } | null>(null);
   return (
     <Stack>
       {entrar.error && <Alert tone="danger">{entrar.error.message}</Alert>}
@@ -379,9 +381,14 @@ function Carteira() {
                         {s.ajudas > 0 && <Badge tone="accent">{s.ajudas} ajuda{s.ajudas === 1 ? "" : "s"}</Badge>}
                         {s.pedidos > 0 && <Badge tone="accent">{s.pedidos} pedido{s.pedidos === 1 ? "" : "s"}</Badge>}
                       </Row>
-                      <Button size="sm" variant="secondary" loading={entrar.running} onClick={() => void entrar.run(s.organizacao, "/workspace")}>
-                        Entrar
-                      </Button>
+                      <Row gap="sm">
+                        <Button size="sm" variant="ghost" onClick={() => setResultados({ organizacao: s.organizacao, nome: s.nome })}>
+                          Resultados
+                        </Button>
+                        <Button size="sm" variant="secondary" loading={entrar.running} onClick={() => void entrar.run(s.organizacao, "/workspace")}>
+                          Entrar
+                        </Button>
+                      </Row>
                     </Row>
                   }
                 >
@@ -405,7 +412,34 @@ function Carteira() {
           )
         }
       </QueryView>
+      <SidePanel
+        open={resultados !== null}
+        onClose={() => setResultados(null)}
+        title={`Resultados: ${resultados?.nome ?? ""}`}
+        description="Os mesmos números que o cliente vê na tela Resultados, no mês atual."
+      >
+        {resultados && <ResultadosDoCliente organizacao={resultados.organizacao} />}
+      </SidePanel>
     </Stack>
+  );
+}
+
+function ResultadosDoCliente({ organizacao }: { organizacao: string }) {
+  const resultados = useQuery(staff.resultadosCliente, { organizacao });
+  return (
+    <QueryView query={resultados}>
+      {(r) => (
+        <Stack>
+          <KeyValue
+            items={[
+              { label: "Concluídas no mês", value: r.concluidas },
+              { label: "Rodaram sozinhas", value: r.autonomia === null ? "—" : `${Math.round(r.autonomia * 100)}%` },
+            ]}
+          />
+          <ProcessResults processes={r.processos} empty="Este cliente ainda não tem processo publicado." />
+        </Stack>
+      )}
+    </QueryView>
   );
 }
 

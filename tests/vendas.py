@@ -139,3 +139,48 @@ def test_reativacao_follow_up_e_sem_caixa_de_entrada_vai_ao_staff():
     assert depois.variables["resultado"]["clientes"] == 1  # quem recebeu a campanha sai da lista no período
     assert (primeira.enviados, segunda.enviados) == (1, 0) and "Conseguiu ver a nossa proposta" in enviados[-1].texto
     assert (sem_caixa.status, sem_caixa.message) == ("handoff", "Conecte a caixa de entrada da empresa em Integrações.")
+
+
+def test_indicadores_do_pacote_propostas_e_reativacao():
+    """Item 7 do alinhamento pós-N7: propostas que saíram no mês, a taxa de aceite e quem voltou a comprar."""
+    from zoneinfo import ZoneInfo
+
+    from core.processes import IndicatorRequest, indicators_subject
+
+    enviados = []
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    mes = hoje.strftime("%Y-%m")
+
+    async def cenario(app):
+        app.respond(EMAIL_SUBJECT, _caixa(enviados))
+        ana = app.user(*OWNER)
+        for cliente, resposta in (("Padaria Pão Quente", True), ("Café Central", False), ("Mercado Sol", None)):
+            pedido = (await ana.post("/propostas", json={"cliente": cliente, "email": "compras@cliente.com.br",
+                                                        "pedido": "Pão francês toda semana, por três meses"})).json()["data"]
+            await app.job("vendas.registrar_proposta", variables={"entrada": {"proposta_id": pedido["id"], "cliente": cliente,
+                                                                              "descricao": "Pão francês", "valor": 1000.0}})
+            await app.job("vendas.enviar_proposta", variables={"entrada": {"proposta_id": pedido["id"]}})
+            if resposta is not None:
+                await app.job("vendas.registrar_resposta", variables={"entrada": {"proposta_id": pedido["id"], "aprovado": resposta}})
+        for nome, ultima, campanha in (("Voltou", hoje, hoje - timedelta(days=5)), ("Parado", hoje - timedelta(days=120), hoje - timedelta(days=3)),
+                                       ("Sem campanha", hoje, None)):
+            await ana.post("/clientes", json={"nome": nome, "ultima_compra": ultima.isoformat(),
+                                              "campanha_em": campanha.isoformat() if campanha else None})
+        responder = app.handlers[indicators_subject("svc-vendas")]
+        with acting_as(system("svc-processos", "acme")):
+            propostas = await responder(IndicatorRequest(modelo="proposta-comercial", mes=mes, nomes=["propostas_enviadas", "taxa_aceite", "valor_aceito"]))
+            reativacao = await responder(IndicatorRequest(modelo="reativacao-carteira", mes=mes, nomes=["voltaram_a_comprar"]))
+            vazio = await responder(IndicatorRequest(modelo="proposta-comercial", mes="2001-01", nomes=["taxa_aceite", "propostas_enviadas"]))
+        catalogo = next(m for s, m in app.published if s == CATALOG_SUBJECT)
+        return propostas, reativacao, vazio, catalogo
+
+    propostas, reativacao, vazio, catalogo = service_app(cenario)
+    assert propostas.valores == {"propostas_enviadas": 3.0, "taxa_aceite": 50.0, "valor_aceito": None}  # valor_aceito: das execuções
+    assert reativacao.valores == {"voltaram_a_comprar": 1.0}
+    assert vazio.valores == {"taxa_aceite": None, "propostas_enviadas": 0.0}  # sem resposta no mês, a taxa fica sem dado
+    indicadores = {m.id: [(i.nome, i.calculo) for i in m.indicadores] for m in catalogo.models}
+    assert indicadores == {
+        "qualificacao-leads": [("leads_recebidos", "contagem"), ("qualificados", "percentual"), ("tempo_primeira_resposta", "tempo")],
+        "proposta-comercial": [("propostas_enviadas", "pacote"), ("taxa_aceite", "pacote"), ("valor_aceito", "soma")],
+        "reativacao-carteira": [("clientes_contatados", "soma"), ("voltaram_a_comprar", "pacote")],
+    }

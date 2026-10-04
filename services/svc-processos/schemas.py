@@ -1009,14 +1009,14 @@ class UsoDeAgente(_Input):
 # ── Resultados (alinhamento pós-N7, item 7): autonomia mês a mês, fins alcançados e indicadores ──
 
 class ResultadosQuery(_Input):
-    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
+    mes: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="AAAA-MM, em Brasília (vazio: o mês atual)")
     meses: int = Field(MESES_RESULTADOS, ge=1, le=24, description="Quantos meses no gráfico de autonomia, até o mês pedido")
 
 
 class ResultadosPedido(BaseModel):
     """rpc.processos.resultados (só o svc-staff, agindo na organização do cliente)."""
 
-    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$")
+    mes: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     meses: int = Field(MESES_RESULTADOS, ge=1, le=24)
 
 
@@ -1073,7 +1073,7 @@ class Resultados(BaseModel):
 
 
 class ResumoMensalIn(_Input):
-    mes: str | None = Field(None, pattern=r"^\d{4}-\d{2}$", description="AAAA-MM (vazio: o mês que acabou)")
+    mes: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="AAAA-MM (vazio: o mês que acabou)")
 
 
 class ResumoMensal(BaseModel):

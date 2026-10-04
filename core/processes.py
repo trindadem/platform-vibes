@@ -27,7 +27,8 @@ Trilhos:
 - Modelo: o pacote da área oferece o fluxo de partida de cada modelo da biblioteca que ele executa (o desenho de cada
   organização começa dali). Ação do próprio pacote citada no modelo e não declarada impede o boot.
 - Paralelo: um passo paralelo com vários caminhos abre ramos que correm ao mesmo tempo; outro, com vários caminhos
-  chegando, espera todos (o BPMN é um parallelGateway nos dois casos).
+  chegando, espera todos (o BPMN é um parallelGateway nos dois casos). O passo com exceção logo antes de um paralelo
+  passa por um ponto de encontro (<passo>__retoma) com a exceção dele: o paralelo espera um token por caminho.
 - Gatilho por outro processo: quando um processo da organização termina (com o resultado pedido), o svc-processos
   inicia os que dependem dele, com as saídas dele no gatilho: a cadeia vira um projeto (ex.: proposta → contrato).
 - Evento de pacote: processes.emit publica <pacote>.<nome> em events.processos.evento, como a organização de quem age;
@@ -57,8 +58,9 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, get_type_hints
+from zoneinfo import ZoneInfo
 from xml.sax.saxutils import escape
 
 import httpx
@@ -76,7 +78,7 @@ __all__ = [
     "ProcessModel", "Step", "Trigger", "Deployed", "Started", "Job", "Handoff", "StepEvent", "camunda", "processes", "to_bpmn",
     "process_id", "parse_process_id", "build_catalog", "CATALOG_SUBJECT", "STEP_SUBJECT", "EVENT_SUBJECT", "START",
     "HANDOFF_ERROR", "JOB_AGENT", "JOB_START", "JOB_TASK", "JOB_WAIT", "JOB_END", "Indicator", "CatalogIndicator",
-    "IndicatorRequest", "IndicatorValues", "indicators_subject", "END",
+    "IndicatorRequest", "IndicatorValues", "IndicatorWindow", "INDICATOR_TZ", "indicators_subject", "END", "exception_merge",
 ]
 
 CATALOG_SUBJECT = "events.processos.catalogo"
@@ -287,12 +289,42 @@ class CatalogIndicator(BaseModel):
     descricao: str = ""
 
 
+INDICATOR_TZ = "America/Sao_Paulo"  # o mês dos indicadores é o civil em Brasília
+
+
+class IndicatorWindow(BaseModel):
+    """O mês de um pedido de indicadores: começo e fim (UTC, fim exclusivo), o corte (o fim; no mês corrente, agora) e o
+    dia do corte em Brasília (o último dia do mês, ou hoje). O que é "situação" (contratos vigentes, valor em atraso) é
+    medido no corte."""
+
+    inicio: datetime
+    fim: datetime
+    corte: datetime
+    dia: date
+
+
 class IndicatorRequest(BaseModel):
     """rpc.<pacote>.indicadores: os indicadores "pacote" de um modelo, no mês, na organização de quem pede."""
 
     modelo: str
-    mes: str = Field(..., pattern=r"^\d{4}-\d{2}$", description="AAAA-MM (o mês em Brasília)")
+    mes: str = Field(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="AAAA-MM (o mês em Brasília)")
     nomes: list[str] = Field(default_factory=list)
+
+    def janela(self) -> IndicatorWindow | None:
+        """O mês em Brasília (IndicatorWindow); mês inválido ou que ainda não começou: None (o indicador fica sem dado)."""
+        try:
+            ano, numero = (int(x) for x in self.mes.split("-"))
+            fuso = ZoneInfo(INDICATOR_TZ)
+            inicio = datetime(ano, numero, 1, tzinfo=fuso).astimezone(UTC)
+            fim = datetime(ano + (numero == 12), 1 if numero == 12 else numero + 1, 1, tzinfo=fuso).astimezone(UTC)
+        except ValueError:
+            return None
+        agora = datetime.now(UTC)
+        if inicio > agora:
+            return None
+        corte = min(agora, fim)
+        dia = (corte - timedelta(microseconds=1) if corte == fim else corte).astimezone(ZoneInfo(INDICATOR_TZ)).date()
+        return IndicatorWindow(inicio=inicio, fim=fim, corte=corte, dia=dia)
 
 
 class IndicatorValues(BaseModel):
@@ -689,6 +721,15 @@ def _handoff_kind(step: Step) -> str | None:
     return None
 
 
+def exception_merge(fluxo: Fluxo, step: Step) -> str | None:
+    """Onde o passo e a exceção dele se juntam antes de seguir, quando o seguinte é um paralelo: o paralelo espera um
+    token em cada caminho que chega, e o passo e a exceção são dois caminhos de um token só. None: seguem direto."""
+    if not _handoff_kind(step):
+        return None
+    nxt = next((fluxo.step(f.para) for f in fluxo.outgoing(step.id) if fluxo.step(f.para) is not None), None)
+    return f"{step.id}__retoma" if nxt is not None and nxt.tipo == "paralelo" else None
+
+
 def _ranks(fluxo: Fluxo) -> tuple[dict[str, int], list[str]]:
     """Camada de cada nó pelo caminho mais longo a partir do início (laços não empurram camada)."""
     rank: dict[str, int] = {START: 0}
@@ -769,6 +810,8 @@ def _layout(fluxo: Fluxo) -> dict[str, tuple[float, float, int, int]]:
         if _handoff_kind(step) and step.id in pos:
             x, y, w, h = pos[step.id]
             pos[f"{step.id}__excecao"] = (x, y + h + 70, *_SIZE["task"])
+            if merge := exception_merge(fluxo, step):  # o ponto de encontro, pequeno, logo depois do passo
+                pos[merge] = (x + w + 20, y + h / 2 - 15, 30, 30)
     return pos
 
 
@@ -866,9 +909,10 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str, actions: Mapping[str, C
         else:
             elements.append(f'<bpmn:endEvent id="{sid}" name="{label}"><bpmn:extensionElements>{listener(JOB_END)}'
                             "</bpmn:extensionElements></bpmn:endEvent>")
+        merge = exception_merge(fluxo, step)
         for flow in fluxo.outgoing(sid):
             if fluxo.step(flow.para) is not None:  # ligação para passo que não existe (rascunho): fica de fora
-                flows.append((f"f_{sid}_{flow.para}", sid, flow.para, flow.condicao if step.tipo == "decisao" else None))
+                flows.append((f"f_{sid}_{flow.para}", sid, merge or flow.para, flow.condicao if step.tipo == "decisao" else None))
         if handoff:
             nxt = next((f.para for f in fluxo.outgoing(sid) if fluxo.step(f.para) is not None), None)
             if handoff == "erro":
@@ -882,7 +926,11 @@ def to_bpmn(fluxo: Fluxo, *, process_id: str, name: str, actions: Mapping[str, C
             elements.append(f'<bpmn:boundaryEvent id="{sid}__{handoff}" attachedToRef="{sid}">{trigger_xml}</bpmn:boundaryEvent>')
             elements.append(user_task(f"{sid}__excecao", task_name, "staff", HANDOFF_HOURS, None))
             flows.append((f"f_{sid}__{handoff}", f"{sid}__{handoff}", f"{sid}__excecao", None))
-            if nxt:
+            if nxt and merge:  # o paralelo seguinte esperaria o passo e a exceção: os dois se juntam antes
+                elements.append(f'<bpmn:exclusiveGateway id="{merge}" />')
+                flows.append((f"f_{sid}__excecao_{nxt}", f"{sid}__excecao", merge, None))
+                flows.append((f"f_{merge}_{nxt}", merge, nxt, None))
+            elif nxt:
                 flows.append((f"f_{sid}__excecao_{nxt}", f"{sid}__excecao", nxt, None))
     for flow in fluxo.outgoing(START):
         if fluxo.step(flow.para) is not None:
