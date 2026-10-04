@@ -123,7 +123,13 @@ class FinanceiroService:
         return Classificacao(conta=fornecedor.get("conta") or CONTA_PADRAO, centro_custo=fornecedor.get("centro_custo"))
 
     async def agendar_pagamento(self, data: Pagamento) -> Agendamento:
-        """Agenda no banco conectado da organização (svc-integracoes) e abre o título a pagar."""
+        """Agenda no banco conectado da organização (svc-integracoes) e abre o título a pagar. Linha digitável com outro
+        número de dígitos que não 47 (boleto bancário) ou 48 (conta de consumo, tributo) não se paga: foi lida pela metade
+        (a foto que quebrou a linha, o documento cortado) e vai ao staff conferir."""
+        digitos = len(re.sub(r"\D", "", data.linha_digitavel or ""))
+        if data.linha_digitavel and digitos not in (47, 48):
+            raise Handoff(f"A linha digitável lida tem {digitos} dígitos (o boleto tem 47; conta de consumo e tributo, 48): "
+                          "confira no documento e informe a linha completa.")
         agendado = await _integracoes(AGENDAR_SUBJECT, AgendarPagamento(
             valor=data.valor, vencimento=data.vencimento, fornecedor=data.fornecedor, linha_digitavel=data.linha_digitavel,
         ), PagamentoAgendado)
@@ -192,9 +198,9 @@ class FinanceiroService:
         o staff emite no portal e informa o número, que segue para a cobrança."""
         fatura = await _fatura(data.fatura_id)
         if fatura.nota_numero:
-            return Nota(nota_numero=fatura.nota_numero)
+            return Nota(nota_numero=fatura.nota_numero, nota_documento=fatura.nota_documento)
         raise Handoff(f"A emissão de NFS-e ainda não tem integração: emita a nota de {fatura.cliente} ({_reais(fatura.valor)}) "
-                      "no portal da prefeitura e informe o número.")
+                      "no portal da prefeitura, informe o número e anexe o PDF da nota (ele segue com a cobrança).")
 
     async def cobrar(self, data: CobrancaIn) -> Cobranca:
         """Emite o boleto no banco e envia a cobrança por e-mail ao cliente (se ele tem e-mail e a caixa de entrada
@@ -205,15 +211,18 @@ class FinanceiroService:
         emitida = await _integracoes(COBRAR_SUBJECT, CobrarNoBanco(valor=fatura.valor, vencimento=fatura.vencimento, pagador=fatura.cliente,
                                                                   descricao=fatura.descricao), CobrancaEmitida)
         nota = data.nota_numero or fatura.nota_numero
+        nota_documento = data.nota_documento or fatura.nota_documento
         row = await db.merge(f"{FATURAS}:{fatura.id}", {"cobranca_id": emitida.cobranca_id, "linha_digitavel": emitida.linha_digitavel,
-                                                        "nota_numero": nota, "status": "cobrada"})
+                                                        "nota_numero": nota, "nota_documento": nota_documento, "status": "cobrada"})
         fatura = Fatura.model_validate(row)
         enviada = False
         if fatura.email:
+            anexos = [{"cobranca": emitida.cobranca_id}, *([{"documento": nota_documento}] if nota_documento else [])]
             texto = (f"Olá, {fatura.cliente}.\n\nSegue a cobrança de {fatura.descricao or 'nossa venda'}"
                      + (f" (nota fiscal {nota})" if nota else "") + f".\n\nValor: {_reais(fatura.valor)}\nVencimento: {_data_br(fatura.vencimento)}\n"
-                     f"Linha digitável: {emitida.linha_digitavel}\n\nObrigado!")
-            enviada = await _email(fatura.email, f"Cobrança: {fatura.descricao or 'venda'}"[:200], texto, obrigatorio=False)
+                     f"Linha digitável: {emitida.linha_digitavel}\n\n"
+                     + ("O boleto e a nota fiscal vão anexados." if nota_documento else "O boleto vai anexado.") + "\n\nObrigado!")
+            enviada = await _email(fatura.email, f"Cobrança: {fatura.descricao or 'venda'}"[:200], texto, obrigatorio=False, anexos=anexos)
         await bus.live(LIVE_FATURAS, FaturaMudou(id=fatura.id, action="cobrada"))
         return Cobranca(cobranca_id=emitida.cobranca_id, linha_digitavel=emitida.linha_digitavel, vencimento=emitida.vencimento, enviada=enviada)
 
@@ -297,7 +306,8 @@ class FinanceiroService:
                              f"({_data_br(fatura.vencimento)}).\nLinha digitável: {fatura.linha_digitavel or '-'}\n\n"
                              "Se já pagou, desconsidere. Obrigado!")
                     try:
-                        await _email(fatura.email or "", f"Lembrete de pagamento: {fatura.descricao or 'cobrança'}"[:200], texto)
+                        await _email(fatura.email or "", f"Lembrete de pagamento: {fatura.descricao or 'cobrança'}"[:200], texto,
+                                     anexos=[{"cobranca": fatura.cobranca_id}] if fatura.cobranca_id else [])
                     except ServiceError:
                         continue  # sem caixa de entrada ou sem provedor: tenta no dia seguinte
                     await db.merge(f"{FATURAS}:{fatura.id}", {"regua": [*fatura.regua, etapa]})
@@ -356,10 +366,11 @@ async def _integracoes(subject: str, pedido: BaseModel, modelo: type[Any]) -> An
         raise ServiceError("ERRO_FINANCEIRO_INTEGRACOES_FORA", "O serviço de integrações não respondeu.", 503) from None
 
 
-async def _email(para: str, assunto: str, texto: str, *, obrigatorio: bool = True) -> bool:
-    """E-mail pela caixa de entrada da organização. obrigatorio=False: sem conexão ou sem provedor, devolve False."""
+async def _email(para: str, assunto: str, texto: str, *, obrigatorio: bool = True, anexos: list[dict[str, str]] | None = None) -> bool:
+    """E-mail pela caixa de entrada da organização, com anexos (o boleto da cobrança, a nota). obrigatorio=False: sem
+    conexão ou sem provedor, devolve False."""
     try:
-        await _integracoes(EMAIL_SUBJECT, EnviarEmail(para=para, assunto=assunto, texto=texto), EmailEnviado)
+        await _integracoes(EMAIL_SUBJECT, EnviarEmail(para=para, assunto=assunto, texto=texto, anexos=anexos or []), EmailEnviado)
         return True
     except ServiceError as exc:
         if obrigatorio or exc.status >= 500:

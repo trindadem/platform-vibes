@@ -141,6 +141,7 @@ jobs:
         run: |
           uv run python -m core.security keygen --production app.exemplo.com
           sed -i 's|^SMTP_URL=$|SMTP_URL=smtps://ci:ci@smtp.exemplo.com:465|' .env
+          sed -i 's|^INTEGRACOES_POSTMARK_TOKEN=$|INTEGRACOES_POSTMARK_TOKEN=ci-token|' .env
           docker compose -f compose.yaml -f compose.prod.yaml config --quiet
       - name: Em produção, só o Traefik publica portas (80 e 443)
         run: |

@@ -126,7 +126,9 @@ services:
 
   svc-integracoes:
     environment:
-      INTEGRACOES_MAILPIT_URL: ""  # sem Mailpit em produção: a caixa de entrada usa o provedor de entrada (spec §3)
+      INTEGRACOES_MAILPIT_URL: ""  # sem Mailpit em produção: a caixa de entrada usa o Postmark (spec §3)
+      INTEGRACOES_POSTMARK_TOKEN: ${INTEGRACOES_POSTMARK_TOKEN:?defina INTEGRACOES_POSTMARK_TOKEN no .env (server token do Postmark)}
+      INTEGRACOES_POSTMARK_ENTRADA: ${INTEGRACOES_POSTMARK_ENTRADA:?defina INTEGRACOES_POSTMARK_ENTRADA no .env (senha do aviso de entrada)}
 
 volumes:
   letsencrypt:

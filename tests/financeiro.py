@@ -70,7 +70,7 @@ def test_agendar_no_banco_e_conciliar_o_titulo():
         agendamentos.append(pedido)
         if pedido.valor > 1_000_000:
             raise ServiceError("ERRO_INTEGRACOES_SEM_BANCO", "Conecte o banco da empresa em Integrações.", 409)
-        return {"pagamento_id": "PG-AB12", "data": pedido.vencimento}
+        return {"pagamento_id": "PG-AB12" if len(agendamentos) == 1 else f"PG-X{len(agendamentos)}", "data": pedido.vencimento}
 
     async def cenario(app):
         app.respond(AGENDAR_SUBJECT, banco)
@@ -85,9 +85,16 @@ def test_agendar_no_banco_e_conciliar_o_titulo():
         estranho = await app.job("financeiro.conciliar", variables={"entrada": {"pagamento_id": "PG-0000"}})
         pago = (await app.user(*OWNER).get("/titulos", params={"status": "pago"})).json()["data"]
         da_beta = (await app.user("bia", "beta", "owner").get("/titulos")).json()["data"]
-        return agendado, sem_banco, faltando, titulos, conciliado, estranho, pago, da_beta, app.published
+        # A foto que quebrou a linha: a linha digitável lida pela metade não se paga, vai ao staff (o banco nem é chamado).
+        pela_metade = await app.job("financeiro.agendar_pagamento", headers={"excecao": "sim"}, variables={"entrada": {
+            **pagamento, "linha_digitavel": "34191.79001 01043.510047 91020.150008 1"}})
+        inteira = await app.job("financeiro.agendar_pagamento", headers={"excecao": "sim"}, variables={"entrada": {
+            **pagamento, "linha_digitavel": "34191.79001 01043.510047 91020.150008 1 98760000189050"}})
+        return agendado, sem_banco, faltando, titulos, conciliado, estranho, pago, da_beta, app.published, pela_metade, inteira
 
-    agendado, sem_banco, faltando, titulos, conciliado, estranho, pago, da_beta, publicados = service_app(cenario)
+    agendado, sem_banco, faltando, titulos, conciliado, estranho, pago, da_beta, publicados, pela_metade, inteira = service_app(cenario)
+    assert pela_metade.status == "handoff" and "33 dígitos" in pela_metade.message and inteira.status != "handoff"
+    assert [a.linha_digitavel for a in agendamentos if a.linha_digitavel] == ["34191.79001 01043.510047 91020.150008 1 98760000189050"]
     assert agendado.variables["resultado"] == {"pagamento_id": "PG-AB12", "data": "2026-10-15"}
     assert agendamentos[0].fornecedor == "Moinho Sul"
     assert (sem_banco.status, sem_banco.message) == ("handoff", "Conecte o banco da empresa em Integrações.")
@@ -120,21 +127,29 @@ def test_faturar_emitir_nota_com_o_staff_cobrar_e_baixar_pelo_extrato():
         sem_valor = await app.job("financeiro.faturar", variables={"entrada": {**venda, "valor": None}})
         fatura_id = faturado.variables["resultado"]["fatura_id"]
         nota = await app.job("financeiro.emitir_nota", element="emitir", variables={"entrada": {"fatura_id": fatura_id}}, headers={"excecao": "sim"})
-        cobrado = await app.job("financeiro.cobrar", variables={"entrada": {"fatura_id": fatura_id, "nota_numero": "2026/000123"}})
+        cobrado = await app.job("financeiro.cobrar", variables={"entrada": {"fatura_id": fatura_id, "nota_numero": "2026/000123",
+                                                                            "nota_documento": "notapdf1"}})
+        de_novo = await app.job("financeiro.emitir_nota", variables={"entrada": {"fatura_id": fatura_id}})  # a nota já está na fatura
         antes = await app.job("financeiro.baixar", variables={"entrada": {"cobranca_id": "CB-1A2B3C4D"}})
         extrato["itens"] = [{"tipo": "recebimento", "id": "CB-1A2B3C4D", "valor": 4800.0, "data": "2026-10-05"}]
         depois = await app.job("financeiro.baixar", variables={"entrada": {"cobranca_id": "CB-1A2B3C4D"}})
         faturas = (await app.user(*OWNER).get("/faturas")).json()["data"]["items"]
         combinada = await app.job("financeiro.faturar", variables={"entrada": {**venda, "vencimento": "2026-10-15"}})  # a mensalidade do plano
-        return faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada
+        return faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada, de_novo
 
-    faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada = service_app(cenario)
+    faturado, sem_valor, nota, cobrado, antes, depois, faturas, combinada, de_novo = service_app(cenario)
     vencimento = (date.today() + timedelta(days=10)).isoformat()
     assert faturado.variables["resultado"]["vencimento"] == vencimento and sem_valor.status == "handoff"
     assert combinada.variables["resultado"]["vencimento"] == "2026-10-15"  # a data combinada vale mais que o prazo
     assert nota.status == "handoff" and "R$ 4.800,00" in nota.message and "prefeitura" in nota.message  # NFS-e: o staff emite
     assert cobrado.variables["resultado"]["enviada"] is True and enviados[0].para == "compras@paoquente.com.br"
     assert "2026/000123" in enviados[0].texto and "34191.79001" in enviados[0].texto
+    # O boleto da cobrança e o PDF da nota que o staff anexou vão junto (os arquivos ficam no svc-integracoes).
+    assert enviados[0].anexos == [{"cobranca": "CB-1A2B3C4D"}, {"documento": "notapdf1"}] and "vão anexados" in enviados[0].texto
+    assert de_novo.variables["resultado"] == {"nota_numero": "2026/000123", "nota_documento": "notapdf1"}
+    assert "anexe o PDF" in nota.message
+    from schemas import Nota  # na exceção, o campo da nota é um arquivo anexado (o svc-processos lê o format)
+    assert Nota.model_json_schema()["properties"]["nota_documento"]["format"] == "documento"
     assert antes.variables["resultado"] == {"recebido": False, "valor": 0} and depois.variables["resultado"] == {"recebido": True, "valor": 4800.0}
     assert [(f["status"], f["nota_numero"], f["cobranca_id"]) for f in faturas] == [("paga", "2026/000123", "CB-1A2B3C4D")]
 

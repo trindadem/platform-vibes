@@ -14,8 +14,8 @@ Ações (`processes.declare` e `processes.worker`), cada uma o método de mesmo 
 - `financeiro.conciliar` (escrita, conexão Banco): `Comprovante {pagamento_id}` → `Conciliacao {conciliado, diferenca}`.
 - `financeiro.conciliar_extrato` (escrita, conexão Banco): `Janela {dias}` → `ConciliacaoDia {lancamentos, conciliados, sem_par, valor_sem_par}`.
 - `financeiro.faturar` (escrita): `Faturamento {cliente, cnpj, email, descricao, valor, prazo_pagamento, proposta_id}` → `FaturaAberta {fatura_id, vencimento}`.
-- `financeiro.emitir_nota` (externa, conexão NFS-e): `NotaIn {fatura_id}` → `Nota {nota_numero}`.
-- `financeiro.cobrar` (externa, conexões Banco e Caixa de entrada): `CobrancaIn {fatura_id, nota_numero}` → `Cobranca {cobranca_id, linha_digitavel, vencimento, enviada}`.
+- `financeiro.emitir_nota` (externa, conexão NFS-e): `NotaIn {fatura_id}` → `Nota {nota_numero, nota_documento?}` (`nota_documento`: o PDF da nota que o staff anexa na exceção, campo de arquivo).
+- `financeiro.cobrar` (externa, conexões Banco e Caixa de entrada): `CobrancaIn {fatura_id, nota_numero, nota_documento}` → `Cobranca {cobranca_id, linha_digitavel, vencimento, enviada}`: o e-mail da cobrança leva o boleto e, se houver, o PDF da nota anexados.
 - `financeiro.baixar` (escrita): `Recebimento {cobranca_id}` → `Baixa {recebido, valor}`.
 - `financeiro.pendencias_do_mes` (leitura): `Mes {referencia}` → `Pendencias {referencia, pendencias, resumo}`.
 - `financeiro.enviar_ao_contador` (externa, conexão Caixa de entrada): `EnvioContador {email_contador, referencia}` → `Envio {enviado_em}`.
@@ -33,7 +33,7 @@ cobradas vencidas e não recebidas no corte (o fim do mês; no corrente, agora).
 Rotas:
 - Cadastro declarado `fornecedores` (README §5.19): `Fornecedor {nome (único), cnpj, conta (padrão 2.1.01 Fornecedores), centro_custo, valor_contrato}`; escrevem dono, admin e operador.
 - `GET /titulos?page&size&sort&status` → `TituloPage` de `Titulo {id, fornecedor, valor, vencimento, data, pagamento_id, status: agendado|pago, conciliado, created_at}`.
-- `GET /faturas?page&size&sort&status` → `FaturaPage` de `Fatura {id, cliente, cnpj, email, descricao, valor, vencimento, nota_numero, cobranca_id, linha_digitavel, status: aberta|cobrada|paga, regua[], recebido_em, conciliada, proposta_id, created_at}`.
+- `GET /faturas?page&size&sort&status` → `FaturaPage` de `Fatura {id, cliente, cnpj, email, descricao, valor, vencimento, nota_numero, nota_documento, cobranca_id, linha_digitavel, status: aberta|cobrada|paga, regua[], recebido_em, conciliada, proposta_id, created_at}`.
 - Ao vivo: `financeiro.fornecedores`, `financeiro.titulos {id, action: agendado|pago|conciliado}` e `financeiro.faturas {id, action: aberta|cobrada|paga|lembrete}`.
 - Consome os RPCs `rpc.integracoes.banco_agendar`, `rpc.integracoes.banco_cobrar`, `rpc.integracoes.banco_extrato` e `rpc.integracoes.enviar_email` (contratos repetidos no schemas.py).
 
@@ -46,9 +46,10 @@ Rotas:
 6. Conciliar o extrato: pede o extrato desde ontem (ou `dias`); cada pagamento casa com um título (pago e conciliado) e cada recebimento com uma fatura (conciliada) pelo id; o resto é sem par, somado.
 7. Faturar: a fatura nasce aberta com o `vencimento` que veio (a data combinada, como a mensalidade do plano que o fechamento da Cogniventure fatura) ou, sem ele, hoje + `prazo_pagamento` (padrão 15). Emitir nota: sem integração de NFS-e, o staff emite e informa o número (handoff). Cobrar: emite o boleto no banco e o envia por e-mail ao cliente (sem e-mail ou sem caixa de entrada, `enviada` falso). Baixar: confere no extrato se a cobrança foi recebida e marca a fatura paga.
 8. Fechamento: pendências do mês (títulos sem comprovante, faturas sem nota); o resumo e os lançamentos por e-mail ao contador; DAS = receita do mês (faturas) × alíquota (padrão 6%), vencendo no dia 20 do mês seguinte; a DRE gerencial (receitas − despesas) vai como aviso a dono e administrador.
-9. Agendamento diário (`ReguaWorkflow`, 9h em Brasília): fatura cobrada e não paga recebe por e-mail o lembrete D-3 (até 3 dias antes), D+1 e D+7, cada um uma vez (`regua`). No D+7, dono e admin da organização também são avisados (tela + e-mail): a vencida além do prazo chega ao gestor (na Cogniventure, ele suspende o cliente pela aba Clientes).
+9. Agendamento diário (`ReguaWorkflow`, 9h em Brasília): fatura cobrada e não paga recebe por e-mail o lembrete D-3 (até 3 dias antes), D+1 e D+7, cada um uma vez (`regua`), com o boleto anexado. No D+7, dono e admin da organização também são avisados (tela + e-mail): a vencida além do prazo chega ao gestor (na Cogniventure, ele suspende o cliente pela aba Clientes).
 
 ## 4. Casos de Borda e Erros Mapeados
+- `agendar_pagamento` com linha digitável que não tem 47 dígitos (boleto) nem 48 (conta de consumo, tributo) não agenda: handoff "A linha digitável lida tem N dígitos" (a foto que quebrou a linha, o documento cortado), antes de chamar o banco.
 - Entrada que falta campo obrigatório (ex.: sem vencimento) → handoff "Faltam dados para ..." (core/processes.py); faturar sem cliente ou valor → handoff.
 - Sem banco ou sem caixa de entrada conectados → o 409 do svc-integracoes vira handoff com a mensagem; svc-integracoes fora do ar → 503 `ERRO_FINANCEIRO_INTEGRACOES_FORA` (o motor tenta de novo).
 - NFS-e sem integração → handoff com o cliente e o valor; enviar ao contador sem `email_contador` → handoff.

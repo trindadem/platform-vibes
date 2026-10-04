@@ -126,7 +126,7 @@ def _upstream_request(ep: Endpoint, request: Request, body: bytes) -> tuple[str,
 
 def _forward_stream(ep: Endpoint, upstream: httpx.AsyncClient):
     async def forward(request: Request) -> Response:
-        url, headers = _upstream_request(ep, request, body := await _read_body(request))
+        url, headers = _upstream_request(ep, request, body := await _read_body(request, ep.max_body_mb))
         outgoing = upstream.build_request(
             request.method, url, content=body, params=request.query_params.multi_items(), headers=headers,
             timeout=ep.timeout,  # vale entre um pedaço e outro, não para a resposta inteira
@@ -159,7 +159,7 @@ def _forward_stream(ep: Endpoint, upstream: httpx.AsyncClient):
 
 def _forward(ep: Endpoint, upstream: httpx.AsyncClient):
     async def forward(request: Request) -> Response:
-        body = await _read_body(request)
+        body = await _read_body(request, ep.max_body_mb)
         url, headers = _upstream_request(ep, request, body)
         try:
             reply = await upstream.request(
@@ -209,13 +209,15 @@ def _message_id(request: Request) -> str:
     return hashlib.sha256(f"{owner}\n{request.url.path}\n{key}".encode()).hexdigest()[:32]
 
 
-async def _read_body(request: Request) -> bytes:
+async def _read_body(request: Request, max_mb: int = 1) -> bytes:
+    """O corpo em pedaços, até 1 MiB (ou o max_body_mb do webhook público que traz arquivos)."""
+    limit = MAX_BODY_BYTES * max_mb
     declared = request.headers.get("content-length", "0")
-    if not declared.isdigit() or int(declared) > MAX_BODY_BYTES:
-        raise ServiceError("ERRO_GATEWAY_PAYLOAD_TOO_LARGE", "Corpo acima de 1 MiB.", status=413)
+    if not declared.isdigit() or int(declared) > limit:
+        raise ServiceError("ERRO_GATEWAY_PAYLOAD_TOO_LARGE", f"Corpo acima de {max_mb} MiB.", status=413)
     body = bytearray()
     async for chunk in request.stream():
         body += chunk
-        if len(body) > MAX_BODY_BYTES:
-            raise ServiceError("ERRO_GATEWAY_PAYLOAD_TOO_LARGE", "Corpo acima de 1 MiB.", status=413)
+        if len(body) > limit:
+            raise ServiceError("ERRO_GATEWAY_PAYLOAD_TOO_LARGE", f"Corpo acima de {max_mb} MiB.", status=413)
     return bytes(body)

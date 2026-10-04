@@ -27,6 +27,8 @@ BILLING = {
          "target_url": "http://svc-billing:8000/ping"},
         {"path": "/trigger", "method": "POST", "auth": "client_jwt", "target_type": "nats",
          "nats_subject": "events.billing.trigger"},
+        {"path": "/entrada", "method": "POST", "auth": "public", "target_type": "http", "headers": ["authorization"],
+         "max_body_mb": 3, "target_url": "http://svc-billing:8000/entrada"},
     ],
 }
 
@@ -87,7 +89,7 @@ def _manifest(**endpoint_overrides):
 def test_manifesto_valido():
     from schemas import Manifest
 
-    assert len(Manifest.model_validate(BILLING).endpoints) == 4
+    assert len(Manifest.model_validate(BILLING).endpoints) == 5
 
 
 @pytest.mark.parametrize(
@@ -112,6 +114,10 @@ def test_manifesto_valido():
         ({"headers": ["Stripe-Signature"]}, "não pode ser repassado"),
         ({"headers": ["cookie"]}, "não pode ser repassado"),
         ({"headers": ["x-forwarded-for"]}, "não pode ser repassado"),
+        ({"headers": ["authorization"]}, "authorization só em rota pública"),  # o token de quem chama nunca vai ao serviço
+        ({"max_body_mb": 5}, "max_body_mb só em webhook público"),
+        ({"auth": "public", "method": "GET", "request": None, "max_body_mb": 5}, "max_body_mb só em webhook público"),
+        ({"max_body_mb": 51}, "less than or equal to 50"),
         ({"stream": True}, "exige delta"),
         ({"delta": "Pedaco"}, "delta só existe com stream: true"),
         ({"target_type": "nats", "target_url": None, "nats_subject": "events.billing.x", "stream": True, "delta": "P"}, "stream: true só em rota HTTP"),
@@ -199,7 +205,7 @@ def test_rota_publica_do_manifesto(gateway, monkeypatch):
     client, _, _ = gateway
     assert client.get("/api/v1/billing/ping").status_code == 201
     monkeypatch.setattr(bus, "_nc", SimpleNamespace(is_connected=True))
-    assert client.get("/health").json()["data"] == {"status": "ok", "checks": {"nats": "ok"}, "routes": 4}
+    assert client.get("/health").json()["data"] == {"status": "ok", "checks": {"nats": "ok"}, "routes": 5}
 
 
 def test_saude_diz_qual_dependencia_caiu_sem_detalhe(gateway, monkeypatch):
@@ -229,6 +235,17 @@ def test_corpo_acima_de_1_mib_e_recusado(gateway):
     client, calls, _ = gateway
     r = client.post("/api/v1/billing/execute", content=b"x" * (1_048_576 + 1), headers=_bearer())
     assert (r.status_code, r.json()["error"]["code"], calls) == (413, "ERRO_GATEWAY_PAYLOAD_TOO_LARGE", [])
+
+
+def test_webhook_publico_com_arquivos_aceita_o_limite_dele_e_repassa_o_basic_auth(gateway):
+    client, calls, _ = gateway
+    basic = {"Authorization": "Basic cG9zdG1hcms6czNuaGE="}  # o provedor manda usuário:senha da URL do webhook
+    r = client.post("/api/v1/billing/entrada", content=b"x" * 2_500_000, headers=basic)
+    assert r.status_code == 201 and len(calls[-1].content) == 2_500_000
+    assert calls[-1].headers["authorization"] == basic["Authorization"]
+    grande = client.post("/api/v1/billing/entrada", content=b"x" * (3 * 1_048_576 + 1), headers=basic)
+    assert (grande.status_code, grande.json()["error"]["message"]) == (413, "Corpo acima de 3 MiB.")
+    assert len(calls) == 1  # o grande não chegou ao serviço
 
 
 def test_corpo_em_partes_sem_tamanho_declarado_tambem_e_limitado(gateway):

@@ -1048,9 +1048,10 @@ async def _agente_da_plataforma(step: Step, tarefa: str, contexto: str, regras: 
         except (NatsError, TimeoutError):
             return "O serviço de documentos não respondeu agora."
         if not doc.texto.strip():
-            return f"{doc.nome} ({doc.tipo}) não tem texto legível (imagem ou PDF escaneado)."
+            return f"{doc.nome} ({doc.tipo}) não tem texto legível (foto ou PDF escaneado que o modelo não conseguiu ler)."
         lidos.append(f"{doc.nome} {doc.assunto or ''} {doc.texto}")
-        return f"{doc.nome} — assunto: {doc.assunto or '-'}\n\n{doc.texto[:12000]}"
+        origem = " (foto ou PDF escaneado: o texto abaixo é a leitura do modelo de visão)" if doc.leitura == "modelo" else ""
+        return f"{doc.nome}{origem} — assunto: {doc.assunto or '-'}\n\n{doc.texto[:12000]}"
 
     async def concluir(dados: BaseModel) -> str:
         resultado.clear()
@@ -2280,7 +2281,7 @@ def _quando(valor: Any) -> datetime | None:
 
 
 _ROTULOS = {"fornecedor": "Fornecedor", "cnpj": "CNPJ", "valor": "Valor", "vencimento": "Vencimento", "linha_digitavel": "Linha digitável",
-            "nome": "Documento", "de": "De", "assunto": "Assunto", "divergente": "Diverge do pedido", "diferenca": "Diferença",
+            "nome": "Documento", "de": "De", "assunto": "Assunto", "nota_documento": "PDF da nota fiscal", "divergente": "Diverge do pedido", "diferenca": "Diferença",
             "fornecedor_novo": "Fornecedor novo", "pedido": "Pedido ou contrato", "conta": "Conta", "pagamento_id": "Pagamento", "data": "Data",
             # N7: os pacotes de área
             "processo_origem": "Iniciado por", "cliente": "Cliente", "email": "E-mail", "descricao": "Descrição", "desconto": "Desconto (%)",
@@ -2311,12 +2312,17 @@ def _campos(step: Step, catalogo: dict[str, CatalogAction], visto: dict[str, Any
         tipos = {c: step.exemplo.get(c) for c in step.saidas}
     elif step.tipo == "acao" and step.acao in catalogo:
         propriedades = catalogo[step.acao].output_schema.get("properties", {})
-        tipos = {c: {"number": 0.0, "integer": 0.0, "boolean": False}.get(_tipo_json(propriedades.get(c, {})), "") for c in step_outputs(step, catalogo)}
+        tipos = {c: _DOCUMENTO if propriedades.get(c, {}).get("format") == "documento"  # a ação pede um arquivo (ex.: o PDF da nota)
+                 else {"number": 0.0, "integer": 0.0, "boolean": False}.get(_tipo_json(propriedades.get(c, {})), "")
+                 for c in step_outputs(step, catalogo)}
     else:
         return []
     return [Campo(nome=c, rotulo=_ROTULOS.get(c, c.replace("_", " ").capitalize()),
-                  tipo="sim_nao" if isinstance(t, bool) else "numero" if isinstance(t, (int, float)) else "texto",
+                  tipo="documento" if t is _DOCUMENTO else "sim_nao" if isinstance(t, bool) else "numero" if isinstance(t, (int, float)) else "texto",
                   valor=visto.get(c) if isinstance(visto.get(c), (str, int, float, bool)) else None) for c, t in tipos.items()]
+
+
+_DOCUMENTO = object()  # marca de campo que é arquivo anexado (format "documento" no schema de saída da ação)
 
 
 def _tipo_json(schema: dict[str, Any]) -> str:
@@ -2344,6 +2350,10 @@ def _valores_da_excecao(tarefa: Tarefa, data: Resposta) -> dict[str, Any]:
                 raise ServiceError("ERRO_PROCESSOS_RESPOSTA", f"{campo.rotulo}: informe um número.", 422) from None
         elif campo.tipo == "sim_nao":
             valores[campo.nome] = bruto if isinstance(bruto, bool) else str(bruto).lower() in ("sim", "true", "1")
+        elif campo.tipo == "documento":  # o id do documento que a tela enviou ao svc-integracoes
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(bruto)):
+                raise ServiceError("ERRO_PROCESSOS_RESPOSTA", f"{campo.rotulo}: anexe o arquivo de novo.", 422)
+            valores[campo.nome] = str(bruto)
         else:
             valores[campo.nome] = str(bruto)[:300]
     if data.comentario:

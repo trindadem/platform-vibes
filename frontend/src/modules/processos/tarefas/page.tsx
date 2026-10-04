@@ -6,6 +6,7 @@ import { Button } from "@/components/Button";
 import { Card } from "@/components/Card";
 import { DateTime } from "@/components/DateTime";
 import { EmptyState } from "@/components/EmptyState";
+import { FileField } from "@/components/FileField";
 import { KeyValue } from "@/components/KeyValue";
 import { Page } from "@/components/Page";
 import { QueryView } from "@/components/QueryView";
@@ -16,9 +17,9 @@ import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
 import { TextArea } from "@/components/TextArea";
 import { TextLink } from "@/components/TextLink";
-import { useAction, useLiveQuery, useQuery } from "@/core/api";
+import { useAction, useLiveQuery, useQuery, useUpload } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
-import { identity, integracoes, type ProcessosTarefa, processos } from "@/core/contracts";
+import { type IntegracoesDocumento, identity, integracoes, type ProcessosCampo, type ProcessosTarefa, processos } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Tarefas", order: 2 };
 
@@ -97,13 +98,22 @@ function TarefaAberta({ tarefa, onDone }: { tarefa: ProcessosTarefa; onDone: () 
   const pode = tarefa.responsavel === "cliente" ? hasAnyRole(session, "owner", "admin") : hasAnyRole(session, "operador") || Boolean(resumo.data?.staff);
   const [comentario, setComentario] = useState("");
   const [regra, setRegra] = useState("");
+  const [anexados, setAnexados] = useState<Record<string, IntegracoesDocumento>>({});
   const responder = useAction(processos.responder, { onSuccess: onDone });
   const documento = useAction(integracoes.arquivo, { onSuccess: (link) => window.open(link.url, "_blank", "noopener") });
   const atrasada = tarefa.prazo ? new Date(tarefa.prazo).getTime() < Date.now() : false;
   // A resolução da exceção é a saída do passo que parou: os campos vêm do backend, com o que o agente chegou a ver.
+  // Campo de arquivo (o PDF da nota): enviado antes, ao svc-integracoes; a saída leva o id do documento.
+  const arquivos = tarefa.campos.filter((c) => c.tipo === "documento");
+  const campos = tarefa.campos.filter((c) => c.tipo !== "documento");
   const resolver = {
     run: (valores: Record<string, unknown>) =>
-      responder.run({ id: tarefa.id, dados: valores as Record<string, string | number | boolean | null>, comentario: comentario || null, regra: regra.trim() || null }),
+      responder.run({
+        id: tarefa.id,
+        dados: { ...(valores as Record<string, string | number | boolean | null>), ...Object.fromEntries(Object.entries(anexados).map(([nome, d]) => [nome, d.id])) },
+        comentario: comentario || null,
+        regra: regra.trim() || null,
+      }),
     running: responder.running,
     error: responder.error,
   };
@@ -166,15 +176,33 @@ function TarefaAberta({ tarefa, onDone }: { tarefa: ProcessosTarefa; onDone: () 
                 hint="Vira regra do passo: o agente refaz este caso com ela e, se chegar ao que você preencheu, passa a segui-la nas próximas execuções."
               />
             )}
+            {arquivos.map((c) => (
+              <CampoArquivo key={c.nome} campo={c} anexado={anexados[c.nome]} onAnexar={(d) => setAnexados((a) => ({ ...a, [c.nome]: d }))} />
+            ))}
             <ActionForm
               action={resolver}
               submitLabel="Resolver e seguir o processo"
-              initial={Object.fromEntries(tarefa.campos.map((c) => [c.nome, c.valor === null || c.valor === undefined ? "" : String(c.valor)]))}
-              fields={tarefa.campos.map((c) => ({ name: c.nome, label: c.rotulo, kind: c.tipo === "numero" ? "number" : c.tipo === "sim_nao" ? "boolean" : "text" }))}
+              initial={Object.fromEntries(campos.map((c) => [c.nome, c.valor === null || c.valor === undefined ? "" : String(c.valor)]))}
+              fields={campos.map((c) => ({ name: c.nome, label: c.rotulo, kind: c.tipo === "numero" ? "number" : c.tipo === "sim_nao" ? "boolean" : "text" }))}
             />
           </Stack>
         )}
       </Stack>
     </Card>
+  );
+}
+
+/** Um campo de arquivo da exceção: o arquivo vira documento da organização (sem iniciar processo) e o id segue na saída. */
+function CampoArquivo({ campo, anexado, onAnexar }: { campo: ProcessosCampo; anexado?: IntegracoesDocumento; onAnexar: (d: IntegracoesDocumento) => void }) {
+  const envio = useUpload(integracoes.documentoUpload, (body) => integracoes.enviarDocumento({ ...body, iniciar: false }), { onSuccess: onAnexar });
+  return (
+    <Stack gap="sm">
+      <FileField label={campo.rotulo} upload={envio} accept="application/pdf,image/jpeg,image/png,image/webp" hint="PDF ou foto, até 10 MB. Segue anexado quando o processo mandar o e-mail." />
+      {anexado && (
+        <Text size="sm" tone="muted">
+          Anexado: {anexado.nome}
+        </Text>
+      )}
+    </Stack>
   );
 }

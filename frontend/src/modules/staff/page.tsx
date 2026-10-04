@@ -254,11 +254,19 @@ function Resolucao({ item, onDone }: { item: StaffItemFila; onDone: () => void }
                   hint="Vira regra do passo: o agente refaz este caso com ela e, se chegar ao que você preencheu, passa a segui-la."
                 />
               )}
+              {t.campos.some((c) => c.tipo === "documento") && (
+                <Alert tone="info" title="Esta exceção pede um arquivo">
+                  {t.campos.filter((c) => c.tipo === "documento").map((c) => c.rotulo).join(", ")}: para anexar, resolva pela tela de tarefas do cliente
+                  (o arquivo fica com ele). Sem o arquivo, o processo segue sem o anexo.
+                </Alert>
+              )}
               <ActionForm
                 action={enviar}
                 submitLabel="Resolver e seguir o processo"
-                initial={Object.fromEntries(t.campos.map((c) => [c.nome, c.valor === null || c.valor === undefined ? "" : String(c.valor)]))}
-                fields={t.campos.map((c) => ({ name: c.nome, label: c.rotulo, kind: c.tipo === "numero" ? "number" : c.tipo === "sim_nao" ? "boolean" : "text" }))}
+                initial={Object.fromEntries(t.campos.filter((c) => c.tipo !== "documento").map((c) => [c.nome, c.valor === null || c.valor === undefined ? "" : String(c.valor)]))}
+                fields={t.campos
+                  .filter((c) => c.tipo !== "documento")
+                  .map((c) => ({ name: c.nome, label: c.rotulo, kind: c.tipo === "numero" ? "number" : c.tipo === "sim_nao" ? "boolean" : "text" }))}
               />
             </Stack>
           );

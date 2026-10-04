@@ -2,11 +2,14 @@
 from datetime import datetime
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.plans import Module
+from core.storage import KeepRequest, Upload, UploadRequest
 from core.surreal import ListQuery, Page
+
+__all__ = ["KeepRequest", "Upload", "UploadRequest"]  # o contrato de envio de arquivo pela tela (core/storage.py)
 
 # Nomes canônicos gerados pelo service.sh — literais de propósito: um grep acha tudo.
 SERVICE = "svc-integracoes"
@@ -42,6 +45,12 @@ MCP_MAX_BYTES = 1_000_000  # resposta de um servidor MCP
 MCP_TIMEOUT = 30.0
 TEXT_MAX_CHARS = 20_000
 ACCEPTED = ("application/pdf", "text/plain", "text/xml", "application/xml", "image/png", "image/jpeg", "image/webp")
+IMAGENS = ("image/png", "image/jpeg", "image/webp")  # o modelo de visão lê (a foto de um boleto, a nota escaneada)
+PAGINAS_LIDAS = 4  # PDF escaneado: as imagens das primeiras páginas vão ao modelo
+EMAIL_MAX_BYTES = 10_000_000  # e-mail que sai, anexos somados (o limite do Postmark)
+ANEXOS_MAX = 5
+POSTMARK_API = "https://api.postmarkapp.com/email"
+POSTMARK_MAX_BYTES = 40 * 1_048_576  # aviso de e-mail que chega: até 35 MB de mensagem, em base64 dentro do JSON
 
 MODULE = Module(
     "Integrações",
@@ -55,6 +64,11 @@ class IntegracoesSettings(BaseSettings):
 
     dominio: str = Field("entrada.localhost", description="Domínio dos endereços de caixa de entrada")
     mailpit_url: str | None = Field(None, description="Ambiente local: o Mailpit que avisa e entrega os e-mails recebidos")
+    postmark_token: SecretStr | None = Field(None, description="Server token do Postmark: os e-mails saem por ele (vale mais que o Mailpit)")
+    postmark_stream: str = Field("outbound", description="Message stream transacional do Postmark")
+    postmark_entrada: SecretStr | None = Field(None, description="Senha do aviso de entrada do Postmark (usuário:senha na URL do "
+                                                                 "webhook, Basic auth); sem ela a rota de entrada não existe")
+    modelo_visao: str = Field("cv/visao", description="Modelo que lê foto e PDF escaneado, como cadastrado no svc-ai")
     secrets_key: SecretStr | None = Field(None, description="Chave (32 bytes, base64url) que cifra as credenciais MCP; sem ela o serviço não sobe")
     environment: str = Field("development", validation_alias="ENVIRONMENT")
 
@@ -112,15 +126,20 @@ class ConexaoMudou(BaseModel):
 
 # ── Documentos recebidos ─────────────────────────────────────────────────────
 
+Leitura = Literal["arquivo", "modelo", "lendo", "sem_texto"]
+
+
 class Documento(BaseModel):
     id: str
-    origem: Literal["email"]
+    origem: Literal["email", "tela"]
     de: str | None = None
     assunto: str | None = None
     nome: str
     tipo: str
     tamanho: int
-    tem_texto: bool = Field(..., description="Falso em imagem ou PDF escaneado: o agente não lê (sem OCR)")
+    tem_texto: bool = Field(..., description="Há texto para o agente ler (do arquivo ou da leitura do modelo)")
+    leitura: Leitura = Field("arquivo", description="arquivo: texto do próprio arquivo; modelo: foto ou PDF escaneado lido pelo "
+                                                    "modelo de visão; lendo: a leitura ainda não acabou; sem_texto: nada legível")
     created_at: datetime | None = None
 
     @field_validator("id", mode="before")
@@ -156,12 +175,29 @@ class DocumentoTexto(BaseModel):
     tipo: str
     de: str | None = None
     assunto: str | None = None
-    texto: str = Field(..., description="Texto extraído (vazio em imagem ou PDF escaneado)")
+    texto: str = Field(..., description="Texto do arquivo ou, em foto e PDF escaneado, o que o modelo de visão leu (vazio: nada legível)")
+    leitura: Leitura = "arquivo"
 
 
 class DocumentoMudou(BaseModel):
     id: str
-    action: Literal["recebido"]
+    action: Literal["recebido", "lido"]
+
+
+class EnviarDocumento(_Input):
+    """A tela confirma o arquivo enviado (a key de Upload). iniciar: o documento chega como os do e-mail e inicia os
+    processos; falso, só fica guardado (ex.: a nota fiscal que o staff anexa numa exceção)."""
+
+    key: str = Field(..., max_length=300, description="A key devolvida em Upload")
+    iniciar: bool = True
+
+
+class LeituraDocumento(BaseModel):
+    """O documento recebido segue para o modelo de visão (foto, PDF escaneado) e só então avisa os processos (a
+    organização vai junto com o workflow, como quem age)."""
+
+    id: str
+    avisar: bool = True
 
 
 class AvisoEmail(BaseModel):
@@ -174,6 +210,38 @@ class AvisoEmail(BaseModel):
 
 class Recebidos(BaseModel):
     documentos: int
+
+
+class PostmarkEndereco(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    Email: str = ""
+
+
+class PostmarkAnexo(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    Name: str = ""
+    Content: str = Field("", description="Base64")
+    ContentType: str = "application/octet-stream"
+
+
+class AvisoPostmark(BaseModel):
+    """O aviso de entrada do Postmark (inbound webhook): um e-mail chegou a um endereço do domínio da caixa de entrada.
+    RawEmail (a mensagem RFC 822) vem com "Include raw email content" ligado; sem ele, a mensagem é montada dos campos."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    MessageID: str = Field(..., min_length=1, max_length=200)
+    From: str = ""
+    Subject: str = ""
+    OriginalRecipient: str = ""
+    ToFull: list[PostmarkEndereco] = Field(default_factory=list)
+    CcFull: list[PostmarkEndereco] = Field(default_factory=list)
+    BccFull: list[PostmarkEndereco] = Field(default_factory=list)
+    TextBody: str = ""
+    Attachments: list[PostmarkAnexo] = Field(default_factory=list)
+    RawEmail: str | None = None
 
 
 # ── Banco simulado ───────────────────────────────────────────────────────────
@@ -310,10 +378,25 @@ class Extrato(BaseModel):
 
 # ── E-mail que sai da caixa de entrada ───────────────────────────────────────
 
+class AnexoRef(_Input):
+    """Um anexo do e-mail que sai: um documento da organização (recebido ou enviado pela tela) ou o boleto de uma
+    cobrança emitida no banco. Os arquivos ficam neste serviço: quem pede o envio diz qual, não manda o arquivo."""
+
+    documento: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$", description="Id do documento")
+    cobranca: str | None = Field(None, pattern=r"^[A-Za-z0-9_-]{1,64}$", description="cobranca_id: vai o boleto em PDF")
+
+    @model_validator(mode="after")
+    def _um(self) -> "AnexoRef":
+        if (self.documento is None) == (self.cobranca is None):
+            raise ValueError("diga documento ou cobranca (um dos dois)")
+        return self
+
+
 class EnviarEmail(_Input):
     para: str = Field(..., max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     assunto: str = Field(..., min_length=1, max_length=200)
     texto: str = Field(..., min_length=1, max_length=20_000)
+    anexos: list[AnexoRef] = Field(default_factory=list, max_length=ANEXOS_MAX)
 
 
 class EmailEnviado(BaseModel):
@@ -326,6 +409,7 @@ class Enviado(BaseModel):
     para: str
     assunto: str
     de: str
+    anexos: list[str] = Field(default_factory=list, description="Os nomes dos arquivos anexados")
     created_at: datetime | None = None
 
     @field_validator("id", mode="before")

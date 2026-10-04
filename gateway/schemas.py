@@ -58,6 +58,8 @@ class Endpoint(BaseModel):
     response: str | None = None
     cookies: bool = False
     headers: tuple[str, ...] = Field((), max_length=8, description="Cabeçalhos extras repassados (webhook que chega)")
+    max_body_mb: int = Field(1, ge=1, le=50, description="Corpo maior que 1 MiB: só webhook público que traz arquivos "
+                                                          "(ex.: o e-mail que chega com anexos)")
     stream: bool = False
     delta: str | None = None
 
@@ -166,8 +168,13 @@ class Manifest(BaseModel):
             if ep.headers and (ep.target_type != "http" or ep.method != "POST"):
                 raise ValueError(f"{where}: headers só em rota HTTP POST (ex.: a assinatura de um webhook que chega)")
             for header in ep.headers:
-                if not _HEADER.match(header) or header in BLOCKED_HEADERS:
-                    raise ValueError(f"{where}: headers: {header!r} não pode ser repassado (minúsculas; nem sessão nem roteamento)")
+                # authorization só em rota pública: não é o token de ninguém, é a senha do webhook (Basic auth do provedor)
+                basic = header == "authorization" and ep.auth == "public"
+                if not _HEADER.match(header) or (header in BLOCKED_HEADERS and not basic):
+                    raise ValueError(f"{where}: headers: {header!r} não pode ser repassado (minúsculas; nem sessão nem roteamento; "
+                                     "authorization só em rota pública)")
+            if ep.max_body_mb > 1 and (ep.auth != "public" or ep.target_type != "http" or ep.method != "POST"):
+                raise ValueError(f"{where}: max_body_mb só em webhook público HTTP POST (arquivo da tela vai direto ao armazenamento)")
             if ep.stream and (ep.target_type != "http" or ep.delta is None):
                 raise ValueError(f"{where}: stream: true só em rota HTTP e exige delta: <Modelo> de cada pedaço")
             if ep.delta is not None and not ep.stream:

@@ -1139,6 +1139,7 @@ export interface FinanceiroFatura {
   valor: number;
   vencimento: string;
   nota_numero: string | null;
+  nota_documento: string | null;
   cobranca_id: string | null;
   linha_digitavel: string | null;
   status: "aberta" | "cobrada" | "paga";
@@ -1546,14 +1547,16 @@ export interface IntegracoesResumo {
 
 export interface IntegracoesDocumento {
   id: string;
-  origem: "email";
+  origem: "email" | "tela";
   de: string | null;
   assunto: string | null;
   nome: string;
   tipo: string;
   tamanho: number;
-  /** Falso em imagem ou PDF escaneado: o agente não lê (sem OCR) */
+  /** Há texto para o agente ler (do arquivo ou da leitura do modelo) */
   tem_texto: boolean;
+  /** arquivo: texto do próprio arquivo; modelo: foto ou PDF escaneado lido pelo modelo de visão; lendo: a leitura ainda não acabou; sem_texto: nada legível */
+  leitura: "arquivo" | "modelo" | "lendo" | "sem_texto";
   created_at: string | null;
 }
 
@@ -1586,6 +1589,59 @@ export interface IntegracoesLink {
 
 export interface IntegracoesDocumentoRef {
   id: string;
+}
+
+/** O que a tela diz antes de enviar: nome, tipo e tamanho do arquivo (o envio só vale para esse tamanho e tipo). */
+export interface IntegracoesUploadRequest {
+  filename: string;
+  content_type: string;
+  /** Tamanho em bytes */
+  size: number;
+}
+
+/** Link de envio: a tela faz PUT do arquivo em url com estes cabeçalhos e depois confirma a key no serviço. */
+export interface IntegracoesUpload {
+  key: string;
+  url: string;
+  /** Cabeçalhos que o PUT precisa levar exatamente assim */
+  headers: Record<string, string>;
+  expires_at: string;
+}
+
+/** A tela confirma o arquivo enviado (a key de Upload). iniciar: o documento chega como os do e-mail e inicia os processos; falso, só fica guardado (ex.: a nota fiscal que o staff anexa numa exceção). */
+export interface IntegracoesEnviarDocumento {
+  /** A key devolvida em Upload */
+  key: string;
+  iniciar?: boolean;
+}
+
+export interface IntegracoesPostmarkAnexo {
+  Name?: string;
+  /** Base64 */
+  Content?: string;
+  ContentType?: string;
+}
+
+export interface IntegracoesPostmarkEndereco {
+  Email?: string;
+}
+
+/** O aviso de entrada do Postmark (inbound webhook): um e-mail chegou a um endereço do domínio da caixa de entrada. RawEmail (a mensagem RFC 822) vem com "Include raw email content" ligado; sem ele, a mensagem é montada dos campos. */
+export interface IntegracoesAvisoPostmark {
+  MessageID: string;
+  From?: string;
+  Subject?: string;
+  OriginalRecipient?: string;
+  ToFull?: IntegracoesPostmarkEndereco[];
+  CcFull?: IntegracoesPostmarkEndereco[];
+  BccFull?: IntegracoesPostmarkEndereco[];
+  TextBody?: string;
+  Attachments?: IntegracoesPostmarkAnexo[];
+  RawEmail?: string | null;
+}
+
+export interface IntegracoesRecebidos {
+  documentos: number;
 }
 
 export interface IntegracoesPagamento {
@@ -1729,6 +1785,8 @@ export interface IntegracoesEnviado {
   para: string;
   assunto: string;
   de: string;
+  /** Os nomes dos arquivos anexados */
+  anexos: string[];
   created_at: string | null;
 }
 
@@ -1760,7 +1818,7 @@ export interface IntegracoesConexaoMudou {
 
 export interface IntegracoesDocumentoMudou {
   id: string;
-  action: "recebido";
+  action: "recebido" | "lido";
 }
 
 export interface IntegracoesPagamentoMudou {
@@ -1803,6 +1861,15 @@ export const integracoes = {
   /** GET /api/v1/integracoes/documentos/arquivo · http · exige token */
   arquivo: (query?: IntegracoesDocumentoRef, options?: RequestOptions) =>
     request<IntegracoesLink>("GET", withQuery("/api/v1/integracoes/documentos/arquivo", query), undefined, options),
+  /** POST /api/v1/integracoes/documentos/upload · http · exige token */
+  documentoUpload: (body: IntegracoesUploadRequest, options?: RequestOptions) =>
+    request<IntegracoesUpload>("POST", "/api/v1/integracoes/documentos/upload", body, options),
+  /** POST /api/v1/integracoes/documentos/enviar · http · exige token */
+  enviarDocumento: (body: IntegracoesEnviarDocumento, options?: RequestOptions) =>
+    request<IntegracoesDocumento>("POST", "/api/v1/integracoes/documentos/enviar", body, options),
+  /** POST /api/v1/integracoes/entrada/postmark · http · pública */
+  entradaPostmark: (body: IntegracoesAvisoPostmark, options?: RequestOptions) =>
+    request<IntegracoesRecebidos>("POST", "/api/v1/integracoes/entrada/postmark", body, options),
   /** GET /api/v1/integracoes/pagamentos · http · exige token */
   pagamentos: (query?: IntegracoesPagamentoQuery, options?: RequestOptions) =>
     request<IntegracoesPagamentoPage>("GET", withQuery("/api/v1/integracoes/pagamentos", query), undefined, options),
@@ -3006,7 +3073,8 @@ export interface ProcessosCancelarExecucao {
 export interface ProcessosCampo {
   nome: string;
   rotulo: string;
-  tipo: "texto" | "numero" | "sim_nao";
+  /** documento: um arquivo que a pessoa anexa pela tela (vira documento da organização, sem iniciar processo); o valor é o id dele (ex.: o PDF da nota fiscal, que segue anexado à cobrança) */
+  tipo: "texto" | "numero" | "sim_nao" | "documento";
   /** O que o agente ou a ação chegou a ver */
   valor: string | number | boolean | null;
 }
