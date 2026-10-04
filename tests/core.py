@@ -2325,6 +2325,8 @@ def test_keygen_de_producao(tmp_path, capsys):
     assert values["ENVIRONMENT"] == "production" and values["AUTH_ISSUER"] == "https://app.exemplo.com"
     assert values["STORAGE_PUBLIC_URL"] == "https://files.app.exemplo.com" and values["SMTP_URL"] == ""
     assert values["STORAGE_CORS_ORIGINS"] == "https://app.exemplo.com"  # o navegador envia arquivo direto ao armazenamento
+    assert values["INTEGRACOES_DOMINIO"] == "entrada.app.exemplo.com" and len(values["INTEGRACOES_POSTMARK_ENTRADA"]) >= 24
+    assert values["INTEGRACOES_POSTMARK_TOKEN"] == ""  # o token vem da conta da Cogniventure no Postmark
     assert len(security._b64d(values["TEMPORAL_PAYLOAD_KEY"])) == 32 and values["NATS_GATEWAY_PASSWORD"] != values["NATS_SERVICES_PASSWORD"]
     assert oct(env.stat().st_mode & 0o777) == "0o600"
     with pytest.raises(SystemExit, match="já existe"):

@@ -6,7 +6,9 @@ HTTP /pagamentos...      → pagamentos no banco simulado; confirmar à mão.
 HTTP /cobrancas...       → cobranças (boletos) emitidas no banco simulado; confirmar o recebimento à mão.
 HTTP /enviados           → os e-mails que saíram da caixa de entrada (propostas, cobranças, pedidos).
 HTTP /servidores...      → servidores MCP da organização (ferramentas para os agentes); /catalogo, o que dá para conectar.
+HTTP /documentos/upload e /documentos/enviar → documento enviado pela tela (vira documento recebido, como o e-mail).
 HTTP POST /entrada/mailpit → só na rede interna, no ambiente local: o Mailpit avisa que chegou um e-mail (spec §2).
+HTTP POST /entrada/postmark → produção, pelo gateway (rota pública com Basic auth): o Postmark avisa que chegou um e-mail.
 NATS rpc.integracoes.documento e rpc.integracoes.banco_agendar → texto do documento (agentes) e agendamento (ações).
 NATS rpc.integracoes.ferramentas e rpc.integracoes.mcp_chamar → ferramentas MCP e a chamada com a credencial (svc-agentes).
 NATS rpc.integracoes.enviar_email, banco_cobrar e banco_extrato → e-mail, cobrança e extrato para as ações dos pacotes.
@@ -16,9 +18,10 @@ Rodar (da raiz): uv run python -m uvicorn --app-dir services/svc-integracoes mai
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
+from pydantic import ValidationError
 
-from core.envelope import ResponseEnvelope, install_envelope
+from core.envelope import ResponseEnvelope, ServiceError, install_envelope
 from core.nats_bus import bus
 from core.plans import plans
 from core.security import install_security
@@ -38,6 +41,7 @@ from schemas import (
     FERRAMENTAS_SUBJECT,
     MCP_SUBJECT,
     MODULE,
+    POSTMARK_MAX_BYTES,
     SEARCH,
     SERVICE,
     TABLES,
@@ -45,6 +49,7 @@ from schemas import (
     UNIQUE,
     AgendarPagamento,
     AvisoEmail,
+    AvisoPostmark,
     ChamadaMcp,
     CobrancaQuery,
     CobrancaRef,
@@ -54,6 +59,7 @@ from schemas import (
     DocumentoRef,
     Empty,
     EnviadoQuery,
+    EnviarDocumento,
     EnviarEmail,
     ExtratoPedido,
     NovaConexao,
@@ -61,9 +67,10 @@ from schemas import (
     PagamentoQuery,
     PagamentoRef,
     ServidorRef,
+    UploadRequest,
 )
-from service import MIGRATIONS, IntegracoesService, _aead
-from workflows import SCHEDULES, CobrancaSimuladaWorkflow, PagamentoSimuladoWorkflow
+from service import MIGRATIONS, IntegracoesService, _aead, autorizado_postmark, settings
+from workflows import SCHEDULES, CobrancaSimuladaWorkflow, LeituraDocumentoWorkflow, PagamentoSimuladoWorkflow
 
 svc = IntegracoesService()
 
@@ -74,7 +81,8 @@ async def lifespan(app: FastAPI):
     async with (
         bus.connected(SERVICE),
         db.connected(tables=TABLES, unique=UNIQUE, search=SEARCH, migrations=MIGRATIONS, service=SERVICE),
-        runner.worker(TASK_QUEUE, workflows=[PagamentoSimuladoWorkflow, CobrancaSimuladaWorkflow], service=svc, schedules=SCHEDULES),
+        runner.worker(TASK_QUEUE, workflows=[PagamentoSimuladoWorkflow, CobrancaSimuladaWorkflow, LeituraDocumentoWorkflow],
+                      service=svc, schedules=SCHEDULES),
     ):
         await storage.connected(SERVICE)  # os documentos recebidos (README §5.14)
         await bus.respond(DOCUMENTO_SUBJECT, svc.documento_texto, model=DocumentoRef)  # agentes dos processos
@@ -91,7 +99,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=SERVICE, lifespan=lifespan)
 install_envelope(app, service=SERVICE)
-install_security(app, service=SERVICE, public=("/entrada/mailpit",))  # spec §2: aviso do Mailpit, só na rede interna
+# spec §2: aviso do Mailpit (só na rede interna) e do Postmark (pelo gateway, com a senha conferida na rota)
+install_security(app, service=SERVICE, public=("/entrada/mailpit", "/entrada/postmark"))
 install_telemetry(app, service=SERVICE)
 
 
@@ -142,6 +151,35 @@ async def confirmar(data: PagamentoRef) -> ResponseEnvelope:
 @app.post("/entrada/mailpit", response_model=ResponseEnvelope)
 async def mailpit(data: AvisoEmail) -> ResponseEnvelope:
     return _ok(await svc.receber_email(data))
+
+
+@app.post("/entrada/postmark", response_model=ResponseEnvelope)
+async def postmark(request: Request) -> ResponseEnvelope:
+    """A senha antes do corpo: um aviso sem ela não chega a ser lido (até 40 MB)."""
+    if not settings.postmark_entrada:
+        raise ServiceError("ERRO_INTEGRACOES_SEM_PROVEDOR", "Nenhum provedor de e-mail configurado.", 404)
+    if not autorizado_postmark(request.headers.get("authorization")):
+        raise ServiceError("ERRO_INTEGRACOES_NAO_AUTORIZADO", "Aviso de e-mail sem a senha certa.", 401)
+    corpo = bytearray()
+    async for pedaco in request.stream():
+        corpo += pedaco
+        if len(corpo) > POSTMARK_MAX_BYTES:
+            raise ServiceError("ERRO_INTEGRACOES_EMAIL", "Mensagem grande demais.", 413)
+    try:
+        aviso = AvisoPostmark.model_validate_json(bytes(corpo))
+    except ValidationError:
+        raise ServiceError("ERRO_INTEGRACOES_EMAIL", "Aviso de e-mail fora do formato do Postmark.", 422) from None
+    return _ok(await svc.receber_postmark(aviso))
+
+
+@app.post("/documentos/upload", response_model=ResponseEnvelope)
+async def documento_upload(data: UploadRequest) -> ResponseEnvelope:
+    return _ok(await svc.documento_upload(data))
+
+
+@app.post("/documentos/enviar", response_model=ResponseEnvelope)
+async def enviar_documento(data: EnviarDocumento) -> ResponseEnvelope:
+    return _ok(await svc.enviar_documento(data))
 
 
 @app.get("/catalogo", response_model=ResponseEnvelope)

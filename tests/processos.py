@@ -1242,3 +1242,25 @@ def test_resultados_mostram_autonomia_por_mes_versoes_fins_e_indicadores_e_o_res
     assert (resumo.mes, resumo.organizacoes, resumo.enviados) == (mes, 1, 1)
     assert avisos[0].roles == ["owner"] and avisos[0].link == f"/processos/resultados?mes={mes}"
     assert "Contas a pagar: 3 concluída(s), 67% sozinhas" in avisos[0].body and "Valor pago: R$ 8.200,00" in avisos[0].body
+
+
+def test_campo_de_arquivo_na_excecao_vem_do_schema_da_acao_e_leva_o_id_do_documento():
+    """A nota fiscal: o staff emite no portal e anexa o PDF; o campo é um arquivo (format documento), o valor é o id."""
+    from core.processes import Step
+    from core.envelope import ServiceError
+
+    from service import _campos, _valores_da_excecao
+    from schemas import Resposta, Tarefa
+
+    catalogo = {a.name: a for c in CATALOGOS for a in c.actions}
+    emitir = Step(id="emitir", tipo="acao", nome="Emitir a nota fiscal", acao="financeiro.emitir_nota", excecao=True)
+    campos = _campos(emitir, catalogo, {})
+    assert [(c.nome, c.tipo, c.rotulo) for c in campos] == [("nota_numero", "texto", "Nota fiscal"),
+                                                           ("nota_documento", "documento", "PDF da nota fiscal")]
+    tarefa = Tarefa.model_construct(campos=campos)
+    valores = _valores_da_excecao(tarefa, Resposta(id="t1", dados={"nota_numero": "2026/000901", "nota_documento": "doc_abc123"}))
+    assert valores == {"nota_numero": "2026/000901", "nota_documento": "doc_abc123"}
+    with pytest.raises(ServiceError) as torto:
+        _valores_da_excecao(tarefa, Resposta(id="t1", dados={"nota_numero": "1", "nota_documento": "../../outro"}))
+    assert torto.value.status == 422
+    assert _valores_da_excecao(tarefa, Resposta(id="t1", dados={"nota_numero": "1"}))["nota_documento"] is None  # sem PDF: segue

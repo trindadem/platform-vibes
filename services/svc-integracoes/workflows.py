@@ -7,10 +7,11 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from core.temporal_runner import Schedule
-    from schemas import Cobranca, CobrancaRef, CobrancaSimulada, Pagamento, PagamentoRef, PagamentoSimulado
+    from schemas import Cobranca, CobrancaRef, CobrancaSimulada, Documento, LeituraDocumento, Pagamento, PagamentoRef, PagamentoSimulado
     from service import IntegracoesService
 
 
@@ -42,6 +43,29 @@ class CobrancaSimuladaWorkflow:
             start_to_close_timeout=timedelta(minutes=1),
             retry_policy=RetryPolicy(maximum_attempts=5),
         )
+
+
+@workflow.defn
+class LeituraDocumentoWorkflow:
+    """Foto ou PDF escaneado: o modelo de visão escreve o texto do documento e então os processos são avisados. A leitura
+    não derruba o recebimento: falha do modelo vira documento sem texto (o agente pede ajuda ao staff)."""
+
+    @workflow.run
+    async def run(self, data: LeituraDocumento) -> Documento:
+        try:
+            return await workflow.execute_activity_method(
+                IntegracoesService.ler_documento,
+                data,
+                start_to_close_timeout=timedelta(minutes=3),
+                retry_policy=RetryPolicy(maximum_attempts=5, initial_interval=timedelta(seconds=5)),
+            )
+        except ActivityError:  # não deu para ler: segue sem texto, e os processos são avisados mesmo assim
+            return await workflow.execute_activity_method(
+                IntegracoesService.desistir_leitura,
+                data,
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=RetryPolicy(maximum_attempts=10),
+            )
 
 
 SCHEDULES: list[Schedule] = []

@@ -499,8 +499,16 @@ NATS_GATEWAY_PASSWORD={nats_gateway_password}
 APP_URL=https://{domain}
 APP_NAME=CV-Frame
 MAIL_FROM=CV-Frame <nao-responda@{domain}>
-# Obrigatório: o servidor de e-mail de verdade (smtps:// ou smtp:// com STARTTLS). Ex.: Amazon SES, Postmark, Resend.
+# Obrigatório: o servidor de e-mail de verdade (smtps:// ou smtp:// com STARTTLS). Com o Postmark (alinhamento, item 11):
+# smtp://<server token>:<server token>@smtp.postmarkapp.com:587 (convites e avisos saem por ele).
 SMTP_URL=
+# Caixas de entrada pelo Postmark: o MX de INTEGRACOES_DOMINIO aponta para inbound.postmarkapp.com e o domínio é
+# verificado como remetente (DKIM). Os e-mails dos processos (cobranças com boleto, propostas) saem pelo server token.
+INTEGRACOES_DOMINIO=entrada.{domain}
+INTEGRACOES_POSTMARK_TOKEN=
+# Senha do aviso de entrada. No Postmark: Inbound webhook = https://postmark:<esta senha>@{domain}/api/v1/integracoes/entrada/postmark
+# e "Include raw email content in JSON payload" ligado.
+INTEGRACOES_POSTMARK_ENTRADA={postmark_entrada}
 # Opcional: para onde vão traces, métricas e logs (OTLP/HTTP). Vazio: só os logs em stdout.
 OTEL_EXPORTER_OTLP_ENDPOINT=
 # Opcional: Temporal Cloud no lugar do Temporal do compose (TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, TEMPORAL_API_KEY).
@@ -539,6 +547,7 @@ def _keygen(env_file: Path, domain: str | None = None, modules: str | None = Non
         ai_secrets_key=new_secret(32),
         webhooks_secrets_key=new_secret(32),
         integracoes_secrets_key=new_secret(32),
+        postmark_entrada=new_secret(24),
         temporal_payload_key=new_secret(32),
         nats_services_password=new_secret(24),
         nats_gateway_password=new_secret(24),
@@ -550,7 +559,7 @@ def _keygen(env_file: Path, domain: str | None = None, modules: str | None = Non
     env_file.chmod(0o600)
     print(f"{env_file} criado (chaves EdDSA e senhas aleatórias). Ele está no .gitignore: nunca o versione.")
     if domain is not None:
-        print("Falta só o SMTP_URL (servidor de e-mail). Depois: docker compose -f compose.yaml -f compose.prod.yaml up -d --build")
+        print("Faltam o SMTP_URL e o INTEGRACOES_POSTMARK_TOKEN (conta do Postmark). Depois: docker compose -f compose.yaml -f compose.prod.yaml up -d --build")
 
 
 def _token(env_file: Path, sub: str, args: list[str]) -> None:

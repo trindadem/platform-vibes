@@ -66,6 +66,36 @@ endpoints:
     target_type: http
     target_url: http://svc-integracoes:8000/documentos/arquivo
 
+  - path: /documentos/upload
+    name: documentoUpload
+    method: POST
+    auth: client_jwt
+    request: UploadRequest
+    response: Upload
+    target_type: http
+    target_url: http://svc-integracoes:8000/documentos/upload
+
+  - path: /documentos/enviar
+    name: enviarDocumento
+    method: POST
+    auth: client_jwt
+    request: EnviarDocumento
+    response: Documento
+    target_type: http
+    target_url: http://svc-integracoes:8000/documentos/enviar
+
+  - path: /entrada/postmark         # o Postmark avisa que chegou um e-mail (Basic auth na URL do webhook)
+    name: entradaPostmark
+    method: POST
+    auth: public
+    request: AvisoPostmark
+    response: Recebidos
+    headers: [authorization]
+    max_body_mb: 40                 # até 35 MB de mensagem, com os anexos em base64
+    timeout: 60
+    target_type: http
+    target_url: http://svc-integracoes:8000/entrada/postmark
+
   - path: /pagamentos
     method: GET
     auth: client_jwt

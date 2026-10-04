@@ -560,6 +560,7 @@ class DocumentoTexto(BaseModel):
     de: str | None = None
     assunto: str | None = None
     texto: str
+    leitura: str = Field("arquivo", description="modelo: foto ou PDF escaneado que o modelo de visão leu")
 
 
 # Do core/processes.py (events.processos.passo).
@@ -722,7 +723,9 @@ class Campo(BaseModel):
 
     nome: str
     rotulo: str
-    tipo: Literal["texto", "numero", "sim_nao"]
+    tipo: Literal["texto", "numero", "sim_nao", "documento"] = Field(..., description=(
+        "documento: um arquivo que a pessoa anexa pela tela (vira documento da organização, sem iniciar processo); o valor é o "
+        "id dele (ex.: o PDF da nota fiscal, que segue anexado à cobrança)"))
     valor: str | float | bool | None = Field(None, description="O que o agente ou a ação chegou a ver")
 
 

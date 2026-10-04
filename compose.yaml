@@ -341,8 +341,11 @@ services:
     environment:
       <<: *service-env
       INTEGRACOES_DOMINIO: ${INTEGRACOES_DOMINIO:-entrada.localhost}  # endereços das caixas de entrada
-      # Local: o Mailpit avisa (webhook) e entrega o e-mail recebido; em produção, um provedor de entrada (spec §3).
+      # Local: o Mailpit avisa (webhook) e entrega o e-mail recebido; em produção, o Postmark (spec §3).
       INTEGRACOES_MAILPIT_URL: http://mailpit:8025
+      INTEGRACOES_POSTMARK_TOKEN: ${INTEGRACOES_POSTMARK_TOKEN:-}  # com ele, os e-mails saem pelo Postmark (vale mais que o Mailpit)
+      INTEGRACOES_POSTMARK_ENTRADA: ${INTEGRACOES_POSTMARK_ENTRADA:-}  # senha do aviso de entrada; vazio: a rota não existe
+      INTEGRACOES_MODELO_VISAO: ${INTEGRACOES_MODELO_VISAO:-cv/visao}  # lê foto e PDF escaneado (cadastrado no svc-ai)
       # Só este serviço cifra e abre as credenciais dos servidores MCP (as chamadas MCP saem daqui).
       INTEGRACOES_SECRETS_KEY: ${INTEGRACOES_SECRETS_KEY:?rode uv run python -m core.security keygen}
 

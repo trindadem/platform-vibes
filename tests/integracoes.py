@@ -5,9 +5,12 @@ armazenamento de arquivos são dublês; o banco simulado roda de verdade, menos 
 
 Rodar (da raiz): PYTHONPATH=services/svc-integracoes uv run python -m pytest tests/integracoes.py
 """
+import base64
+import io
 import json
 import os
 import sys
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -15,9 +18,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from core.envelope import ServiceError
 from core.http_client import http
 from core.security import Principal, acting_as
-from core.storage import StoredFile, storage
+from core.storage import StoredFile, Upload, storage
 from core.testing import service_app
 
 import service
@@ -91,9 +95,31 @@ def fora(monkeypatch):
     async def delete(key):
         estado["arquivos"].pop(key, None)
 
+    async def read(key, *, max_bytes):
+        return estado["arquivos"][key]
+
+    async def upload(request, *, accept, max_bytes, folder="files"):
+        if request.content_type not in accept:
+            raise ServiceError("ERRO_FILE_TYPE", "Tipo de arquivo não aceito aqui.", status=422)
+        chave = f"tmp/x/svc-integracoes/{folder}/{1000 + len(estado['envios']) + len(estado['arquivos']):032x}"
+        estado["envios"][chave] = (request.filename, request.content_type)
+        return Upload(key=chave, url=f"https://armazenamento/{chave}", headers={}, expires_at=datetime.now(UTC))
+
+    async def keep(key):
+        if key not in estado["envios"]:  # não enviado, expirado ou já confirmado (como o de verdade)
+            raise ServiceError("ERRO_FILE_NOT_FOUND", "Arquivo não encontrado.", status=404)
+        nome, tipo = estado["envios"].pop(key)
+        final = key.replace("tmp/", "t/", 1)
+        estado["arquivos"][final] = estado["enviados"].pop(key)  # o PUT que a tela fez
+        return StoredFile(key=final, filename=nome, content_type=tipo, size=len(estado["arquivos"][final]))
+
+    estado |= {"envios": {}, "enviados": {}}
     monkeypatch.setattr(http, "get", get)
     monkeypatch.setattr(storage, "save", save)
     monkeypatch.setattr(storage, "delete", delete)
+    monkeypatch.setattr(storage, "read", read)
+    monkeypatch.setattr(storage, "upload", upload)
+    monkeypatch.setattr(storage, "keep", keep)
     monkeypatch.setattr(storage, "url", lambda key, **kw: f"https://arquivos/{key}")
     return estado
 
@@ -359,3 +385,244 @@ def test_conta_encerrada_revoga_as_conexoes_so_da_organizacao_que_saiu():
 
     acme, beta = service_app(cenario)
     assert acme == [] and [c["tipo"] for c in beta] == ["caixa_entrada"]
+
+
+# ── O4: Postmark, documento pela tela, leitura de foto e anexos (alinhamento pós-N7, item 11) ──────────────
+
+from pypdf import PdfReader  # noqa: E402
+
+from core.llm import llm  # noqa: E402
+from schemas import AnexoRef, LeituraDocumento  # noqa: E402
+
+JPEG = b"\xff\xd8\xff\xe0" + b"foto-do-boleto" * 20 + b"\xff\xd9"  # o modelo de mentira não olha os bytes
+
+
+def _foto_por_email(para: str) -> bytes:
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = "Dona Rosa <rosa@padaria.com>", para, "Foto do boleto"
+    msg.set_content("Tirei a foto do boleto do moinho.")
+    msg.add_attachment(JPEG, maintype="image", subtype="jpeg", filename="boleto.jpg")
+    return msg.as_bytes()
+
+
+def _pdf_escaneado() -> bytes:
+    """PDF de uma página que é só uma foto (JPEG), como o scanner grava: sem camada de texto."""
+    imagem = b"<< /Type /XObject /Subtype /Image /Width 10 /Height 10 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\nstream\n" % len(JPEG) + JPEG + b"\nendstream"
+    pagina = b"q 595 0 0 842 0 0 cm /Im1 Do Q"
+    objetos = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>",
+               b"<< /Length %d >>\nstream\n" % len(pagina) + pagina + b"\nendstream", imagem]
+    saida, posicoes = b"%PDF-1.4\n", []
+    for i, obj in enumerate(objetos, 1):
+        posicoes.append(len(saida))
+        saida += b"%d 0 obj\n" % i + obj + b"\nendobj\n"
+    xref = len(saida)
+    saida += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objetos) + 1) + b"".join(b"%010d 00000 n \n" % p for p in posicoes)
+    return saida + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objetos) + 1, xref)
+
+
+def _basic(senha: str) -> dict[str, str]:
+    return {"Authorization": "Basic " + base64.b64encode(f"postmark:{senha}".encode()).decode()}
+
+
+def test_email_pelo_postmark_entra_com_a_senha_pelo_envelope_e_uma_vez_so(fora, monkeypatch):
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
+        beta = (await app.user("bia", "beta", "owner").post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
+        postmark = app.anonymous()  # o gateway repassa a rota pública com o Authorization do Postmark
+        # Com cópia oculta: o endereço da caixa só aparece no envelope (OriginalRecipient), não no To.
+        cru = _email("financeiro@padaria.com", _pdf("Moinho Sul R$ 1.250,00 vence 2026-10-15"))
+        aviso = {"MessageID": "a8c1-22", "From": "cobranca@moinho.com", "Subject": "Boleto", "OriginalRecipient": caixa["endereco"],
+                 "ToFull": [{"Email": "financeiro@padaria.com"}], "RawEmail": base64.b64encode(cru).decode(), "Extra": {"ignorado": 1}}
+        sem_senha_configurada = await postmark.post("/entrada/postmark", json=aviso)
+        monkeypatch.setattr(service.settings, "postmark_entrada", SecretStr("s3nha-do-webhook"))
+        sem_senha = await postmark.post("/entrada/postmark", json=aviso)
+        errada = await postmark.post("/entrada/postmark", json=aviso, headers=_basic("outra"))
+        bearer = await postmark.post("/entrada/postmark", json=aviso, headers={"Authorization": "Basic ###"})
+        primeiro = (await postmark.post("/entrada/postmark", json=aviso, headers=_basic("s3nha-do-webhook"))).json()["data"]
+        repetido = (await postmark.post("/entrada/postmark", json=aviso, headers=_basic("s3nha-do-webhook"))).json()["data"]
+        # Sem a mensagem crua ("Include raw email content" desligado): montada dos campos, com o anexo em base64.
+        campos = {"MessageID": "b9d2-33", "From": "Moinho <cobranca@moinho.com>", "Subject": "Nota fiscal", "TextBody": "Segue a nota.",
+                  "ToFull": [{"Email": beta["endereco"]}],
+                  "Attachments": [{"Name": "nota.xml", "ContentType": "text/xml", "Content": base64.b64encode(b"<nota>NF-77</nota>").decode()},
+                                  {"Name": "virus.exe", "ContentType": "application/x-msdownload", "Content": "TVo="}]}
+        segundo = (await postmark.post("/entrada/postmark", json=campos, headers=_basic("s3nha-do-webhook"))).json()["data"]
+        torto = await postmark.post("/entrada/postmark", content=b'{"From": 1}', headers=_basic("s3nha-do-webhook"))
+        da_acme = (await ana.get("/documentos")).json()["data"]["items"]
+        da_beta = (await app.user("bia", "beta", "owner").get("/documentos")).json()["data"]["items"]
+        return (sem_senha_configurada, sem_senha, errada, bearer, primeiro, repetido, segundo, torto, da_acme, da_beta,
+                [m for s, m in app.published if s == EVENT_SUBJECT])
+
+    (sem_config, sem_senha, errada, bearer, primeiro, repetido, segundo, torto, da_acme, da_beta, eventos) = service_app(cenario)
+    assert sem_config.status_code == 404  # sem senha configurada a rota não existe
+    assert [r.status_code for r in (sem_senha, errada, bearer)] == [401, 401, 401]
+    assert sem_senha.json()["error"]["code"] == "ERRO_INTEGRACOES_NAO_AUTORIZADO"
+    assert (primeiro, repetido, segundo) == ({"documentos": 1}, {"documentos": 0}, {"documentos": 1})
+    assert torto.status_code == 422
+    assert [(d["nome"], d["origem"], d["leitura"]) for d in da_acme] == [("boleto-outubro.pdf", "email", "arquivo")]
+    assert [(d["nome"], d["tem_texto"]) for d in da_beta] == [("nota.xml", True)]  # o .exe ficou de fora
+    assert [e.dados["nome"] for e in eventos] == ["boleto-outubro.pdf", "nota.xml"]
+
+
+def test_documento_enviado_pela_tela_inicia_os_processos_ou_so_fica_guardado(fora):
+    async def cenario(app):
+        mel = app.user("mel", "acme", "member")  # qualquer pessoa da organização: é como mandar à caixa de entrada
+        envio = (await mel.post("/documentos/upload", json={"filename": "boleto.pdf", "content_type": "application/pdf",
+                                                              "size": 900})).json()["data"]
+        fora["enviados"][envio["key"]] = _pdf("Moinho Sul R$ 980,00 vence 2026-11-03")
+        enviado = (await mel.post("/documentos/enviar", json={"key": envio["key"]})).json()["data"]
+        nota = (await mel.post("/documentos/upload", json={"filename": "nota.pdf", "content_type": "application/pdf", "size": 900})).json()["data"]
+        fora["enviados"][nota["key"]] = _pdf("NFS-e 2026/000901")
+        guardada = (await mel.post("/documentos/enviar", json={"key": nota["key"], "iniciar": False})).json()["data"]
+        zip_ = await mel.post("/documentos/upload", json={"filename": "x.zip", "content_type": "application/zip", "size": 10})
+        de_novo = await mel.post("/documentos/enviar", json={"key": envio["key"]})  # a key já foi confirmada
+        with acting_as(Principal(sub="system:svc-processos", tenant="acme", roles=frozenset({"system"}))):
+            lido = await app.handlers[DOCUMENTO_SUBJECT](DocumentoRef(id=enviado["id"]))
+        return enviado, guardada, zip_, de_novo, lido, [m for s, m in app.published if s == EVENT_SUBJECT], app.live
+
+    enviado, guardada, zip_, de_novo, lido, eventos, live = service_app(cenario)
+    assert (enviado["origem"], enviado["nome"], enviado["leitura"], enviado["tem_texto"]) == ("tela", "boleto.pdf", "arquivo", True)
+    assert "980,00" in lido.texto
+    assert [(e.nome, e.dados["documento_id"], e.dados["origem"]) for e in eventos] == [("documento.recebido", enviado["id"], "tela")]
+    assert guardada["origem"] == "tela"  # iniciar falso: guardada, sem evento (ex.: a nota que o staff anexa)
+    assert zip_.status_code == 422 and de_novo.status_code >= 400
+    assert ("integracoes.documentos", enviado["id"], "recebido") in live
+
+
+def test_foto_e_pdf_escaneado_lidos_pelo_modelo_antes_de_avisar_os_processos(fora, monkeypatch):
+    chamadas = []
+    respostas = iter([
+        "Banco Itaú S.A. | 341-7\nBeneficiário: Moinho Sul Ltda\nVencimento 27/10/2026\nValor do documento R$ 1.890,50",
+        ServiceError("ERRO_AI_PROVIDER_AUTH", "x", 502),
+        "SEM TEXTO LEGIVEL",
+        "Nota fiscal escaneada NF-4471",
+    ])
+
+    async def ask(model, prompt, *, instructions=None, output=None, tools=(), images=()):
+        chamadas.append((model, [(i.mime_type, len(i.content or b"")) for i in images], instructions))
+        resposta = next(respostas)
+        if isinstance(resposta, Exception):
+            raise resposta
+        return resposta
+
+    monkeypatch.setattr(llm, "ask", ask)
+
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
+        for i in range(3):
+            fora["mensagens"][f"f{i}"] = _foto_por_email(caixa["endereco"])
+            await app.anonymous().post("/entrada/mailpit", json={"ID": f"f{i}"})
+        antes = (await ana.get("/documentos")).json()["data"]["items"]
+        eventos_antes = [m for s, m in app.published if s == EVENT_SUBJECT]
+        de_novo = await app.anonymous().post("/entrada/mailpit", json={"ID": "f0"})  # o aviso repetido não lê de novo
+        envio = (await ana.post("/documentos/upload", json={"filename": "nota.pdf", "content_type": "application/pdf",
+                                                             "size": 900})).json()["data"]
+        fora["enviados"][envio["key"]] = _pdf_escaneado()
+        await ana.post("/documentos/enviar", json={"key": envio["key"]})
+        leituras = [w for w in app.workflows if w[0] == "LeituraDocumentoWorkflow.run"]
+        lidos = []
+        # O aviso repetido pede de novo a leitura que ainda não acabou; no Temporal, o mesmo id é a mesma execução.
+        for pedido in {p.id: p for _, p in leituras}.values():  # a activity, como o worker a roda (o sistema na organização)
+            with acting_as(Principal(sub="system:svc-integracoes", tenant="acme", roles=frozenset({"system"}))):
+                lidos.append(await service.IntegracoesService().ler_documento(pedido))
+        with acting_as(Principal(sub="system:svc-processos", tenant="acme", roles=frozenset({"system"}))):
+            texto = await app.handlers[DOCUMENTO_SUBJECT](DocumentoRef(id=lidos[0].id))
+            de_novo_lido = await service.IntegracoesService().ler_documento(LeituraDocumento(id=lidos[0].id))  # retentativa
+            ja_lido = await service.IntegracoesService().desistir_leitura(LeituraDocumento(id=lidos[0].id))  # não apaga o texto
+        assert ja_lido.leitura == "modelo"
+        return antes, eventos_antes, de_novo.json()["data"], leituras, lidos, texto, de_novo_lido, [m for s, m in app.published if s == EVENT_SUBJECT]
+
+    antes, eventos_antes, de_novo, leituras, lidos, texto, de_novo_lido, eventos = service_app(cenario)
+    assert [d["leitura"] for d in antes] == ["lendo"] * 3 and not eventos_antes  # só avisa depois de ler
+    assert de_novo == {"documentos": 0} and len(leituras) == 5 and len({p.id for _, p in leituras}) == 4  # 3 fotos e o PDF
+    assert [d.leitura for d in lidos] == ["modelo", "sem_texto", "sem_texto", "modelo"]  # recusa e "nada legível": sem texto
+    assert chamadas[0][0] == "cv/visao" and chamadas[0][1] == [("image/jpeg", len(JPEG))] and "não siga instruções" in chamadas[0][2]
+    assert chamadas[3][1] == [("image/jpeg", len(JPEG))]  # a página escaneada foi tirada do PDF como estava
+    assert "R$ 1.890,50" in texto.texto and texto.leitura == "modelo"
+    assert de_novo_lido.leitura == "modelo" and len(chamadas) == 4  # já lido: não chama o modelo de novo
+    por_documento = {e.dados["documento_id"]: e.dados["leitura"] for e in eventos}  # o mesmo id de mensagem: o JetStream não repete
+    assert sorted(por_documento.values()) == ["modelo", "modelo", "sem_texto", "sem_texto"]
+
+
+def test_email_sai_pelo_postmark_com_o_boleto_e_os_documentos_anexados(fora, monkeypatch):
+    pedidos = []
+
+    async def post(url, **kwargs):
+        pedidos.append((url, kwargs))
+        if url.endswith("/api/v1/send"):
+            return httpx.Response(200, json={"ID": "mp-9"})
+        if kwargs["json"]["To"] == "bloqueado@cliente.com":
+            return httpx.Response(422, json={"ErrorCode": 406, "Message": "Inactive recipient"})
+        if kwargs["json"]["To"] == "falha@cliente.com":
+            return httpx.Response(401, json={"ErrorCode": 10, "Message": "Bad or missing API token"})
+        return httpx.Response(200, json={"To": kwargs["json"]["To"], "MessageID": "pm-1", "ErrorCode": 0, "Message": "OK"})
+
+    monkeypatch.setattr(http, "post", post)
+    monkeypatch.setattr(service.settings, "postmark_token", SecretStr("token-do-servidor"))
+
+    async def cenario(app):
+        ana = app.user(*OWNER)
+        caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
+        await ana.post("/conexoes", json={"tipo": "banco_simulado"})
+        envio = (await ana.post("/documentos/upload", json={"filename": "nota.pdf", "content_type": "application/pdf", "size": 9})).json()["data"]
+        fora["enviados"][envio["key"]] = _pdf("NFS-e 2026/000901")
+        nota = (await ana.post("/documentos/enviar", json={"key": envio["key"], "iniciar": False})).json()["data"]
+        with acting_as(SISTEMA):
+            emitida = await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Café Central",
+                                                                      descricao="Pães por 3 meses"))
+            pedido = EnviarEmail(para="compras@cafe.com", assunto="Cobrança", texto="Segue a cobrança.",
+                                 anexos=[AnexoRef(cobranca=emitida.cobranca_id), AnexoRef(documento=nota["id"])])
+            enviado = await app.handlers[EMAIL_SUBJECT](pedido)
+            erros = []
+            for para, anexos in (("bloqueado@cliente.com", []), ("falha@cliente.com", []),
+                                 ("x@cliente.com", [AnexoRef(documento="naoexiste")])):
+                try:
+                    await app.handlers[EMAIL_SUBJECT](EnviarEmail(para=para, assunto="x", texto="x", anexos=anexos))
+                except ServiceError as exc:
+                    erros.append((exc.code, exc.status))
+        with acting_as(Principal(sub="system:svc-financeiro", tenant="beta", roles=frozenset({"system"}))):
+            await app.user("bia", "beta", "owner").post("/conexoes", json={"tipo": "caixa_entrada"})
+            try:  # o boleto da acme não sai pela beta
+                await app.handlers[EMAIL_SUBJECT](EnviarEmail(para="a@b.com", assunto="x", texto="x", anexos=[AnexoRef(cobranca=emitida.cobranca_id)]))
+            except ServiceError as exc:
+                erros.append((exc.code, exc.status))
+        monkeypatch.setattr(service.settings, "postmark_token", None)
+        monkeypatch.setattr(service.settings, "mailpit_url", "http://mailpit:8025")
+        with acting_as(SISTEMA):
+            local = await app.handlers[EMAIL_SUBJECT](EnviarEmail(para="compras@cafe.com", assunto="Lembrete", texto="x",
+                                                                  anexos=[AnexoRef(cobranca=emitida.cobranca_id)]))
+        lista = (await ana.get("/enviados")).json()["data"]["items"]
+        return caixa, emitida, enviado, erros, local, lista
+
+    caixa, emitida, enviado, erros, local, lista = service_app(cenario)
+    url, kwargs = pedidos[0]
+    assert url == "https://api.postmarkapp.com/email" and kwargs["headers"]["X-Postmark-Server-Token"] == "token-do-servidor"
+    corpo = kwargs["json"]
+    assert (corpo["From"], corpo["ReplyTo"], corpo["To"], corpo["MessageStream"]) == (caixa["endereco"], caixa["endereco"], "compras@cafe.com", "outbound")
+    assert [(a["Name"], a["ContentType"]) for a in corpo["Attachments"]] == [(f"boleto-{emitida.cobranca_id}.pdf", "application/pdf"),
+                                                                            ("nota.pdf", "application/pdf")]
+    boleto = PdfReader(io.BytesIO(base64.b64decode(corpo["Attachments"][0]["Content"]))).pages[0].extract_text()
+    assert emitida.linha_digitavel in boleto and "R$ 4.800,00" in boleto and "30/10/2026" in boleto and "Café Central" in boleto
+    assert "não pague" in boleto  # o simulado diz que é simulado
+    assert enviado.mensagem_id == "pm-1"
+    assert erros == [("ERRO_INTEGRACOES_EMAIL_DESTINO", 422), ("ERRO_INTEGRACOES_EMAIL_ENVIO", 502),
+                     ("ERRO_INTEGRACOES_NAO_ENCONTRADO", 404), ("ERRO_INTEGRACOES_NAO_ENCONTRADO", 404)]
+    mailpit = pedidos[-1][1]["json"]
+    assert local.mensagem_id == "mp-9" and [a["Filename"] for a in mailpit["Attachments"]] == [f"boleto-{emitida.cobranca_id}.pdf"]
+    assert lista[-1]["anexos"] == [f"boleto-{emitida.cobranca_id}.pdf", "nota.pdf"]  # o primeiro enviado
+    with pytest.raises(ValueError):
+        AnexoRef(documento="a", cobranca="b")
+
+
+def test_linha_digitavel_quebrada_em_duas_linhas_volta_a_ser_uma():
+    """A foto quebrou a linha digitável: junta só quando dá 47 dígitos (boleto) ou 48 (consumo e tributo)."""
+    quebrada = "Banco Itaú S.A. | 341-7 | 34191.79001 01043.510047 91020.150008 1\n98760000189050\nBeneficiário"
+    assert service._linha_digitavel_inteira(quebrada).split("\n") == [
+        "Banco Itaú S.A. | 341-7 | 34191.79001 01043.510047 91020.150008 1 98760000189050", "Beneficiário"]
+    consumo = "Código: 83640000001 5 33660138000 9\n00000000000 0 12345678901 2 Vencimento 10/11"
+    assert service._linha_digitavel_inteira(consumo).split("\n") == [
+        "Código: 83640000001 5 33660138000 9 00000000000 0 12345678901 2", "Vencimento 10/11"]
+    for intacto in ("Valor 1.890,50\n27/10/2026", "CNPJ 12.345.678/0001-90\n123", "34191.79001 01043.510047 91020.150008 1\n9876"):
+        assert service._linha_digitavel_inteira(intacto) == intacto  # não soma 47 nem 48: fica como está

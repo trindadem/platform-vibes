@@ -152,11 +152,14 @@ class NotaIn(BaseModel):
 
 class Nota(BaseModel):
     nota_numero: str = Field(..., description="Número da NFS-e emitida")
+    nota_documento: str | None = Field(None, description="O PDF da nota, anexado pelo staff na exceção: segue com a cobrança",
+                                       json_schema_extra={"format": "documento"})
 
 
 class CobrancaIn(BaseModel):
     fatura_id: str
     nota_numero: str | None = None
+    nota_documento: str | None = Field(None, description="O PDF da nota (documento no svc-integracoes), anexado à cobrança")
 
 
 class Cobranca(BaseModel):
@@ -265,6 +268,7 @@ class EnviarEmail(BaseModel):
     para: str
     assunto: str
     texto: str
+    anexos: list[dict[str, str]] = Field(default_factory=list, description="{cobranca: id} (o boleto) ou {documento: id}")
 
 
 class EmailEnviado(BaseModel):
@@ -325,6 +329,7 @@ class Fatura(BaseModel):
     valor: float
     vencimento: str
     nota_numero: str | None = None
+    nota_documento: str | None = None
     cobranca_id: str | None = None
     linha_digitavel: str | None = None
     status: StatusFatura

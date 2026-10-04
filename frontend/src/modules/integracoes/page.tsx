@@ -8,6 +8,7 @@ import { Card } from "@/components/Card";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { CopyField } from "@/components/CopyField";
 import { DateTime } from "@/components/DateTime";
+import { FileField } from "@/components/FileField";
 import { Grid } from "@/components/Grid";
 import { ListView } from "@/components/ListView";
 import { Money } from "@/components/Money";
@@ -19,9 +20,9 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
 import { TextField } from "@/components/TextField";
-import { useAction, useListQuery, useLiveQuery, useQuery } from "@/core/api";
+import { useAction, useListQuery, useLiveQuery, useQuery, useUpload } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
-import { type IntegracoesConexao, type IntegracoesServidorMcp, integracoes } from "@/core/contracts";
+import { type IntegracoesConexao, type IntegracoesDocumento, type IntegracoesServidorMcp, integracoes } from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Integrações", module: "integracoes" };
 
@@ -235,33 +236,65 @@ function Servidor({ servidor, pode, onDone }: { servidor: IntegracoesServidorMcp
   );
 }
 
+const LEITURAS: Record<IntegracoesDocumento["leitura"], string> = {
+  arquivo: "Texto do arquivo",
+  modelo: "Lido pelo modelo",
+  lendo: "Lendo…",
+  sem_texto: "Sem texto legível",
+};
+const ACEITOS = "application/pdf,image/jpeg,image/png,image/webp,text/plain,text/xml,application/xml";
+
 function Documentos() {
   const lista = useListQuery(integracoes.documentos, { live: "integracoes.documentos" });
   const abrir = useAction(integracoes.arquivo, { onSuccess: (link) => window.open(link.url, "_blank", "noopener") });
+  const [enviado, setEnviado] = useState<IntegracoesDocumento | null>(null);
+  const envio = useUpload(integracoes.documentoUpload, integracoes.enviarDocumento, { onSuccess: setEnviado });
   return (
-    <ListView
-      list={lista}
-      rowKey={(d) => d.id}
-      noun="documentos"
-      search="nome, assunto ou remetente"
-      empty="Nenhum documento recebido ainda."
-      columns={[
-        { key: "nome", header: "Documento" },
-        { key: "de", header: "De", render: (d) => d.de ?? "—" },
-        { key: "assunto", header: "Assunto", render: (d) => d.assunto ?? "—" },
-        { key: "tem_texto", header: "Legível", render: (d) => (d.tem_texto ? "Sim" : "Sem texto (imagem)") },
-        { key: "created_at", header: "Chegou", sort: "created_at", render: (d) => (d.created_at ? <DateTime value={d.created_at} /> : "—") },
-        {
-          key: "abrir",
-          header: "",
-          render: (d) => (
-            <Button size="sm" variant="ghost" onClick={() => void abrir.run({ id: d.id })}>
-              Abrir
-            </Button>
-          ),
-        },
-      ]}
-    />
+    <Stack>
+      <Card
+        title="Enviar um documento"
+        description="O boleto, a nota ou o recibo entra como se tivesse chegado à caixa de entrada e inicia os processos que esperam por ele. Foto e PDF escaneado passam antes pela leitura do modelo."
+      >
+        <Stack>
+          <FileField label="Documento" upload={envio} accept={ACEITOS} hint="PDF, foto (JPG, PNG ou WebP), XML ou texto, até 10 MB." />
+          {enviado && (
+            <Alert tone="success" title={`${enviado.nome} recebido`}>
+              {enviado.leitura === "lendo"
+                ? "O modelo está lendo a foto; os processos começam assim que a leitura terminar."
+                : "Os processos que esperam por documentos já começaram."}
+            </Alert>
+          )}
+        </Stack>
+      </Card>
+      <ListView
+        list={lista}
+        rowKey={(d) => d.id}
+        noun="documentos"
+        search="nome, assunto ou remetente"
+        empty="Nenhum documento recebido ainda."
+        columns={[
+          { key: "nome", header: "Documento" },
+          { key: "origem", header: "Chegou por", render: (d) => (d.origem === "tela" ? "Tela" : "E-mail") },
+          { key: "de", header: "De", render: (d) => d.de ?? "—" },
+          { key: "assunto", header: "Assunto", render: (d) => d.assunto ?? "—" },
+          {
+            key: "leitura",
+            header: "Leitura",
+            render: (d) => <StatusBadge value={d.leitura} labels={LEITURAS} tones={{ arquivo: "neutral", modelo: "accent", lendo: "warning", sem_texto: "danger" }} />,
+          },
+          { key: "created_at", header: "Chegou", sort: "created_at", render: (d) => (d.created_at ? <DateTime value={d.created_at} /> : "—") },
+          {
+            key: "abrir",
+            header: "",
+            render: (d) => (
+              <Button size="sm" variant="ghost" onClick={() => void abrir.run({ id: d.id })}>
+                Abrir
+              </Button>
+            ),
+          },
+        ]}
+      />
+    </Stack>
   );
 }
 
@@ -354,6 +387,7 @@ function Enviados() {
         { key: "para", header: "Para" },
         { key: "assunto", header: "Assunto" },
         { key: "de", header: "De" },
+        { key: "anexos", header: "Anexos", render: (e) => (e.anexos.length ? e.anexos.join(", ") : "—") },
         { key: "created_at", header: "Enviado", sort: "created_at", render: (e) => (e.created_at ? <DateTime value={e.created_at} /> : "—") },
       ]}
     />
