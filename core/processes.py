@@ -38,7 +38,9 @@ Trilhos:
   no motor é p_<organização>_<processo>, só o svc-processos implanta). A entrada vem dos passos anteriores pelo nome do
   campo (o mais perto antes dele; senão, do gatilho); a saída validada vai para <passo>. Ação que não pode seguir
   levanta Handoff(motivo) (ou um ServiceError de negócio, status < 500): com caminho de exceção, vira a tarefa do staff;
-  sem ele, incidente. Erro de infraestrutura volta ao motor para nova tentativa. Módulo fora do plano vira handoff.
+  sem ele, incidente. Handoff(motivo, parcial={...}) leva junto o que a ação já sabia (ex.: o pagamento que o staff vai
+  agendar à mão): vai ao motor como a variável <passo> e preenche os campos da exceção. Erro de infraestrutura volta ao
+  motor para nova tentativa. Módulo fora do plano vira handoff.
 - Ação como ferramenta (alinhamento pós-N7, item 6): o worker com ações atende rpc.<pacote>.acao (ActionCall {acao,
   entrada} → ActionResult {ok, resultado, motivo}). Só o svc-agentes chama, na organização do agente; a ação roda como
   o pacote nessa organização, com a mesma conferência do job (plano, entrada). Irreversível: 403, só num passo do
@@ -506,6 +508,7 @@ class Outcome(BaseModel):
     status: Literal["concluido", "handoff", "falhou"]
     variables: dict[str, Any] = Field(default_factory=dict)
     message: str | None = None
+    parcial: dict[str, Any] = Field(default_factory=dict, description="Handoff: o que o passo já sabia (preenche a exceção)")
     retries: int = 0
     em: datetime = Field(default_factory=lambda: datetime.now(UTC), description="Quando o handler terminou")
 
@@ -659,7 +662,7 @@ class Processes:
                 variables = await handler(job)
                 return Outcome(status="concluido", variables=variables or {})
             except Handoff as exc:
-                return Outcome(status="handoff", message=exc.motivo)
+                return Outcome(status="handoff", message=exc.motivo, parcial=_jsonavel(exc.parcial))
             except ServiceError as exc:
                 if exc.status < 500:  # erro de negócio: tentar de novo não muda nada
                     return Outcome(status="handoff", message=exc.message)
@@ -721,7 +724,9 @@ class Processes:
         if outcome.status == "concluido":
             await camunda.complete_job(job.key, outcome.variables)
         elif outcome.status == "handoff" and job.kind == "BPMN_ELEMENT" and job.headers.get("excecao"):
-            await camunda.throw_error(job.key, HANDOFF_ERROR, outcome.message or "Exceção")
+            # O parcial vira a variável <passo> no motor: a tarefa de exceção (svc-processos) já nasce preenchida com ele.
+            await camunda.throw_error(job.key, HANDOFF_ERROR, outcome.message or "Exceção",
+                                      variables={job.element: outcome.parcial} if outcome.parcial else None)
         elif outcome.status == "handoff":  # sem caminho de exceção: incidente para o staff ver no motor
             await camunda.fail_job(job.key, retries=0, message=outcome.message or "Exceção")
         else:
@@ -742,6 +747,11 @@ xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.or
 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:modeler="http://camunda.org/schema/modeler/1.0" \
 id="definicoes" targetNamespace="https://cogniventure.com/processos" modeler:executionPlatform="Camunda Cloud" \
 modeler:executionPlatformVersion="8.10.0">"""
+
+
+def _jsonavel(dados: Mapping[str, Any]) -> dict[str, Any]:
+    """O parcial como JSON (datas viram texto): vai ao motor como variável."""
+    return json.loads(json.dumps(dict(dados), default=str)) if dados else {}
 
 
 def _feel_value(value: Any) -> str:
@@ -1113,8 +1123,13 @@ class Camunda:
             return
         self._ok(response, "concluir o job")
 
-    async def throw_error(self, key: str, code: str, message: str) -> None:
-        response = await self._call("POST", f"/v2/jobs/{key}/error", json={"errorCode": code, "errorMessage": message[:500]})
+    async def throw_error(self, key: str, code: str, message: str, *, variables: Mapping[str, Any] | None = None) -> None:
+        """Leva o passo ao caminho de erro (a exceção). variables: ficam no escopo de quem pega o erro, que as passa à
+        execução (sem mapeamento de saída no evento de erro)."""
+        corpo: dict[str, Any] = {"errorCode": code, "errorMessage": message[:500]}
+        if variables:
+            corpo["variables"] = dict(variables)
+        response = await self._call("POST", f"/v2/jobs/{key}/error", json=corpo)
         self._ok(response, "levar o passo à exceção")
 
     async def fail_job(self, key: str, *, retries: int, message: str, backoff_ms: int = 0) -> None:

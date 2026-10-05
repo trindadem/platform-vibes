@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import time
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import ClassVar, Literal
 
@@ -3017,6 +3017,42 @@ def test_acao_do_pacote_como_ferramenta_do_agente(monkeypatch):
     assert processes_module.action_subject("svc-financeiro") == "rpc.financeiro.acao"
     with pytest.raises(ValidationError):
         ActionCall(acao="financeiro.consultar_pagamento")  # o nome curto: o pacote vem do subject
+
+
+def test_handoff_de_uma_acao_leva_o_parcial_ao_motor_e_preenche_a_excecao(monkeypatch):
+    """Fatia C do O5: o pagamento que o staff agenda à mão. A ação manda ao staff com o que já sabe (o pagamento_id), e
+    isso vai ao motor junto do erro: a exceção nasce preenchida."""
+    from core.processes import Handoff, Job, processes as procs
+
+    corpos = {}
+
+    def motor(request):
+        corpos[request.url.path] = json.loads(request.content)
+        return httpx.Response(204)
+
+    async def com_parcial(job):
+        raise Handoff("Agende no banco da empresa.", parcial={"pagamento_id": "PG-1", "data": date(2026, 10, 15)})
+
+    async def sem_parcial(job):
+        raise Handoff("Documento ilegível")
+
+    monkeypatch.setattr(processes_module.camunda, "_client",
+                        httpx.AsyncClient(base_url="http://camunda:8080", transport=httpx.MockTransport(motor)))
+
+    async def cenario():
+        excecao = {"customHeaders": {"excecao": "sim"}}
+        um = Job.from_engine(_job_bruto(jobKey=91, **excecao))
+        outro = Job.from_engine(_job_bruto(jobKey=92, **excecao))
+        saida = await procs.run_job("svc-financeiro", com_parcial, um)
+        await procs._settle(um, saida)
+        await procs._settle(outro, await procs.run_job("svc-financeiro", sem_parcial, outro))
+        return saida
+
+    saida = asyncio.run(cenario())
+    assert (saida.status, saida.parcial) == ("handoff", {"pagamento_id": "PG-1", "data": "2026-10-15"})  # JSON para o motor
+    assert corpos["/v2/jobs/91/error"] == {"errorCode": "handoff", "errorMessage": "Agende no banco da empresa.",
+                                            "variables": {"agendar": {"pagamento_id": "PG-1", "data": "2026-10-15"}}}
+    assert "variables" not in corpos["/v2/jobs/92/error"]  # sem parcial, o erro vai como antes
 
 
 def test_worker_pega_jobs_e_devolve_cada_resultado_ao_motor(monkeypatch):
