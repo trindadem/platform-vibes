@@ -170,7 +170,11 @@ class IntegracoesService:
     # ── Conexões ─────────────────────────────────────────────────────────────
 
     async def conexoes(self, data: Empty) -> Conexoes:
+        """As conexões da organização; a do banco com o nome atual do gateway (a Cogniventure pode tê-lo renomeado)."""
         rows = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant ORDER BY created_at")
+        if any(r.get("gateway") not in (None, SIMULADO) for r in rows):
+            nomes = {g.slug: g.nome for g in await _gateways_da_plataforma(gerencia=False)}
+            rows = [{**r, "gateway_nome": nomes.get(r.get("gateway"), r.get("gateway_nome"))} for r in rows]
         return Conexoes(itens=[Conexao.model_validate(r) for r in rows])
 
     async def conectar(self, data: NovaConexao) -> Conexao:
@@ -694,8 +698,8 @@ async def _banco(operacao: str) -> _Banco:
     conexao = rows[0]
     gateway, guardado = await _gateway_e_row(conexao.get("gateway") or SIMULADO)
     if gateway is None or not gateway.ativo:
-        raise ServiceError("ERRO_INTEGRACOES_GATEWAY", f"O banco conectado ({conexao.get('gateway_nome') or conexao.get('gateway')}) "
-                                                       "não está disponível agora: a Cogniventure foi avisada.", 409)
+        nome = gateway.nome if gateway else conexao.get("gateway_nome") or conexao.get("gateway")  # removido: o nome que ele tinha
+        raise ServiceError("ERRO_INTEGRACOES_GATEWAY", f"O banco conectado ({nome}) não está disponível agora: a Cogniventure foi avisada.", 409)
     adaptador = ADAPTADORES.get(gateway.provedor)
     if adaptador is None or operacao not in adaptador.operacoes:
         raise ServiceError("ERRO_INTEGRACOES_SEM_SUPORTE", f"O banco conectado ({gateway.nome}) não {_NOMES_OPERACAO[operacao]} "

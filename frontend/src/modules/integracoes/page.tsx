@@ -1,5 +1,5 @@
 // Tela do módulo integracoes: conexões da empresa com o mundo de fora. Fonte da verdade: specs/integracoes.md.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { PageMeta } from "@/App";
 import { Alert } from "@/components/Alert";
 import { Badge } from "@/components/Badge";
@@ -23,7 +23,7 @@ import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
 import { TextField } from "@/components/TextField";
 import { Toggle } from "@/components/Toggle";
-import { type QueryState, useAction, useListQuery, useLiveQuery, useQuery, useUpload } from "@/core/api";
+import { type ApiError, type QueryState, useAction, useListQuery, useLiveQuery, useQuery, useUpload } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
 import {
   type IntegracoesConexao,
@@ -38,12 +38,17 @@ export const meta: PageMeta = { title: "Integrações", module: "integracoes" };
 
 export default function Integracoes() {
   const gateways = useLiveQuery("integracoes.gateways", integracoes.gateways);
+  // A aba só aparece para quem gerencia; uma recarga que falha não a tira da tela (nem fecha o painel aberto nela).
+  const [gerencia, setGerencia] = useState(false);
+  useEffect(() => {
+    if (gateways.data) setGerencia(gateways.data.gerencia);
+  }, [gateways.data]);
   return (
     <Page title="Integrações" description="Por onde os documentos chegam e os e-mails saem, o banco dos pagamentos e das cobranças e os sistemas da empresa que os agentes usam.">
       <Tabs
         tabs={[
           { id: "conexoes", label: "Conexões", content: <Conexoes gateways={gateways} /> },
-          ...(gateways.data?.gerencia ? [{ id: "gateways", label: "Gateways", content: <GatewaysDaPlataforma gateways={gateways} /> }] : []),
+          ...(gerencia ? [{ id: "gateways", label: "Gateways", content: <GatewaysDaPlataforma gateways={gateways} /> }] : []),
           { id: "mcp", label: "Servidores MCP", content: <ServidoresMcp /> },
           { id: "documentos", label: "Documentos recebidos", content: <Documentos /> },
           { id: "pagamentos", label: "Pagamentos", content: <Pagamentos /> },
@@ -57,6 +62,13 @@ export default function Integracoes() {
 
 const OPERACOES = { agendar: "Agendar", cobrar: "Cobrar", extrato: "Extrato" };
 
+/** O erro do servidor com o campo de cada problema (o 422 traz um por campo), em vez de só "Payload inválido". */
+const erroComCampos = (erro: ApiError) =>
+  erro.details.map((d) => [d.loc?.slice(1).join("."), d.msg].filter(Boolean).join(": ")).filter(Boolean).join(" · ") || erro.message;
+
+/** Casas do custo: fração de centavo (R$ 0,004 por chamada) não pode aparecer como R$ 0,00. */
+const casas = (valor: number) => (Math.abs(valor * 100 - Math.round(valor * 100)) > 1e-9 ? 4 : 2);
+
 /** Quanto cada operação do gateway custa ao cliente (soma no plano), em etiquetas. */
 function Custos({ gateway }: { gateway: IntegracoesGateway }) {
   const custos = Object.entries(gateway.custos).filter(([, valor]) => valor > 0);
@@ -64,7 +76,7 @@ function Custos({ gateway }: { gateway: IntegracoesGateway }) {
     <Row gap="sm">
       {custos.map(([operacao, valor]) => (
         <Badge key={operacao}>
-          {OPERACOES[operacao as keyof typeof OPERACOES] ?? operacao}: <Money value={valor} />
+          {OPERACOES[operacao as keyof typeof OPERACOES] ?? operacao}: <Money value={valor} digits={casas(valor)} />
         </Badge>
       ))}
     </Row>
@@ -94,6 +106,16 @@ function Conexoes({ gateways }: { gateways: QueryState<IntegracoesGateways> }) {
         return (
           <Stack>
             {(conectar.error ?? desconectar.error) && <Alert tone="danger">{(conectar.error ?? desconectar.error)?.message}</Alert>}
+            {gateways.error && (
+              <Alert tone="warning" title="Os gateways não responderam">
+                <Row gap="sm">
+                  <Text size="sm">{gateways.error.message}</Text>
+                  <Button size="sm" variant="secondary" onClick={gateways.reload}>
+                    Tentar de novo
+                  </Button>
+                </Row>
+              </Alert>
+            )}
             <Grid cols={2}>
               <Card
                 title="Caixa de entrada"
@@ -134,10 +156,15 @@ function Conexoes({ gateways }: { gateways: QueryState<IntegracoesGateways> }) {
                 {banco ? (
                   <Stack gap="sm">
                     <Text tone="success">
-                      {`Conectado pelo ${banco.gateway_nome ?? banco.nome}`}
+                      {`Conectado pelo ${doBanco?.nome ?? banco.gateway_nome ?? banco.nome}`}
                       {banco.gateway === "simulado" ? `: confirma pagamentos e cobranças ${banco.confirmar_apos ?? 30} s depois de emitidos.` : "."}
                     </Text>
-                    {doBanco ? <Custos gateway={doBanco} /> : banco.gateway !== "simulado" && <Alert tone="warning">Este gateway não está disponível agora: as operações do banco vão para o staff.</Alert>}
+                    {doBanco ? (
+                      <Custos gateway={doBanco} />
+                    ) : (
+                      banco.gateway !== "simulado" &&
+                      gateways.data && <Alert tone="warning">Este gateway não está disponível agora: as operações do banco vão para o staff.</Alert>
+                    )}
                   </Stack>
                 ) : pode ? (
                   <Stack gap="sm">
@@ -178,7 +205,7 @@ function GatewaysDaPlataforma({ gateways }: { gateways: QueryState<IntegracoesGa
             </Text>
             <Button onClick={() => setEditando("novo")}>Novo gateway</Button>
           </Row>
-          {(editar.error ?? remover.error) && <Alert tone="danger">{(editar.error ?? remover.error)?.message}</Alert>}
+          {(editar.error ?? remover.error) && <Alert tone="danger">{erroComCampos((editar.error ?? remover.error) as ApiError)}</Alert>}
           <Grid cols={2}>
             {dados.itens.map((g) => (
               <Card
@@ -259,12 +286,18 @@ function FormularioGateway({
   const criar = useAction(integracoes.criarGateway, { onSuccess: onDone });
   const editar = useAction(integracoes.editarGateway, { onSuccess: onDone });
   const escolhido = provedores.find((p) => p.provedor === provedor);
-  const valores = Object.fromEntries(Object.entries(custos).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, Number(v.replace(",", "."))]));
-  const trocaCredencial = Object.values(credencial).some((v) => v.trim() !== "");
+  // Só o que o provedor escolhido faz e pede: o que foi digitado para outro provedor não vai junto.
+  const valores = Object.fromEntries(
+    Object.entries(custos)
+      .filter(([op, v]) => escolhido?.operacoes.includes(op as keyof typeof OPERACOES) && v.trim() !== "")
+      .map(([k, v]) => [k, Number(v.replace(",", "."))]),
+  );
+  const daCredencial = Object.fromEntries(Object.entries(credencial).filter(([campo]) => escolhido?.campos.includes(campo)));
+  const trocaCredencial = Object.values(daCredencial).some((v) => v.trim() !== "");
   const salvar = () =>
     gateway
-      ? void editar.run({ id: gateway.id, nome, custos: valores, credencial: trocaCredencial ? credencial : null })
-      : void criar.run({ slug, nome, provedor, custos: valores, credencial: escolhido?.campos.length ? credencial : null });
+      ? void editar.run({ id: gateway.id, nome, custos: valores, credencial: trocaCredencial ? daCredencial : null })
+      : void criar.run({ slug, nome, provedor, custos: valores, credencial: escolhido?.campos.length ? daCredencial : null });
   const erro = criar.error ?? editar.error;
   return (
     <Stack>
@@ -274,7 +307,11 @@ function FormularioGateway({
           <SelectField
             label="Provedor"
             value={provedor}
-            onChange={setProvedor}
+            onChange={(p) => {
+              setProvedor(p);
+              setCustos({});
+              setCredencial({});
+            }}
             options={provedores.map((p) => ({ value: p.provedor, label: p.nome }))}
             hint={escolhido ? `Faz: ${escolhido.operacoes.map((op) => OPERACOES[op]).join(", ")}.` : undefined}
           />
@@ -303,7 +340,7 @@ function FormularioGateway({
           required={!gateway}
         />
       ))}
-      {erro && <Alert tone="danger">{erro.message}</Alert>}
+      {erro && <Alert tone="danger">{erroComCampos(erro)}</Alert>}
       <Row>
         <Button loading={criar.running || editar.running} onClick={salvar}>
           {gateway ? "Salvar" : "Criar o gateway"}

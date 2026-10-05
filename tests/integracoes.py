@@ -764,3 +764,25 @@ def test_conexao_antiga_do_banco_simulado_migra_para_o_gateway_embutido():
     conexoes, agendado, workflows = service_app(cenario)
     assert [(c["tipo"], c["gateway"], c["confirmar_apos"]) for c in conexoes] == [("banco", "simulado", 5)]
     assert agendado.pagamento_id.startswith("PG-") and workflows[-1][1].segundos == 5
+
+
+def test_gateway_renomeado_aparece_com_o_nome_atual_para_o_cliente(plataforma):
+    """Achado da revisão da fatia B: a conexão guardava o nome do gateway de quando conectou."""
+    financeiro = Principal(sub="system:svc-financeiro", tenant="acme", roles=frozenset({"system"}))
+
+    async def cenario(app):
+        gil, ana = app.user(*GIL), app.user(*OWNER)
+        criado = (await gil.post("/gateways", json=GATEWAY)).json()["data"]
+        await ana.post("/conexoes", json={"tipo": "banco", "gateway": "banco-x"})
+        await gil.post("/gateways/editar", json={"id": criado["id"], "nome": "Banco Y", "ativo": False})
+        nome = next(c["gateway_nome"] for c in (await ana.get("/conexoes")).json()["data"]["itens"] if c["tipo"] == "banco")
+        with acting_as(financeiro):
+            with pytest.raises(ServiceError) as inativo:
+                await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=10.0, vencimento="2026-10-30"))
+        await gil.post("/gateways/remover", json={"id": criado["id"]})
+        removido = next(c["gateway_nome"] for c in (await ana.get("/conexoes")).json()["data"]["itens"] if c["tipo"] == "banco")
+        return nome, inativo.value.message, removido
+
+    nome, mensagem, removido = service_app(cenario)
+    assert nome == "Banco Y" and "(Banco Y)" in mensagem
+    assert removido == "Banco X"  # removido: fica o nome de quando conectou (o único que existe)
