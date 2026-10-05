@@ -129,7 +129,7 @@ def test_email_na_caixa_de_entrada_vira_documento_e_evento_uma_vez_so(fora):
         ana = app.user(*OWNER)
         caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
         de_novo = await ana.post("/conexoes", json={"tipo": "caixa_entrada"})
-        membro = await app.user("mel", "acme", "member").post("/conexoes", json={"tipo": "banco_simulado"})
+        membro = await app.user("mel", "acme", "member").post("/conexoes", json={"tipo": "banco"})
         beta = (await app.user("bia", "beta", "owner").post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
         endereco, codigo_errado = caixa["endereco"], caixa["endereco"].replace(".", ".0", 1)[:-1]
         fora["mensagens"]["m1"] = _email(endereco, _pdf("Moinho Sul R$ 1.250,00 vence 2026-10-15"))
@@ -172,7 +172,7 @@ def test_banco_simulado_agenda_e_confirma_avisando_o_processo(fora):
         with acting_as(sistema):
             with pytest.raises(Exception) as sem_banco:
                 await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=1250, vencimento="2099-10-15"))
-        await ana.post("/conexoes", json={"tipo": "banco_simulado", "confirmar_apos": 5})
+        await ana.post("/conexoes", json={"tipo": "banco", "confirmar_apos": 5})
         with acting_as(sistema):
             agendado = await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=1250, vencimento="2099-10-15", fornecedor="Moinho Sul"))
             vencido = await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=90, vencimento="2001-01-01"))
@@ -252,7 +252,7 @@ def test_servidor_mcp_conectado_com_a_credencial_cifrada_e_as_ferramentas_pinada
     assert getattr(alheio, "status", None) == 404
     assert all(p["allow_private"] and p["max_bytes"] for p in erp)  # rede interna só porque o ambiente é local; com teto
     assert any(p["headers"].get("Authorization") == "Bearer erp-dev-token" for p in erp)  # a credencial aberta só aqui
-    assert {i["tipo"] for i in catalogo if i["disponivel"]} == {"caixa_entrada", "banco_simulado", "servidor_mcp"}
+    assert {i["tipo"] for i in catalogo if i["disponivel"]} == {"caixa_entrada", "banco", "servidor_mcp"}
 
 
 def test_ferramenta_que_muda_no_servidor_vai_para_quarentena_ate_alguem_atualizar(erp, monkeypatch):
@@ -342,7 +342,7 @@ def test_cobranca_no_banco_simulado_recebe_avisa_os_processos_e_entra_no_extrato
                 await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Padaria Pão Quente"))
             except Exception as exc:  # noqa: BLE001
                 sem_banco = exc
-        await ana.post("/conexoes", json={"tipo": "banco_simulado", "confirmar_apos": 5})
+        await ana.post("/conexoes", json={"tipo": "banco", "confirmar_apos": 5})
         with acting_as(SISTEMA):
             emitida = await app.handlers[COBRAR_SUBJECT](CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Padaria Pão Quente"))
             pago = await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=1250.0, vencimento="2020-01-01", fornecedor="Moinho Sul"))
@@ -377,7 +377,7 @@ def test_conta_encerrada_revoga_as_conexoes_so_da_organizacao_que_saiu():
     async def cenario(app):
         ana, bia = app.user(*OWNER), app.user("bia", "beta", "owner")
         await ana.post("/conexoes", json={"tipo": "caixa_entrada"})
-        await ana.post("/conexoes", json={"tipo": "banco_simulado"})
+        await ana.post("/conexoes", json={"tipo": "banco"})
         await bia.post("/conexoes", json={"tipo": "caixa_entrada"})
         plans = Principal(sub="system:svc-plans", tenant="acme", roles=frozenset({"system"}))
         await app.deliver(ENCERRADA_SUBJECT, ContaEncerrada(tenant="acme", em=datetime.now(UTC)), who=plans)
@@ -565,7 +565,7 @@ def test_email_sai_pelo_postmark_com_o_boleto_e_os_documentos_anexados(fora, mon
     async def cenario(app):
         ana = app.user(*OWNER)
         caixa = (await ana.post("/conexoes", json={"tipo": "caixa_entrada"})).json()["data"]
-        await ana.post("/conexoes", json={"tipo": "banco_simulado"})
+        await ana.post("/conexoes", json={"tipo": "banco"})
         envio = (await ana.post("/documentos/upload", json={"filename": "nota.pdf", "content_type": "application/pdf", "size": 9})).json()["data"]
         fora["enviados"][envio["key"]] = _pdf("NFS-e 2026/000901")
         nota = (await ana.post("/documentos/enviar", json={"key": envio["key"], "iniciar": False})).json()["data"]
@@ -626,3 +626,141 @@ def test_linha_digitavel_quebrada_em_duas_linhas_volta_a_ser_uma():
         "Código: 83640000001 5 33660138000 9 00000000000 0 12345678901 2", "Vencimento 10/11"]
     for intacto in ("Valor 1.890,50\n27/10/2026", "CNPJ 12.345.678/0001-90\n123", "34191.79001 01043.510047 91020.150008 1\n9876"):
         assert service._linha_digitavel_inteira(intacto) == intacto  # não soma 47 nem 48: fica como está
+
+
+# ── O5 (fatia B): banco por capacidade, gateways da Cogniventure e custo por cliente ─
+
+from core.plans import LIMITS_SUBJECT, USAGE_SUBJECT, LimitState, PlanLimits  # noqa: E402
+from core.security import system  # noqa: E402
+from core.surreal import db  # noqa: E402
+from schemas import CONEXOES, GATEWAYS  # noqa: E402
+
+GIL = ("gil", "cogni", "owner")  # dono da organização da Cogniventure (PLATFORM_TENANT)
+GATEWAY = {"slug": "banco-x", "nome": "Banco X", "provedor": "teste", "custos": {"cobrar": 1.5, "extrato": 0.2},
+           "credencial": {"client_id": "id-1", "client_secret": "s3gr3d0"}}
+
+
+class _BancoDeTeste(service._BancoSimulado):
+    """Um provedor com credencial que emite cobranças e dá o extrato, mas não agenda pagamentos (como um agregador)."""
+
+    provedor, nome, operacoes, campos = "teste", "Banco de teste", ("cobrar", "extrato"), ("client_id", "client_secret")
+
+    def __init__(self):
+        self.credenciais = []
+
+    async def cobrar(self, banco, data):
+        self.credenciais.append(banco.credencial())
+        return await super().cobrar(banco, data)
+
+
+@pytest.fixture
+def plataforma(monkeypatch):
+    adaptador = _BancoDeTeste()
+    monkeypatch.setattr(service.settings, "platform_tenant", "cogni")
+    monkeypatch.setitem(service.ADAPTADORES, "teste", adaptador)
+    return adaptador
+
+
+def _usos(publicados):
+    return [(m.name, m.amount) for s, m in publicados if s == USAGE_SUBJECT]
+
+
+def test_gateway_da_cogniventure_guarda_a_credencial_cifrada_e_so_ela_gerencia(plataforma):
+    async def cenario(app):
+        gil, ana = app.user(*GIL), app.user(*OWNER)
+        de_fora = await ana.post("/gateways", json=GATEWAY)
+        criado = (await gil.post("/gateways", json=GATEWAY)).json()["data"]
+        erros = [(await gil.post("/gateways", json={**GATEWAY, **mudanca})).json()["error"]["code"] for mudanca in (
+            {"slug": "banco-y", "custos": {"agendar": 1}},  # o provedor não agenda
+            {"slug": "banco-y", "credencial": {"client_id": "id-1"}},  # falta campo
+            {"slug": "banco-y", "provedor": "pluggy"},  # provedor que o serviço não sabe usar
+            {"slug": "simulado"},  # o embutido
+            {},  # repetido
+        )]
+        with acting_as(system("svc-integracoes", "cogni")):
+            guardado = await db.query(f"SELECT * FROM {GATEWAYS} WHERE tenant = $tenant")
+        visto_por_ana = (await ana.get("/gateways")).json()["data"]
+        visto_por_gil = (await gil.get("/gateways")).json()["data"]
+        trocado = (await gil.post("/gateways/editar", json={"id": criado["id"], "custos": {"cobrar": 2.0},
+                                                             "credencial": {"client_id": "id-2", "client_secret": "novo"}})).json()["data"]
+        desativado = (await gil.post("/gateways/editar", json={"id": criado["id"], "ativo": False})).json()["data"]
+        sumiu = (await ana.get("/gateways")).json()["data"]
+        editar_de_fora = await ana.post("/gateways/editar", json={"id": criado["id"], "ativo": True})
+        return de_fora, criado, erros, guardado, visto_por_ana, visto_por_gil, trocado, desativado, sumiu, editar_de_fora
+
+    de_fora, criado, erros, guardado, ana, gil, trocado, desativado, sumiu, editar_de_fora = service_app(cenario)
+    assert de_fora.status_code == 403 and editar_de_fora.status_code == 403
+    assert (criado["slug"], criado["credencial"], criado["custos"]) == ("banco-x", ["client_id", "client_secret"], {"cobrar": 1.5, "extrato": 0.2})
+    assert "s3gr3d0" not in json.dumps(criado) and "s3gr3d0" not in json.dumps(guardado, default=str)  # cifrada no banco
+    assert erros == ["ERRO_INTEGRACOES_GATEWAY", "ERRO_INTEGRACOES_CREDENCIAL", "ERRO_INTEGRACOES_PROVEDOR",
+                     "ERRO_INTEGRACOES_JA_CONECTADA", "ERRO_INTEGRACOES_JA_CONECTADA"]
+    assert [g["slug"] for g in ana["itens"]] == ["simulado", "banco-x"] and not ana["gerencia"]
+    assert ana["itens"][1]["credencial"] == [] and ana["itens"][1]["operacoes"] == ["cobrar", "extrato"]  # sem os campos
+    assert ana["itens"][0]["embutido"] and gil["gerencia"] and {p["provedor"] for p in gil["provedores"]} == {"simulado", "teste"}
+    assert trocado["custos"] == {"cobrar": 2.0} and desativado["ativo"] is False
+    assert [g["slug"] for g in sumiu["itens"]] == ["simulado"]  # desativado: o cliente não vê para conectar
+
+
+def test_banco_pelo_gateway_usa_a_credencial_e_soma_o_custo_na_organizacao(plataforma):
+    financeiro = Principal(sub="system:svc-financeiro", tenant="acme", roles=frozenset({"system"}))
+    da_beta = Principal(sub="system:svc-financeiro", tenant="beta", roles=frozenset({"system"}))
+
+    async def tenta(handler, dado, quem=financeiro):
+        with acting_as(quem):
+            try:
+                return await handler(dado)
+            except ServiceError as exc:
+                return exc.code, exc.status
+
+    async def cenario(app):
+        gil, ana, bia = app.user(*GIL), app.user(*OWNER), app.user("bia", "beta", "owner")
+        criado = (await gil.post("/gateways", json=GATEWAY)).json()["data"]
+        inexistente = await ana.post("/conexoes", json={"tipo": "banco", "gateway": "banco-z"})
+        conexao = (await ana.post("/conexoes", json={"tipo": "banco", "gateway": "banco-x"})).json()["data"]
+        await bia.post("/conexoes", json={"tipo": "banco"})  # a beta fica no simulado (embutido, sem custo)
+        cobrar, agendar = app.handlers[COBRAR_SUBJECT], app.handlers[AGENDAR_SUBJECT]
+        emitida = await tenta(cobrar, CobrarNoBanco(valor=4800.0, vencimento="2026-10-30", pagador="Padaria"))
+        extrato = await tenta(app.handlers[EXTRATO_SUBJECT], ExtratoPedido(desde="2026-01-01"))
+        sem_suporte = await tenta(agendar, AgendarPagamento(valor=1250, vencimento="2099-10-15"))
+        da_beta_emitida = await tenta(cobrar, CobrarNoBanco(valor=90.0, vencimento="2026-10-30"), da_beta)
+        usos = _usos(app.published)
+        app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan="essencial", plan_name="Essencial", month="2026-10", limits=[LimitState(
+            name="integracoes.gateway-banco", service="svc-integracoes", description="Gasto com o banco", default=None, monthly=True,
+            currency="BRL", limit=10.0, used=10.0)]))
+        no_limite = await tenta(cobrar, CobrarNoBanco(valor=50.0, vencimento="2026-10-30"))
+        app.respond(LIMITS_SUBJECT, lambda _: PlanLimits(plan=None, plan_name="", month="2026-10", limits=[]))
+        service.plans.clear()
+        await gil.post("/gateways/editar", json={"id": criado["id"], "ativo": False})
+        desativado = await tenta(cobrar, CobrarNoBanco(valor=50.0, vencimento="2026-10-30"))
+        cobrancas = (await ana.get("/cobrancas")).json()["data"]["items"]
+        return inexistente, conexao, emitida, extrato, sem_suporte, da_beta_emitida, usos, no_limite, desativado, cobrancas
+
+    (inexistente, conexao, emitida, extrato, sem_suporte, da_beta_emitida, usos, no_limite, desativado,
+     cobrancas) = service_app(cenario)
+    assert inexistente.json()["error"]["code"] == "ERRO_INTEGRACOES_GATEWAY"
+    assert (conexao["tipo"], conexao["gateway"], conexao["gateway_nome"]) == ("banco", "banco-x", "Banco X")
+    assert emitida.cobranca_id.startswith("CB-") and extrato.itens == []
+    assert plataforma.credenciais == [{"client_id": "id-1", "client_secret": "s3gr3d0"}]  # aberta só na hora, para o adaptador
+    assert sem_suporte == ("ERRO_INTEGRACOES_SEM_SUPORTE", 409)  # o provedor não agenda: o staff faz no banco
+    assert da_beta_emitida.cobranca_id.startswith("CB-")
+    assert usos == [("integracoes.gateway-banco", 1.5), ("integracoes.gateway-banco", 0.2)]  # só a acme, no gateway com custo
+    assert no_limite == ("ERRO_PLAN_LIMIT", 402) and len(plataforma.credenciais) == 1  # o limite do mês barra antes do banco
+    assert desativado == ("ERRO_INTEGRACOES_GATEWAY", 409)
+    assert [c["gateway"] for c in cobrancas] == ["banco-x"]
+
+
+def test_conexao_antiga_do_banco_simulado_migra_para_o_gateway_embutido():
+    from service import MIGRATIONS
+
+    async def cenario(app):
+        with acting_as(Principal(sub="ana", tenant="acme", roles=frozenset({"owner"}))):
+            await db.create(CONEXOES, {"tipo": "banco_simulado", "nome": "Banco (simulado)", "confirmar_apos": 5})
+        await db._conn.query(MIGRATIONS[0].sql)  # a migração 1, como o boot de um banco que já tinha a conexão antiga
+        conexoes = (await app.user(*OWNER).get("/conexoes")).json()["data"]["itens"]
+        with acting_as(Principal(sub="system:svc-financeiro", tenant="acme", roles=frozenset({"system"}))):
+            agendado = await app.handlers[AGENDAR_SUBJECT](AgendarPagamento(valor=10, vencimento="2099-10-15"))
+        return conexoes, agendado, app.workflows
+
+    conexoes, agendado, workflows = service_app(cenario)
+    assert [(c["tipo"], c["gateway"], c["confirmar_apos"]) for c in conexoes] == [("banco", "simulado", 5)]
+    assert agendado.pagamento_id.startswith("PG-") and workflows[-1][1].segundos == 5

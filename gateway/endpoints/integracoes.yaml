@@ -15,6 +15,8 @@ live:
     model: EnviadoMudou
   - topic: servidores               # servidor MCP conectado, atualizado, removido ou com ferramenta em quarentena
     model: ServidorMudou
+  - topic: gateways                 # a Cogniventure criou, alterou ou removeu um gateway (só na organização dela)
+    model: GatewayMudou
 
 endpoints:
   - path: /conexoes
@@ -119,6 +121,40 @@ endpoints:
     response: Catalogo
     target_type: http
     target_url: http://svc-integracoes:8000/catalogo
+
+  - path: /gateways
+    method: GET
+    auth: client_jwt
+    response: Gateways
+    target_type: http
+    target_url: http://svc-integracoes:8000/gateways
+
+  - path: /gateways
+    name: criarGateway
+    method: POST
+    auth: client_jwt
+    request: NovoGateway
+    response: Gateway
+    target_type: http
+    target_url: http://svc-integracoes:8000/gateways
+
+  - path: /gateways/editar
+    name: editarGateway
+    method: POST
+    auth: client_jwt
+    request: EdicaoGateway
+    response: Gateway
+    target_type: http
+    target_url: http://svc-integracoes:8000/gateways/editar
+
+  - path: /gateways/remover
+    name: removerGateway
+    method: POST
+    auth: client_jwt
+    request: GatewayRef
+    response: Gateway
+    target_type: http
+    target_url: http://svc-integracoes:8000/gateways/remover
 
   - path: /servidores
     method: GET

@@ -15,23 +15,35 @@ import { Money } from "@/components/Money";
 import { Page } from "@/components/Page";
 import { QueryView } from "@/components/QueryView";
 import { Row } from "@/components/Row";
+import { SelectField } from "@/components/SelectField";
+import { SidePanel } from "@/components/SidePanel";
 import { Stack } from "@/components/Stack";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Tabs } from "@/components/Tabs";
 import { Text } from "@/components/Text";
 import { TextField } from "@/components/TextField";
-import { useAction, useListQuery, useLiveQuery, useQuery, useUpload } from "@/core/api";
+import { Toggle } from "@/components/Toggle";
+import { type QueryState, useAction, useListQuery, useLiveQuery, useQuery, useUpload } from "@/core/api";
 import { hasAnyRole, useSession } from "@/core/auth";
-import { type IntegracoesConexao, type IntegracoesDocumento, type IntegracoesServidorMcp, integracoes } from "@/core/contracts";
+import {
+  type IntegracoesConexao,
+  type IntegracoesDocumento,
+  type IntegracoesGateway,
+  type IntegracoesGateways,
+  type IntegracoesServidorMcp,
+  integracoes,
+} from "@/core/contracts";
 
 export const meta: PageMeta = { title: "Integrações", module: "integracoes" };
 
 export default function Integracoes() {
+  const gateways = useLiveQuery("integracoes.gateways", integracoes.gateways);
   return (
     <Page title="Integrações" description="Por onde os documentos chegam e os e-mails saem, o banco dos pagamentos e das cobranças e os sistemas da empresa que os agentes usam.">
       <Tabs
         tabs={[
-          { id: "conexoes", label: "Conexões", content: <Conexoes /> },
+          { id: "conexoes", label: "Conexões", content: <Conexoes gateways={gateways} /> },
+          ...(gateways.data?.gerencia ? [{ id: "gateways", label: "Gateways", content: <GatewaysDaPlataforma gateways={gateways} /> }] : []),
           { id: "mcp", label: "Servidores MCP", content: <ServidoresMcp /> },
           { id: "documentos", label: "Documentos recebidos", content: <Documentos /> },
           { id: "pagamentos", label: "Pagamentos", content: <Pagamentos /> },
@@ -43,18 +55,42 @@ export default function Integracoes() {
   );
 }
 
-function Conexoes() {
+const OPERACOES = { agendar: "Agendar", cobrar: "Cobrar", extrato: "Extrato" };
+
+/** Quanto cada operação do gateway custa ao cliente (soma no plano), em etiquetas. */
+function Custos({ gateway }: { gateway: IntegracoesGateway }) {
+  const custos = Object.entries(gateway.custos).filter(([, valor]) => valor > 0);
+  return custos.length ? (
+    <Row gap="sm">
+      {custos.map(([operacao, valor]) => (
+        <Badge key={operacao}>
+          {OPERACOES[operacao as keyof typeof OPERACOES] ?? operacao}: <Money value={valor} />
+        </Badge>
+      ))}
+    </Row>
+  ) : (
+    <Text size="sm" tone="muted">
+      Sem custo por operação.
+    </Text>
+  );
+}
+
+function Conexoes({ gateways }: { gateways: QueryState<IntegracoesGateways> }) {
   const conexoes = useLiveQuery("integracoes.conexoes", integracoes.conexoes);
   const session = useSession();
   const pode = hasAnyRole(session, "owner", "admin");
+  const [escolhido, setEscolhido] = useState("simulado");
   const conectar = useAction(integracoes.conectar, { onSuccess: conexoes.reload });
   const desconectar = useAction(integracoes.desconectar, { onSuccess: conexoes.reload });
+  const disponiveis = (gateways.data?.itens ?? []).filter((g) => g.capacidade === "banco" && g.ativo);
+  const gateway = disponiveis.find((g) => g.slug === escolhido);
   return (
     <QueryView query={conexoes}>
       {(dados) => {
         const por = (tipo: IntegracoesConexao["tipo"]) => dados.itens.find((c) => c.tipo === tipo);
         const caixa = por("caixa_entrada");
-        const banco = por("banco_simulado");
+        const banco = por("banco");
+        const doBanco = disponiveis.find((g) => g.slug === banco?.gateway);
         return (
           <Stack>
             {(conectar.error ?? desconectar.error) && <Alert tone="danger">{(conectar.error ?? desconectar.error)?.message}</Alert>}
@@ -81,23 +117,42 @@ function Conexoes() {
                 )}
               </Card>
               <Card
-                title="Banco (simulado)"
-                description="Até escolhermos o banco da empresa, pagamentos e cobranças passam por um banco de simulação, que confirma cada um alguns segundos depois."
+                title="Banco"
+                description="Pagamentos, cobranças e extrato passam pelo gateway que a Cogniventure contrata (o custo de cada operação entra no seu plano) ou pelo banco simulado, que confirma cada um alguns segundos depois."
                 footer={
                   pode && (banco ? (
                     <ConfirmButton size="sm" confirmLabel="Desconectar o banco" loading={desconectar.running} onConfirm={() => void desconectar.run({ id: banco.id })}>
                       Desconectar
                     </ConfirmButton>
                   ) : (
-                    <Button loading={conectar.running} onClick={() => void conectar.run({ tipo: "banco_simulado", confirmar_apos: 30 })}>
-                      Conectar o banco simulado
+                    <Button loading={conectar.running} disabled={!gateway} onClick={() => void conectar.run({ tipo: "banco", gateway: escolhido, confirmar_apos: 30 })}>
+                      Conectar o banco
                     </Button>
                   ))
                 }
               >
-                <Text tone={banco ? "success" : "muted"}>
-                  {banco ? `Conectado: confirma pagamentos e cobranças ${banco.confirmar_apos ?? 30} s depois de emitidos.` : "Ainda não conectado."}
-                </Text>
+                {banco ? (
+                  <Stack gap="sm">
+                    <Text tone="success">
+                      {`Conectado pelo ${banco.gateway_nome ?? banco.nome}`}
+                      {banco.gateway === "simulado" ? `: confirma pagamentos e cobranças ${banco.confirmar_apos ?? 30} s depois de emitidos.` : "."}
+                    </Text>
+                    {doBanco ? <Custos gateway={doBanco} /> : banco.gateway !== "simulado" && <Alert tone="warning">Este gateway não está disponível agora: as operações do banco vão para o staff.</Alert>}
+                  </Stack>
+                ) : pode ? (
+                  <Stack gap="sm">
+                    <SelectField
+                      label="Gateway"
+                      value={escolhido}
+                      onChange={setEscolhido}
+                      options={disponiveis.map((g) => ({ value: g.slug, label: g.nome }))}
+                      hint="O banco simulado não tem custo; os da Cogniventure somam cada operação no plano."
+                    />
+                    {gateway && <Custos gateway={gateway} />}
+                  </Stack>
+                ) : (
+                  <Text tone="muted">Ainda não conectado.</Text>
+                )}
               </Card>
             </Grid>
             <EmBreve />
@@ -105,6 +160,156 @@ function Conexoes() {
         );
       }}
     </QueryView>
+  );
+}
+
+/** Os gateways que a Cogniventure contrata e repassa no plano: só quem a administra vê esta aba. */
+function GatewaysDaPlataforma({ gateways }: { gateways: QueryState<IntegracoesGateways> }) {
+  const [editando, setEditando] = useState<IntegracoesGateway | "novo" | null>(null);
+  const editar = useAction(integracoes.editarGateway, { onSuccess: gateways.reload });
+  const remover = useAction(integracoes.removerGateway, { onSuccess: gateways.reload });
+  return (
+    <QueryView query={gateways}>
+      {(dados) => (
+        <Stack>
+          <Row justify="between">
+            <Text tone="muted">
+              A credencial fica cifrada neste serviço e nunca volta à tela. O custo de cada operação soma no limite do plano de cada cliente (Gasto com o banco no mês).
+            </Text>
+            <Button onClick={() => setEditando("novo")}>Novo gateway</Button>
+          </Row>
+          {(editar.error ?? remover.error) && <Alert tone="danger">{(editar.error ?? remover.error)?.message}</Alert>}
+          <Grid cols={2}>
+            {dados.itens.map((g) => (
+              <Card
+                key={g.slug}
+                title={g.nome}
+                description={g.embutido ? "Embutido: sempre disponível, sem custo e sem credencial." : `${g.provedor} · ${g.slug}`}
+                footer={
+                  !g.embutido && (
+                    <Row justify="between">
+                      <Toggle label="Ativo" checked={g.ativo} onChange={(ativo) => void editar.run({ id: g.id, ativo })} />
+                      <Row gap="sm">
+                        <Button size="sm" variant="secondary" onClick={() => setEditando(g)}>
+                          Editar
+                        </Button>
+                        <ConfirmButton size="sm" confirmLabel="Remover o gateway" loading={remover.running} onConfirm={() => void remover.run({ id: g.id })}>
+                          Remover
+                        </ConfirmButton>
+                      </Row>
+                    </Row>
+                  )
+                }
+              >
+                <Stack gap="sm">
+                  <Row gap="sm">
+                    {g.operacoes.map((op) => (
+                      <Badge key={op}>{OPERACOES[op]}</Badge>
+                    ))}
+                    {!g.ativo && <StatusBadge value="inativo" labels={{ inativo: "Inativo" }} tones={{ inativo: "warning" }} />}
+                  </Row>
+                  <Custos gateway={g} />
+                  {g.credencial.length > 0 && (
+                    <Text size="sm" tone="muted">
+                      Credencial guardada: {g.credencial.join(", ")}
+                    </Text>
+                  )}
+                </Stack>
+              </Card>
+            ))}
+          </Grid>
+          <SidePanel
+            open={editando !== null}
+            onClose={() => setEditando(null)}
+            title={editando === "novo" ? "Novo gateway" : "Editar o gateway"}
+            description="Custo em reais por chamada, repassado ao cliente. A credencial é trocada inteira."
+          >
+            {editando !== null && (
+              <FormularioGateway
+                key={editando === "novo" ? "novo" : editando.id}
+                gateway={editando === "novo" ? null : editando}
+                provedores={dados.provedores}
+                onDone={() => {
+                  setEditando(null);
+                  gateways.reload();
+                }}
+              />
+            )}
+          </SidePanel>
+        </Stack>
+      )}
+    </QueryView>
+  );
+}
+
+function FormularioGateway({
+  gateway,
+  provedores,
+  onDone,
+}: {
+  gateway: IntegracoesGateway | null;
+  provedores: IntegracoesGateways["provedores"];
+  onDone: () => void;
+}) {
+  const [slug, setSlug] = useState(gateway?.slug ?? "");
+  const [nome, setNome] = useState(gateway?.nome ?? "");
+  const [provedor, setProvedor] = useState(gateway?.provedor ?? provedores.find((p) => p.campos.length > 0)?.provedor ?? provedores[0]?.provedor ?? "");
+  const [custos, setCustos] = useState<Record<string, string>>(Object.fromEntries(Object.entries(gateway?.custos ?? {}).map(([k, v]) => [k, String(v)])));
+  const [credencial, setCredencial] = useState<Record<string, string>>({});
+  const criar = useAction(integracoes.criarGateway, { onSuccess: onDone });
+  const editar = useAction(integracoes.editarGateway, { onSuccess: onDone });
+  const escolhido = provedores.find((p) => p.provedor === provedor);
+  const valores = Object.fromEntries(Object.entries(custos).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, Number(v.replace(",", "."))]));
+  const trocaCredencial = Object.values(credencial).some((v) => v.trim() !== "");
+  const salvar = () =>
+    gateway
+      ? void editar.run({ id: gateway.id, nome, custos: valores, credencial: trocaCredencial ? credencial : null })
+      : void criar.run({ slug, nome, provedor, custos: valores, credencial: escolhido?.campos.length ? credencial : null });
+  const erro = criar.error ?? editar.error;
+  return (
+    <Stack>
+      {!gateway && (
+        <>
+          <TextField label="Identificador" value={slug} onChange={setSlug} hint="Letras minúsculas, números e hífen (ex.: pluggy-producao). Não muda depois." required />
+          <SelectField
+            label="Provedor"
+            value={provedor}
+            onChange={setProvedor}
+            options={provedores.map((p) => ({ value: p.provedor, label: p.nome }))}
+            hint={escolhido ? `Faz: ${escolhido.operacoes.map((op) => OPERACOES[op]).join(", ")}.` : undefined}
+          />
+        </>
+      )}
+      <TextField label="Nome" value={nome} onChange={setNome} required />
+      {(escolhido?.operacoes ?? []).map((op) => (
+        <TextField
+          key={op}
+          label={`${OPERACOES[op]} (R$ por chamada)`}
+          type="number"
+          value={custos[op] ?? ""}
+          onChange={(v) => setCustos((atual) => ({ ...atual, [op]: v }))}
+          hint="Vazio ou 0: sem custo."
+        />
+      ))}
+      {(escolhido?.campos ?? []).map((campo) => (
+        <TextField
+          key={campo}
+          label={`Credencial: ${campo}`}
+          type="password"
+          autoComplete="off"
+          value={credencial[campo] ?? ""}
+          onChange={(v) => setCredencial((atual) => ({ ...atual, [campo]: v }))}
+          hint={gateway ? "Em branco: mantém a guardada." : undefined}
+          required={!gateway}
+        />
+      ))}
+      {erro && <Alert tone="danger">{erro.message}</Alert>}
+      <Row>
+        <Button loading={criar.running || editar.running} onClick={salvar}>
+          {gateway ? "Salvar" : "Criar o gateway"}
+        </Button>
+      </Row>
+    </Stack>
   );
 }
 

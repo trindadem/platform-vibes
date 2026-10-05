@@ -1515,11 +1515,14 @@ export const identity = {
 
 export interface IntegracoesConexao {
   id: string;
-  tipo: "caixa_entrada" | "banco_simulado";
+  tipo: "caixa_entrada" | "banco";
   nome: string;
   /** caixa_entrada: para onde encaminhar boletos e notas */
   endereco: string | null;
-  /** banco_simulado: segundos até o banco confirmar um pagamento */
+  /** banco: o gateway (simulado, ou um da Cogniventure) */
+  gateway: string | null;
+  gateway_nome: string | null;
+  /** banco simulado: segundos até o banco confirmar um pagamento */
   confirmar_apos: number | null;
   created_at: string | null;
 }
@@ -1529,9 +1532,11 @@ export interface IntegracoesConexoes {
 }
 
 export interface IntegracoesNovaConexao {
-  tipo: "caixa_entrada" | "banco_simulado";
+  tipo: "caixa_entrada" | "banco";
   nome?: string | null;
-  /** banco_simulado: segundos até confirmar o pagamento */
+  /** banco: o gateway (GET /gateways); padrão, o simulado */
+  gateway?: string;
+  /** banco simulado: segundos até confirmar o pagamento */
   confirmar_apos?: number;
 }
 
@@ -1658,6 +1663,8 @@ export interface IntegracoesPagamento {
   linha_digitavel: string | null;
   status: "agendado" | "pago";
   pago_em: string | null;
+  /** Por qual gateway passou */
+  gateway: string | null;
   created_at: string | null;
 }
 
@@ -1698,6 +1705,68 @@ export interface IntegracoesItemCatalogo {
 
 export interface IntegracoesCatalogo {
   itens: IntegracoesItemCatalogo[];
+}
+
+/** Um gateway que a Cogniventure contrata e repassa no plano: o provedor, a credencial (só aqui, cifrada) e quanto cada operação custa ao cliente (soma no limite integracoes.gateway-<capacidade> do mês). */
+export interface IntegracoesGateway {
+  id: string;
+  slug: string;
+  nome: string;
+  capacidade: "banco";
+  provedor: string;
+  ativo: boolean;
+  /** Operação → R$ por chamada */
+  custos: Record<string, number>;
+  /** O que o provedor faz (o resto vai ao staff) */
+  operacoes: ("agendar" | "cobrar" | "extrato")[];
+  /** O banco simulado: sempre disponível, sem custo e sem credencial */
+  embutido: boolean;
+  /** Os campos guardados (só para quem gerencia a plataforma) */
+  credencial: string[];
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Um provedor que o serviço sabe usar (um adaptador da capacidade): o que ele faz e a credencial que pede. */
+export interface IntegracoesProvedor {
+  provedor: string;
+  nome: string;
+  capacidade: "banco";
+  operacoes: ("agendar" | "cobrar" | "extrato")[];
+  /** Campos da credencial que o gateway guarda (cifrada) */
+  campos: string[];
+}
+
+export interface IntegracoesGateways {
+  itens: IntegracoesGateway[];
+  provedores: IntegracoesProvedor[];
+  /** Quem pergunta gerencia os gateways (dono ou admin da Cogniventure) */
+  gerencia: boolean;
+}
+
+export interface IntegracoesNovoGateway {
+  /** Identificador curto (a conexão do cliente guarda este) */
+  slug: string;
+  nome: string;
+  capacidade?: "banco";
+  provedor: string;
+  custos?: Record<string, number>;
+  /** Os campos que o provedor pede: guardados cifrados, nunca voltam */
+  credencial?: Record<string, string> | null;
+  ativo?: boolean;
+}
+
+export interface IntegracoesEdicaoGateway {
+  id: string;
+  nome?: string | null;
+  custos?: Record<string, number> | null;
+  /** Troca a credencial inteira */
+  credencial?: Record<string, string> | null;
+  ativo?: boolean | null;
+}
+
+export interface IntegracoesGatewayRef {
+  id: string;
 }
 
 /** Uma ferramenta anunciada pelo servidor, sanitizada e pinada (a impressão de nome, descrição e schema). */
@@ -1755,6 +1824,8 @@ export interface IntegracoesCobranca {
   linha_digitavel: string;
   status: "aberta" | "recebida";
   recebido_em: string | null;
+  /** Por qual gateway passou */
+  gateway: string | null;
   created_at: string | null;
 }
 
@@ -1845,6 +1916,11 @@ export interface IntegracoesServidorMudou {
   action: "conectado" | "atualizado" | "removido" | "quarentena";
 }
 
+export interface IntegracoesGatewayMudou {
+  id: string;
+  action: "criado" | "alterado" | "removido";
+}
+
 /** svc-integracoes · /api/v1/integracoes */
 export const integracoes = {
   /** GET /api/v1/integracoes/conexoes · http · exige token */
@@ -1883,6 +1959,18 @@ export const integracoes = {
   /** GET /api/v1/integracoes/catalogo · http · exige token */
   catalogo: (options?: RequestOptions) =>
     request<IntegracoesCatalogo>("GET", "/api/v1/integracoes/catalogo", undefined, options),
+  /** GET /api/v1/integracoes/gateways · http · exige token */
+  gateways: (options?: RequestOptions) =>
+    request<IntegracoesGateways>("GET", "/api/v1/integracoes/gateways", undefined, options),
+  /** POST /api/v1/integracoes/gateways · http · exige token */
+  criarGateway: (body: IntegracoesNovoGateway, options?: RequestOptions) =>
+    request<IntegracoesGateway>("POST", "/api/v1/integracoes/gateways", body, options),
+  /** POST /api/v1/integracoes/gateways/editar · http · exige token */
+  editarGateway: (body: IntegracoesEdicaoGateway, options?: RequestOptions) =>
+    request<IntegracoesGateway>("POST", "/api/v1/integracoes/gateways/editar", body, options),
+  /** POST /api/v1/integracoes/gateways/remover · http · exige token */
+  removerGateway: (body: IntegracoesGatewayRef, options?: RequestOptions) =>
+    request<IntegracoesGateway>("POST", "/api/v1/integracoes/gateways/remover", body, options),
   /** GET /api/v1/integracoes/servidores · http · exige token */
   servidores: (options?: RequestOptions) =>
     request<IntegracoesServidoresMcp>("GET", "/api/v1/integracoes/servidores", undefined, options),
@@ -4253,6 +4341,8 @@ export interface LiveTopics {
   "integracoes.enviados": IntegracoesEnviadoMudou;
   /** svc-integracoes · bus.live("integracoes.servidores", ...) */
   "integracoes.servidores": IntegracoesServidorMudou;
+  /** svc-integracoes · bus.live("integracoes.gateways", ...) */
+  "integracoes.gateways": IntegracoesGatewayMudou;
   /** svc-juridico · cadastro contratos (core/resources.py) */
   "juridico.contratos": ResourceChanged;
   /** svc-juridico · cadastro certidoes (core/resources.py) */

@@ -346,8 +346,9 @@ services:
       INTEGRACOES_POSTMARK_TOKEN: ${INTEGRACOES_POSTMARK_TOKEN:-}  # com ele, os e-mails saem pelo Postmark (vale mais que o Mailpit)
       INTEGRACOES_POSTMARK_ENTRADA: ${INTEGRACOES_POSTMARK_ENTRADA:-}  # senha do aviso de entrada; vazio: a rota não existe
       INTEGRACOES_MODELO_VISAO: ${INTEGRACOES_MODELO_VISAO:-cv/visao}  # lê foto e PDF escaneado (cadastrado no svc-ai)
-      # Só este serviço cifra e abre as credenciais dos servidores MCP (as chamadas MCP saem daqui).
+      # Só este serviço cifra e abre as credenciais dos servidores MCP e dos gateways (as chamadas saem daqui).
       INTEGRACOES_SECRETS_KEY: ${INTEGRACOES_SECRETS_KEY:?rode uv run python -m core.security keygen}
+      PLATFORM_TENANT: ${PLATFORM_TENANT:-}  # a organização da Cogniventure: dono e admin dela gerenciam os gateways
 
   svc-staff:
     <<: *service

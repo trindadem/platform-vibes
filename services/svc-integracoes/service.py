@@ -4,10 +4,15 @@ Trilho (validado no import por @activities): todo método público é async, rec
 modelo de schemas.py, e vira a activity "integracoes.<método>".
 
 As conexões da organização com o mundo de fora. Neste bloco: a caixa de entrada (e-mail encaminhado ao endereço da
-organização; em produção o Postmark avisa com a mensagem, no ambiente local o Mailpit) e o banco simulado (agenda e
-confirma depois de alguns segundos, ou à mão). O que chega sai em events.integracoes.evento: o svc-processos inicia as
-execuções e entrega as mensagens que elas esperam. Foto e PDF escaneado passam antes pelo modelo de visão, que escreve
-o texto do documento (o agente do passo lê esse texto e cita o trecho de cada valor, como num PDF com texto).
+organização; em produção o Postmark avisa com a mensagem, no ambiente local o Mailpit) e o banco. O que chega sai em
+events.integracoes.evento: o svc-processos inicia as execuções e entrega as mensagens que elas esperam. Foto e PDF
+escaneado passam antes pelo modelo de visão, que escreve o texto do documento (o agente do passo lê esse texto e cita o
+trecho de cada valor, como num PDF com texto).
+
+Banco por capacidade (alinhamento pós-N7, item 9): os pacotes pedem agendar, cobrar e extrato; a conexão da organização
+aponta um gateway (o simulado, embutido, ou um que a Cogniventure contrata e guarda na organização dela, PLATFORM_TENANT,
+com a credencial cifrada) e o adaptador do provedor faz a operação. O que o provedor não faz é 409 (o staff faz). Cada
+operação com custo no gateway soma no limite mensal integracoes.gateway-banco da organização: o repasse no plano.
 """
 import asyncio
 import base64
@@ -18,10 +23,12 @@ import io
 import logging
 import os
 import re
+import json
 import secrets
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from email import policy
 from email.message import EmailMessage
@@ -33,12 +40,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from exovision.harness.mcp import MCPClient, MCPError, MCPTool, StreamableHTTPTransport
 from exovision.harness.mcp.toolset import blocks_to_result
 from pypdf import PdfReader
+from surrealdb import RecordID
 
 from core.envelope import ServiceError
 from core.http_client import http
 from core.llm import Image, llm
 from core.nats_bus import bus
-from core.security import acting_as, assert_public_url, current, current_tenant, system
+from core.plans import plans
+from core.security import Principal, acting_as, assert_public_url, current, current_tenant, system
 from core.storage import storage
 from core.surreal import Migration, db
 from core.temporal_runner import activities, runner
@@ -58,7 +67,10 @@ from schemas import (
     DOCUMENTOS,
     ENVIADOS,
     EVENT_SUBJECT,
+    GATEWAYS,
+    LIMITE_BANCO,
     LIVE_COBRANCAS,
+    LIVE_GATEWAYS,
     LIVE_CONEXOES,
     LIVE_ENVIADOS,
     LIVE_DOCUMENTOS,
@@ -69,6 +81,7 @@ from schemas import (
     PAGAMENTOS,
     SERVICE,
     SERVIDORES,
+    SIMULADO,
     TASK_QUEUE,
     TEXT_MAX_CHARS,
     WRITERS,
@@ -97,6 +110,7 @@ from schemas import (
     DocumentoQuery,
     DocumentoRef,
     DocumentoTexto,
+    EdicaoGateway,
     EmailEnviado,
     Empty,
     Enviado,
@@ -115,9 +129,14 @@ from schemas import (
     FerramentaDisponivel,
     FerramentaMcp,
     FerramentasDisponiveis,
+    Gateway,
+    GatewayMudou,
+    GatewayRef,
+    Gateways,
     IntegracoesSettings,
     Link,
     NovaConexao,
+    NovoGateway,
     NovoServidorMcp,
     Pagamento,
     PagamentoAgendado,
@@ -126,6 +145,7 @@ from schemas import (
     PagamentoQuery,
     PagamentoRef,
     PagamentoSimulado,
+    Provedor,
     Recebidos,
     ResultadoMcp,
     Resumo,
@@ -135,10 +155,14 @@ from schemas import (
     ServidorRef,
 )
 
-MIGRATIONS: list[Migration] = []
+MIGRATIONS: list[Migration] = [
+    Migration(1, "banco_simulado vira a conexão banco com o gateway embutido simulado (contrato por capacidade)",
+              sql="UPDATE integracoes_conexoes SET tipo = 'banco', gateway = 'simulado', gateway_nome = 'Banco simulado' "
+                  "WHERE tipo = 'banco_simulado'"),
+]
 settings = IntegracoesSettings()
 log = logging.getLogger(SERVICE)
-_NOMES = {"caixa_entrada": "Caixa de entrada", "banco_simulado": "Banco (simulado)"}
+_NOMES = {"caixa_entrada": "Caixa de entrada", "banco": "Banco"}
 
 
 @activities("integracoes")
@@ -150,14 +174,20 @@ class IntegracoesService:
         return Conexoes(itens=[Conexao.model_validate(r) for r in rows])
 
     async def conectar(self, data: NovaConexao) -> Conexao:
-        """Uma conexão de cada tipo por organização. Caixa de entrada ganha um endereço próprio."""
+        """Uma conexão de cada tipo por organização. Caixa de entrada ganha um endereço próprio; o banco aponta o
+        gateway escolhido (o simulado ou um ativo da Cogniventure)."""
         _writer()
         dados: dict[str, Any] = {"tipo": data.tipo, "nome": data.nome or _NOMES[data.tipo]}
         if data.tipo == "caixa_entrada":
             codigo = secrets.token_hex(4)
             dados |= {"codigo": codigo, "endereco": f"{current_tenant()}.{codigo}@{settings.dominio}"}
         else:
-            dados["confirmar_apos"] = data.confirmar_apos
+            gateway = await _gateway(data.gateway)
+            if gateway is None or not gateway.ativo or gateway.capacidade != "banco":
+                raise ServiceError("ERRO_INTEGRACOES_GATEWAY", "Este gateway de banco não está disponível.", 422)
+            dados |= {"gateway": gateway.slug, "gateway_nome": gateway.nome}
+            if gateway.provedor == SIMULADO:
+                dados["confirmar_apos"] = data.confirmar_apos
         try:
             row = await db.create(CONEXOES, dados)
         except ServiceError as exc:
@@ -193,7 +223,7 @@ class IntegracoesService:
         agendados = await db.query(f"SELECT count() AS n FROM {PAGAMENTOS} WHERE tenant = $tenant AND status = 'agendado' GROUP ALL")
         cobrancas = await db.query(f"SELECT count() AS n FROM {COBRANCAS} WHERE tenant = $tenant AND status = 'aberta' GROUP ALL")
         caixa = conexoes.get("caixa_entrada")
-        return Resumo(caixa_entrada=caixa.endereco if caixa else None, banco="banco_simulado" in conexoes,
+        return Resumo(caixa_entrada=caixa.endereco if caixa else None, banco="banco" in conexoes,
                       documentos=documentos[0]["n"] if documentos else 0, agendados=agendados[0]["n"] if agendados else 0,
                       cobrancas=cobrancas[0]["n"] if cobrancas else 0)
 
@@ -304,21 +334,14 @@ class IntegracoesService:
             await _avisar(documento, row)
         return documento
 
-    # ── Banco simulado ───────────────────────────────────────────────────────
+    # ── Banco: a capacidade, pelo adaptador do gateway conectado ────────────
 
     async def agendar_pagamento(self, data: AgendarPagamento) -> PagamentoAgendado:
-        """rpc.integracoes.banco_agendar: agenda no banco conectado. O simulado confirma depois de confirmar_apos s."""
-        banco = [await _banco()]
-        hoje = date.today().isoformat()
-        data_agendada = data.vencimento if data.vencimento and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data.vencimento) and data.vencimento > hoje else hoje
-        pagamento_id = "PG-" + secrets.token_hex(4).upper()
-        row = await db.create(PAGAMENTOS, {"pagamento_id": pagamento_id, "valor": data.valor, "data": data_agendada,
-                                           "fornecedor": data.fornecedor, "linha_digitavel": data.linha_digitavel, "status": "agendado"})
-        pagamento = Pagamento.model_validate(row)
-        await runner.start_workflow(_workflow_pagamento(), PagamentoSimulado(id=pagamento.id, segundos=int(banco[0].get("confirmar_apos") or 30)),
-                                    task_queue=TASK_QUEUE, id=f"pagamento-{current_tenant()}-{pagamento.id}")
-        await bus.live(LIVE_PAGAMENTOS, PagamentoMudou(id=pagamento.id, action="agendado"))
-        return PagamentoAgendado(pagamento_id=pagamento_id, data=data_agendada)
+        """rpc.integracoes.banco_agendar: agenda no banco conectado (o adaptador do gateway)."""
+        banco = await _banco("agendar")
+        agendado = await banco.adaptador.agendar(banco, data)
+        await _custo(banco, "agendar", agendado.pagamento_id)
+        return agendado
 
     async def pagamentos(self, data: PagamentoQuery) -> PagamentoPage:
         return await db.page(PAGAMENTOS, data, PagamentoPage)
@@ -343,18 +366,12 @@ class IntegracoesService:
         return pagamento
 
     async def cobrar(self, data: CobrarNoBanco) -> CobrancaEmitida:
-        """rpc.integracoes.banco_cobrar: emite o boleto no banco conectado. O simulado confirma o recebimento depois
-        de confirmar_apos s (ou alguém confirma à mão), e a confirmação acorda a execução que espera."""
-        banco = await _banco()
-        cobranca_id = "CB-" + secrets.token_hex(4).upper()
-        row = await db.create(COBRANCAS, {"cobranca_id": cobranca_id, "valor": data.valor, "vencimento": data.vencimento,
-                                          "pagador": data.pagador, "descricao": data.descricao, "status": "aberta",
-                                          "linha_digitavel": _linha_digitavel(data.valor)})
-        cobranca = Cobranca.model_validate(row)
-        await runner.start_workflow(_workflow_cobranca(), CobrancaSimulada(id=cobranca.id, segundos=int(banco.get("confirmar_apos") or 30)),
-                                    task_queue=TASK_QUEUE, id=f"cobranca-{current_tenant()}-{cobranca.id}")
-        await bus.live(LIVE_COBRANCAS, CobrancaMudou(id=cobranca.id, action="emitida"))
-        return CobrancaEmitida(cobranca_id=cobranca_id, linha_digitavel=cobranca.linha_digitavel, vencimento=cobranca.vencimento)
+        """rpc.integracoes.banco_cobrar: emite o boleto no banco conectado; a confirmação do recebimento acorda a
+        execução que espera."""
+        banco = await _banco("cobrar")
+        emitida = await banco.adaptador.cobrar(banco, data)
+        await _custo(banco, "cobrar", emitida.cobranca_id)
+        return emitida
 
     async def cobrancas(self, data: CobrancaQuery) -> CobrancaPage:
         return await db.page(COBRANCAS, data, CobrancaPage)
@@ -379,21 +396,66 @@ class IntegracoesService:
         return cobranca
 
     async def extrato(self, data: ExtratoPedido) -> Extrato:
-        """rpc.integracoes.banco_extrato: o que entrou e saiu da conta desde o dia pedido (pagamentos confirmados e
-        cobranças recebidas), para a conciliação."""
-        await _banco()
-        itens: list[Lancamento] = []
-        for row in await db.query(f"SELECT * FROM {PAGAMENTOS} WHERE tenant = $tenant AND status = 'pago' ORDER BY pago_em"):
-            quando = _dia(row.get("pago_em"))
-            if quando >= data.desde:
-                itens.append(Lancamento(tipo="pagamento", id=row["pagamento_id"], valor=-float(row["valor"]), data=quando,
-                                        descricao=row.get("fornecedor")))
-        for row in await db.query(f"SELECT * FROM {COBRANCAS} WHERE tenant = $tenant AND status = 'recebida' ORDER BY recebido_em"):
-            quando = _dia(row.get("recebido_em"))
-            if quando >= data.desde:
-                itens.append(Lancamento(tipo="recebimento", id=row["cobranca_id"], valor=float(row["valor"]), data=quando,
-                                        descricao=row.get("pagador")))
-        return Extrato(itens=sorted(itens, key=lambda i: i.data))
+        """rpc.integracoes.banco_extrato: o que entrou e saiu da conta desde o dia pedido, para a conciliação."""
+        banco = await _banco("extrato")
+        extrato = await banco.adaptador.extrato(banco, data)
+        await _custo(banco, "extrato", None)
+        return extrato
+
+    # ── Gateways da Cogniventure (na organização dela) ──────────────────────
+
+    async def gateways(self, data: Empty) -> Gateways:
+        """Os gateways que dá para usar: o simulado e os ativos da Cogniventure. Quem a administra vê todos, com os
+        campos da credencial guardados (nunca os valores), e os provedores que o serviço sabe usar."""
+        gerencia = _gerencia(current())
+        itens = [_SIMULADO_GATEWAY] + [g for g in await _gateways_da_plataforma(gerencia=gerencia) if gerencia or g.ativo]
+        return Gateways(itens=itens, provedores=[a.provedor_info() for a in ADAPTADORES.values()], gerencia=gerencia)
+
+    async def criar_gateway(self, data: NovoGateway) -> Gateway:
+        """Um gateway contratado pela Cogniventure: o provedor, a credencial (cifrada) e o custo de cada operação."""
+        _gestor()
+        adaptador = _adaptador_para(data.provedor, data.capacidade)
+        if data.slug == SIMULADO:
+            raise ServiceError("ERRO_INTEGRACOES_JA_CONECTADA", "simulado é o gateway embutido: escolha outro identificador.", 409)
+        _conferir_gateway(adaptador, data.custos, list(data.credencial or {}))
+        try:
+            row = await db.create(GATEWAYS, {
+                "slug": data.slug, "nome": data.nome, "capacidade": data.capacidade, "provedor": data.provedor, "ativo": data.ativo,
+                "custos": dict(data.custos), **_credencial_guardada(data.slug, data.credencial),
+            })
+        except ServiceError as exc:
+            if exc.code == "ERRO_RECORD_DUPLICATE":
+                raise ServiceError("ERRO_INTEGRACOES_JA_CONECTADA", "Já existe um gateway com este identificador.", 409) from None
+            raise
+        gateway = _gateway_view(row, gerencia=True)
+        await bus.live(LIVE_GATEWAYS, GatewayMudou(id=gateway.id, action="criado"))
+        return gateway
+
+    async def editar_gateway(self, data: EdicaoGateway) -> Gateway:
+        """Nome, custos, credencial (troca inteira) ou ativo. Desativado, as organizações que o usam recebem 409 (o passo
+        vai ao staff) até alguém ativar de novo; provedor e identificador não mudam."""
+        _gestor()
+        row = await _gateway_row(data.id)
+        adaptador = _adaptador_para(row["provedor"], row["capacidade"])
+        _conferir_gateway(adaptador, data.custos if data.custos is not None else row.get("custos") or {},
+                          list(data.credencial) if data.credencial is not None else list(row.get("campos") or []))
+        mudancas: dict[str, Any] = data.model_dump(exclude={"id", "credencial", "custos"}, exclude_none=True)
+        if data.credencial is not None:
+            mudancas |= _credencial_guardada(row["slug"], data.credencial)
+        if data.custos is not None:  # troca inteira: o MERGE juntaria com os custos de antes
+            await db.query("UPDATE $rid SET custos = $custos WHERE tenant = $tenant", rid=RecordID(GATEWAYS, data.id),
+                           custos=dict(data.custos))
+        gateway = _gateway_view(await db.merge(f"{GATEWAYS}:{data.id}", mudancas), gerencia=True)
+        await bus.live(LIVE_GATEWAYS, GatewayMudou(id=data.id, action="alterado"))
+        return gateway
+
+    async def remover_gateway(self, data: GatewayRef) -> Gateway:
+        """Remove o gateway e a credencial. Quem estava conectado a ele recebe 409 até conectar outro."""
+        _gestor()
+        row = await _gateway_row(data.id)
+        await db.delete(f"{GATEWAYS}:{data.id}")
+        await bus.live(LIVE_GATEWAYS, GatewayMudou(id=data.id, action="removido"))
+        return _gateway_view(row, gerencia=True)
 
     # ── E-mail que sai da caixa de entrada ───────────────────────────────────
 
@@ -523,12 +585,212 @@ def _workflow_cobranca() -> Any:
     return CobrancaSimuladaWorkflow.run
 
 
-async def _banco() -> dict[str, Any]:
-    """A conexão do banco da organização; sem ela, 409 (no processo, o passo vai para o staff)."""
-    banco = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant AND tipo = 'banco_simulado' LIMIT 1")
-    if not banco:
+# ── Banco por capacidade: a conexão, o gateway e o adaptador do provedor ────
+
+@dataclass(frozen=True)
+class _Banco:
+    """O banco conectado da organização, pronto para uma operação: a conexão, o gateway e o adaptador do provedor."""
+
+    conexao: dict[str, Any]
+    gateway: Gateway
+    adaptador: "_AdaptadorBanco"
+    guardado: dict[str, Any] = field(default_factory=dict)  # o registro do gateway, com a credencial cifrada
+
+    def credencial(self) -> dict[str, str]:
+        """A credencial do gateway, aberta só na hora da operação (agindo como a organização da Cogniventure)."""
+        if not self.guardado.get("credencial"):
+            return {}
+        with acting_as(system(SERVICE, settings.platform_tenant)):
+            return json.loads(_abrir(f"gateway:{self.gateway.slug}", self.guardado["credencial"]))
+
+
+class _AdaptadorBanco:
+    """Um provedor da capacidade banco. Cada operação recebe o banco conectado (conexão, gateway e a credencial, por
+    banco.credencial()) e devolve o contrato da capacidade, igual para todo provedor. O que o provedor não faz fica fora
+    de operacoes: o serviço responde 409 e, no processo, o passo vai para o staff."""
+
+    provedor: str = ""
+    nome: str = ""
+    capacidade: str = "banco"
+    operacoes: tuple[str, ...] = ()
+    campos: tuple[str, ...] = ()  # a credencial que o gateway da Cogniventure guarda para este provedor
+
+    def provedor_info(self) -> Provedor:
+        return Provedor(provedor=self.provedor, nome=self.nome, capacidade="banco", operacoes=list(self.operacoes),
+                        campos=list(self.campos))
+
+    async def agendar(self, banco: _Banco, data: AgendarPagamento) -> PagamentoAgendado:
+        raise NotImplementedError
+
+    async def cobrar(self, banco: _Banco, data: CobrarNoBanco) -> CobrancaEmitida:
+        raise NotImplementedError
+
+    async def extrato(self, banco: _Banco, data: ExtratoPedido) -> Extrato:
+        raise NotImplementedError
+
+
+class _BancoSimulado(_AdaptadorBanco):
+    """O banco simulado: grava aqui, confirma depois de confirmar_apos s num workflow durável (ou à mão) e dá o extrato
+    do que foi confirmado. Até o banco de verdade ser escolhido (e para homologar um gateway com custo)."""
+
+    provedor, nome, operacoes = SIMULADO, "Banco simulado", ("agendar", "cobrar", "extrato")
+
+    async def agendar(self, banco: _Banco, data: AgendarPagamento) -> PagamentoAgendado:
+        hoje = date.today().isoformat()
+        data_agendada = data.vencimento if data.vencimento and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data.vencimento) and data.vencimento > hoje else hoje
+        pagamento_id = "PG-" + secrets.token_hex(4).upper()
+        row = await db.create(PAGAMENTOS, {"pagamento_id": pagamento_id, "valor": data.valor, "data": data_agendada,
+                                           "fornecedor": data.fornecedor, "linha_digitavel": data.linha_digitavel, "status": "agendado",
+                                           "gateway": banco.gateway.slug})
+        pagamento = Pagamento.model_validate(row)
+        await runner.start_workflow(_workflow_pagamento(), PagamentoSimulado(id=pagamento.id, segundos=_segundos(banco)),
+                                    task_queue=TASK_QUEUE, id=f"pagamento-{current_tenant()}-{pagamento.id}")
+        await bus.live(LIVE_PAGAMENTOS, PagamentoMudou(id=pagamento.id, action="agendado"))
+        return PagamentoAgendado(pagamento_id=pagamento_id, data=data_agendada)
+
+    async def cobrar(self, banco: _Banco, data: CobrarNoBanco) -> CobrancaEmitida:
+        cobranca_id = "CB-" + secrets.token_hex(4).upper()
+        row = await db.create(COBRANCAS, {"cobranca_id": cobranca_id, "valor": data.valor, "vencimento": data.vencimento,
+                                          "pagador": data.pagador, "descricao": data.descricao, "status": "aberta",
+                                          "linha_digitavel": _linha_digitavel(data.valor), "gateway": banco.gateway.slug})
+        cobranca = Cobranca.model_validate(row)
+        await runner.start_workflow(_workflow_cobranca(), CobrancaSimulada(id=cobranca.id, segundos=_segundos(banco)),
+                                    task_queue=TASK_QUEUE, id=f"cobranca-{current_tenant()}-{cobranca.id}")
+        await bus.live(LIVE_COBRANCAS, CobrancaMudou(id=cobranca.id, action="emitida"))
+        return CobrancaEmitida(cobranca_id=cobranca_id, linha_digitavel=cobranca.linha_digitavel, vencimento=cobranca.vencimento)
+
+    async def extrato(self, banco: _Banco, data: ExtratoPedido) -> Extrato:
+        """Os pagamentos confirmados (negativos) e as cobranças recebidas desde o dia pedido."""
+        itens: list[Lancamento] = []
+        for row in await db.query(f"SELECT * FROM {PAGAMENTOS} WHERE tenant = $tenant AND status = 'pago' ORDER BY pago_em"):
+            quando = _dia(row.get("pago_em"))
+            if quando >= data.desde:
+                itens.append(Lancamento(tipo="pagamento", id=row["pagamento_id"], valor=-float(row["valor"]), data=quando,
+                                        descricao=row.get("fornecedor")))
+        for row in await db.query(f"SELECT * FROM {COBRANCAS} WHERE tenant = $tenant AND status = 'recebida' ORDER BY recebido_em"):
+            quando = _dia(row.get("recebido_em"))
+            if quando >= data.desde:
+                itens.append(Lancamento(tipo="recebimento", id=row["cobranca_id"], valor=float(row["valor"]), data=quando,
+                                        descricao=row.get("pagador")))
+        return Extrato(itens=sorted(itens, key=lambda i: i.data))
+
+
+ADAPTADORES: dict[str, _AdaptadorBanco] = {a.provedor: a for a in (_BancoSimulado(),)}
+_SIMULADO_GATEWAY = Gateway(id=SIMULADO, slug=SIMULADO, nome="Banco simulado", capacidade="banco", provedor=SIMULADO,
+                            operacoes=list(_BancoSimulado.operacoes), embutido=True)
+_NOMES_OPERACAO = {"agendar": "agenda pagamentos", "cobrar": "emite cobranças", "extrato": "dá o extrato"}
+
+
+def _segundos(banco: _Banco) -> int:
+    return int(banco.conexao.get("confirmar_apos") or 30)
+
+
+async def _banco(operacao: str) -> _Banco:
+    """O banco conectado da organização para a operação. Sem conexão, gateway indisponível ou operação que o provedor
+    não faz: 409 (no processo, o passo vai para o staff). Operação com custo confere antes o limite do mês (402)."""
+    rows = await db.query(f"SELECT * FROM {CONEXOES} WHERE tenant = $tenant AND tipo = 'banco' LIMIT 1")
+    if not rows:
         raise ServiceError("ERRO_INTEGRACOES_SEM_BANCO", "Conecte o banco da empresa em Integrações para pagamentos, cobranças e extrato.", 409)
-    return banco[0]
+    conexao = rows[0]
+    gateway, guardado = await _gateway_e_row(conexao.get("gateway") or SIMULADO)
+    if gateway is None or not gateway.ativo:
+        raise ServiceError("ERRO_INTEGRACOES_GATEWAY", f"O banco conectado ({conexao.get('gateway_nome') or conexao.get('gateway')}) "
+                                                       "não está disponível agora: a Cogniventure foi avisada.", 409)
+    adaptador = ADAPTADORES.get(gateway.provedor)
+    if adaptador is None or operacao not in adaptador.operacoes:
+        raise ServiceError("ERRO_INTEGRACOES_SEM_SUPORTE", f"O banco conectado ({gateway.nome}) não {_NOMES_OPERACAO[operacao]} "
+                                                           "por aqui: o staff faz no banco da empresa.", 409)
+    banco = _Banco(conexao=conexao, gateway=gateway, adaptador=adaptador, guardado=guardado)
+    if gateway.custos.get(operacao):
+        await plans.check(LIMITE_BANCO)  # o plano pode limitar o gasto do mês: passou, 402 (o passo vai para o staff)
+    return banco
+
+
+async def _custo(banco: _Banco, operacao: str, ref: str | None) -> None:
+    """Soma o custo da operação no limite do mês da organização (o repasse no plano). Falhar aqui não desfaz a
+    operação feita no banco: o custo perdido vai para o log, e a operação não se repete."""
+    valor = banco.gateway.custos.get(operacao)
+    if not valor:
+        return
+    try:
+        await plans.use(LIMITE_BANCO, valor, key=f"{current_tenant()}:{banco.gateway.slug}:{operacao}:{ref}" if ref else None)
+    except Exception:  # noqa: BLE001 - o banco já fez a operação
+        log.exception("custo de %s no gateway %s não foi somado", operacao, banco.gateway.slug)
+
+
+# ── Gateways da Cogniventure: guardados na organização dela (PLATFORM_TENANT) ─
+
+def _gerencia(who: Principal | None) -> bool:
+    """Dono ou admin da organização da Cogniventure: quem contrata e gerencia os gateways."""
+    return bool(settings.platform_tenant) and who is not None and who.tenant == settings.platform_tenant and bool(WRITERS & who.roles)
+
+
+def _gestor() -> None:
+    if not _gerencia(current()):
+        raise ServiceError("ERRO_INTEGRACOES_FORBIDDEN", "Só donos e administradores da Cogniventure gerenciam os gateways.", 403)
+
+
+async def _gateways_da_plataforma(*, gerencia: bool) -> list[Gateway]:
+    """Os gateways da organização da Cogniventure (lidos como ela: a tabela é por organização, como as outras)."""
+    if not settings.platform_tenant:
+        return []
+    with acting_as(system(SERVICE, settings.platform_tenant)):
+        rows = await db.query(f"SELECT * FROM {GATEWAYS} WHERE tenant = $tenant ORDER BY nome")
+    return [_gateway_view(r, gerencia=gerencia) for r in rows]
+
+
+async def _gateway_e_row(slug: str) -> tuple[Gateway | None, dict[str, Any]]:
+    """O gateway pelo identificador (o simulado é embutido) e o registro guardado, com a credencial cifrada."""
+    if slug == SIMULADO:
+        return _SIMULADO_GATEWAY, {}
+    if not settings.platform_tenant:
+        return None, {}
+    with acting_as(system(SERVICE, settings.platform_tenant)):
+        rows = await db.query(f"SELECT * FROM {GATEWAYS} WHERE tenant = $tenant AND slug = $slug LIMIT 1", slug=slug)
+    return (_gateway_view(rows[0], gerencia=False), rows[0]) if rows else (None, {})
+
+
+async def _gateway(slug: str) -> Gateway | None:
+    return (await _gateway_e_row(slug))[0]
+
+
+async def _gateway_row(gateway_id: str) -> dict[str, Any]:
+    row = await db.select(f"{GATEWAYS}:{gateway_id}")
+    if row is None:
+        raise ServiceError("ERRO_INTEGRACOES_NAO_ENCONTRADO", "Gateway não encontrado.", 404)
+    return row
+
+
+def _gateway_view(row: dict[str, Any], *, gerencia: bool) -> Gateway:
+    """O gateway como a tela vê: a credencial nunca; os campos guardados, só para quem gerencia."""
+    adaptador = ADAPTADORES.get(row["provedor"])
+    return Gateway.model_validate({**{k: v for k, v in row.items() if k not in ("credencial", "campos")},
+                                   "operacoes": list(adaptador.operacoes) if adaptador else [],
+                                   "credencial": list(row.get("campos") or []) if gerencia else []})
+
+
+def _adaptador_para(provedor: str, capacidade: str) -> _AdaptadorBanco:
+    adaptador = ADAPTADORES.get(provedor)
+    if adaptador is None or adaptador.capacidade != capacidade:
+        raise ServiceError("ERRO_INTEGRACOES_PROVEDOR", f"O serviço não sabe usar o provedor {provedor} para {capacidade}.", 422)
+    return adaptador
+
+
+def _conferir_gateway(adaptador: _AdaptadorBanco, custos: dict[str, Any], campos: list[str]) -> None:
+    """Custo só de operação que o provedor faz; a credencial com exatamente os campos que ele pede."""
+    if fora := [op for op in custos if op not in adaptador.operacoes]:
+        raise ServiceError("ERRO_INTEGRACOES_GATEWAY", f"{adaptador.nome} não faz: {', '.join(fora)} (custo sem operação).", 422)
+    if sorted(campos) != sorted(adaptador.campos):
+        raise ServiceError("ERRO_INTEGRACOES_CREDENCIAL",
+                           f"A credencial de {adaptador.nome} tem os campos: {', '.join(adaptador.campos) or 'nenhum'}.", 422)
+
+
+def _credencial_guardada(slug: str, credencial: dict[str, Any] | None) -> dict[str, Any]:
+    """A credencial cifrada (AES-256-GCM, presa à organização da Cogniventure e ao gateway) e os nomes dos campos."""
+    if not credencial:
+        return {"credencial": None, "campos": []}
+    aberta = json.dumps({k: v.get_secret_value() for k, v in credencial.items()})
+    return {"credencial": _cifrar(f"gateway:{slug}", aberta), "campos": sorted(credencial)}
 
 
 def _dia(valor: Any) -> str:
@@ -949,13 +1211,16 @@ def _aead() -> AESGCM:
 
 
 def _cifrar(nome: str, segredo: str) -> str:
-    """AES-256-GCM preso à organização e ao nome do servidor: copiado para outro registro, não abre."""
+    """AES-256-GCM preso à organização e ao nome (do servidor MCP, ou gateway:<slug>): copiado para outro registro, não
+    abre. O nome do servidor não tem dois-pontos, então um não abre o outro."""
     nonce = os.urandom(12)
     return base64.urlsafe_b64encode(nonce + _aead().encrypt(nonce, segredo.encode(), f"{current_tenant()}:{nome}".encode())).decode()
 
 
+def _abrir(nome: str, cifrado: str) -> str:
+    bruto = base64.urlsafe_b64decode(cifrado)
+    return _aead().decrypt(bruto[:12], bruto[12:], f"{current_tenant()}:{nome}".encode()).decode()
+
+
 def _segredo(row: dict[str, Any]) -> str | None:
-    if not row.get("segredo"):
-        return None
-    bruto = base64.urlsafe_b64decode(row["segredo"])
-    return _aead().decrypt(bruto[:12], bruto[12:], f"{current_tenant()}:{row['nome']}".encode()).decode()
+    return _abrir(row["nome"], row["segredo"]) if row.get("segredo") else None

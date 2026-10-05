@@ -1,9 +1,10 @@
 """svc-integracoes · ingress duplo + worker Temporal no mesmo loop. Fonte da verdade: specs/integracoes.md
 
-HTTP /conexoes...        → conexões da organização (caixa de entrada, banco simulado).
+HTTP /conexoes...        → conexões da organização (caixa de entrada; banco, pelo gateway escolhido).
+HTTP /gateways...        → os gateways que a Cogniventure contrata (credencial cifrada, custo por operação); o simulado.
 HTTP /documentos...      → documentos recebidos e o link para abrir cada um.
-HTTP /pagamentos...      → pagamentos no banco simulado; confirmar à mão.
-HTTP /cobrancas...       → cobranças (boletos) emitidas no banco simulado; confirmar o recebimento à mão.
+HTTP /pagamentos...      → pagamentos agendados no banco; confirmar à mão.
+HTTP /cobrancas...       → cobranças (boletos) emitidas no banco; confirmar o recebimento à mão.
 HTTP /enviados           → os e-mails que saíram da caixa de entrada (propostas, cobranças, pedidos).
 HTTP /servidores...      → servidores MCP da organização (ferramentas para os agentes); /catalogo, o que dá para conectar.
 HTTP /documentos/upload e /documentos/enviar → documento enviado pela tela (vira documento recebido, como o e-mail).
@@ -57,12 +58,15 @@ from schemas import (
     ConexaoRef,
     DocumentoQuery,
     DocumentoRef,
+    EdicaoGateway,
     Empty,
     EnviadoQuery,
     EnviarDocumento,
     EnviarEmail,
     ExtratoPedido,
+    GatewayRef,
     NovaConexao,
+    NovoGateway,
     NovoServidorMcp,
     PagamentoQuery,
     PagamentoRef,
@@ -185,6 +189,26 @@ async def enviar_documento(data: EnviarDocumento) -> ResponseEnvelope:
 @app.get("/catalogo", response_model=ResponseEnvelope)
 async def catalogo() -> ResponseEnvelope:
     return _ok(await svc.catalogo(Empty()))
+
+
+@app.get("/gateways", response_model=ResponseEnvelope)
+async def gateways() -> ResponseEnvelope:
+    return _ok(await svc.gateways(Empty()))
+
+
+@app.post("/gateways", response_model=ResponseEnvelope)
+async def criar_gateway(data: NovoGateway) -> ResponseEnvelope:
+    return _ok(await svc.criar_gateway(data))
+
+
+@app.post("/gateways/editar", response_model=ResponseEnvelope)
+async def editar_gateway(data: EdicaoGateway) -> ResponseEnvelope:
+    return _ok(await svc.editar_gateway(data))
+
+
+@app.post("/gateways/remover", response_model=ResponseEnvelope)
+async def remover_gateway(data: GatewayRef) -> ResponseEnvelope:
+    return _ok(await svc.remover_gateway(data))
 
 
 @app.get("/servidores", response_model=ResponseEnvelope)

@@ -1,11 +1,11 @@
 """svc-integracoes · contratos (DTOs, enums, constantes). Fonte da verdade: specs/integracoes.md §2"""
 from datetime import datetime
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from core.plans import Module
+from core.plans import Limit, Module
 from core.storage import KeepRequest, Upload, UploadRequest
 from core.surreal import ListQuery, Page
 
@@ -28,6 +28,7 @@ LIVE_DOCUMENTOS = "integracoes.documentos"
 LIVE_PAGAMENTOS = "integracoes.pagamentos"
 LIVE_COBRANCAS = "integracoes.cobrancas"
 LIVE_ENVIADOS = "integracoes.enviados"
+LIVE_GATEWAYS = "integracoes.gateways"
 
 CONEXOES = "integracoes_conexoes"
 DOCUMENTOS = "integracoes_documentos"
@@ -35,11 +36,15 @@ PAGAMENTOS = "integracoes_pagamentos"
 SERVIDORES = "integracoes_servidores_mcp"
 COBRANCAS = "integracoes_cobrancas"
 ENVIADOS = "integracoes_enviados"
-TABLES = [CONEXOES, DOCUMENTOS, PAGAMENTOS, SERVIDORES, COBRANCAS, ENVIADOS]
-UNIQUE = {CONEXOES: ["tipo"], DOCUMENTOS: ["origem_id"], PAGAMENTOS: ["pagamento_id"], SERVIDORES: ["nome"], COBRANCAS: ["cobranca_id"]}
+GATEWAYS = "integracoes_gateways"  # os gateways que a Cogniventure contrata: só na organização dela (PLATFORM_TENANT)
+TABLES = [CONEXOES, DOCUMENTOS, PAGAMENTOS, SERVIDORES, COBRANCAS, ENVIADOS, GATEWAYS]
+UNIQUE = {CONEXOES: ["tipo"], DOCUMENTOS: ["origem_id"], PAGAMENTOS: ["pagamento_id"], SERVIDORES: ["nome"], COBRANCAS: ["cobranca_id"],
+          GATEWAYS: ["slug"]}
 SEARCH = {DOCUMENTOS: ["nome", "assunto", "de"], ENVIADOS: ["para", "assunto"]}
 WRITERS = frozenset({"owner", "admin"})
 BANK_OPERATORS = frozenset({"owner", "admin", "operador"})  # confirmam à mão um pagamento do banco simulado
+SIMULADO = "simulado"  # o gateway embutido: o banco simulado, sempre disponível e sem custo
+LIMITE_BANCO = "gateway-banco"  # integracoes.gateway-banco: o gasto do mês com o gateway do banco, repassado no plano
 DOCUMENT_MAX_BYTES = 10_000_000
 MCP_MAX_BYTES = 1_000_000  # resposta de um servidor MCP
 MCP_TIMEOUT = 30.0
@@ -56,6 +61,7 @@ MODULE = Module(
     "Integrações",
     "Conexões da empresa com o mundo de fora: caixa de entrada de documentos, banco e servidores MCP",
     category="Integrações",
+    limits=[Limit(LIMITE_BANCO, "Gasto com o banco no mês (gateway da Cogniventure)", monthly=True, currency="BRL")],
 )
 
 
@@ -69,7 +75,10 @@ class IntegracoesSettings(BaseSettings):
     postmark_entrada: SecretStr | None = Field(None, description="Senha do aviso de entrada do Postmark (usuário:senha na URL do "
                                                                  "webhook, Basic auth); sem ela a rota de entrada não existe")
     modelo_visao: str = Field("cv/visao", description="Modelo que lê foto e PDF escaneado, como cadastrado no svc-ai")
-    secrets_key: SecretStr | None = Field(None, description="Chave (32 bytes, base64url) que cifra as credenciais MCP; sem ela o serviço não sobe")
+    secrets_key: SecretStr | None = Field(None, description="Chave (32 bytes, base64url) que cifra as credenciais (MCP e "
+                                                            "gateways); sem ela o serviço não sobe")
+    platform_tenant: str | None = Field(None, validation_alias="PLATFORM_TENANT",
+                                        description="A organização da Cogniventure: dono e admin dela gerenciam os gateways")
     environment: str = Field("development", validation_alias="ENVIRONMENT")
 
 
@@ -88,7 +97,8 @@ def _key(value: Any) -> Any:
 
 # ── Conexões ─────────────────────────────────────────────────────────────────
 
-TipoConexao = Literal["caixa_entrada", "banco_simulado"]
+TipoConexao = Literal["caixa_entrada", "banco"]
+_SLUG = r"^[a-z][a-z0-9-]{1,39}$"
 
 
 class Conexao(BaseModel):
@@ -96,7 +106,9 @@ class Conexao(BaseModel):
     tipo: TipoConexao
     nome: str
     endereco: str | None = Field(None, description="caixa_entrada: para onde encaminhar boletos e notas")
-    confirmar_apos: int | None = Field(None, description="banco_simulado: segundos até o banco confirmar um pagamento")
+    gateway: str | None = Field(None, description="banco: o gateway (simulado, ou um da Cogniventure)")
+    gateway_nome: str | None = None
+    confirmar_apos: int | None = Field(None, description="banco simulado: segundos até o banco confirmar um pagamento")
     created_at: datetime | None = None
 
     @field_validator("id", mode="before")
@@ -112,7 +124,8 @@ class Conexoes(BaseModel):
 class NovaConexao(_Input):
     tipo: TipoConexao
     nome: str | None = Field(None, min_length=2, max_length=80)
-    confirmar_apos: int = Field(30, ge=5, le=86_400, description="banco_simulado: segundos até confirmar o pagamento")
+    gateway: str = Field(SIMULADO, pattern=_SLUG, description="banco: o gateway (GET /gateways); padrão, o simulado")
+    confirmar_apos: int = Field(30, ge=5, le=86_400, description="banco simulado: segundos até confirmar o pagamento")
 
 
 class ConexaoRef(_Input):
@@ -122,6 +135,82 @@ class ConexaoRef(_Input):
 class ConexaoMudou(BaseModel):
     id: str
     action: Literal["conectada", "removida"]
+
+
+# ── Gateways: o contrato por capacidade (alinhamento pós-N7, item 9) ─────────
+
+Capacidade = Literal["banco"]
+OperacaoBanco = Literal["agendar", "cobrar", "extrato"]
+
+
+class Provedor(BaseModel):
+    """Um provedor que o serviço sabe usar (um adaptador da capacidade): o que ele faz e a credencial que pede."""
+
+    provedor: str
+    nome: str
+    capacidade: Capacidade
+    operacoes: list[OperacaoBanco]
+    campos: list[str] = Field(default_factory=list, description="Campos da credencial que o gateway guarda (cifrada)")
+
+
+class Gateway(BaseModel):
+    """Um gateway que a Cogniventure contrata e repassa no plano: o provedor, a credencial (só aqui, cifrada) e quanto
+    cada operação custa ao cliente (soma no limite integracoes.gateway-<capacidade> do mês)."""
+
+    id: str
+    slug: str
+    nome: str
+    capacidade: Capacidade
+    provedor: str
+    ativo: bool = True
+    custos: dict[OperacaoBanco, float] = Field(default_factory=dict, description="Operação → R$ por chamada")
+    operacoes: list[OperacaoBanco] = Field(default_factory=list, description="O que o provedor faz (o resto vai ao staff)")
+    embutido: bool = Field(False, description="O banco simulado: sempre disponível, sem custo e sem credencial")
+    credencial: list[str] = Field(default_factory=list, description="Os campos guardados (só para quem gerencia a plataforma)")
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _chave(cls, value: Any) -> Any:
+        return _key(value)
+
+
+class Gateways(BaseModel):
+    itens: list[Gateway]
+    provedores: list[Provedor]
+    gerencia: bool = Field(False, description="Quem pergunta gerencia os gateways (dono ou admin da Cogniventure)")
+
+
+Custos = dict[OperacaoBanco, Annotated[float, Field(ge=0, le=10_000)]]
+Credencial = dict[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")], Annotated[SecretStr, Field(min_length=1, max_length=4000)]]
+
+
+class NovoGateway(_Input):
+    slug: str = Field(..., pattern=_SLUG, description="Identificador curto (a conexão do cliente guarda este)")
+    nome: str = Field(..., min_length=2, max_length=80)
+    capacidade: Capacidade = "banco"
+    provedor: str = Field(..., pattern=r"^[a-z][a-z0-9_-]{1,39}$")
+    custos: Custos = Field(default_factory=dict)
+    credencial: Credencial | None = Field(None, description="Os campos que o provedor pede: guardados cifrados, nunca voltam")
+    ativo: bool = True
+
+
+class EdicaoGateway(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    nome: str | None = Field(None, min_length=2, max_length=80)
+    custos: Custos | None = None
+    credencial: Credencial | None = Field(None, description="Troca a credencial inteira")
+    ativo: bool | None = None
+
+
+class GatewayRef(_Input):
+    id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class GatewayMudou(BaseModel):
+    id: str
+    action: Literal["criado", "alterado", "removido"]
 
 
 # ── Documentos recebidos ─────────────────────────────────────────────────────
@@ -267,6 +356,7 @@ class Pagamento(BaseModel):
     linha_digitavel: str | None = None
     status: Literal["agendado", "pago"]
     pago_em: datetime | None = None
+    gateway: str | None = Field(None, description="Por qual gateway passou")
     created_at: datetime | None = None
 
     @field_validator("id", mode="before")
@@ -326,6 +416,7 @@ class Cobranca(BaseModel):
     linha_digitavel: str
     status: Literal["aberta", "recebida"]
     recebido_em: datetime | None = None
+    gateway: str | None = Field(None, description="Por qual gateway passou")
     created_at: datetime | None = None
 
     @field_validator("id", mode="before")
@@ -550,13 +641,14 @@ CATALOGO = Catalogo(itens=[
     ItemCatalogo(tipo="caixa_entrada", nome="Caixa de entrada", disponivel=True,
                  descricao="Um endereço de e-mail da empresa: cada anexo que chega vira documento, e as propostas, cobranças e "
                            "pedidos saem por ele."),
-    ItemCatalogo(tipo="banco_simulado", nome="Banco (simulado)", disponivel=True,
-                 descricao="Agenda pagamentos, emite cobranças e dá o extrato enquanto o banco de verdade não é escolhido."),
+    ItemCatalogo(tipo="banco", nome="Banco", disponivel=True,
+                 descricao="Agenda pagamentos, emite cobranças e dá o extrato pelo gateway que a Cogniventure contrata (ou pelo "
+                           "banco simulado, enquanto o banco de verdade não é escolhido)."),
     ItemCatalogo(tipo="servidor_mcp", nome="Servidor MCP", disponivel=True, varias=True,
                  descricao="Ferramentas de um sistema da empresa (ERP, CRM...) para os agentes, com a credencial guardada aqui."),
     ItemCatalogo(tipo="whatsapp", nome="WhatsApp", disponivel=False, descricao="Documentos e conversas pelo WhatsApp da empresa."),
-    ItemCatalogo(tipo="banco", nome="Banco (Open Finance ou API do banco)", disponivel=False,
-                 descricao="Pagamentos e extratos no banco de verdade."),
+    ItemCatalogo(tipo="open_finance", nome="Extrato pelo Open Finance", disponivel=False,
+                 descricao="O extrato da conta de verdade, autorizado pela empresa no agregador."),
     ItemCatalogo(tipo="nfse", nome="NFS-e", disponivel=False, descricao="Emissão e consulta de notas de serviço na prefeitura."),
     ItemCatalogo(tipo="assinatura", nome="Assinatura eletrônica", disponivel=False, descricao="Contratos assinados pelas partes, sem papel."),
     ItemCatalogo(tipo="esocial", nome="eSocial ou folha", disponivel=False, descricao="Admissões e eventos da folha no eSocial."),
